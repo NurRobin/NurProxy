@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { CircleCheck, TriangleAlert } from 'lucide-react';
 import { api } from '../lib/api';
 import { usePolling } from '../lib/usePolling';
@@ -14,6 +15,7 @@ function seen(date?: string) {
 }
 
 export default function Overview() {
+  const { t } = useTranslation();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [domains, setDomains] = useState<Domain[]>([]);
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
@@ -49,20 +51,20 @@ export default function Overview() {
   const healthy = errors === 0 && offline === 0;
 
   if (loading) {
-    return <div className="py-12 text-center text-sm text-fg-muted">Loading your dashboard…</div>;
+    return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
   }
 
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Overview</h1>
+          <h1 className="font-display text-3xl font-bold tracking-tight text-fg">{t('overview.title')}</h1>
           <p className="mt-1 text-sm text-fg-muted">
-            {updatedAt && !stale ? `Updated ${seen(updatedAt)}` : 'Your proxy at a glance'}
-            {stale && <span className="text-danger-fg"> · couldn’t refresh — check the orchestrator</span>}
+            {updatedAt && !stale ? t('overview.updated', { time: seen(updatedAt) }) : t('overview.glance')}
+            {stale && <span className="text-danger-fg"> · {t('overview.staleNote')}</span>}
           </p>
         </div>
-        <Link to="/domains" className={buttonClass('primary')}>New domain</Link>
+        <Link to="/domains" className={buttonClass('primary')}>{t('overview.newDomain')}</Link>
       </div>
 
       {/* Health summary — one panel, not a wall of identical metric cards. */}
@@ -74,28 +76,28 @@ export default function Overview() {
             </span>
             <div>
               <p className="font-medium text-fg">
-                {healthy ? 'All systems normal' : `${errors + offline} thing${errors + offline !== 1 ? 's' : ''} need${errors + offline === 1 ? 's' : ''} attention`}
+                {healthy ? t('overview.allNormal') : t('overview.attention', { count: errors + offline })}
               </p>
               <p className="text-sm text-fg-muted">
-                {agents.length} agent{agents.length !== 1 ? 's' : ''} · {domains.length} domain{domains.length !== 1 ? 's' : ''}
-                {pendingAgents > 0 && <> · {pendingAgents} awaiting adoption</>}
+                {t('overview.summary', { agents: t('counts.agents', { count: agents.length }), domains: t('counts.domains', { count: domains.length }) })}
+                {pendingAgents > 0 && <> · {t('overview.awaiting', { count: pendingAgents })}</>}
               </p>
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
             {errors > 0 && (
               <Link to="/domains" className="rounded-lg bg-danger-soft px-3 py-1.5 text-sm font-medium text-danger-fg hover:brightness-105">
-                {errors} error{errors !== 1 ? 's' : ''} →
+                {t('overview.errorsLink', { count: errors })}
               </Link>
             )}
             {offline > 0 && (
               <Link to="/agents" className="rounded-lg bg-surface-2 px-3 py-1.5 text-sm font-medium text-fg-muted hover:text-fg">
-                {offline} offline →
+                {t('overview.offlineLink', { count: offline })}
               </Link>
             )}
             {pendingAgents > 0 && (
               <Link to="/agents" className="rounded-lg bg-warning-soft px-3 py-1.5 text-sm font-medium text-warning-fg hover:brightness-105">
-                Review {pendingAgents} pending →
+                {t('overview.reviewPending', { count: pendingAgents })}
               </Link>
             )}
           </div>
@@ -105,13 +107,13 @@ export default function Overview() {
       {/* Agents */}
       {agents.length === 0 ? (
         <EmptyState
-          title="No agents connected yet"
-          description="Install the NurProxy agent on an edge server. It registers itself and shows up here for approval."
-          action={<Link to="/agents" className={buttonClass('primary')}>Connect an agent</Link>}
+          title={t('overview.noAgents')}
+          description={t('overview.noAgentsBody')}
+          action={<Link to="/agents" className={buttonClass('primary')}>{t('overview.connectAgent')}</Link>}
         />
       ) : (
         <section>
-          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-fg-faint">Agents</h2>
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-fg-faint">{t('overview.agents')}</h2>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {agents.map((agent) => (
               <Link
@@ -128,7 +130,7 @@ export default function Overview() {
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-fg-faint">
                   {agent.public_ip && <span className="font-mono">{agent.public_ip}</span>}
-                  <span>Seen {seen(agent.last_seen)}</span>
+                  <span>{t('overview.seen', { time: seen(agent.last_seen) })}</span>
                   {agent.version && <span>v{agent.version}</span>}
                 </div>
               </Link>
@@ -140,7 +142,7 @@ export default function Overview() {
       {/* Recent activity */}
       {auditLog.length > 0 && (
         <section>
-          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-fg-faint">Recent activity</h2>
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-fg-faint">{t('overview.recentActivity')}</h2>
           <div className="overflow-hidden rounded-xl border border-border bg-surface shadow-card">
             <ul className="divide-y divide-border">
               {auditLog.map((entry) => (

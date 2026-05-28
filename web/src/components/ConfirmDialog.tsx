@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation, Trans } from 'react-i18next';
 import Modal from './Modal';
 import Button from './Button';
 import { Input } from './Field';
@@ -16,7 +17,8 @@ interface ConfirmDialogProps {
   confirmText?: string;
 }
 
-export default function ConfirmDialog({ open, onClose, onConfirm, title, message, confirmLabel = 'Confirm', danger, loading, confirmText }: ConfirmDialogProps) {
+export default function ConfirmDialog({ open, onClose, onConfirm, title, message, confirmLabel, danger, loading, confirmText }: ConfirmDialogProps) {
+  const { t } = useTranslation();
   const [typed, setTyped] = useState('');
   useEffect(() => { if (!open) setTyped(''); }, [open]);
 
@@ -29,15 +31,15 @@ export default function ConfirmDialog({ open, onClose, onConfirm, title, message
       {needsType && (
         <div className="mt-4">
           <label className="block text-sm text-fg-muted">
-            Type <span className="font-mono font-semibold text-fg">{confirmText}</span> to confirm
+            <Trans i18nKey="confirm.typeToConfirm" values={{ text: confirmText }} components={[<span className="font-mono font-semibold text-fg" />]} />
           </label>
           <Input value={typed} onChange={(e) => setTyped(e.target.value)} className="mt-1.5 font-mono" autoFocus />
         </div>
       )}
       <div className="mt-6 flex justify-end gap-3">
-        <Button variant="secondary" onClick={onClose}>Cancel</Button>
+        <Button variant="secondary" onClick={onClose}>{t('common.cancel')}</Button>
         <Button variant={danger ? 'danger' : 'primary'} onClick={onConfirm} loading={loading} disabled={!canConfirm}>
-          {confirmLabel}
+          {confirmLabel ?? t('common.delete')}
         </Button>
       </div>
     </Modal>

@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import { useTranslation, Trans } from 'react-i18next';
 import { api } from '../lib/api';
+import { LANGUAGES } from '../lib/i18n';
 import type { Provider, Zone, Setting } from '../lib/types';
 import type { HealthResponse, TestProviderZone } from '../lib/api';
 import Modal from '../components/Modal';
@@ -8,7 +10,7 @@ import ConfirmDialog from '../components/ConfirmDialog';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
-import { Field, Input, PasswordInput } from '../components/Field';
+import { Field, Input, PasswordInput, Select } from '../components/Field';
 import MultiSelect from '../components/MultiSelect';
 import { useToast, errMessage } from '../components/toast-context';
 import { useUIVariant, UI_VARIANTS } from '../lib/ui-variant-context';
@@ -29,6 +31,7 @@ function Section({ title, help, action, children }: { title: string; help?: stri
 
 export default function Settings() {
   const toast = useToast();
+  const { t, i18n } = useTranslation();
   const { variant, setVariant } = useUIVariant();
   const [providers, setProviders] = useState<Provider[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
@@ -176,10 +179,10 @@ export default function Settings() {
 
   return (
     <div className="space-y-6">
-      <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Settings</h1>
+      <h1 className="font-display text-3xl font-bold tracking-tight text-fg">{t('settings.title')}</h1>
 
-      <Section title="Appearance">
-        <p className="-mt-1 text-sm text-fg-muted">Pick the interface that suits you. Switch light/dark from the toggle in the navigation.</p>
+      <Section title={t('settings.appearance')}>
+        <p className="-mt-1 text-sm text-fg-muted">{t('settings.appearanceSub')}</p>
         <div className="mt-4 grid gap-3 sm:grid-cols-2">
           {UI_VARIANTS.map((v) => {
             const active = v.id === variant;
@@ -190,19 +193,26 @@ export default function Settings() {
                 className={`rounded-xl border p-4 text-left transition-colors ${active ? 'border-accent bg-accent-soft' : 'border-border bg-surface-2 hover:border-border-strong'}`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="font-medium text-fg">{v.name}</span>
-                  {active && <span className="rounded-full bg-accent px-2 py-0.5 text-xs font-semibold text-accent-fg">Active</span>}
+                  <span className="font-medium text-fg">{t(`appearanceVariants.${v.id}.name`)}</span>
+                  {active && <span className="rounded-full bg-accent px-2 py-0.5 text-xs font-semibold text-accent-fg">{t('settings.active')}</span>}
                 </div>
-                <p className="mt-1 text-sm text-fg-muted">{v.description}</p>
+                <p className="mt-1 text-sm text-fg-muted">{t(`appearanceVariants.${v.id}.description`)}</p>
               </button>
             );
           })}
         </div>
+        <div className="mt-4 max-w-xs">
+          <Field label={t('settings.language')}>
+            <Select value={i18n.resolvedLanguage} onChange={(e) => i18n.changeLanguage(e.target.value)}>
+              {LANGUAGES.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </Select>
+          </Field>
+        </div>
       </Section>
 
-      <Section title="DNS providers" action={<Button size="sm" onClick={() => { resetProviderModal(); setShowAddProvider(true); }}>Add provider</Button>}>
+      <Section title={t('settings.dnsProviders')} action={<Button size="sm" onClick={() => { resetProviderModal(); setShowAddProvider(true); }}>{t('settings.addProvider')}</Button>}>
         {providers.length === 0 ? (
-          <p className="text-sm text-fg-faint">No DNS providers configured.</p>
+          <p className="text-sm text-fg-faint">{t('settings.noProviders')}</p>
         ) : (
           <div className="space-y-3">
             {providers.map((p) => {
@@ -227,7 +237,7 @@ export default function Settings() {
                       ))}
                     </div>
                   ) : (
-                    <p className="mt-1 text-xs text-fg-faint">No zones</p>
+                    <p className="mt-1 text-xs text-fg-faint">{t('settings.noZones')}</p>
                   )}
                 </div>
               );
@@ -236,50 +246,50 @@ export default function Settings() {
         )}
       </Section>
 
-      <Section title="Reconciler" help="reconciler">
-        <p className="-mt-1 text-sm text-fg-muted">How often NurProxy syncs DNS records and proxy configs.</p>
+      <Section title={t('settings.reconciler')} help="reconciler">
+        <p className="-mt-1 text-sm text-fg-muted">{t('settings.reconcilerSub')}</p>
         <div className="mt-4 flex items-end gap-3">
-          <Field label="Interval (seconds)" className="w-40">
+          <Field label={t('settings.intervalSeconds')} className="w-40">
             <Input type="number" value={reconcilerInterval} onChange={(e) => setReconcilerInterval(e.target.value)} min={5} />
           </Field>
-          <Button onClick={handleSaveReconciler} loading={reconcilerSaving} className="mb-0.5">Save</Button>
+          <Button onClick={handleSaveReconciler} loading={reconcilerSaving} className="mb-0.5">{t('common.save')}</Button>
         </div>
       </Section>
 
-      <Section title="Authentication">
+      <Section title={t('settings.authentication')}>
         {passwordError && <Callout tone="danger">{passwordError}</Callout>}
         <div className="mt-3 max-w-sm space-y-3">
-          <Field label="Current password"><PasswordInput value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} /></Field>
-          <Field label="New password"><PasswordInput value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="At least 8 characters" /></Field>
-          <Field label="Confirm new password"><PasswordInput value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} /></Field>
-          <Button onClick={handleChangePassword} loading={passwordLoading} disabled={!currentPassword || !newPassword}>Change password</Button>
+          <Field label={t('settings.currentPassword')}><PasswordInput value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} /></Field>
+          <Field label={t('settings.newPassword')}><PasswordInput value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder={t('login.phMin')} /></Field>
+          <Field label={t('settings.confirmNewPassword')}><PasswordInput value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} /></Field>
+          <Button onClick={handleChangePassword} loading={passwordLoading} disabled={!currentPassword || !newPassword}>{t('settings.changePassword')}</Button>
         </div>
       </Section>
 
-      <Section title="Admin API key" help="admin-api-key">
-        <p className="-mt-1 text-sm text-fg-muted">Use this as a <code className="rounded bg-surface-2 px-1 text-fg">Bearer</code> token for programmatic access and the MCP server.</p>
+      <Section title={t('settings.adminApiKey')} help="admin-api-key">
+        <p className="-mt-1 text-sm text-fg-muted"><Trans i18nKey="settings.adminApiKeySub" components={[<code className="rounded bg-surface-2 px-1 text-fg" />]} /></p>
         {apiKeyPlaintext && (
-          <Callout tone="success" title="Copy this now — it won’t be shown again">
+          <Callout tone="success" title={t('settings.copyNow')}>
             <code className="mt-1 block break-all font-mono text-xs">{apiKeyPlaintext}</code>
           </Callout>
         )}
         <div className="mt-4 flex flex-wrap items-center gap-3">
           {apiKeyInfo.exists ? (
             <>
-              <span className="text-sm text-fg-muted">Active key: <code className="font-mono text-fg">{apiKeyInfo.masked ?? '••••'}</code></span>
-              <Button size="sm" onClick={handleGenerateAPIKey}>Regenerate</Button>
-              <Button variant="danger-ghost" size="sm" onClick={handleRevokeAPIKey}>Revoke</Button>
+              <span className="text-sm text-fg-muted">{t('settings.activeKey')} <code className="font-mono text-fg">{apiKeyInfo.masked ?? '••••'}</code></span>
+              <Button size="sm" onClick={handleGenerateAPIKey}>{t('settings.regenerate')}</Button>
+              <Button variant="danger-ghost" size="sm" onClick={handleRevokeAPIKey}>{t('settings.revoke')}</Button>
             </>
           ) : (
-            <Button onClick={handleGenerateAPIKey}>Generate API key</Button>
+            <Button onClick={handleGenerateAPIKey}>{t('settings.generateKey')}</Button>
           )}
         </div>
       </Section>
 
-      <Section title="System">
+      <Section title={t('settings.system')}>
         <dl className="-mt-1 space-y-2 text-sm">
-          <div className="flex justify-between"><dt className="text-fg-faint">Version</dt><dd className="text-fg">{health?.version ?? 'unknown'}</dd></div>
-          <div className="flex justify-between"><dt className="text-fg-faint">Status</dt><dd className="capitalize text-success-fg">{health?.status ?? 'unknown'}</dd></div>
+          <div className="flex justify-between"><dt className="text-fg-faint">{t('settings.versionLabel')}</dt><dd className="text-fg">{health?.version ?? 'unknown'}</dd></div>
+          <div className="flex justify-between"><dt className="text-fg-faint">{t('settings.statusLabel')}</dt><dd className="capitalize text-success-fg">{health?.status ?? 'unknown'}</dd></div>
         </dl>
       </Section>
 

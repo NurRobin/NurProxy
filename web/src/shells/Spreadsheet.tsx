@@ -1,4 +1,5 @@
 import { BrowserRouter, NavLink } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { ThemeToggle } from '../lib/theme';
 import BrandMark from '../components/BrandMark';
 import NotificationBell from '../components/NotificationBell';
@@ -15,6 +16,7 @@ function navLinkClass({ isActive }: { isActive: boolean }) {
 
 /** Dense, table-first shell for power users. Overview is a sortable grid. */
 export default function SpreadsheetShell({ onLogout }: { onLogout: () => void }) {
+  const { t } = useTranslation();
   return (
     <BrowserRouter>
       <div className="min-h-screen bg-bg text-fg">
@@ -23,14 +25,14 @@ export default function SpreadsheetShell({ onLogout }: { onLogout: () => void })
             <div className="flex min-w-0 items-center gap-4">
               <span className="flex items-center gap-2"><BrandMark size={22} /><span className="font-display text-base font-bold tracking-tight">NurProxy</span></span>
               <nav className="hidden items-center gap-0.5 sm:flex">
-                {NAV.map(({ to, label }) => <NavLink key={to} to={to} end={to === '/'} className={navLinkClass}>{label}</NavLink>)}
+                {NAV.map(({ to, label }) => <NavLink key={to} to={to} end={to === '/'} className={navLinkClass}>{t(label)}</NavLink>)}
               </nav>
             </div>
             <div className="flex items-center gap-1">
-              <NavLink to="/help" className={navLinkClass}>Docs</NavLink>
+              <NavLink to="/help" className={navLinkClass}>{t('common.docs')}</NavLink>
               <NotificationBell />
               <ThemeToggle />
-              <button onClick={onLogout} className="rounded-md px-2.5 py-1.5 text-sm font-medium text-fg-muted hover:bg-surface-2 hover:text-fg">Logout</button>
+              <button onClick={onLogout} className="rounded-md px-2.5 py-1.5 text-sm font-medium text-fg-muted hover:bg-surface-2 hover:text-fg">{t('common.logout')}</button>
             </div>
           </div>
         </header>

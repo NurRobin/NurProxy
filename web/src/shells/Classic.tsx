@@ -1,4 +1,5 @@
 import { BrowserRouter, NavLink } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { ThemeToggle } from '../lib/theme';
 import BrandMark from '../components/BrandMark';
 import NotificationBell from '../components/NotificationBell';
@@ -14,6 +15,7 @@ function navLinkClass({ isActive }: { isActive: boolean }) {
 }
 
 export default function ClassicShell({ onLogout }: { onLogout: () => void }) {
+  const { t } = useTranslation();
   return (
     <BrowserRouter>
       <div className="min-h-screen bg-bg text-fg">
@@ -27,22 +29,22 @@ export default function ClassicShell({ onLogout }: { onLogout: () => void }) {
                 </span>
                 <nav className="hidden items-center gap-1 sm:flex">
                   {NAV.map(({ to, label }) => (
-                    <NavLink key={to} to={to} end={to === '/'} className={navLinkClass}>{label}</NavLink>
+                    <NavLink key={to} to={to} end={to === '/'} className={navLinkClass}>{t(label)}</NavLink>
                   ))}
                 </nav>
               </div>
               <div className="flex items-center gap-1">
-                <NavLink to="/help" className={navLinkClass}>Docs</NavLink>
+                <NavLink to="/help" className={navLinkClass}>{t('common.docs')}</NavLink>
                 <NotificationBell />
                 <ThemeToggle />
-                <button onClick={onLogout} className="rounded-lg px-3 py-2 text-sm font-medium text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg">Logout</button>
+                <button onClick={onLogout} className="rounded-lg px-3 py-2 text-sm font-medium text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg">{t('common.logout')}</button>
               </div>
             </div>
             <nav className="-mx-1 flex gap-1 overflow-x-auto pb-2 sm:hidden">
               {NAV.map(({ to, label }) => (
                 <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) =>
                   `whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${isActive ? 'bg-accent-soft text-accent' : 'text-fg-muted hover:bg-surface-2 hover:text-fg'}`
-                }>{label}</NavLink>
+                }>{t(label)}</NavLink>
               ))}
             </nav>
           </div>

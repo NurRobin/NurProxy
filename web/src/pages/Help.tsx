@@ -1,9 +1,11 @@
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import Markdown from '../components/Markdown';
 import { TOPICS, getTopic } from '../lib/wiki';
 
 export default function Help() {
+  const { t } = useTranslation();
   const { slug } = useParams();
   const navigate = useNavigate();
   const known = TOPICS.some((t) => t.slug === slug);
@@ -18,8 +20,8 @@ export default function Help() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Docs &amp; help</h1>
-        <p className="mt-1 text-sm text-fg-muted">Everything about NurProxy — available offline, right here.</p>
+        <h1 className="font-display text-3xl font-bold tracking-tight text-fg">{t('help.title')}</h1>
+        <p className="mt-1 text-sm text-fg-muted">{t('help.subtitle')}</p>
       </div>
 
       <div className="grid gap-8 lg:grid-cols-[15rem_1fr]">

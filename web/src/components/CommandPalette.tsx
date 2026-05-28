@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { useTheme } from '../lib/theme-context';
 import { useUIVariant, UI_VARIANTS } from '../lib/ui-variant-context';
 
@@ -15,26 +16,27 @@ export default function CommandPalette() {
   const [q, setQ] = useState('');
   const [active, setActive] = useState(0);
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const { toggle: toggleTheme } = useTheme();
   const { variant, setVariant } = useUIVariant();
   const inputRef = useRef<HTMLInputElement>(null);
 
   const commands = useMemo<Cmd[]>(() => {
-    const go = (to: string, label: string): Cmd => ({ id: `go:${to}`, label, hint: 'Go', run: () => navigate(to) });
+    const go = (to: string, label: string): Cmd => ({ id: `go:${to}`, label, hint: t('palette.go'), run: () => navigate(to) });
     return [
-      go('/', 'Overview'),
-      go('/agents', 'Agents'),
-      go('/servers', 'Servers'),
-      go('/domains', 'Domains'),
-      go('/settings', 'Settings'),
-      go('/help', 'Docs'),
-      { id: 'new-domain', label: 'New domain', hint: 'Create', run: () => navigate('/domains') },
-      { id: 'theme', label: 'Toggle light / dark', hint: 'Theme', run: toggleTheme },
+      go('/', t('nav.overview')),
+      go('/agents', t('nav.agents')),
+      go('/servers', t('nav.servers')),
+      go('/domains', t('nav.domains')),
+      go('/settings', t('nav.settings')),
+      go('/help', t('common.docs')),
+      { id: 'new-domain', label: t('palette.newDomain'), hint: t('palette.create'), run: () => navigate('/domains') },
+      { id: 'theme', label: t('palette.toggleTheme'), hint: t('palette.theme'), run: toggleTheme },
       ...UI_VARIANTS.filter((v) => v.id !== variant).map((v): Cmd => ({
-        id: `variant:${v.id}`, label: `Switch to ${v.name} appearance`, hint: 'Appearance', run: () => setVariant(v.id),
+        id: `variant:${v.id}`, label: t('palette.switchTo', { name: t(`appearanceVariants.${v.id}.name`) }), hint: t('palette.appearance'), run: () => setVariant(v.id),
       })),
     ];
-  }, [navigate, toggleTheme, setVariant, variant]);
+  }, [navigate, t, toggleTheme, setVariant, variant]);
 
   const filtered = q ? commands.filter((c) => c.label.toLowerCase().includes(q.toLowerCase())) : commands;
 
@@ -69,12 +71,12 @@ export default function CommandPalette() {
             else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((a) => Math.max(a - 1, 0)); }
             else if (e.key === 'Enter') { const c = filtered[active]; if (c) run(c); }
           }}
-          placeholder="Type a command…"
+          placeholder={t('palette.placeholder')}
           className="w-full border-b border-border bg-transparent px-4 py-3 text-sm text-fg placeholder:text-fg-faint focus:outline-none"
         />
         <ul className="max-h-80 overflow-y-auto p-1">
           {filtered.length === 0 ? (
-            <li className="px-3 py-2 text-sm text-fg-faint">No commands.</li>
+            <li className="px-3 py-2 text-sm text-fg-faint">{t('palette.noCommands')}</li>
           ) : filtered.map((c, i) => (
             <li key={c.id}>
               <button

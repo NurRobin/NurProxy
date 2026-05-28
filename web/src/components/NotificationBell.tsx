@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useTranslation } from 'react-i18next';
 import { Bell } from 'lucide-react';
 import { useToast } from './toast-context';
 import { formatRelativeTime } from '../lib/utils';
@@ -7,6 +8,7 @@ import { formatRelativeTime } from '../lib/utils';
 const dotColor = { error: 'bg-danger', success: 'bg-success', info: 'bg-info' } as const;
 
 export default function NotificationBell() {
+  const { t } = useTranslation();
   const { history, unseen, markSeen, clearHistory } = useToast();
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ top: 0, right: 0 });
@@ -42,7 +44,7 @@ export default function NotificationBell() {
         ref={btnRef}
         type="button"
         onClick={toggle}
-        aria-label={`Notifications${unseen > 0 ? ` (${unseen} unseen)` : ''}`}
+        aria-label={unseen > 0 ? t('notifications.ariaUnseen', { count: unseen }) : t('notifications.aria')}
         className="relative inline-flex h-9 w-9 items-center justify-center rounded-lg text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg"
       >
         <Bell className="h-5 w-5" />
@@ -59,13 +61,13 @@ export default function NotificationBell() {
           className="animate-pop-in fixed z-[90] w-80 max-w-[calc(100vw-1rem)] overflow-hidden rounded-xl border border-border bg-surface shadow-pop"
         >
           <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-            <span className="text-sm font-semibold text-fg">Notifications</span>
+            <span className="text-sm font-semibold text-fg">{t('notifications.title')}</span>
             {history.length > 0 && (
-              <button onClick={clearHistory} className="text-xs font-medium text-fg-faint hover:text-fg">Clear</button>
+              <button onClick={clearHistory} className="text-xs font-medium text-fg-faint hover:text-fg">{t('common.clear')}</button>
             )}
           </div>
           {history.length === 0 ? (
-            <p className="px-4 py-6 text-center text-sm text-fg-faint">No recent activity.</p>
+            <p className="px-4 py-6 text-center text-sm text-fg-faint">{t('notifications.none')}</p>
           ) : (
             <ul className="max-h-80 divide-y divide-border overflow-y-auto">
               {history.map((r) => (
