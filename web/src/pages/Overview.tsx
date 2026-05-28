@@ -74,7 +74,7 @@ export default function Overview() {
             </span>
             <div>
               <p className="font-medium text-fg">
-                {healthy ? 'All systems normal' : `${errors + offline} thing${errors + offline !== 1 ? 's' : ''} need attention`}
+                {healthy ? 'All systems normal' : `${errors + offline} thing${errors + offline !== 1 ? 's' : ''} need${errors + offline === 1 ? 's' : ''} attention`}
               </p>
               <p className="text-sm text-fg-muted">
                 {agents.length} agent{agents.length !== 1 ? 's' : ''} · {domains.length} domain{domains.length !== 1 ? 's' : ''}

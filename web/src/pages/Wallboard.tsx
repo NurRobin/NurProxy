@@ -34,7 +34,7 @@ export default function Wallboard() {
         <span className={`h-4 w-4 flex-shrink-0 rounded-full ${healthy ? 'bg-success' : 'bg-danger'} ${healthy ? '' : 'animate-pulse'}`} />
         <div>
           <p className="font-display text-2xl font-bold tracking-tight text-fg">
-            {healthy ? 'All systems normal' : `${errs + offline} thing${errs + offline !== 1 ? 's' : ''} need attention`}
+            {healthy ? 'All systems normal' : `${errs + offline} thing${errs + offline !== 1 ? 's' : ''} need${errs + offline === 1 ? 's' : ''} attention`}
           </p>
           <p className="text-sm text-fg-muted">{agents.length} agents · {domains.length} domains · {count(domains, 'active')} active</p>
         </div>
