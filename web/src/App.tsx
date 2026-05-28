@@ -6,11 +6,39 @@ import Agents from './pages/Agents';
 import Domains from './pages/Domains';
 import Settings from './pages/Settings';
 import Login from './pages/Login';
+import SetupWizard from './pages/SetupWizard';
 
-type AuthState = 'loading' | 'setup_required' | 'unauthenticated' | 'authenticated';
+type AuthState = 'loading' | 'setup_required' | 'unauthenticated' | 'needs_setup_wizard' | 'authenticated';
 
 function App() {
   const [authState, setAuthState] = useState<AuthState>('loading');
+
+  const checkSetupWizard = useCallback(async () => {
+    try {
+      const [settings, providers, agents] = await Promise.all([
+        api.getSettings(),
+        api.listProviders(),
+        api.listAgents(),
+      ]);
+      const setupComplete = settings.find((s) => s.key === 'setup_complete');
+      if (setupComplete?.value === 'true') {
+        setAuthState('authenticated');
+      } else if (providers.length === 0 && agents.length === 0) {
+        setAuthState('needs_setup_wizard');
+      } else {
+        // Resources exist already, mark as complete and skip wizard
+        try {
+          await api.updateSetting('setup_complete', 'true');
+        } catch {
+          // ignore
+        }
+        setAuthState('authenticated');
+      }
+    } catch {
+      // If we can't check, just proceed to dashboard
+      setAuthState('authenticated');
+    }
+  }, []);
 
   const checkAuth = useCallback(async () => {
     try {
@@ -18,14 +46,15 @@ function App() {
       if (status.setup_required) {
         setAuthState('setup_required');
       } else if (status.authenticated) {
-        setAuthState('authenticated');
+        // Authenticated - check if wizard is needed
+        await checkSetupWizard();
       } else {
         setAuthState('unauthenticated');
       }
     } catch {
       setAuthState('unauthenticated');
     }
-  }, []);
+  }, [checkSetupWizard]);
 
   useEffect(() => {
     checkAuth();
@@ -52,7 +81,17 @@ function App() {
     return (
       <BrowserRouter>
         <Routes>
-          <Route path="*" element={<Login onAuth={() => setAuthState('authenticated')} />} />
+          <Route path="*" element={<Login onAuth={() => checkSetupWizard()} />} />
+        </Routes>
+      </BrowserRouter>
+    );
+  }
+
+  if (authState === 'needs_setup_wizard') {
+    return (
+      <BrowserRouter>
+        <Routes>
+          <Route path="*" element={<SetupWizard onComplete={() => setAuthState('authenticated')} />} />
         </Routes>
       </BrowserRouter>
     );
