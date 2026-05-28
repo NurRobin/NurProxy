@@ -1,8 +1,12 @@
 package caddygen
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
 func TestSlugify(t *testing.T) {
@@ -350,6 +354,15 @@ func TestGenerateRoute_ForceHTTPS(t *testing.T) {
 		t.Fatal("redirect subroute structure unexpected")
 	}
 
+	// The redirect must be gated on the http protocol to avoid an HTTPS loop.
+	redirectRoute := redirectSubroute.Routes[0]
+	if !redirectRoute.Terminal {
+		t.Error("redirect route should be terminal")
+	}
+	if len(redirectRoute.Match) != 1 || redirectRoute.Match[0]["protocol"] != "http" {
+		t.Errorf("redirect should match protocol=http, got %v", redirectRoute.Match)
+	}
+
 	srBytes, _ := json.Marshal(redirectSubroute.Routes[0].Handle[0])
 	var sr StaticResponse
 	if err := json.Unmarshal(srBytes, &sr); err != nil {
@@ -382,6 +395,188 @@ func TestGenerateRoute_MissingRequired(t *testing.T) {
 				t.Error("expected error for missing required field")
 			}
 		})
+	}
+}
+
+// innerHandlerStrings marshals every inner handler of the main route back to
+// JSON so tests can assert on the presence of specific handlers/keys.
+func mainRouteHandlers(t *testing.T, raw json.RawMessage) []string {
+	t.Helper()
+	var route CaddyRoute
+	if err := json.Unmarshal(raw, &route); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The main route is the last inner route of the (last) subroute handler.
+	sub := route.Handle[len(route.Handle)-1]
+	mainRoute := sub.Routes[len(sub.Routes)-1]
+	out := make([]string, 0, len(mainRoute.Handle))
+	for _, h := range mainRoute.Handle {
+		b, _ := json.Marshal(h)
+		out = append(out, string(b))
+	}
+	return out
+}
+
+func TestGenerateRoute_PathStripAndRewrite(t *testing.T) {
+	raw, err := GenerateRoute(DomainConfig{
+		FQDN: "p.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
+		PathStrip: "/api", PathRewrite: "/v2{http.request.uri.path}",
+	})
+	if err != nil {
+		t.Fatalf("GenerateRoute: %v", err)
+	}
+	handlers := mainRouteHandlers(t, raw)
+	joined := strings.Join(handlers, "\n")
+	if !strings.Contains(joined, `"strip_path_prefix":"/api"`) {
+		t.Errorf("missing strip_path_prefix handler:\n%s", joined)
+	}
+	if !strings.Contains(joined, `"uri":"/v2`) {
+		t.Errorf("missing rewrite uri handler:\n%s", joined)
+	}
+	// rewrite handlers must come before reverse_proxy.
+	if idxRP := strings.Index(joined, "reverse_proxy"); idxRP >= 0 {
+		if strings.Index(joined, "strip_path_prefix") > idxRP {
+			t.Error("strip_path_prefix should precede reverse_proxy")
+		}
+	}
+}
+
+func TestGenerateRoute_Timeouts(t *testing.T) {
+	raw, err := GenerateRoute(DomainConfig{
+		FQDN: "t.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
+		TimeoutRead: 30, TimeoutWrite: 10, TimeoutIdle: 120,
+	})
+	if err != nil {
+		t.Fatalf("GenerateRoute: %v", err)
+	}
+	var route CaddyRoute
+	if err := json.Unmarshal(raw, &route); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	sub := route.Handle[len(route.Handle)-1]
+	mainRoute := sub.Routes[len(sub.Routes)-1]
+	rpBytes, _ := json.Marshal(mainRoute.Handle[len(mainRoute.Handle)-1])
+	var rp ReverseProxy
+	if err := json.Unmarshal(rpBytes, &rp); err != nil {
+		t.Fatalf("unmarshal reverse_proxy: %v", err)
+	}
+	if rp.Transport == nil {
+		t.Fatal("expected transport for timeouts")
+	}
+	if rp.Transport.DialTimeout != "10s" {
+		t.Errorf("DialTimeout = %q, want 10s", rp.Transport.DialTimeout)
+	}
+	if rp.Transport.ResponseHeaderTimeout != "30s" {
+		t.Errorf("ResponseHeaderTimeout = %q, want 30s", rp.Transport.ResponseHeaderTimeout)
+	}
+	if rp.Transport.KeepAlive == nil || rp.Transport.KeepAlive.IdleTimeout != "120s" {
+		t.Errorf("KeepAlive idle = %+v, want 120s", rp.Transport.KeepAlive)
+	}
+}
+
+func TestGenerateRoute_BasicAuth(t *testing.T) {
+	raw, err := GenerateRoute(DomainConfig{
+		FQDN: "auth.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
+		BasicAuthUser: "alice", BasicAuthHash: "$2a$14$abcdefghijklmnopqrstuv",
+	})
+	if err != nil {
+		t.Fatalf("GenerateRoute: %v", err)
+	}
+	joined := strings.Join(mainRouteHandlers(t, raw), "\n")
+	if !strings.Contains(joined, `"handler":"authentication"`) {
+		t.Errorf("missing authentication handler:\n%s", joined)
+	}
+	if !strings.Contains(joined, `"http_basic"`) {
+		t.Errorf("missing http_basic provider:\n%s", joined)
+	}
+	wantPW := base64.StdEncoding.EncodeToString([]byte("$2a$14$abcdefghijklmnopqrstuv"))
+	if !strings.Contains(joined, wantPW) {
+		t.Errorf("password not base64-encoded as expected (%s):\n%s", wantPW, joined)
+	}
+}
+
+func TestGenerateRoute_IPLists(t *testing.T) {
+	raw, err := GenerateRoute(DomainConfig{
+		FQDN: "ip.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
+		IPBlocklist: []string{"1.2.3.0/24"},
+		IPAllowlist: []string{"10.0.0.0/8"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateRoute: %v", err)
+	}
+	var route CaddyRoute
+	if err := json.Unmarshal(raw, &route); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	sub := route.Handle[len(route.Handle)-1]
+	// Expect 3 inner routes: blocklist guard, allowlist guard, main route.
+	if len(sub.Routes) != 3 {
+		t.Fatalf("expected 3 inner routes (block, allow, main), got %d", len(sub.Routes))
+	}
+	if !sub.Routes[0].Terminal || !sub.Routes[1].Terminal {
+		t.Error("guard routes must be terminal")
+	}
+	full := string(raw)
+	if !strings.Contains(full, `"remote_ip"`) || !strings.Contains(full, `"1.2.3.0/24"`) {
+		t.Errorf("blocklist matcher missing: %s", full)
+	}
+	if !strings.Contains(full, `"not"`) || !strings.Contains(full, `"10.0.0.0/8"`) {
+		t.Errorf("allowlist negated matcher missing: %s", full)
+	}
+}
+
+func TestGenerateRoute_RateLimit(t *testing.T) {
+	raw, err := GenerateRoute(DomainConfig{
+		FQDN: "rl.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
+		RateLimit: 25,
+	})
+	if err != nil {
+		t.Fatalf("GenerateRoute: %v", err)
+	}
+	joined := strings.Join(mainRouteHandlers(t, raw), "\n")
+	if !strings.Contains(joined, `"handler":"rate_limit"`) {
+		t.Errorf("missing rate_limit handler:\n%s", joined)
+	}
+	if !strings.Contains(joined, `"max_events":25`) {
+		t.Errorf("rate_limit max_events not set to 25:\n%s", joined)
+	}
+}
+
+func TestConfigFromDomain(t *testing.T) {
+	d := models.Domain{
+		Port:       3000,
+		WebSocket:  true,
+		ForceHTTPS: false,
+		ProxyConfig: models.ProxyConfig{
+			ForceHTTPS:  true, // OR-ed with top-level
+			MaxBodySize: "20m",
+			PathStrip:   "/x",
+			TimeoutRead: 5,
+			IPAllowlist: []string{"1.1.1.1/32"},
+			RateLimit:   3,
+			BasicAuth:   &models.BasicAuthConfig{Username: "u", Password: "h"},
+		},
+	}
+	cfg := ConfigFromDomain(d, "x.example.com", "10.0.0.9")
+	if cfg.UpstreamAddr != "10.0.0.9" || cfg.UpstreamPort != 3000 {
+		t.Errorf("upstream wrong: %+v", cfg)
+	}
+	if !cfg.WebSocket || !cfg.ForceHTTPS {
+		t.Errorf("ws/forcehttps OR-ing wrong: %+v", cfg)
+	}
+	if cfg.PathStrip != "/x" || cfg.TimeoutRead != 5 || cfg.RateLimit != 3 {
+		t.Errorf("proxy fields not mapped: %+v", cfg)
+	}
+	if cfg.BasicAuthUser != "u" || cfg.BasicAuthHash != "h" {
+		t.Errorf("basic auth not mapped: %+v", cfg)
+	}
+	if len(cfg.IPAllowlist) != 1 || cfg.IPAllowlist[0] != "1.1.1.1/32" {
+		t.Errorf("ip allowlist not mapped: %+v", cfg)
+	}
+
+	// And the generated route must be valid JSON.
+	if _, err := GenerateRoute(cfg); err != nil {
+		t.Fatalf("GenerateRoute from ConfigFromDomain: %v", err)
 	}
 }
 
