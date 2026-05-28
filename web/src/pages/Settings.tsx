@@ -42,18 +42,25 @@ export default function Settings() {
   const [passwordSuccess, setPasswordSuccess] = useState('');
   const [passwordLoading, setPasswordLoading] = useState(false);
 
+  // Admin API key
+  const [apiKeyInfo, setApiKeyInfo] = useState<{ exists: boolean; masked?: string }>({ exists: false });
+  const [apiKeyPlaintext, setApiKeyPlaintext] = useState('');
+  const [apiKeyError, setApiKeyError] = useState('');
+
   const fetchData = useCallback(async () => {
     try {
-      const [p, z, s, h] = await Promise.all([
+      const [p, z, s, h, k] = await Promise.all([
         api.listProviders(),
         api.listAllZones(),
         api.getSettings(),
         api.health(),
+        api.getAPIKey(),
       ]);
       setProviders(p);
       setZones(z);
       setSettings(s);
       setHealth(h);
+      setApiKeyInfo(k);
       const rec = s.find((st) => st.key === 'reconciler_interval');
       if (rec) setReconcilerInterval(rec.value);
     } catch { /* ignore */ } finally {
@@ -180,14 +187,37 @@ export default function Settings() {
     if (newPassword !== confirmPassword) { setPasswordError('Passwords do not match'); return; }
     setPasswordLoading(true);
     try {
-      await api.login(currentPassword);
-      await api.updateSetting('admin_password_hash', newPassword);
+      await api.changePassword(currentPassword, newPassword);
       setPasswordSuccess('Password updated');
       setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
     } catch (err) {
       setPasswordError(err instanceof Error ? err.message : 'Failed to change password');
     } finally {
       setPasswordLoading(false);
+    }
+  }
+
+  async function handleGenerateAPIKey() {
+    setApiKeyError('');
+    setApiKeyPlaintext('');
+    try {
+      const res = await api.generateAPIKey();
+      setApiKeyPlaintext(res.api_key);
+      const info = await api.getAPIKey();
+      setApiKeyInfo(info);
+    } catch (err) {
+      setApiKeyError(err instanceof Error ? err.message : 'Failed to generate API key');
+    }
+  }
+
+  async function handleRevokeAPIKey() {
+    setApiKeyError('');
+    setApiKeyPlaintext('');
+    try {
+      await api.revokeAPIKey();
+      setApiKeyInfo({ exists: false });
+    } catch (err) {
+      setApiKeyError(err instanceof Error ? err.message : 'Failed to revoke API key');
     }
   }
 
@@ -287,6 +317,32 @@ export default function Settings() {
             className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">
             {passwordLoading ? 'Updating...' : 'Change Password'}
           </button>
+        </div>
+      </section>
+
+      {/* Admin API Key */}
+      <section className="rounded-xl border border-gray-800 bg-gray-900 p-6">
+        <h2 className="text-lg font-semibold text-white">Admin API Key</h2>
+        <p className="mt-1 text-sm text-gray-400">
+          Use this key as a <code className="text-gray-300">Bearer</code> token for programmatic access and the MCP server.
+        </p>
+        {apiKeyError && <div className="mt-3 rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{apiKeyError}</div>}
+        {apiKeyPlaintext && (
+          <div className="mt-3 rounded-lg bg-green-900/30 border border-green-800 px-3 py-2 text-sm text-green-300">
+            <p className="font-medium">New API key (copy it now — it won't be shown again):</p>
+            <code className="mt-1 block break-all font-mono text-green-200">{apiKeyPlaintext}</code>
+          </div>
+        )}
+        <div className="mt-4 flex items-center gap-3">
+          {apiKeyInfo.exists ? (
+            <>
+              <span className="text-sm text-gray-300">Active key: <code className="font-mono text-gray-200">{apiKeyInfo.masked ?? '••••'}</code></span>
+              <button onClick={handleGenerateAPIKey} className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700">Regenerate</button>
+              <button onClick={handleRevokeAPIKey} className="rounded-lg border border-red-700 px-3 py-1.5 text-sm font-medium text-red-400 hover:bg-red-900/30">Revoke</button>
+            </>
+          ) : (
+            <button onClick={handleGenerateAPIKey} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Generate API Key</button>
+          )}
         </div>
       </section>
 

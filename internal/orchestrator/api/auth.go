@@ -3,6 +3,7 @@ package api
 import (
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
@@ -119,6 +120,50 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged in"})
 }
 
+// POST /api/v1/auth/change-password — changes the admin password.
+// Requires the current password and a new password of at least 8 characters.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.NewPassword == "" || req.CurrentPassword == "" {
+		writeError(w, http.StatusBadRequest, "current_password and new_password are required")
+		return
+	}
+	if len(req.NewPassword) < 8 {
+		writeError(w, http.StatusBadRequest, "new password must be at least 8 characters")
+		return
+	}
+
+	hash, err := s.db.GetSetting("admin_password_hash")
+	if err != nil || hash == "" {
+		writeError(w, http.StatusBadRequest, "admin password not configured")
+		return
+	}
+	if err := auth.CheckPassword(hash, req.CurrentPassword); err != nil {
+		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+
+	newHash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to hash password")
+		return
+	}
+	if err := s.db.SetSetting("admin_password_hash", newHash); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save password")
+		return
+	}
+
+	s.audit(r, "system", "admin", "change_password", "admin password changed")
+	writeJSON(w, http.StatusOK, map[string]string{"message": "password changed"})
+}
+
 // POST /api/v1/auth/logout — clears session cookie.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
@@ -135,13 +180,29 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) setSessionCookie(w http.ResponseWriter) {
 	token, _ := auth.GenerateSessionToken()
 	signed := s.sessions.Sign(token)
+	d := s.sessionDuration()
 	http.SetCookie(w, &http.Cookie{
 		Name:     "nurproxy_session",
 		Value:    signed,
 		Path:     "/",
-		MaxAge:   86400 * 7, // 7 days
+		MaxAge:   int(d.Seconds()),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Expires:  time.Now().Add(7 * 24 * time.Hour),
+		Expires:  time.Now().Add(d),
 	})
+}
+
+// sessionDuration returns the configured session lifetime, read from the
+// session_expiry_hours setting (default 168h = 7 days).
+func (s *Server) sessionDuration() time.Duration {
+	const def = 7 * 24 * time.Hour
+	v, err := s.db.GetSetting("session_expiry_hours")
+	if err != nil || v == "" {
+		return def
+	}
+	hours, err := strconv.Atoi(v)
+	if err != nil || hours <= 0 {
+		return def
+	}
+	return time.Duration(hours) * time.Hour
 }

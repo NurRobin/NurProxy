@@ -3,6 +3,8 @@ package api
 import (
 	"net/http"
 	"strconv"
+
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
 
 // GET /api/v1/health
@@ -43,6 +45,47 @@ func (s *Server) handleAuditLog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /api/v1/api-key — reports whether an admin API key exists (never returns
+// the key itself, only a masked preview).
+func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
+	key, err := s.db.GetSetting("admin_api_key")
+	if err != nil || key == "" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"exists": false})
+		return
+	}
+	masked := key
+	if len(key) > 8 {
+		masked = key[:4] + "…" + key[len(key)-4:]
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"exists": true, "masked": masked})
+}
+
+// POST /api/v1/api-key — generates (or regenerates) the admin API key and
+// returns it once. The plaintext is only shown at creation time.
+func (s *Server) handleGenerateAPIKey(w http.ResponseWriter, r *http.Request) {
+	key, err := auth.GenerateAPIKey()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate API key")
+		return
+	}
+	if err := s.db.SetSetting("admin_api_key", key); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save API key")
+		return
+	}
+	s.audit(r, "system", "admin", "generate_api_key", "admin API key generated")
+	writeJSON(w, http.StatusCreated, map[string]string{"api_key": key})
+}
+
+// DELETE /api/v1/api-key — revokes the admin API key.
+func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
+	if err := s.db.SetSetting("admin_api_key", ""); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to revoke API key")
+		return
+	}
+	s.audit(r, "system", "admin", "revoke_api_key", "admin API key revoked")
+	writeJSON(w, http.StatusOK, map[string]string{"message": "API key revoked"})
+}
+
 // GET /api/v1/settings
 func (s *Server) handleListSettings(w http.ResponseWriter, r *http.Request) {
 	settings, err := s.db.ListSettings()
@@ -54,7 +97,7 @@ func (s *Server) handleListSettings(w http.ResponseWriter, r *http.Request) {
 	// Filter out sensitive settings
 	filtered := make([]map[string]interface{}, 0, len(settings))
 	for _, setting := range settings {
-		if setting.Key == "admin_password_hash" {
+		if setting.Key == "admin_password_hash" || setting.Key == "admin_api_key" {
 			continue
 		}
 		filtered = append(filtered, map[string]interface{}{
@@ -78,6 +121,10 @@ func (s *Server) handleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 	// Prevent updating sensitive settings via this endpoint
 	if key == "admin_password_hash" {
 		writeError(w, http.StatusForbidden, "cannot update password via settings endpoint")
+		return
+	}
+	if key == "admin_api_key" {
+		writeError(w, http.StatusForbidden, "use the /api/v1/api-key endpoint to manage the API key")
 		return
 	}
 

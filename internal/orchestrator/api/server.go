@@ -44,6 +44,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/auth/setup", s.handleSetup)
 	s.mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
+	s.mux.HandleFunc("POST /api/v1/auth/change-password", s.requireAuth(s.handleChangePassword))
 
 	// Agent registration (no auth — agent is registering its token)
 	s.mux.HandleFunc("POST /api/v1/agents/register", s.handleRegisterAgent)
@@ -92,6 +93,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/audit-log", s.requireAuth(s.handleAuditLog))
 	s.mux.HandleFunc("GET /api/v1/settings", s.requireAuth(s.handleListSettings))
 	s.mux.HandleFunc("PUT /api/v1/settings/{key}", s.requireAuth(s.handleUpdateSetting))
+	s.mux.HandleFunc("GET /api/v1/api-key", s.requireAuth(s.handleGetAPIKey))
+	s.mux.HandleFunc("POST /api/v1/api-key", s.requireAuth(s.handleGenerateAPIKey))
+	s.mux.HandleFunc("DELETE /api/v1/api-key", s.requireAuth(s.handleRevokeAPIKey))
 }
 
 // audit is a helper to insert an audit log entry.

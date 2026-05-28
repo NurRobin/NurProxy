@@ -47,6 +47,8 @@ export const api = {
   setup: (password: string) => request<{ message: string }>('/auth/setup', { method: 'POST', body: JSON.stringify({ password }) }),
   login: (password: string) => request<{ message: string }>('/auth/login', { method: 'POST', body: JSON.stringify({ password }) }),
   logout: () => request<{ message: string }>('/auth/logout', { method: 'POST' }),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ message: string }>('/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) }),
 
   // Providers
   listProviders: () => request<Provider[]>('/providers'),
@@ -109,4 +111,9 @@ export const api = {
   getSettings: () => request<Setting[]>('/settings'),
   updateSetting: (key: string, value: string) =>
     request<{ key: string; value: string }>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+
+  // Admin API key
+  getAPIKey: () => request<{ exists: boolean; masked?: string }>('/api-key'),
+  generateAPIKey: () => request<{ api_key: string }>('/api-key', { method: 'POST' }),
+  revokeAPIKey: () => request<{ message: string }>('/api-key', { method: 'DELETE' }),
 };
