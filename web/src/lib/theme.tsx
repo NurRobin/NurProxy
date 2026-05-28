@@ -1,16 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
-
-type Theme = 'light' | 'dark';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { ThemeContext, useTheme, type Theme } from './theme-context';
 
 const STORAGE_KEY = 'nurproxy-theme';
-
-interface ThemeContextValue {
-  theme: Theme;
-  setTheme: (t: Theme) => void;
-  toggle: () => void;
-}
-
-const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 function readInitialTheme(): Theme {
   if (typeof document !== 'undefined' && document.documentElement.classList.contains('dark')) {
@@ -38,12 +29,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       {children}
     </ThemeContext.Provider>
   );
-}
-
-function useTheme(): ThemeContextValue {
-  const ctx = useContext(ThemeContext);
-  if (!ctx) throw new Error('useTheme must be used within ThemeProvider');
-  return ctx;
 }
 
 export function ThemeToggle({ className = '' }: { className?: string }) {

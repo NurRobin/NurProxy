@@ -1,11 +1,14 @@
 import { createContext, useContext } from 'react';
 
 /** A UI variant is a whole different shell/experience, not just a color theme. */
-export type UIVariant = 'workbench' | 'classic';
+export type UIVariant = 'workbench' | 'classic' | 'terminal' | 'wallboard' | 'spreadsheet';
 
 export const UI_VARIANTS: { id: UIVariant; name: string; description: string }[] = [
+  { id: 'classic', name: 'Classic', description: 'A compact top-nav dashboard with a health panel, cards, and tables.' },
   { id: 'workbench', name: 'Workbench', description: 'A live topology map of your infrastructure with a sidebar and click-to-inspect panels.' },
-  { id: 'classic', name: 'Classic', description: 'A compact top-nav dashboard with cards and tables.' },
+  { id: 'terminal', name: 'Terminal', description: 'Keyboard-first. A ⌘K command palette is the nav; a monospace status board is home.' },
+  { id: 'wallboard', name: 'Wallboard', description: 'A read-only status grid for a spare monitor. Big, glanceable, auto-refreshing.' },
+  { id: 'spreadsheet', name: 'Spreadsheet', description: 'A dense, table-first view with multi-select and bulk actions for power users.' },
 ];
 
 export interface UIVariantContextValue {

@@ -2,6 +2,7 @@ import { BrowserRouter, NavLink } from 'react-router-dom';
 import { ThemeToggle } from '../lib/theme';
 import BrandMark from '../components/BrandMark';
 import NotificationBell from '../components/NotificationBell';
+import CommandPalette from '../components/CommandPalette';
 import Overview from '../pages/Overview';
 import { AppRoutes } from './appRoutes';
 import { NAV } from './nav';
@@ -50,6 +51,7 @@ export default function ClassicShell({ onLogout }: { onLogout: () => void }) {
           <AppRoutes overview={<Overview />} />
         </main>
       </div>
+      <CommandPalette />
     </BrowserRouter>
   );
 }

@@ -3,10 +3,12 @@ import { UIVariantContext, type UIVariant } from './ui-variant-context';
 
 const STORAGE_KEY = 'nurproxy-ui';
 
+const VALID: UIVariant[] = ['classic', 'workbench', 'terminal', 'wallboard', 'spreadsheet'];
+
 function readInitial(): UIVariant {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    if (v === 'classic' || v === 'workbench') return v;
+    if (v && (VALID as string[]).includes(v)) return v as UIVariant;
   } catch { /* ignore */ }
   return 'classic';
 }

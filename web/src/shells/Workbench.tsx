@@ -5,6 +5,7 @@ import { usePolling } from '../lib/usePolling';
 import { ThemeToggle } from '../lib/theme';
 import BrandMark from '../components/BrandMark';
 import NotificationBell from '../components/NotificationBell';
+import CommandPalette from '../components/CommandPalette';
 import Topology from '../pages/Topology';
 import { AppRoutes } from './appRoutes';
 import { NAV } from './nav';
@@ -87,6 +88,7 @@ export default function WorkbenchShell({ onLogout }: { onLogout: () => void }) {
           </main>
         </div>
       </div>
+      <CommandPalette />
     </BrowserRouter>
   );
 }

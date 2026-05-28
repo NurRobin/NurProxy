@@ -7,6 +7,17 @@ import Login from './pages/Login';
 import SetupWizard from './pages/SetupWizard';
 import ClassicShell from './shells/Classic';
 import WorkbenchShell from './shells/Workbench';
+import TerminalShell from './shells/Terminal';
+import WallboardShell from './shells/Wallboard';
+import SpreadsheetShell from './shells/Spreadsheet';
+
+const SHELLS = {
+  classic: ClassicShell,
+  workbench: WorkbenchShell,
+  terminal: TerminalShell,
+  wallboard: WallboardShell,
+  spreadsheet: SpreadsheetShell,
+} as const;
 
 type AuthState = 'loading' | 'error' | 'setup_required' | 'unauthenticated' | 'needs_setup_wizard' | 'authenticated';
 
@@ -84,9 +95,8 @@ function App() {
     );
   }
 
-  return variant === 'classic'
-    ? <ClassicShell onLogout={handleLogout} />
-    : <WorkbenchShell onLogout={handleLogout} />;
+  const Shell = SHELLS[variant] ?? ClassicShell;
+  return <Shell onLogout={handleLogout} />;
 }
 
 export default App;
