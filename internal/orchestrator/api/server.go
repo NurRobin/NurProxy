@@ -54,7 +54,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/providers/{id}", s.requireAuth(s.handleGetProvider))
 	s.mux.HandleFunc("PUT /api/v1/providers/{id}", s.requireAuth(s.handleUpdateProvider))
 	s.mux.HandleFunc("DELETE /api/v1/providers/{id}", s.requireAuth(s.handleDeleteProvider))
-	s.mux.HandleFunc("GET /api/v1/providers/{id}/zones", s.requireAuth(s.handleListZones))
+	s.mux.HandleFunc("GET /api/v1/providers/{id}/zones", s.requireAuth(s.handleListProviderZones))
+
+	// Zones (auth required)
+	s.mux.HandleFunc("GET /api/v1/zones", s.requireAuth(s.handleListAllZones))
+	s.mux.HandleFunc("POST /api/v1/zones", s.requireAuth(s.handleCreateZone))
+	s.mux.HandleFunc("POST /api/v1/zones/batch", s.requireAuth(s.handleCreateZonesBatch))
+	s.mux.HandleFunc("DELETE /api/v1/zones/{id}", s.requireAuth(s.handleDeleteZone))
 
 	// Agents (auth required except heartbeat which uses agent auth)
 	s.mux.HandleFunc("GET /api/v1/agents", s.requireAuth(s.handleListAgents))

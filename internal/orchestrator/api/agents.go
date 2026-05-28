@@ -18,7 +18,27 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	if agents == nil {
 		agents = []models.Agent{}
 	}
-	writeJSON(w, http.StatusOK, agents)
+
+	// Build response with zones included
+	type agentResponse struct {
+		models.Agent
+		Zones []models.Zone `json:"zones"`
+	}
+	resp := make([]agentResponse, len(agents))
+	for i, a := range agents {
+		zones, err := s.db.ListAgentZones(a.ID)
+		if err != nil {
+			zones = []models.Zone{}
+		}
+		if zones == nil {
+			zones = []models.Zone{}
+		}
+		resp[i] = agentResponse{
+			Agent: a,
+			Zones: zones,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // POST /api/v1/agents/register — called BY the agent during adoption.
@@ -57,7 +77,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		FQDN:      req.FQDN,
 		APIURL:    req.APIURL,
 		TokenHash: tokenHash,
-		PublicIP:   req.PublicIP,
+		PublicIP:  req.PublicIP,
 		Status:    models.AgentStatusPending,
 		Version:   req.Version,
 	}
@@ -95,10 +115,10 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name         string          `json:"name"`
-		ProviderID   string          `json:"provider_id"`
-		DNSMode      models.DNSMode  `json:"dns_mode"`
-		DDNSInterval int             `json:"ddns_interval"`
+		Name         string         `json:"name"`
+		ZoneIDs      []string       `json:"zone_ids"`
+		DNSMode      models.DNSMode `json:"dns_mode"`
+		DDNSInterval int            `json:"ddns_interval"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -107,13 +127,6 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 
 	if req.Name != "" {
 		agent.Name = req.Name
-	}
-	if req.ProviderID != "" {
-		if _, err := s.db.GetProvider(req.ProviderID); err != nil {
-			writeError(w, http.StatusBadRequest, "provider not found")
-			return
-		}
-		agent.ProviderID = req.ProviderID
 	}
 	if req.DNSMode != "" {
 		agent.DNSMode = req.DNSMode
@@ -126,6 +139,13 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.UpdateAgent(agent); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to adopt agent")
 		return
+	}
+
+	if len(req.ZoneIDs) > 0 {
+		if err := s.db.SetAgentZones(id, req.ZoneIDs); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to set agent zones")
+			return
+		}
 	}
 
 	s.audit(r, "agent", id, "adopt", agent.Name)
@@ -170,7 +190,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Name         *string         `json:"name"`
-		ProviderID   *string         `json:"provider_id"`
+		ZoneIDs      *[]string       `json:"zone_ids"`
 		DNSMode      *models.DNSMode `json:"dns_mode"`
 		DDNSInterval *int            `json:"ddns_interval"`
 	}
@@ -182,13 +202,6 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if req.Name != nil {
 		agent.Name = *req.Name
 	}
-	if req.ProviderID != nil {
-		if _, err := s.db.GetProvider(*req.ProviderID); err != nil {
-			writeError(w, http.StatusBadRequest, "provider not found")
-			return
-		}
-		agent.ProviderID = *req.ProviderID
-	}
 	if req.DNSMode != nil {
 		agent.DNSMode = *req.DNSMode
 	}
@@ -199,6 +212,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.UpdateAgent(agent); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update agent")
 		return
+	}
+
+	if req.ZoneIDs != nil {
+		if err := s.db.SetAgentZones(id, *req.ZoneIDs); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to set agent zones")
+			return
+		}
 	}
 
 	s.audit(r, "agent", id, "update", agent.Name)

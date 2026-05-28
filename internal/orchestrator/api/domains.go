@@ -32,13 +32,13 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/domains
 func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Subdomain  string             `json:"subdomain"`
-		ProviderID string             `json:"provider_id"`
-		ServerID   string             `json:"server_id"`
-		Port       int                `json:"port"`
-		WebSocket  bool               `json:"websocket"`
-		ForceHTTPS bool               `json:"force_https"`
-		SSLMode    models.SSLMode     `json:"ssl_mode"`
+		Subdomain   string              `json:"subdomain"`
+		ZoneID      string              `json:"zone_id"`
+		ServerID    string              `json:"server_id"`
+		Port        int                 `json:"port"`
+		WebSocket   bool                `json:"websocket"`
+		ForceHTTPS  bool                `json:"force_https"`
+		SSLMode     models.SSLMode      `json:"ssl_mode"`
 		ProxyConfig *models.ProxyConfig `json:"proxy_config"`
 	}
 	if err := readJSON(r, &req); err != nil {
@@ -46,8 +46,8 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Subdomain == "" || req.ProviderID == "" || req.ServerID == "" {
-		writeError(w, http.StatusBadRequest, "subdomain, provider_id, and server_id are required")
+	if req.Subdomain == "" || req.ZoneID == "" || req.ServerID == "" {
+		writeError(w, http.StatusBadRequest, "subdomain, zone_id, and server_id are required")
 		return
 	}
 	if req.Port <= 0 || req.Port > 65535 {
@@ -55,9 +55,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate provider exists
-	if _, err := s.db.GetProvider(req.ProviderID); err != nil {
-		writeError(w, http.StatusBadRequest, "provider not found")
+	// Validate zone exists
+	if _, err := s.db.GetZone(req.ZoneID); err != nil {
+		writeError(w, http.StatusBadRequest, "zone not found")
 		return
 	}
 
@@ -67,11 +67,11 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check subdomain uniqueness within provider
+	// Check subdomain uniqueness within zone
 	existing, _ := s.db.ListDomains(db.DomainFilter{})
 	for _, d := range existing {
-		if d.Subdomain == req.Subdomain && d.ProviderID == req.ProviderID {
-			writeError(w, http.StatusConflict, "subdomain already exists for this provider")
+		if d.Subdomain == req.Subdomain && d.ZoneID == req.ZoneID {
+			writeError(w, http.StatusConflict, "subdomain already exists for this zone")
 			return
 		}
 	}
@@ -83,7 +83,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 
 	dom := &models.Domain{
 		Subdomain:  req.Subdomain,
-		ProviderID: req.ProviderID,
+		ZoneID:     req.ZoneID,
 		ServerID:   req.ServerID,
 		Port:       req.Port,
 		WebSocket:  req.WebSocket,
@@ -138,14 +138,14 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Subdomain   *string              `json:"subdomain"`
-		ProviderID  *string              `json:"provider_id"`
-		ServerID    *string              `json:"server_id"`
-		Port        *int                 `json:"port"`
-		WebSocket   *bool                `json:"websocket"`
-		ForceHTTPS  *bool                `json:"force_https"`
-		SSLMode     *models.SSLMode      `json:"ssl_mode"`
-		ProxyConfig *models.ProxyConfig  `json:"proxy_config"`
+		Subdomain   *string             `json:"subdomain"`
+		ZoneID      *string             `json:"zone_id"`
+		ServerID    *string             `json:"server_id"`
+		Port        *int                `json:"port"`
+		WebSocket   *bool               `json:"websocket"`
+		ForceHTTPS  *bool               `json:"force_https"`
+		SSLMode     *models.SSLMode     `json:"ssl_mode"`
+		ProxyConfig *models.ProxyConfig `json:"proxy_config"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -155,12 +155,12 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	if req.Subdomain != nil {
 		dom.Subdomain = *req.Subdomain
 	}
-	if req.ProviderID != nil {
-		if _, err := s.db.GetProvider(*req.ProviderID); err != nil {
-			writeError(w, http.StatusBadRequest, "provider not found")
+	if req.ZoneID != nil {
+		if _, err := s.db.GetZone(*req.ZoneID); err != nil {
+			writeError(w, http.StatusBadRequest, "zone not found")
 			return
 		}
-		dom.ProviderID = *req.ProviderID
+		dom.ZoneID = *req.ZoneID
 	}
 	if req.ServerID != nil {
 		if _, err := s.db.GetServer(*req.ServerID); err != nil {
@@ -250,15 +250,15 @@ func (s *Server) handleGetDomainConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get provider for zone name
-	prov, err := s.db.GetProvider(dom.ProviderID)
+	// Get zone for zone name
+	zone, err := s.db.GetZone(dom.ZoneID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "provider not found")
+		writeError(w, http.StatusInternalServerError, "zone not found")
 		return
 	}
 
 	cfg := caddygen.DomainConfig{
-		FQDN:                  dom.FQDN(prov.ZoneName),
+		FQDN:                  dom.FQDN(zone.Name),
 		UpstreamAddr:          srv.Address,
 		UpstreamPort:          dom.Port,
 		WebSocket:             dom.WebSocket || dom.ProxyConfig.WebSocket,

@@ -218,33 +218,40 @@ func testDB(t *testing.T) *db.DB {
 	return d
 }
 
-// setupScenario creates a provider, agent, server, and domain for testing.
+// setupScenario creates a provider, zone, agent, server, and domain for testing.
 // It returns all entities for further assertions. The agent is marked adopted
 // and the domain has status pending.
-func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, agent *models.Agent, srv *models.Server, dom *models.Domain) {
+func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, zone *models.Zone, agent *models.Agent, srv *models.Server, dom *models.Domain) {
 	t.Helper()
 
 	prov = &models.Provider{
-		ID:       "prov-1",
-		Type:     "mock",
-		Name:     "Mock CF",
-		Config:   `{"api_token":"secret"}`,
-		ZoneID:   "zone-1",
-		ZoneName: "example.com",
+		ID:     "prov-1",
+		Type:   "mock",
+		Name:   "Mock CF",
+		Config: `{"api_token":"secret"}`,
 	}
 	if err := d.CreateProvider(prov); err != nil {
 		t.Fatalf("CreateProvider: %v", err)
 	}
 
-	agent = &models.Agent{
-		ID:         "agent-1",
-		Name:       "Agent One",
-		FQDN:       "agent1.example.com",
-		APIURL:     "https://agent1.example.com:8443",
-		TokenHash:  "token-hash-1",
+	zone = &models.Zone{
+		ID:         "zone-1",
 		ProviderID: prov.ID,
-		DNSMode:    models.DNSModeStatic,
-		Status:     models.AgentStatusAdopted,
+		ExternalID: "ext-zone-1",
+		Name:       "example.com",
+	}
+	if err := d.CreateZone(zone); err != nil {
+		t.Fatalf("CreateZone: %v", err)
+	}
+
+	agent = &models.Agent{
+		ID:        "agent-1",
+		Name:      "Agent One",
+		FQDN:      "agent1.example.com",
+		APIURL:    "https://agent1.example.com:8443",
+		TokenHash: "token-hash-1",
+		DNSMode:   models.DNSModeStatic,
+		Status:    models.AgentStatusAdopted,
 	}
 	if err := d.CreateAgent(agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
@@ -261,12 +268,12 @@ func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, agent *models
 	}
 
 	dom = &models.Domain{
-		Subdomain:  "app",
-		ProviderID: prov.ID,
-		ServerID:   srv.ID,
-		Port:       8080,
-		SSLMode:    models.SSLModeAuto,
-		Status:     models.DomainStatusPending,
+		Subdomain: "app",
+		ZoneID:    zone.ID,
+		ServerID:  srv.ID,
+		Port:      8080,
+		SSLMode:   models.SSLModeAuto,
+		Status:    models.DomainStatusPending,
 	}
 	if err := d.CreateDomain(dom); err != nil {
 		t.Fatalf("CreateDomain: %v", err)
@@ -290,7 +297,7 @@ func registerMockProvider(t *testing.T) *mockDNSProvider {
 
 func TestReconcileRoutes_PushMissing(t *testing.T) {
 	d := testDB(t)
-	_, agent, _, dom := setupScenario(t, d)
+	_, _, agent, _, dom := setupScenario(t, d)
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -345,7 +352,7 @@ func TestReconcileRoutes_PushMissing(t *testing.T) {
 
 func TestReconcileRoutes_IgnoreUnmanaged(t *testing.T) {
 	d := testDB(t)
-	_, agent, _, _ := setupScenario(t, d)
+	_, _, agent, _, _ := setupScenario(t, d)
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -392,7 +399,7 @@ func TestReconcileRoutes_IgnoreUnmanaged(t *testing.T) {
 
 func TestReconcileRoutes_FixDrift(t *testing.T) {
 	d := testDB(t)
-	_, agent, _, dom := setupScenario(t, d)
+	_, _, agent, _, dom := setupScenario(t, d)
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -434,7 +441,7 @@ func TestReconcileRoutes_FixDrift(t *testing.T) {
 
 func TestReconcileRoutes_RespectManualConfig(t *testing.T) {
 	d := testDB(t)
-	_, agent, _, dom := setupScenario(t, d)
+	_, _, agent, _, dom := setupScenario(t, d)
 
 	// Set manual config on the domain.
 	dom.ManualConfig = true
@@ -487,7 +494,7 @@ func TestReconcileRoutes_RespectManualConfig(t *testing.T) {
 func TestReconcileDNS_CreateMissingRecord(t *testing.T) {
 	d := testDB(t)
 	mp := registerMockProvider(t)
-	_, _, _, dom := setupScenario(t, d)
+	_, _, _, _, dom := setupScenario(t, d)
 
 	mc := newMockAgentClient()
 	r := New(d, mc, time.Minute)
@@ -524,7 +531,7 @@ func TestReconcileDNS_CreateMissingRecord(t *testing.T) {
 func TestReconcileDNS_FixDrift(t *testing.T) {
 	d := testDB(t)
 	mp := registerMockProvider(t)
-	_, _, _, dom := setupScenario(t, d)
+	_, _, _, _, dom := setupScenario(t, d)
 
 	// Pre-create a DNS record pointing to the wrong target.
 	mp.mu.Lock()
@@ -574,7 +581,7 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 
 func TestReconcileAgents_MarkOffline(t *testing.T) {
 	d := testDB(t)
-	_, agent, _, _ := setupScenario(t, d)
+	_, _, agent, _, _ := setupScenario(t, d)
 
 	mc := newMockAgentClient()
 	// Agent is NOT healthy.
@@ -611,7 +618,7 @@ func TestReconcileAgents_MarkOffline(t *testing.T) {
 
 func TestReconcileAgents_ComeBackOnline(t *testing.T) {
 	d := testDB(t)
-	_, agent, _, _ := setupScenario(t, d)
+	_, _, agent, _, _ := setupScenario(t, d)
 
 	// Mark agent as offline first.
 	if err := d.UpdateAgentStatus(agent.ID, models.AgentStatusOffline); err != nil {
@@ -640,7 +647,7 @@ func TestReconcileAgents_ComeBackOnline(t *testing.T) {
 func TestRunOnce_FullCycle(t *testing.T) {
 	d := testDB(t)
 	mp := registerMockProvider(t)
-	_, agent, _, dom := setupScenario(t, d)
+	_, _, agent, _, dom := setupScenario(t, d)
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)

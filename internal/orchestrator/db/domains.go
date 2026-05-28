@@ -41,11 +41,11 @@ func (d *DB) CreateDomain(dom *models.Domain) error {
 	}
 
 	res, err := d.sql.Exec(`
-		INSERT INTO domains (subdomain, provider_id, server_id, port, proxy_config,
+		INSERT INTO domains (subdomain, zone_id, server_id, port, proxy_config,
 			manual_config, websocket, force_https, ssl_mode, dns_record_id,
 			status, error_msg, last_synced, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		dom.Subdomain, dom.ProviderID, dom.ServerID, dom.Port, string(pcJSON),
+		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID,
 		string(dom.Status), dom.ErrorMsg, lastSynced,
@@ -74,7 +74,7 @@ func scanDomain(sc interface {
 	var createdAt, updatedAt string
 
 	err := sc.Scan(
-		&dom.ID, &dom.Subdomain, &dom.ProviderID, &dom.ServerID, &dom.Port,
+		&dom.ID, &dom.Subdomain, &dom.ZoneID, &dom.ServerID, &dom.Port,
 		&pcJSON, &manualConfig, &websocket, &forceHTTPS,
 		&dom.SSLMode, &dom.DNSRecordID, &dom.Status, &dom.ErrorMsg,
 		&lastSynced, &createdAt, &updatedAt,
@@ -100,7 +100,7 @@ func scanDomain(sc interface {
 	return &dom, nil
 }
 
-const domainColumns = `id, subdomain, provider_id, server_id, port, proxy_config,
+const domainColumns = `id, subdomain, zone_id, server_id, port, proxy_config,
 	manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
 	error_msg, last_synced, created_at, updated_at`
 
@@ -192,11 +192,11 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 
 	res, err := d.sql.Exec(`
 		UPDATE domains
-		SET subdomain = ?, provider_id = ?, server_id = ?, port = ?, proxy_config = ?,
+		SET subdomain = ?, zone_id = ?, server_id = ?, port = ?, proxy_config = ?,
 			manual_config = ?, websocket = ?, force_https = ?, ssl_mode = ?,
 			dns_record_id = ?, status = ?, error_msg = ?, last_synced = ?, updated_at = ?
 		WHERE id = ?`,
-		dom.Subdomain, dom.ProviderID, dom.ServerID, dom.Port, string(pcJSON),
+		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID, string(dom.Status), dom.ErrorMsg,
 		lastSynced, dom.UpdatedAt.Format(time.RFC3339), dom.ID,
@@ -265,7 +265,7 @@ func (d *DB) UpdateDomainDNSRecord(id int64, recordID string) error {
 // ListDomainsByAgent returns all domains whose server belongs to the given agent.
 func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 	// Qualify all column references with d. to avoid ambiguity with the servers join.
-	qualifiedColumns := `d.id, d.subdomain, d.provider_id, d.server_id, d.port, d.proxy_config,
+	qualifiedColumns := `d.id, d.subdomain, d.zone_id, d.server_id, d.port, d.proxy_config,
 		d.manual_config, d.websocket, d.force_https, d.ssl_mode, d.dns_record_id, d.status,
 		d.error_msg, d.last_synced, d.created_at, d.updated_at`
 

@@ -121,6 +121,110 @@ var migrations = []string{
 	DROP TABLE agents;
 	ALTER TABLE agents_new RENAME TO agents;
 	`,
+
+	// Migration 003: separate zones from providers, agent-zone many-to-many
+	`
+	-- 1. Create zones table. Use provider.id as zone.id for seamless data migration
+	--    (since old model was 1:1 provider-to-zone).
+	CREATE TABLE IF NOT EXISTS zones (
+		id          TEXT PRIMARY KEY,
+		provider_id TEXT NOT NULL REFERENCES providers(id),
+		external_id TEXT NOT NULL DEFAULT '',
+		name        TEXT NOT NULL DEFAULT '',
+		created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+
+	-- 2. Create agent_zones junction table for many-to-many.
+	CREATE TABLE IF NOT EXISTS agent_zones (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		zone_id  TEXT NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+		PRIMARY KEY (agent_id, zone_id)
+	);
+
+	-- 3. Migrate existing provider zone data into zones table.
+	--    Use provider.id as zone.id so existing domain.provider_id values
+	--    will remain valid as zone_id references.
+	INSERT OR IGNORE INTO zones (id, provider_id, external_id, name, created_at)
+	SELECT id, id, zone_id, zone_name, created_at FROM providers
+	WHERE zone_id != '' OR zone_name != '';
+
+	-- 4. Migrate agent.provider_id into agent_zones entries.
+	INSERT OR IGNORE INTO agent_zones (agent_id, zone_id)
+	SELECT id, provider_id FROM agents
+	WHERE provider_id IS NOT NULL AND provider_id != ''
+	AND provider_id IN (SELECT id FROM zones);
+
+	-- 5. Recreate domains table with zone_id instead of provider_id.
+	CREATE TABLE domains_new (
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		subdomain     TEXT NOT NULL,
+		zone_id       TEXT NOT NULL DEFAULT '' REFERENCES zones(id),
+		server_id     TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+		port          INTEGER NOT NULL DEFAULT 80,
+		proxy_config  TEXT NOT NULL DEFAULT '{}',
+		manual_config INTEGER NOT NULL DEFAULT 0,
+		websocket     INTEGER NOT NULL DEFAULT 0,
+		force_https   INTEGER NOT NULL DEFAULT 0,
+		ssl_mode      TEXT NOT NULL DEFAULT 'auto',
+		dns_record_id TEXT NOT NULL DEFAULT '',
+		status        TEXT NOT NULL DEFAULT 'pending',
+		error_msg     TEXT NOT NULL DEFAULT '',
+		last_synced   TEXT,
+		created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+		updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(subdomain, zone_id)
+	);
+	INSERT INTO domains_new (id, subdomain, zone_id, server_id, port, proxy_config,
+		manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
+		error_msg, last_synced, created_at, updated_at)
+	SELECT id, subdomain, provider_id, server_id, port, proxy_config,
+		manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
+		error_msg, last_synced, created_at, updated_at
+	FROM domains;
+	DROP TABLE domains;
+	ALTER TABLE domains_new RENAME TO domains;
+
+	-- 6. Recreate agents table without provider_id.
+	CREATE TABLE agents_new (
+		id            TEXT PRIMARY KEY,
+		name          TEXT NOT NULL,
+		fqdn          TEXT NOT NULL UNIQUE,
+		api_url       TEXT NOT NULL DEFAULT '',
+		token_hash    TEXT NOT NULL DEFAULT '',
+		dns_mode      TEXT NOT NULL DEFAULT 'static',
+		ddns_interval INTEGER NOT NULL DEFAULT 300,
+		public_ip     TEXT NOT NULL DEFAULT '',
+		dns_record_id TEXT NOT NULL DEFAULT '',
+		status        TEXT NOT NULL DEFAULT 'pending',
+		last_seen     TEXT,
+		version       TEXT NOT NULL DEFAULT '',
+		created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+		updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+	INSERT INTO agents_new (id, name, fqdn, api_url, token_hash,
+		dns_mode, ddns_interval, public_ip, dns_record_id, status,
+		last_seen, version, created_at, updated_at)
+	SELECT id, name, fqdn, api_url, token_hash,
+		dns_mode, ddns_interval, public_ip, dns_record_id, status,
+		last_seen, version, created_at, updated_at
+	FROM agents;
+	DROP TABLE agents;
+	ALTER TABLE agents_new RENAME TO agents;
+
+	-- 7. Recreate providers table without zone_id/zone_name.
+	CREATE TABLE providers_new (
+		id         TEXT PRIMARY KEY,
+		type       TEXT NOT NULL,
+		name       TEXT NOT NULL,
+		config     TEXT NOT NULL,
+		is_default INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+	INSERT INTO providers_new (id, type, name, config, is_default, created_at)
+	SELECT id, type, name, config, is_default, created_at FROM providers;
+	DROP TABLE providers;
+	ALTER TABLE providers_new RENAME TO providers;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

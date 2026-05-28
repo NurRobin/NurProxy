@@ -44,11 +44,18 @@ type Provider struct {
 	ID        string    `json:"id"`
 	Type      string    `json:"type"`
 	Name      string    `json:"name"`
-	Config    string    `json:"-"`          // encrypted, never in API responses
-	ZoneID    string    `json:"zone_id"`
-	ZoneName  string    `json:"zone_name"`
+	Config    string    `json:"-"` // encrypted, never in API responses
 	IsDefault bool      `json:"is_default"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// Zone represents a DNS zone belonging to a provider.
+type Zone struct {
+	ID         string    `json:"id"`
+	ProviderID string    `json:"provider_id"`
+	ExternalID string    `json:"external_id"`
+	Name       string    `json:"name"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // Agent represents a registered proxy agent.
@@ -58,7 +65,6 @@ type Agent struct {
 	FQDN         string      `json:"fqdn"`
 	APIURL       string      `json:"api_url"`
 	TokenHash    string      `json:"-"`
-	ProviderID   string      `json:"provider_id,omitempty"`
 	DNSMode      DNSMode     `json:"dns_mode"`
 	DDNSInterval int         `json:"ddns_interval"`
 	PublicIP     string      `json:"public_ip,omitempty"`
@@ -110,7 +116,7 @@ type ProxyConfig struct {
 type Domain struct {
 	ID           int64        `json:"id"`
 	Subdomain    string       `json:"subdomain"`
-	ProviderID   string       `json:"provider_id"`
+	ZoneID       string       `json:"zone_id"`
 	ServerID     string       `json:"server_id"`
 	Port         int          `json:"port"`
 	ProxyConfig  ProxyConfig  `json:"proxy_config"`

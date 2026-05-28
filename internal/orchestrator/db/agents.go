@@ -20,18 +20,11 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 		lastSeen = &s
 	}
 
-	// Use SQL NULL for empty provider_id to avoid FK constraint violations
-	// when agent registers without a provider (pre-adoption).
-	var providerID interface{} = a.ProviderID
-	if a.ProviderID == "" {
-		providerID = nil
-	}
-
 	_, err := d.sql.Exec(`
-		INSERT INTO agents (id, name, fqdn, api_url, token_hash, provider_id, dns_mode,
+		INSERT INTO agents (id, name, fqdn, api_url, token_hash, dns_mode,
 			ddns_interval, public_ip, dns_record_id, status, last_seen, version, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash, providerID,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
@@ -47,12 +40,11 @@ func scanAgent(sc interface {
 	Scan(dest ...any) error
 }) (*models.Agent, error) {
 	var a models.Agent
-	var providerID sql.NullString
 	var lastSeen sql.NullString
 	var createdAt, updatedAt string
 
 	err := sc.Scan(
-		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash, &providerID,
+		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
 		&a.DNSMode, &a.DDNSInterval, &a.PublicIP, &a.DNSRecordID,
 		&a.Status, &lastSeen, &a.Version, &createdAt, &updatedAt,
 	)
@@ -60,9 +52,6 @@ func scanAgent(sc interface {
 		return nil, err
 	}
 
-	if providerID.Valid {
-		a.ProviderID = providerID.String
-	}
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	if lastSeen.Valid {
@@ -73,13 +62,14 @@ func scanAgent(sc interface {
 	return &a, nil
 }
 
+const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
+	ddns_interval, public_ip, dns_record_id, status, last_seen, version,
+	created_at, updated_at`
+
 // GetAgent retrieves an agent by ID.
 func (d *DB) GetAgent(id string) (*models.Agent, error) {
-	row := d.sql.QueryRow(`
-		SELECT id, name, fqdn, api_url, token_hash, provider_id, dns_mode,
-			ddns_interval, public_ip, dns_record_id, status, last_seen, version,
-			created_at, updated_at
-		FROM agents WHERE id = ?`, id)
+	row := d.sql.QueryRow(
+		"SELECT "+agentColumns+" FROM agents WHERE id = ?", id)
 
 	a, err := scanAgent(row)
 	if err == sql.ErrNoRows {
@@ -93,11 +83,8 @@ func (d *DB) GetAgent(id string) (*models.Agent, error) {
 
 // GetAgentByFQDN retrieves an agent by its unique FQDN.
 func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
-	row := d.sql.QueryRow(`
-		SELECT id, name, fqdn, api_url, token_hash, provider_id, dns_mode,
-			ddns_interval, public_ip, dns_record_id, status, last_seen, version,
-			created_at, updated_at
-		FROM agents WHERE fqdn = ?`, fqdn)
+	row := d.sql.QueryRow(
+		"SELECT "+agentColumns+" FROM agents WHERE fqdn = ?", fqdn)
 
 	a, err := scanAgent(row)
 	if err == sql.ErrNoRows {
@@ -111,11 +98,8 @@ func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
 
 // ListAgents returns all agents ordered by creation time.
 func (d *DB) ListAgents() ([]models.Agent, error) {
-	rows, err := d.sql.Query(`
-		SELECT id, name, fqdn, api_url, token_hash, provider_id, dns_mode,
-			ddns_interval, public_ip, dns_record_id, status, last_seen, version,
-			created_at, updated_at
-		FROM agents ORDER BY created_at`)
+	rows, err := d.sql.Query(
+		"SELECT " + agentColumns + " FROM agents ORDER BY created_at")
 	if err != nil {
 		return nil, fmt.Errorf("listing agents: %w", err)
 	}
@@ -142,19 +126,13 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		lastSeen = &s
 	}
 
-	// Use SQL NULL for empty provider_id to avoid FK constraint violations.
-	var providerID interface{} = a.ProviderID
-	if a.ProviderID == "" {
-		providerID = nil
-	}
-
 	res, err := d.sql.Exec(`
 		UPDATE agents
-		SET name = ?, fqdn = ?, api_url = ?, token_hash = ?, provider_id = ?,
+		SET name = ?, fqdn = ?, api_url = ?, token_hash = ?,
 			dns_mode = ?, ddns_interval = ?, public_ip = ?, dns_record_id = ?,
 			status = ?, last_seen = ?, version = ?, updated_at = ?
 		WHERE id = ?`,
-		a.Name, a.FQDN, a.APIURL, a.TokenHash, providerID,
+		a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version, a.UpdatedAt.Format(time.RFC3339),
 		a.ID,
@@ -222,11 +200,9 @@ func (d *DB) UpdateAgentHeartbeat(id string, ip string) error {
 
 // ListPendingAgents returns all agents with status "pending".
 func (d *DB) ListPendingAgents() ([]models.Agent, error) {
-	rows, err := d.sql.Query(`
-		SELECT id, name, fqdn, api_url, token_hash, provider_id, dns_mode,
-			ddns_interval, public_ip, dns_record_id, status, last_seen, version,
-			created_at, updated_at
-		FROM agents WHERE status = ? ORDER BY created_at`, string(models.AgentStatusPending))
+	rows, err := d.sql.Query(
+		"SELECT "+agentColumns+" FROM agents WHERE status = ? ORDER BY created_at",
+		string(models.AgentStatusPending))
 	if err != nil {
 		return nil, fmt.Errorf("listing pending agents: %w", err)
 	}

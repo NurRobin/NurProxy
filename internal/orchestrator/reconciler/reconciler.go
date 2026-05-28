@@ -193,29 +193,29 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		return fmt.Errorf("listing domains for agent %s: %w", agent.ID, err)
 	}
 
-	// Look up provider zone names for FQDN construction.
-	type providerCache struct {
+	// Look up zone names for FQDN construction.
+	type zoneCache struct {
 		zoneName string
 	}
-	provCache := make(map[string]providerCache)
+	zCache := make(map[string]zoneCache)
 
 	// Build the expected set of routes keyed by FQDN.
 	desiredByFQDN := make(map[string]desiredRoute)
 	for i := range domains {
 		dom := &domains[i]
 
-		// Resolve zone name from the domain's provider.
-		pc, ok := provCache[dom.ProviderID]
+		// Resolve zone name from the domain's zone.
+		zc, ok := zCache[dom.ZoneID]
 		if !ok {
-			prov, pErr := r.db.GetProvider(dom.ProviderID)
-			if pErr != nil {
-				log.Printf("reconciler: cannot resolve provider %s for domain %d: %v", dom.ProviderID, dom.ID, pErr)
+			zone, zErr := r.db.GetZone(dom.ZoneID)
+			if zErr != nil {
+				log.Printf("reconciler: cannot resolve zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
 				continue
 			}
-			pc = providerCache{zoneName: prov.ZoneName}
-			provCache[dom.ProviderID] = pc
+			zc = zoneCache{zoneName: zone.Name}
+			zCache[dom.ZoneID] = zc
 		}
-		fqdn := dom.FQDN(pc.zoneName)
+		fqdn := dom.FQDN(zc.zoneName)
 
 		// Resolve server address.
 		srv, sErr := r.db.GetServer(dom.ServerID)
@@ -353,10 +353,16 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 			continue
 		}
 
-		// Resolve the provider.
-		prov, pErr := r.db.GetProvider(dom.ProviderID)
+		// Resolve zone -> provider chain.
+		zone, zErr := r.db.GetZone(dom.ZoneID)
+		if zErr != nil {
+			log.Printf("reconciler: cannot get zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
+			continue
+		}
+
+		prov, pErr := r.db.GetProvider(zone.ProviderID)
 		if pErr != nil {
-			log.Printf("reconciler: cannot get provider %s for domain %d: %v", dom.ProviderID, dom.ID, pErr)
+			log.Printf("reconciler: cannot get provider %s for zone %s: %v", zone.ProviderID, zone.ID, pErr)
 			continue
 		}
 
@@ -366,9 +372,12 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 			continue
 		}
 
-		provConfig := json.RawMessage(prov.Config)
+		// Merge zone's external ID into provider config for DNS API calls.
+		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
 
-		// Resolve: domain → server → agent → agent.FQDN for CNAME target.
+		fqdn := dom.FQDN(zone.Name)
+
+		// Resolve: domain -> server -> agent -> agent.FQDN for CNAME target.
 		srv, sErr := r.db.GetServer(dom.ServerID)
 		if sErr != nil {
 			log.Printf("reconciler: cannot get server %s for domain %d: %v", dom.ServerID, dom.ID, sErr)
@@ -381,7 +390,6 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 			continue
 		}
 
-		fqdn := dom.FQDN(prov.ZoneName)
 		expectedTarget := agent.FQDN
 
 		if dom.DNSRecordID == "" {
@@ -467,6 +475,18 @@ type desiredRoute struct {
 	route  json.RawMessage
 }
 
+// mergeZoneIDIntoConfig injects the zone's external ID into the provider config
+// so the DNS provider can target the correct zone.
+func mergeZoneIDIntoConfig(providerConfig string, zoneExternalID string) json.RawMessage {
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(providerConfig), &cfg); err != nil {
+		cfg = make(map[string]interface{})
+	}
+	cfg["zone_id"] = zoneExternalID
+	merged, _ := json.Marshal(cfg)
+	return json.RawMessage(merged)
+}
+
 // extractHostFromRoute pulls the first host out of a Caddy route JSON blob.
 func extractHostFromRoute(raw json.RawMessage) string {
 	var partial struct {
@@ -512,4 +532,3 @@ func (r *Reconciler) audit(entityType, entityID, action, details string) {
 		log.Printf("reconciler: failed to insert audit log: %v", err)
 	}
 }
-

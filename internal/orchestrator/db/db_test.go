@@ -33,6 +33,7 @@ func TestMigration_TablesExist(t *testing.T) {
 	tables := []string{
 		"providers", "agents", "servers", "domains",
 		"notifiers", "audit_log", "settings", "schema_version",
+		"zones", "agent_zones",
 	}
 	for _, tbl := range tables {
 		var name string
@@ -60,12 +61,10 @@ func TestMigration_Idempotent(t *testing.T) {
 func createTestProvider(t *testing.T, d *DB) *models.Provider {
 	t.Helper()
 	p := &models.Provider{
-		ID:       "prov-1",
-		Type:     "cloudflare",
-		Name:     "My CF",
-		Config:   `{"api_token":"secret123"}`,
-		ZoneID:   "zone-abc",
-		ZoneName: "example.com",
+		ID:     "prov-1",
+		Type:   "cloudflare",
+		Name:   "My CF",
+		Config: `{"api_token":"secret123"}`,
 	}
 	if err := d.CreateProvider(p); err != nil {
 		t.Fatalf("CreateProvider: %v", err)
@@ -86,9 +85,6 @@ func TestProvider_CreateAndGet(t *testing.T) {
 	}
 	if got.Config != p.Config {
 		t.Errorf("Config not decrypted correctly: got %q, want %q", got.Config, p.Config)
-	}
-	if got.ZoneID != p.ZoneID {
-		t.Errorf("ZoneID: got %q, want %q", got.ZoneID, p.ZoneID)
 	}
 }
 
@@ -208,10 +204,213 @@ func TestProvider_GetNotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Zones
+// ---------------------------------------------------------------------------
+
+func createTestZone(t *testing.T, d *DB, providerID string) *models.Zone {
+	t.Helper()
+	z := &models.Zone{
+		ID:         "zone-1",
+		ProviderID: providerID,
+		ExternalID: "ext-zone-abc",
+		Name:       "example.com",
+	}
+	if err := d.CreateZone(z); err != nil {
+		t.Fatalf("CreateZone: %v", err)
+	}
+	return z
+}
+
+func TestZone_CreateAndGet(t *testing.T) {
+	d := testDB(t)
+	p := createTestProvider(t, d)
+	z := createTestZone(t, d, p.ID)
+
+	got, err := d.GetZone(z.ID)
+	if err != nil {
+		t.Fatalf("GetZone: %v", err)
+	}
+	if got.Name != z.Name {
+		t.Errorf("Name: got %q, want %q", got.Name, z.Name)
+	}
+	if got.ProviderID != p.ID {
+		t.Errorf("ProviderID: got %q, want %q", got.ProviderID, p.ID)
+	}
+	if got.ExternalID != z.ExternalID {
+		t.Errorf("ExternalID: got %q, want %q", got.ExternalID, z.ExternalID)
+	}
+}
+
+func TestZone_List(t *testing.T) {
+	d := testDB(t)
+	p := createTestProvider(t, d)
+	createTestZone(t, d, p.ID)
+
+	z2 := &models.Zone{
+		ID: "zone-2", ProviderID: p.ID, ExternalID: "ext-zone-def", Name: "other.com",
+	}
+	if err := d.CreateZone(z2); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := d.ListZones()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 zones, got %d", len(list))
+	}
+}
+
+func TestZone_ListByProvider(t *testing.T) {
+	d := testDB(t)
+	p1 := createTestProvider(t, d)
+	p2 := &models.Provider{ID: "prov-2", Type: "cloudflare", Name: "P2", Config: "{}"}
+	if err := d.CreateProvider(p2); err != nil {
+		t.Fatal(err)
+	}
+
+	createTestZone(t, d, p1.ID)
+	z2 := &models.Zone{ID: "zone-2", ProviderID: p2.ID, ExternalID: "ext-2", Name: "other.com"}
+	if err := d.CreateZone(z2); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := d.ListZonesByProvider(p1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 zone for prov-1, got %d", len(list))
+	}
+	if list[0].ID != "zone-1" {
+		t.Errorf("expected zone-1, got %s", list[0].ID)
+	}
+}
+
+func TestZone_Delete(t *testing.T) {
+	d := testDB(t)
+	p := createTestProvider(t, d)
+	z := createTestZone(t, d, p.ID)
+
+	if err := d.DeleteZone(z.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := d.GetZone(z.ID)
+	if err == nil {
+		t.Fatal("expected error after delete")
+	}
+}
+
+func TestZone_GetNotFound(t *testing.T) {
+	d := testDB(t)
+	_, err := d.GetZone("nonexistent")
+	if err == nil {
+		t.Fatal("expected error for nonexistent zone")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Agent Zones
+// ---------------------------------------------------------------------------
+
+func TestAgentZones_AddAndList(t *testing.T) {
+	d := testDB(t)
+	p := createTestProvider(t, d)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
+
+	if err := d.AddAgentZone(a.ID, z.ID); err != nil {
+		t.Fatalf("AddAgentZone: %v", err)
+	}
+
+	zones, err := d.ListAgentZones(a.ID)
+	if err != nil {
+		t.Fatalf("ListAgentZones: %v", err)
+	}
+	if len(zones) != 1 {
+		t.Fatalf("expected 1 zone, got %d", len(zones))
+	}
+	if zones[0].ID != z.ID {
+		t.Errorf("expected zone %s, got %s", z.ID, zones[0].ID)
+	}
+}
+
+func TestAgentZones_Remove(t *testing.T) {
+	d := testDB(t)
+	p := createTestProvider(t, d)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
+
+	if err := d.AddAgentZone(a.ID, z.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RemoveAgentZone(a.ID, z.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	zones, err := d.ListAgentZones(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(zones) != 0 {
+		t.Fatalf("expected 0 zones after remove, got %d", len(zones))
+	}
+}
+
+func TestAgentZones_SetAgentZones(t *testing.T) {
+	d := testDB(t)
+	p := createTestProvider(t, d)
+	z1 := createTestZone(t, d, p.ID)
+	z2 := &models.Zone{ID: "zone-2", ProviderID: p.ID, ExternalID: "ext-2", Name: "other.com"}
+	if err := d.CreateZone(z2); err != nil {
+		t.Fatal(err)
+	}
+	a := createTestAgent(t, d)
+
+	// Set to z1 only
+	if err := d.SetAgentZones(a.ID, []string{z1.ID}); err != nil {
+		t.Fatal(err)
+	}
+	zones, _ := d.ListAgentZones(a.ID)
+	if len(zones) != 1 || zones[0].ID != z1.ID {
+		t.Fatalf("expected [zone-1], got %v", zones)
+	}
+
+	// Replace with z2
+	if err := d.SetAgentZones(a.ID, []string{z2.ID}); err != nil {
+		t.Fatal(err)
+	}
+	zones, _ = d.ListAgentZones(a.ID)
+	if len(zones) != 1 || zones[0].ID != z2.ID {
+		t.Fatalf("expected [zone-2], got %v", zones)
+	}
+
+	// Set to both
+	if err := d.SetAgentZones(a.ID, []string{z1.ID, z2.ID}); err != nil {
+		t.Fatal(err)
+	}
+	zones, _ = d.ListAgentZones(a.ID)
+	if len(zones) != 2 {
+		t.Fatalf("expected 2 zones, got %d", len(zones))
+	}
+
+	// Clear all
+	if err := d.SetAgentZones(a.ID, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	zones, _ = d.ListAgentZones(a.ID)
+	if len(zones) != 0 {
+		t.Fatalf("expected 0 zones, got %d", len(zones))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
 
-func createTestAgent(t *testing.T, d *DB, providerID string) *models.Agent {
+func createTestAgent(t *testing.T, d *DB) *models.Agent {
 	t.Helper()
 	a := &models.Agent{
 		ID:           "agent-1",
@@ -219,7 +418,6 @@ func createTestAgent(t *testing.T, d *DB, providerID string) *models.Agent {
 		FQDN:         "agent1.example.com",
 		APIURL:       "https://agent1.example.com:8443",
 		TokenHash:    "hash123",
-		ProviderID:   providerID,
 		DNSMode:      models.DNSModeStatic,
 		DDNSInterval: 300,
 		Status:       models.AgentStatusPending,
@@ -233,8 +431,7 @@ func createTestAgent(t *testing.T, d *DB, providerID string) *models.Agent {
 
 func TestAgent_CreateAndGet(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 
 	got, err := d.GetAgent(a.ID)
 	if err != nil {
@@ -253,8 +450,7 @@ func TestAgent_CreateAndGet(t *testing.T) {
 
 func TestAgent_GetByFQDN(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 
 	got, err := d.GetAgentByFQDN(a.FQDN)
 	if err != nil {
@@ -267,12 +463,11 @@ func TestAgent_GetByFQDN(t *testing.T) {
 
 func TestAgent_List(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	createTestAgent(t, d, p.ID)
+	createTestAgent(t, d)
 
 	a2 := &models.Agent{
 		ID: "agent-2", Name: "Agent Two", FQDN: "agent2.example.com",
-		ProviderID: p.ID, DNSMode: models.DNSModeStatic, Status: models.AgentStatusAdopted,
+		DNSMode: models.DNSModeStatic, Status: models.AgentStatusAdopted,
 	}
 	if err := d.CreateAgent(a2); err != nil {
 		t.Fatal(err)
@@ -289,8 +484,7 @@ func TestAgent_List(t *testing.T) {
 
 func TestAgent_Update(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 
 	a.Name = "Updated Agent"
 	a.Version = "2.0.0"
@@ -309,8 +503,7 @@ func TestAgent_Update(t *testing.T) {
 
 func TestAgent_Delete_CascadesToServers(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 
 	s := &models.Server{
 		ID: "srv-1", AgentID: a.ID, Name: "Server 1", Address: "10.0.0.1",
@@ -332,8 +525,7 @@ func TestAgent_Delete_CascadesToServers(t *testing.T) {
 
 func TestAgent_UpdateStatus(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 
 	if err := d.UpdateAgentStatus(a.ID, models.AgentStatusAdopted); err != nil {
 		t.Fatal(err)
@@ -347,8 +539,7 @@ func TestAgent_UpdateStatus(t *testing.T) {
 
 func TestAgent_Heartbeat(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 
 	if err := d.UpdateAgentHeartbeat(a.ID, "1.2.3.4"); err != nil {
 		t.Fatal(err)
@@ -365,12 +556,11 @@ func TestAgent_Heartbeat(t *testing.T) {
 
 func TestAgent_ListPending(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	createTestAgent(t, d, p.ID) // status = pending
+	createTestAgent(t, d) // status = pending
 
 	a2 := &models.Agent{
 		ID: "agent-2", Name: "Adopted", FQDN: "a2.example.com",
-		ProviderID: p.ID, DNSMode: models.DNSModeStatic, Status: models.AgentStatusAdopted,
+		DNSMode: models.DNSModeStatic, Status: models.AgentStatusAdopted,
 	}
 	if err := d.CreateAgent(a2); err != nil {
 		t.Fatal(err)
@@ -405,8 +595,7 @@ func createTestServer(t *testing.T, d *DB, agentID string) *models.Server {
 
 func TestServer_CreateAndGet(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
 
 	got, err := d.GetServer(s.ID)
@@ -423,8 +612,7 @@ func TestServer_CreateAndGet(t *testing.T) {
 
 func TestServer_ListByAgent(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 	createTestServer(t, d, a.ID)
 
 	s2 := &models.Server{
@@ -445,8 +633,7 @@ func TestServer_ListByAgent(t *testing.T) {
 
 func TestServer_Update(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
 
 	s.Name = "Updated"
@@ -463,8 +650,7 @@ func TestServer_Update(t *testing.T) {
 
 func TestServer_Delete(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
 
 	if err := d.DeleteServer(s.ID); err != nil {
@@ -481,13 +667,13 @@ func TestServer_Delete(t *testing.T) {
 // Domains
 // ---------------------------------------------------------------------------
 
-func createTestDomain(t *testing.T, d *DB, providerID, serverID string) *models.Domain {
+func createTestDomain(t *testing.T, d *DB, zoneID, serverID string) *models.Domain {
 	t.Helper()
 	dom := &models.Domain{
-		Subdomain:  "app",
-		ProviderID: providerID,
-		ServerID:   serverID,
-		Port:       8080,
+		Subdomain: "app",
+		ZoneID:    zoneID,
+		ServerID:  serverID,
+		Port:      8080,
 		ProxyConfig: models.ProxyConfig{
 			WebSocket:  true,
 			ForceHTTPS: true,
@@ -506,9 +692,10 @@ func createTestDomain(t *testing.T, d *DB, providerID, serverID string) *models.
 func TestDomain_CreateAndGet(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
-	dom := createTestDomain(t, d, p.ID, s.ID)
+	dom := createTestDomain(t, d, z.ID, s.ID)
 
 	if dom.ID == 0 {
 		t.Fatal("expected domain ID to be assigned")
@@ -533,14 +720,18 @@ func TestDomain_CreateAndGet(t *testing.T) {
 	if got.SSLMode != models.SSLModeAuto {
 		t.Errorf("SSLMode: got %q, want %q", got.SSLMode, models.SSLModeAuto)
 	}
+	if got.ZoneID != z.ID {
+		t.Errorf("ZoneID: got %q, want %q", got.ZoneID, z.ID)
+	}
 }
 
 func TestDomain_ListWithFilters(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
-	createTestDomain(t, d, p.ID, s.ID)
+	createTestDomain(t, d, z.ID, s.ID)
 
 	// Create a second domain on a different server.
 	s2 := &models.Server{ID: "srv-2", AgentID: a.ID, Name: "S2", Address: "10.0.0.2"}
@@ -548,7 +739,7 @@ func TestDomain_ListWithFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	dom2 := &models.Domain{
-		Subdomain: "api", ProviderID: p.ID, ServerID: s2.ID,
+		Subdomain: "api", ZoneID: z.ID, ServerID: s2.ID,
 		Port: 3000, SSLMode: models.SSLModeAuto, Status: models.DomainStatusActive,
 	}
 	if err := d.CreateDomain(dom2); err != nil {
@@ -595,9 +786,10 @@ func TestDomain_ListWithFilters(t *testing.T) {
 func TestDomain_Update(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
-	dom := createTestDomain(t, d, p.ID, s.ID)
+	dom := createTestDomain(t, d, z.ID, s.ID)
 
 	dom.Port = 9090
 	dom.Status = models.DomainStatusActive
@@ -614,9 +806,10 @@ func TestDomain_Update(t *testing.T) {
 func TestDomain_Delete(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
-	dom := createTestDomain(t, d, p.ID, s.ID)
+	dom := createTestDomain(t, d, z.ID, s.ID)
 
 	if err := d.DeleteDomain(dom.ID); err != nil {
 		t.Fatal(err)
@@ -631,9 +824,10 @@ func TestDomain_Delete(t *testing.T) {
 func TestDomain_UpdateStatus(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
-	dom := createTestDomain(t, d, p.ID, s.ID)
+	dom := createTestDomain(t, d, z.ID, s.ID)
 
 	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusError, "dns failed"); err != nil {
 		t.Fatal(err)
@@ -651,9 +845,10 @@ func TestDomain_UpdateStatus(t *testing.T) {
 func TestDomain_UpdateDNSRecord(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
-	dom := createTestDomain(t, d, p.ID, s.ID)
+	dom := createTestDomain(t, d, z.ID, s.ID)
 
 	if err := d.UpdateDomainDNSRecord(dom.ID, "rec-xyz"); err != nil {
 		t.Fatal(err)
@@ -668,14 +863,15 @@ func TestDomain_UpdateDNSRecord(t *testing.T) {
 func TestDomain_ListByAgent(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
-	createTestDomain(t, d, p.ID, s.ID)
+	createTestDomain(t, d, z.ID, s.ID)
 
 	// Agent with no domains.
 	a2 := &models.Agent{
 		ID: "agent-2", Name: "No Domains", FQDN: "a2.example.com",
-		ProviderID: p.ID, DNSMode: models.DNSModeStatic, Status: models.AgentStatusAdopted,
+		DNSMode: models.DNSModeStatic, Status: models.AgentStatusAdopted,
 	}
 	if err := d.CreateAgent(a2); err != nil {
 		t.Fatal(err)
@@ -840,8 +1036,7 @@ func TestSettings_GetNotFound(t *testing.T) {
 
 func TestAgent_LastSeenNilRoundtrip(t *testing.T) {
 	d := testDB(t)
-	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID) // LastSeen is nil
+	a := createTestAgent(t, d) // LastSeen is nil
 
 	got, err := d.GetAgent(a.ID)
 	if err != nil {
@@ -855,14 +1050,15 @@ func TestAgent_LastSeenNilRoundtrip(t *testing.T) {
 func TestDomain_ProxyConfigRoundtrip(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
 
 	dom := &models.Domain{
-		Subdomain:  "complex",
-		ProviderID: p.ID,
-		ServerID:   s.ID,
-		Port:       443,
+		Subdomain: "complex",
+		ZoneID:    z.ID,
+		ServerID:  s.ID,
+		Port:      443,
 		ProxyConfig: models.ProxyConfig{
 			WebSocket:             true,
 			ForceHTTPS:            true,
@@ -903,13 +1099,14 @@ func TestDomain_ProxyConfigRoundtrip(t *testing.T) {
 func TestDomain_LastSyncedRoundtrip(t *testing.T) {
 	d := testDB(t)
 	p := createTestProvider(t, d)
-	a := createTestAgent(t, d, p.ID)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
 	s := createTestServer(t, d, a.ID)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	dom := &models.Domain{
 		Subdomain:  "synced",
-		ProviderID: p.ID,
+		ZoneID:     z.ID,
 		ServerID:   s.ID,
 		Port:       80,
 		SSLMode:    models.SSLModeOff,

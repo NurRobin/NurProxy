@@ -26,9 +26,9 @@ func (d *DB) CreateProvider(p *models.Provider) error {
 	}
 
 	_, err = d.sql.Exec(`
-		INSERT INTO providers (id, type, name, config, zone_id, zone_name, is_default, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, p.Type, p.Name, enc, p.ZoneID, p.ZoneName, isDefault, now.Format(time.RFC3339),
+		INSERT INTO providers (id, type, name, config, is_default, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Type, p.Name, enc, isDefault, now.Format(time.RFC3339),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting provider: %w", err)
@@ -44,9 +44,9 @@ func (d *DB) GetProvider(id string) (*models.Provider, error) {
 	var createdAt string
 
 	err := d.sql.QueryRow(`
-		SELECT id, type, name, config, zone_id, zone_name, is_default, created_at
+		SELECT id, type, name, config, is_default, created_at
 		FROM providers WHERE id = ?`, id,
-	).Scan(&p.ID, &p.Type, &p.Name, &encConfig, &p.ZoneID, &p.ZoneName, &isDefault, &createdAt)
+	).Scan(&p.ID, &p.Type, &p.Name, &encConfig, &isDefault, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("provider not found: %s", id)
 	}
@@ -68,7 +68,7 @@ func (d *DB) GetProvider(id string) (*models.Provider, error) {
 // ListProviders returns all providers with their configs decrypted.
 func (d *DB) ListProviders() ([]models.Provider, error) {
 	rows, err := d.sql.Query(`
-		SELECT id, type, name, config, zone_id, zone_name, is_default, created_at
+		SELECT id, type, name, config, is_default, created_at
 		FROM providers ORDER BY created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("listing providers: %w", err)
@@ -82,7 +82,7 @@ func (d *DB) ListProviders() ([]models.Provider, error) {
 		var isDefault int
 		var createdAt string
 
-		if err := rows.Scan(&p.ID, &p.Type, &p.Name, &encConfig, &p.ZoneID, &p.ZoneName, &isDefault, &createdAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Type, &p.Name, &encConfig, &isDefault, &createdAt); err != nil {
 			return nil, fmt.Errorf("scanning provider: %w", err)
 		}
 
@@ -114,9 +114,9 @@ func (d *DB) UpdateProvider(p *models.Provider) error {
 
 	res, err := d.sql.Exec(`
 		UPDATE providers
-		SET type = ?, name = ?, config = ?, zone_id = ?, zone_name = ?, is_default = ?
+		SET type = ?, name = ?, config = ?, is_default = ?
 		WHERE id = ?`,
-		p.Type, p.Name, enc, p.ZoneID, p.ZoneName, isDefault, p.ID,
+		p.Type, p.Name, enc, isDefault, p.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("updating provider: %w", err)

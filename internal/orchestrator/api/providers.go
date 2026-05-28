@@ -26,8 +26,6 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 		ID        string `json:"id"`
 		Type      string `json:"type"`
 		Name      string `json:"name"`
-		ZoneID    string `json:"zone_id"`
-		ZoneName  string `json:"zone_name"`
 		IsDefault bool   `json:"is_default"`
 		CreatedAt string `json:"created_at"`
 	}
@@ -37,8 +35,6 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 			ID:        p.ID,
 			Type:      p.Type,
 			Name:      p.Name,
-			ZoneID:    p.ZoneID,
-			ZoneName:  p.ZoneName,
 			IsDefault: p.IsDefault,
 			CreatedAt: p.CreatedAt.String(),
 		}
@@ -49,11 +45,9 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/providers
 func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Type     string          `json:"type"`
-		Name     string          `json:"name"`
-		Config   json.RawMessage `json:"config"`
-		ZoneID   string          `json:"zone_id"`
-		ZoneName string          `json:"zone_name"`
+		Type   string          `json:"type"`
+		Name   string          `json:"name"`
+		Config json.RawMessage `json:"config"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -81,12 +75,10 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p := &models.Provider{
-		ID:       uuid.New().String(),
-		Type:     req.Type,
-		Name:     req.Name,
-		Config:   string(req.Config),
-		ZoneID:   req.ZoneID,
-		ZoneName: req.ZoneName,
+		ID:     uuid.New().String(),
+		Type:   req.Type,
+		Name:   req.Name,
+		Config: string(req.Config),
 	}
 
 	if err := s.db.CreateProvider(p); err != nil {
@@ -126,10 +118,8 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name     *string          `json:"name"`
-		Config   *json.RawMessage `json:"config"`
-		ZoneID   *string          `json:"zone_id"`
-		ZoneName *string          `json:"zone_name"`
+		Name   *string          `json:"name"`
+		Config *json.RawMessage `json:"config"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -151,12 +141,6 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		existing.Config = string(*req.Config)
-	}
-	if req.ZoneID != nil {
-		existing.ZoneID = *req.ZoneID
-	}
-	if req.ZoneName != nil {
-		existing.ZoneName = *req.ZoneName
 	}
 
 	if err := s.db.UpdateProvider(existing); err != nil {
@@ -231,24 +215,16 @@ func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/v1/providers/{id}/zones
-func (s *Server) handleListZones(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListProviderZones(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
-	p, err := s.db.GetProvider(id)
+
+	zones, err := s.db.ListZonesByProvider(id)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "provider not found")
+		writeError(w, http.StatusInternalServerError, "failed to list zones")
 		return
 	}
-
-	prov, err := provider.Get(p.Type)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "provider type not registered")
-		return
-	}
-
-	zones, err := prov.ListZones(context.Background(), json.RawMessage(p.Config))
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to list zones: "+err.Error())
-		return
+	if zones == nil {
+		zones = []models.Zone{}
 	}
 
 	writeJSON(w, http.StatusOK, zones)
