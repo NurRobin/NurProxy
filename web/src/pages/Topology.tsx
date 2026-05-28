@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Agent, Server, Domain, Zone } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
+import { usePolling } from '../lib/usePolling';
+import { statusMeta } from '../lib/status';
 import StatusBadge from '../components/StatusBadge';
 import EmptyState from '../components/EmptyState';
 import Button from '../components/Button';
@@ -48,7 +50,7 @@ export default function Topology() {
     }
   }, [toast]);
 
-  useEffect(() => { fetchData(); const t = setInterval(fetchData, 30000); return () => clearInterval(t); }, [fetchData]);
+  usePolling(fetchData, 30000);
 
   const allServers = useMemo(() => Object.values(serversByAgent).flat(), [serversByAgent]);
   const zoneName = (id: string) => zones.find((z) => z.id === id)?.name ?? '';
@@ -329,11 +331,8 @@ function NodeCard({ innerRef, title, sub, icon, status, selected, onClick, onCon
 }
 
 function statusDot(status: string) {
-  const color = status === 'active' || status === 'adopted' ? 'bg-success'
-    : status === 'pending' ? 'bg-warning' : status === 'error' ? 'bg-danger'
-    : status === 'deleting' ? 'bg-info' : 'bg-fg-faint';
-  const pulse = status === 'pending' || status === 'deleting';
-  return <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${color} ${pulse ? 'animate-pulse' : ''}`} />;
+  const m = statusMeta(status);
+  return <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${m.dot} ${m.pulse ? 'animate-pulse' : ''}`} />;
 }
 
 function Hint({ children }: { children: React.ReactNode }) {

@@ -38,11 +38,13 @@ export default function HelpTip({ term, label }: { term: string; label?: string 
 
   useEffect(() => {
     if (!open) return;
-    const close = () => setOpen(false);
-    window.addEventListener('scroll', close, true);
-    window.addEventListener('resize', close);
-    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
-  }, [open]);
+    // Follow the anchor on scroll/resize instead of dismissing — closing on
+    // scroll would yank away a tip the user scrolled in order to read.
+    const reposition = () => place();
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
+    return () => { window.removeEventListener('scroll', reposition, true); window.removeEventListener('resize', reposition); };
+  }, [open, place]);
 
   if (!entry) return null;
 

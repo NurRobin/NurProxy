@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
+import { usePolling } from '../lib/usePolling';
 import type { Agent, Domain, AuditLogEntry } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
 import { buttonClass } from '../components/button-styles';
@@ -38,11 +39,7 @@ export default function Overview() {
     }
   }, []);
 
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 30000);
-    return () => clearInterval(interval);
-  }, [fetchData]);
+  usePolling(fetchData, 30000);
 
   const count = (arr: { status: string }[], s: string) => arr.filter((x) => x.status === s).length;
   const errors = count(agents, 'error') + count(domains, 'error');

@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { BrowserRouter, NavLink } from 'react-router-dom';
 import { api } from '../lib/api';
+import { usePolling } from '../lib/usePolling';
 import { ThemeToggle } from '../lib/theme';
 import BrandMark from '../components/BrandMark';
 import NotificationBell from '../components/NotificationBell';
@@ -10,21 +11,16 @@ import { NAV } from './nav';
 
 function useCounts() {
   const [counts, setCounts] = useState<Record<string, number>>({});
-  useEffect(() => {
-    let live = true;
-    const load = async () => {
-      try {
-        const [a, d] = await Promise.all([api.listAgents(), api.listDomains()]);
-        if (live) setCounts({ '/agents': a.length, '/domains': d.length });
-      } catch (e) {
-        // Non-critical (nav badges); don't toast every 30s, but don't swallow silently.
-        console.warn('nav counts refresh failed', e);
-      }
-    };
-    load();
-    const t = setInterval(load, 30000);
-    return () => { live = false; clearInterval(t); };
+  const load = useCallback(async () => {
+    try {
+      const [a, d] = await Promise.all([api.listAgents(), api.listDomains()]);
+      setCounts({ '/agents': a.length, '/domains': d.length });
+    } catch (e) {
+      // Non-critical (nav badges); don't toast every 30s, but don't swallow silently.
+      console.warn('nav counts refresh failed', e);
+    }
   }, []);
+  usePolling(load, 30000);
   return counts;
 }
 

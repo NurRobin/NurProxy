@@ -8,7 +8,7 @@ function readInitial(): UIVariant {
     const v = localStorage.getItem(STORAGE_KEY);
     if (v === 'classic' || v === 'workbench') return v;
   } catch { /* ignore */ }
-  return 'workbench';
+  return 'classic';
 }
 
 export function UIVariantProvider({ children }: { children: ReactNode }) {

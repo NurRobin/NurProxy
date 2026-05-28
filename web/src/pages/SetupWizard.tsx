@@ -7,6 +7,7 @@ import Button, { Spinner } from '../components/Button';
 import { Field, Input, PasswordInput } from '../components/Field';
 import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
+import BrandMark from '../components/BrandMark';
 import MultiSelect from '../components/MultiSelect';
 import StatusBadge from '../components/StatusBadge';
 
@@ -21,18 +22,6 @@ const STEPS = [
 ] as const;
 
 const CF_TOKEN_URL = 'https://dash.cloudflare.com/?to=/:account/api-tokens';
-
-function BrandMark() {
-  return (
-    <svg width="34" height="34" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-      <rect width="32" height="32" rx="8" fill="var(--accent)" />
-      <g stroke="var(--accent-fg)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" fill="none">
-        <path d="M9 16 H15" /><path d="M15 16 C19 16 19 10 23 10" /><path d="M15 16 C19 16 19 22 23 22" />
-      </g>
-      <g fill="var(--accent-fg)"><circle cx="9" cy="16" r="2.6" /><circle cx="23" cy="10" r="2.4" /><circle cx="23" cy="22" r="2.4" /></g>
-    </svg>
-  );
-}
 
 export default function SetupWizard({ onComplete }: SetupWizardProps) {
   const [currentStep, setCurrentStep] = useState(0);
@@ -184,7 +173,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     <div className="flex min-h-screen items-center justify-center bg-bg px-4 py-12">
       <div className="w-full max-w-lg">
         <div className="mb-8 flex flex-col items-center text-center">
-          <BrandMark />
+          <BrandMark size={34} />
           <h1 className="mt-3 font-display text-2xl font-bold tracking-tight text-fg">Set up NurProxy</h1>
           <p className="mt-1 text-sm text-fg-muted">
             Two quick steps. New to this?{' '}
