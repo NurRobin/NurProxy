@@ -244,6 +244,26 @@ func (d *DB) UpdateDomainStatus(id int64, status models.DomainStatus, errMsg str
 	return nil
 }
 
+// MarkDomainSynced marks a domain as active, clears any error message, and
+// stamps last_synced with the current time. Used by the reconciler after a
+// successful sync cycle.
+func (d *DB) MarkDomainSynced(id int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE domains SET status = ?, error_msg = '', last_synced = ?, updated_at = ? WHERE id = ?`,
+		string(models.DomainStatusActive), now, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("marking domain synced: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("domain not found: %d", id)
+	}
+	return nil
+}
+
 // UpdateDomainDNSRecord sets the dns_record_id for a domain.
 func (d *DB) UpdateDomainDNSRecord(id int64, recordID string) error {
 	now := time.Now().UTC().Format(time.RFC3339)

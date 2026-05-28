@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,19 +91,34 @@ func (r *Reconciler) loop(ctx context.Context) {
 		log.Printf("reconciler: initial cycle failed: %v", err)
 	}
 
-	ticker := time.NewTicker(r.interval)
-	defer ticker.Stop()
+	// A timer (reset each cycle) lets us pick up interval changes made through
+	// the dashboard settings without restarting the orchestrator.
+	timer := time.NewTimer(r.currentInterval())
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			if err := r.RunOnce(ctx); err != nil {
 				log.Printf("reconciler: cycle failed: %v", err)
 			}
+			timer.Reset(r.currentInterval())
 		}
 	}
+}
+
+// currentInterval returns the configured reconciler interval, re-reading the
+// reconciler_interval setting on each cycle so changes take effect live. It
+// falls back to the interval the reconciler was constructed with.
+func (r *Reconciler) currentInterval() time.Duration {
+	if v, err := r.db.GetSetting("reconciler_interval"); err == nil && v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 5 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return r.interval
 }
 
 // RunOnce executes a single reconciliation cycle. It is safe to call
@@ -112,6 +129,12 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 	if err := r.reconcileAgents(ctx); err != nil {
 		log.Printf("reconciler: agents phase failed: %v", err)
 		// Continue with the other phases even if agents fail.
+	}
+
+	// Tear down domains marked for deletion before reconciling the rest, so we
+	// don't re-create records/routes for them.
+	if err := r.reconcileDeletions(ctx); err != nil {
+		log.Printf("reconciler: deletions phase failed: %v", err)
 	}
 
 	// Reconcile routes for each adopted agent.
@@ -130,6 +153,10 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 
 	if err := r.reconcileDNS(ctx); err != nil {
 		log.Printf("reconciler: DNS phase failed: %v", err)
+	}
+
+	if err := r.reconcileAgentDNS(ctx); err != nil {
+		log.Printf("reconciler: agent DNS phase failed: %v", err)
 	}
 
 	log.Println("reconciler: cycle complete")
@@ -204,6 +231,12 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 	for i := range domains {
 		dom := &domains[i]
 
+		// Domains being deleted are handled by reconcileDeletions; do not
+		// (re-)push routes for them here.
+		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+
 		// Resolve zone name from the domain's zone.
 		zc, ok := zCache[dom.ZoneID]
 		if !ok {
@@ -224,20 +257,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 			continue
 		}
 
-		cfg := caddygen.DomainConfig{
-			FQDN:                  fqdn,
-			UpstreamAddr:          srv.Address,
-			UpstreamPort:          dom.Port,
-			WebSocket:             dom.ProxyConfig.WebSocket,
-			ForceHTTPS:            dom.ProxyConfig.ForceHTTPS,
-			MaxBodySize:           dom.ProxyConfig.MaxBodySize,
-			CustomRequestHeaders:  dom.ProxyConfig.CustomRequestHeaders,
-			CustomResponseHeaders: dom.ProxyConfig.CustomResponseHeaders,
-			UpstreamScheme:        dom.ProxyConfig.UpstreamScheme,
-			RawCaddy:              dom.ProxyConfig.RawCaddy,
-		}
-
-		route, gErr := caddygen.GenerateRoute(cfg)
+		route, gErr := caddygen.GenerateRoute(caddygen.ConfigFromDomain(*dom, fqdn, srv.Address))
 		if gErr != nil {
 			log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
 			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
@@ -283,19 +303,18 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 				continue
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_pushed", "pushed missing route to agent")
-			if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusActive, ""); dErr != nil {
-				log.Printf("reconciler: failed to update domain status: %v", dErr)
+			if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
+				log.Printf("reconciler: failed to mark domain synced: %v", dErr)
 			}
 			continue
 		}
 
 		// Route exists — check for config mismatch.
 		if routesMatch(desired.route, actual) {
-			// All good.
-			if desired.domain.Status != models.DomainStatusActive {
-				if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusActive, ""); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
+			// All good — keep last_synced fresh so the dashboard reflects the
+			// most recent successful reconciliation.
+			if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
+				log.Printf("reconciler: failed to mark domain synced: %v", dErr)
 			}
 			continue
 		}
@@ -319,8 +338,8 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 			continue
 		}
 		r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "drift_fixed", "pushed corrected route to agent")
-		if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusActive, ""); dErr != nil {
-			log.Printf("reconciler: failed to update domain status: %v", dErr)
+		if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
+			log.Printf("reconciler: failed to mark domain synced: %v", dErr)
 		}
 	}
 
@@ -463,6 +482,191 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Agent A records (FQDN -> public IP) and DDNS
+// ---------------------------------------------------------------------------
+
+// reconcileAgentDNS ensures every adopted agent has an A record for its FQDN
+// pointing at its current public IP. In DDNS mode the record is updated whenever
+// the IP changes; in static mode it is created once and left untouched (an admin
+// can force an update through the API).
+func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
+	agents, err := r.db.ListAgents()
+	if err != nil {
+		return fmt.Errorf("listing agents: %w", err)
+	}
+
+	for i := range agents {
+		a := &agents[i]
+		if a.Status != models.AgentStatusAdopted && a.Status != models.AgentStatusOffline {
+			continue
+		}
+		if a.PublicIP == "" {
+			continue // nothing to point the record at yet
+		}
+
+		// Find the zone (among the agent's assigned zones) that the FQDN lives in.
+		zones, zErr := r.db.ListAgentZones(a.ID)
+		if zErr != nil {
+			log.Printf("reconciler: cannot list zones for agent %s: %v", a.ID, zErr)
+			continue
+		}
+		zone := matchZoneForFQDN(a.FQDN, zones)
+		if zone == nil {
+			// FQDN not covered by any assigned zone — can't manage its A record.
+			continue
+		}
+
+		prov, pErr := r.db.GetProvider(zone.ProviderID)
+		if pErr != nil {
+			log.Printf("reconciler: cannot get provider %s for agent %s: %v", zone.ProviderID, a.ID, pErr)
+			continue
+		}
+		dnsProvider, gErr := provider.Get(prov.Type)
+		if gErr != nil {
+			log.Printf("reconciler: provider %s not registered: %v", prov.Type, gErr)
+			continue
+		}
+		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
+
+		rec := provider.Record{Type: "A", Name: a.FQDN, Content: a.PublicIP, TTL: 0}
+
+		if a.DNSRecordID == "" {
+			recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, rec)
+			if cErr != nil {
+				log.Printf("reconciler: failed to create A record for agent %s: %v", a.ID, cErr)
+				r.audit("agent", a.ID, "a_record_create_failed", cErr.Error())
+				continue
+			}
+			a.DNSRecordID = recordID
+			if uErr := r.db.UpdateAgentDNSRecord(a.ID, recordID); uErr != nil {
+				log.Printf("reconciler: failed to persist A record id for agent %s: %v", a.ID, uErr)
+			}
+			r.audit("agent", a.ID, "a_record_created", fmt.Sprintf("created A %s -> %s", a.FQDN, a.PublicIP))
+			continue
+		}
+
+		// Static mode: created once, never auto-updated.
+		if a.DNSMode != models.DNSModeDDNS {
+			continue
+		}
+
+		// DDNS mode: update only when the IP actually changed.
+		existing, gErr := dnsProvider.GetRecord(ctx, provConfig, a.DNSRecordID)
+		if gErr != nil {
+			// The provider gives a generic error for transient failures and
+			// genuine 404s alike. Recreating here would risk duplicate records
+			// on a transient error, so skip and retry next cycle instead.
+			log.Printf("reconciler: cannot read A record %s for agent %s, skipping this cycle: %v", a.DNSRecordID, a.ID, gErr)
+			continue
+		}
+
+		if existing.Content == a.PublicIP {
+			continue // already up to date — avoid an unnecessary API call
+		}
+
+		if uErr := dnsProvider.UpdateRecord(ctx, provConfig, a.DNSRecordID, rec); uErr != nil {
+			log.Printf("reconciler: failed to update A record for agent %s: %v", a.ID, uErr)
+			r.audit("agent", a.ID, "a_record_update_failed", uErr.Error())
+			continue
+		}
+		r.audit("agent", a.ID, "ddns_updated", fmt.Sprintf("updated A %s: %s -> %s", a.FQDN, existing.Content, a.PublicIP))
+	}
+
+	return nil
+}
+
+// matchZoneForFQDN returns the zone whose name is the longest suffix of fqdn
+// (so "host.sub.example.com" prefers "sub.example.com" over "example.com").
+func matchZoneForFQDN(fqdn string, zones []models.Zone) *models.Zone {
+	var best *models.Zone
+	for i := range zones {
+		z := &zones[i]
+		if fqdn == z.Name || strings.HasSuffix(fqdn, "."+z.Name) {
+			if best == nil || len(z.Name) > len(best.Name) {
+				best = z
+			}
+		}
+	}
+	return best
+}
+
+// ---------------------------------------------------------------------------
+// Deletions
+// ---------------------------------------------------------------------------
+
+// reconcileDeletions tears down domains whose status is "deleting": it removes
+// the CNAME record at the DNS provider, removes the route from the agent, then
+// deletes the domain row from the database.
+func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
+	domains, err := r.db.ListDomains(db.DomainFilter{Status: string(models.DomainStatusDeleting)})
+	if err != nil {
+		return fmt.Errorf("listing domains to delete: %w", err)
+	}
+
+	for i := range domains {
+		dom := &domains[i]
+
+		// Best-effort DNS record cleanup.
+		if dom.DNSRecordID != "" {
+			if zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID); ok {
+				provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
+				if dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID); dErr != nil {
+					log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
+					r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
+					// Keep the domain around so we retry next cycle.
+					continue
+				}
+				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+			}
+		}
+
+		// Best-effort route cleanup on the owning agent.
+		if zone, err := r.db.GetZone(dom.ZoneID); err == nil {
+			fqdn := dom.FQDN(zone.Name)
+			if srv, sErr := r.db.GetServer(dom.ServerID); sErr == nil {
+				if agent, aErr := r.db.GetAgent(srv.AgentID); aErr == nil {
+					if rErr := r.agentClient.DeleteRoute(ctx, agent.APIURL, agent.TokenHash, fqdn); rErr != nil {
+						// Agent may be offline; the route will be flagged as
+						// unmanaged later. Don't block domain deletion on it.
+						log.Printf("reconciler: failed to delete route %s on agent %s: %v", fqdn, agent.ID, rErr)
+					}
+				}
+			}
+		}
+
+		// Finally remove the domain row.
+		if dErr := r.db.DeleteDomain(dom.ID); dErr != nil {
+			log.Printf("reconciler: failed to delete domain row %d: %v", dom.ID, dErr)
+			continue
+		}
+		r.audit("domain", fmt.Sprintf("%d", dom.ID), "deleted", "domain removed after cleanup")
+	}
+
+	return nil
+}
+
+// resolveDNS resolves a zone ID to its zone, provider, and DNS provider plugin.
+// It returns ok=false (after logging) if any step fails.
+func (r *Reconciler) resolveDNS(zoneID string) (*models.Zone, *models.Provider, provider.Provider, bool) {
+	zone, err := r.db.GetZone(zoneID)
+	if err != nil {
+		log.Printf("reconciler: cannot get zone %s: %v", zoneID, err)
+		return nil, nil, nil, false
+	}
+	prov, err := r.db.GetProvider(zone.ProviderID)
+	if err != nil {
+		log.Printf("reconciler: cannot get provider %s for zone %s: %v", zone.ProviderID, zone.ID, err)
+		return nil, nil, nil, false
+	}
+	dnsProvider, err := provider.Get(prov.Type)
+	if err != nil {
+		log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, err)
+		return nil, nil, nil, false
+	}
+	return zone, prov, dnsProvider, true
 }
 
 // ---------------------------------------------------------------------------

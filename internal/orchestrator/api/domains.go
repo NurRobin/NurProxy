@@ -257,19 +257,7 @@ func (s *Server) handleGetDomainConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := caddygen.DomainConfig{
-		FQDN:                  dom.FQDN(zone.Name),
-		UpstreamAddr:          srv.Address,
-		UpstreamPort:          dom.Port,
-		WebSocket:             dom.WebSocket || dom.ProxyConfig.WebSocket,
-		ForceHTTPS:            dom.ForceHTTPS || dom.ProxyConfig.ForceHTTPS,
-		MaxBodySize:           dom.ProxyConfig.MaxBodySize,
-		CustomRequestHeaders:  dom.ProxyConfig.CustomRequestHeaders,
-		CustomResponseHeaders: dom.ProxyConfig.CustomResponseHeaders,
-		UpstreamScheme:        dom.ProxyConfig.UpstreamScheme,
-	}
-
-	route, err := caddygen.GenerateRoute(cfg)
+	route, err := caddygen.GenerateRoute(caddygen.ConfigFromDomain(*dom, dom.FQDN(zone.Name), srv.Address))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate config: "+err.Error())
 		return

@@ -180,6 +180,26 @@ func (d *DB) UpdateAgentStatus(id string, status models.AgentStatus) error {
 	return nil
 }
 
+// UpdateAgentDNSRecord sets only the dns_record_id for an agent. Using a narrow
+// update (rather than a full-row UpdateAgent) avoids clobbering fields like
+// public_ip/last_seen that concurrent heartbeats write.
+func (d *DB) UpdateAgentDNSRecord(id string, recordID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET dns_record_id = ?, updated_at = ? WHERE id = ?`,
+		recordID, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent DNS record: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
 // UpdateAgentHeartbeat updates the last_seen timestamp and public IP.
 func (d *DB) UpdateAgentHeartbeat(id string, ip string) error {
 	now := time.Now().UTC().Format(time.RFC3339)

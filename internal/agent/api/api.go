@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
 
 // version is set at build time via ldflags.
@@ -91,8 +92,11 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		// Accept either the plaintext token or its SHA-256 hash. The
+		// orchestrator only persists the hashed token (never the plaintext),
+		// so it authenticates to the agent by presenting the hash.
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token != s.token {
+		if token != s.token && token != auth.HashToken(s.token) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid token"})
 			return
 		}

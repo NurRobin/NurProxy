@@ -3,7 +3,6 @@ package agentclient
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -40,27 +39,44 @@ func TestHealth_Failure(t *testing.T) {
 }
 
 func TestPushRoute(t *testing.T) {
-	var receivedBody []byte
+	var payload struct {
+		Domain string          `json:"domain"`
+		Route  json.RawMessage `json:"route"`
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			t.Errorf("expected PUT, got %s", r.Method)
+		// Single-route add maps to the agent's POST /routes handler.
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
 		}
 		if r.URL.Path != "/routes" {
 			t.Errorf("expected /routes, got %s", r.URL.Path)
 		}
-		receivedBody, _ = io.ReadAll(r.Body)
+		_ = json.NewDecoder(r.Body).Decode(&payload)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
 	c := NewWithHTTPClient(srv.Client())
-	route := json.RawMessage(`{"test":"route"}`)
+	route := json.RawMessage(`{"match":[{"host":["app.example.com"]}],"handle":[]}`)
 	if err := c.PushRoute(context.Background(), srv.URL, "token", route); err != nil {
 		t.Fatalf("PushRoute: %v", err)
 	}
 
-	if len(receivedBody) == 0 {
-		t.Fatal("expected body to be sent")
+	// The client must send {domain, route} with the domain extracted from the host.
+	if payload.Domain != "app.example.com" {
+		t.Errorf("expected domain app.example.com, got %q", payload.Domain)
+	}
+	if len(payload.Route) == 0 {
+		t.Fatal("expected route to be sent")
+	}
+}
+
+func TestPushRoute_NoHost(t *testing.T) {
+	c := New()
+	// A route without a host match cannot be keyed by domain.
+	err := c.PushRoute(context.Background(), "http://example", "token", json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("expected error for route without host")
 	}
 }
 
@@ -83,30 +99,31 @@ func TestDeleteRoute(t *testing.T) {
 }
 
 func TestSyncRoutes(t *testing.T) {
-	var receivedBody []byte
+	var received map[string]json.RawMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("expected POST, got %s", r.Method)
+		// Full sync maps to the agent's PUT /routes (domain -> route map).
+		if r.Method != http.MethodPut {
+			t.Errorf("expected PUT, got %s", r.Method)
 		}
-		if r.URL.Path != "/routes/sync" {
-			t.Errorf("expected /routes/sync, got %s", r.URL.Path)
+		if r.URL.Path != "/routes" {
+			t.Errorf("expected /routes, got %s", r.URL.Path)
 		}
-		receivedBody, _ = io.ReadAll(r.Body)
+		_ = json.NewDecoder(r.Body).Decode(&received)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
 	c := NewWithHTTPClient(srv.Client())
 	routes := []json.RawMessage{
-		json.RawMessage(`{"test":"route1"}`),
-		json.RawMessage(`{"test":"route2"}`),
+		json.RawMessage(`{"match":[{"host":["a.example.com"]}]}`),
+		json.RawMessage(`{"match":[{"host":["b.example.com"]}]}`),
 	}
 	if err := c.SyncRoutes(context.Background(), srv.URL, "token", routes); err != nil {
 		t.Fatalf("SyncRoutes: %v", err)
 	}
 
-	if len(receivedBody) == 0 {
-		t.Fatal("expected body to be sent")
+	if len(received) != 2 || received["a.example.com"] == nil || received["b.example.com"] == nil {
+		t.Fatalf("expected routes keyed by domain, got %v", received)
 	}
 }
 
@@ -119,7 +136,8 @@ func TestGetRoutes(t *testing.T) {
 			t.Errorf("expected /routes, got %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`[{"test":"route1"},{"test":"route2"}]`))
+		// The agent returns a map of domain -> route.
+		w.Write([]byte(`{"a.example.com":{"test":"route1"},"b.example.com":{"test":"route2"}}`))
 	}))
 	defer srv.Close()
 
@@ -142,7 +160,7 @@ func TestPushRoute_ServerError(t *testing.T) {
 	defer srv.Close()
 
 	c := NewWithHTTPClient(srv.Client())
-	err := c.PushRoute(context.Background(), srv.URL, "token", json.RawMessage(`{}`))
+	err := c.PushRoute(context.Background(), srv.URL, "token", json.RawMessage(`{"match":[{"host":["x.example.com"]}]}`))
 	if err == nil {
 		t.Fatal("expected error for 500 response")
 	}

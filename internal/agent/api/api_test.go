@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
 
 const testToken = "np_ag_testtoken1234567890"
@@ -74,6 +75,29 @@ func TestAuthMiddlewareValidToken(t *testing.T) {
 	}
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestAuthMiddlewareAcceptsHashedToken(t *testing.T) {
+	// The orchestrator only stores the hashed token and presents that hash as
+	// the bearer token. The agent must accept it, otherwise every reconciler
+	// route push is rejected with 403.
+	s := newTestServer()
+
+	called := false
+	handler := s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+auth.HashToken(testToken))
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if !called || w.Code != http.StatusOK {
+		t.Errorf("agent rejected the hashed token: called=%v code=%d", called, w.Code)
 	}
 }
 

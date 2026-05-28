@@ -14,9 +14,12 @@ import (
 
 	"io/fs"
 	"strings"
+	"time"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/agentclient"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/web"
@@ -62,6 +65,16 @@ func main() {
 	}
 	defer database.Close()
 
+	// Root context canceled on shutdown signal.
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
+	// Start the reconciliation engine: it syncs desired state (DB) with the
+	// actual state on agents (routes) and at DNS providers (records).
+	rec := reconciler.New(database, agentclient.New(), reconcilerInterval(database))
+	rec.Start(rootCtx)
+	defer rec.Stop()
+
 	// Create API server
 	srv := api.NewServer(database, version)
 
@@ -106,6 +119,7 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		log.Println("shutting down...")
+		rootCancel()
 		httpSrv.Shutdown(context.Background())
 	}()
 
@@ -113,4 +127,19 @@ func main() {
 	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("HTTP server error: %v", err)
 	}
+}
+
+// reconcilerInterval reads the reconciler_interval setting (in seconds) from the
+// database, falling back to 60s when unset or invalid.
+func reconcilerInterval(database *db.DB) time.Duration {
+	const def = 60 * time.Second
+	v, err := database.GetSetting("reconciler_interval")
+	if err != nil || v == "" {
+		return def
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 5 {
+		return def
+	}
+	return time.Duration(secs) * time.Second
 }
