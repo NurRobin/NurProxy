@@ -47,14 +47,14 @@ func TestConfigSchema(t *testing.T) {
 
 func TestValidateConfig_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/user/tokens/verify" {
+		if r.URL.Path != "/zones" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Errorf("unexpected auth header: %s", r.Header.Get("Authorization"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"success": true, "result": {"status": "active"}}`))
+		w.Write([]byte(`{"success": true, "result": [{"id": "z1", "name": "example.com"}]}`))
 	}))
 	defer server.Close()
 
@@ -79,19 +79,6 @@ func TestValidateConfig_InvalidToken(t *testing.T) {
 	}
 }
 
-func TestValidateConfig_InactiveToken(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"success": true, "result": {"status": "expired"}}`))
-	}))
-	defer server.Close()
-
-	p := newTestProvider(server)
-	err := p.ValidateConfig(context.Background(), makeConfig("expired-token", ""))
-	if err == nil {
-		t.Fatal("expected error for inactive token, got nil")
-	}
-}
 
 func TestValidateConfig_MissingToken(t *testing.T) {
 	p := &CloudflareProvider{}

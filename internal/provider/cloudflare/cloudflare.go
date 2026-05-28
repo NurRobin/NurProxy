@@ -111,17 +111,11 @@ func (p *CloudflareProvider) ValidateConfig(ctx context.Context, config json.Raw
 		return err
 	}
 
-	resp, err := p.doRequest(ctx, cfg.APIToken, http.MethodGet, "/user/tokens/verify", nil)
+	// Validate by listing zones — works for both user-owned and account-owned tokens,
+	// and proves the token has the permissions we actually need (Zone:Read).
+	_, err = p.doRequest(ctx, cfg.APIToken, http.MethodGet, "/zones?per_page=1", nil)
 	if err != nil {
-		return fmt.Errorf("cloudflare: token verification request failed: %w", err)
-	}
-
-	var verify cfTokenVerify
-	if err := json.Unmarshal(resp.Result, &verify); err != nil {
-		return fmt.Errorf("cloudflare: failed to parse token verify response: %w", err)
-	}
-	if verify.Status != "active" {
-		return fmt.Errorf("cloudflare: token status is %q, expected \"active\"", verify.Status)
+		return fmt.Errorf("cloudflare: token validation failed: %w", err)
 	}
 	return nil
 }
