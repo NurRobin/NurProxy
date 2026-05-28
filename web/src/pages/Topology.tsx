@@ -12,6 +12,7 @@ import { buttonClass } from '../components/button-styles';
 import ConfirmDialog from '../components/ConfirmDialog';
 import ContextMenu, { type MenuState } from '../components/ContextMenu';
 import { useToast, errMessage } from '../components/toast-context';
+import { useUndoableDelete } from '../lib/undo';
 
 type NodeKind = 'internet' | 'agent' | 'server' | 'domain';
 interface Selection { kind: NodeKind; id: string }
@@ -21,6 +22,7 @@ const seen = (d?: string) => (d ? formatRelativeTime(d) : 'never');
 
 export default function Topology() {
   const toast = useToast();
+  const undoableDelete = useUndoableDelete();
   const navigate = useNavigate();
 
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -141,7 +143,16 @@ export default function Topology() {
     } else if (sel.kind === 'domain') {
       const d = domains.find((x) => String(x.id) === sel.id);
       items.push({ label: 'Edit in Domains', onSelect: () => navigate('/domains') });
-      if (d) items.push({ label: 'Delete domain', danger: true, onSelect: () => confirmDelete('Delete domain', `Delete “${d.subdomain}”? DNS record and proxy config are removed.`, async () => { await api.deleteDomain(d.id); }) });
+      if (d) items.push({ label: 'Delete domain', danger: true, onSelect: () => {
+        setDomains((prev) => prev.filter((x) => x.id !== d.id));
+        if (selected?.kind === 'domain' && selected.id === String(d.id)) setSelected(null);
+        undoableDelete({
+          message: `Deleted ${fqdn(d)}`,
+          doDelete: async () => { await api.deleteDomain(d.id); },
+          onUndo: () => setDomains((prev) => (prev.some((x) => x.id === d.id) ? prev : [...prev, d])),
+          failMessage: 'Failed to delete domain.',
+        });
+      } });
     }
     setMenu({ x: e.clientX, y: e.clientY, title: labelFor(sel), items });
   }

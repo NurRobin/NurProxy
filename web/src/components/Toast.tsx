@@ -1,10 +1,11 @@
 import { useCallback, useRef, useState, type ReactNode } from 'react';
-import { ToastContext, type ToastVariant, type ToastRecord } from './toast-context';
+import { ToastContext, type ToastVariant, type ToastRecord, type ToastAction, type ToastOptions } from './toast-context';
 
 interface Toast {
   id: number;
   message: string;
   variant: ToastVariant;
+  action?: ToastAction;
 }
 
 const HISTORY_CAP = 50;
@@ -19,12 +20,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const push = useCallback((message: string, variant: ToastVariant = 'info') => {
+  const push = useCallback((message: string, variant: ToastVariant = 'info', opts?: ToastOptions) => {
     const id = ++counter.current;
-    setToasts((prev) => [...prev, { id, message, variant }]);
+    setToasts((prev) => [...prev, { id, message, variant, action: opts?.action }]);
     setHistory((prev) => [{ id, message, variant, at: new Date().toISOString() }, ...prev].slice(0, HISTORY_CAP));
     if (variant === 'error') setUnseen((n) => n + 1);
-    window.setTimeout(() => remove(id), variant === 'error' ? 7000 : 4000);
+    const duration = opts?.duration ?? (variant === 'error' ? 7000 : 4000);
+    window.setTimeout(() => remove(id), duration);
   }, [remove]);
 
   const error = useCallback((message: string) => push(message, 'error'), [push]);
@@ -70,6 +72,14 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
         {s.icon}
       </svg>
       <p className="flex-1 break-words text-sm">{toast.message}</p>
+      {toast.action && (
+        <button
+          onClick={() => { toast.action!.onClick(); onClose(); }}
+          className="-my-0.5 flex-shrink-0 rounded-md border border-current/30 px-2 py-1 text-xs font-semibold hover:bg-current/10"
+        >
+          {toast.action.label}
+        </button>
+      )}
       <button onClick={onClose} aria-label="Dismiss" className="-mr-1 -mt-0.5 rounded p-1 opacity-70 hover:opacity-100">
         <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />

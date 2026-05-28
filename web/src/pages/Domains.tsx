@@ -11,6 +11,7 @@ import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
 import { Field, Input, Select, Textarea, Checkbox } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
+import { useUndoableDelete } from '../lib/undo';
 
 function seen(date?: string) {
   return date ? formatRelativeTime(date) : 'Never';
@@ -56,7 +57,9 @@ export default function Domains() {
   const [advancedError, setAdvancedError] = useState('');
   const [editLoading, setEditLoading] = useState(false);
 
-  const [deleteDomain, setDeleteDomain] = useState<Domain | null>(null);
+  const undoableDelete = useUndoableDelete();
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkConfirm, setBulkConfirm] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
@@ -201,17 +204,33 @@ export default function Domains() {
     }
   }
 
-  async function handleDeleteDomain() {
-    if (!deleteDomain) return;
-    try {
-      await api.deleteDomain(deleteDomain.id);
-      toast.success('Domain deleted.');
-      if (detailDomain?.id === deleteDomain.id) setDetailDomain(null);
-      setDeleteDomain(null);
-      fetchData();
-    } catch (err) {
-      toast.error(errMessage(err, 'Failed to delete domain.'));
+  function removeDomain(d: Domain) {
+    setDomains((prev) => prev.filter((x) => x.id !== d.id));
+    setSelected((prev) => { const n = new Set(prev); n.delete(d.id); return n; });
+    if (detailDomain?.id === d.id) setDetailDomain(null);
+    undoableDelete({
+      message: `Deleted ${d.subdomain}.${getZoneName(d.zone_id)}`,
+      doDelete: async () => { await api.deleteDomain(d.id); },
+      onUndo: () => setDomains((prev) => (prev.some((x) => x.id === d.id) ? prev : [...prev, d])),
+      failMessage: 'Failed to delete domain.',
+    });
+  }
+
+  function toggleSelected(id: number) {
+    setSelected((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  }
+
+  async function handleBulkDelete() {
+    const ids = [...selected];
+    setBulkConfirm(false);
+    setDomains((prev) => prev.filter((x) => !selected.has(x.id)));
+    setSelected(new Set());
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+      try { await api.deleteDomain(id); ok++; } catch { fail++; }
     }
+    if (fail === 0) toast.success(`Deleted ${ok} domain${ok !== 1 ? 's' : ''}.`);
+    else { toast.error(`Deleted ${ok}, ${fail} failed.`); fetchData(); }
   }
 
   if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading domains…</div>;
@@ -242,6 +261,13 @@ export default function Domains() {
           <option value="all">All agents</option>
           {agents.filter((a) => a.status !== 'pending').map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
         </Select>
+        {selected.size > 0 && (
+          <div className="ml-auto flex items-center gap-3">
+            <span className="text-xs text-fg-muted">{selected.size} selected</span>
+            <Button variant="danger" size="sm" onClick={() => setBulkConfirm(true)}>Delete selected</Button>
+            <button onClick={() => setSelected(new Set())} className="text-xs text-fg-faint hover:text-fg">Clear</button>
+          </div>
+        )}
       </div>
 
       {/* Table */}
@@ -256,6 +282,15 @@ export default function Domains() {
           <table className="w-full text-left text-sm">
             <thead className="border-b border-border text-xs uppercase tracking-wide text-fg-faint">
               <tr>
+                <th className="w-10 px-4 py-3">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all domains"
+                    className="h-4 w-4 accent-[var(--accent)]"
+                    checked={filtered.length > 0 && filtered.every((d) => selected.has(d.id))}
+                    onChange={(e) => setSelected(e.target.checked ? new Set(filtered.map((d) => d.id)) : new Set())}
+                  />
+                </th>
                 <th className="px-4 py-3 font-semibold">Domain</th>
                 <th className="px-4 py-3 font-semibold">Target</th>
                 <th className="px-4 py-3 font-semibold">Agent</th>
@@ -269,7 +304,16 @@ export default function Domains() {
                 const zone = getZoneName(d.zone_id);
                 const srv = getServerInfo(d.server_id);
                 return (
-                  <tr key={d.id} className="transition-colors hover:bg-surface-2">
+                  <tr key={d.id} className={`transition-colors ${selected.has(d.id) ? 'bg-accent-soft/50' : 'hover:bg-surface-2'}`}>
+                    <td className="px-4 py-3">
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${d.subdomain}`}
+                        className="h-4 w-4 accent-[var(--accent)]"
+                        checked={selected.has(d.id)}
+                        onChange={() => toggleSelected(d.id)}
+                      />
+                    </td>
                     <td className="px-4 py-3 font-medium text-fg">{zone ? `${d.subdomain}.${zone}` : d.subdomain}</td>
                     <td className="px-4 py-3 font-mono text-xs text-fg-muted">{srv ? `${srv.address}:${d.port}` : `:${d.port}`}</td>
                     <td className="px-4 py-3 text-fg-muted">{srv?.agentName ?? '—'}</td>
@@ -278,7 +322,7 @@ export default function Domains() {
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-3">
                         <button onClick={() => openDetail(d)} className="text-xs font-medium text-accent hover:underline">Edit</button>
-                        <button onClick={() => setDeleteDomain(d)} className="text-xs font-medium text-danger-fg hover:underline">Delete</button>
+                        <button onClick={() => removeDomain(d)} className="text-xs font-medium text-danger-fg hover:underline">Delete</button>
                       </div>
                     </td>
                   </tr>
@@ -360,7 +404,7 @@ export default function Domains() {
                   <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder="e.g. 100mb" />
                 </Field>
                 <div className="flex justify-end gap-3 pt-1">
-                  <Button variant="danger-ghost" onClick={() => setDeleteDomain(detailDomain)}>Delete</Button>
+                  <Button variant="danger-ghost" onClick={() => removeDomain(detailDomain)}>Delete</Button>
                   <Button onClick={handleSaveDetail} loading={editLoading}>Save</Button>
                 </div>
               </div>
@@ -405,7 +449,15 @@ export default function Domains() {
         )}
       </Modal>
 
-      <ConfirmDialog open={deleteDomain !== null} onClose={() => setDeleteDomain(null)} onConfirm={handleDeleteDomain} title="Delete domain" message={`Delete “${deleteDomain?.subdomain}”? The DNS record and proxy config will be removed.`} confirmLabel="Delete" danger />
+      <ConfirmDialog
+        open={bulkConfirm}
+        onClose={() => setBulkConfirm(false)}
+        onConfirm={handleBulkDelete}
+        title="Delete domains"
+        message={`Delete ${selected.size} domain${selected.size !== 1 ? 's' : ''}? Their DNS records and proxy configs will be removed.`}
+        confirmLabel={`Delete ${selected.size}`}
+        danger
+      />
     </div>
   );
 }

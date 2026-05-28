@@ -9,8 +9,19 @@ export interface ToastRecord {
   at: string; // ISO timestamp
 }
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
+export interface ToastOptions {
+  action?: ToastAction;
+  /** Override the auto-dismiss duration in ms. */
+  duration?: number;
+}
+
 export interface ToastContextValue {
-  push: (message: string, variant?: ToastVariant) => void;
+  push: (message: string, variant?: ToastVariant, opts?: ToastOptions) => void;
   error: (message: string) => void;
   success: (message: string) => void;
   /** Recent notifications (newest first), retained after the transient toast fades. */
