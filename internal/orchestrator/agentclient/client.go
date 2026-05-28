@@ -50,14 +50,24 @@ func (c *Client) Health(ctx context.Context, agentURL, token string) error {
 	return nil
 }
 
-// PushRoute sends a single route configuration to the agent.
+// PushRoute adds or updates a single route on the agent. The agent keys routes
+// by domain, so the domain (the route's host) is sent alongside the route. This
+// maps to the agent's `POST /routes` single-route handler.
 func (c *Client) PushRoute(ctx context.Context, agentURL, token string, route json.RawMessage) error {
-	body, err := json.Marshal(route)
-	if err != nil {
-		return fmt.Errorf("marshaling route: %w", err)
+	domain := hostFromRoute(route)
+	if domain == "" {
+		return fmt.Errorf("cannot push route: no host found in route config")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, trimSlash(agentURL)+"/routes", bytes.NewReader(body))
+	body, err := json.Marshal(struct {
+		Domain string          `json:"domain"`
+		Route  json.RawMessage `json:"route"`
+	}{Domain: domain, Route: route})
+	if err != nil {
+		return fmt.Errorf("marshaling route payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, trimSlash(agentURL)+"/routes", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("creating push request: %w", err)
 	}
@@ -98,14 +108,22 @@ func (c *Client) DeleteRoute(ctx context.Context, agentURL, token, domain string
 	return nil
 }
 
-// SyncRoutes pushes a complete set of routes to the agent (full sync).
+// SyncRoutes replaces the agent's entire route set in one call. The agent's
+// `PUT /routes` handler expects a map of domain -> route config.
 func (c *Client) SyncRoutes(ctx context.Context, agentURL, token string, routes []json.RawMessage) error {
-	body, err := json.Marshal(routes)
+	byDomain := make(map[string]json.RawMessage, len(routes))
+	for _, r := range routes {
+		if domain := hostFromRoute(r); domain != "" {
+			byDomain[domain] = r
+		}
+	}
+
+	body, err := json.Marshal(byDomain)
 	if err != nil {
 		return fmt.Errorf("marshaling routes: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, trimSlash(agentURL)+"/routes/sync", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, trimSlash(agentURL)+"/routes", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("creating sync request: %w", err)
 	}
@@ -125,7 +143,8 @@ func (c *Client) SyncRoutes(ctx context.Context, agentURL, token string, routes 
 	return nil
 }
 
-// GetRoutes fetches all currently active routes from the agent.
+// GetRoutes fetches all currently active routes from the agent. The agent
+// returns a map of domain -> route config; the values are returned as a slice.
 func (c *Client) GetRoutes(ctx context.Context, agentURL, token string) ([]json.RawMessage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimSlash(agentURL)+"/routes", nil)
 	if err != nil {
@@ -144,11 +163,32 @@ func (c *Client) GetRoutes(ctx context.Context, agentURL, token string) ([]json.
 		return nil, fmt.Errorf("get routes returned status %d", resp.StatusCode)
 	}
 
-	var routes []json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
+	var byDomain map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&byDomain); err != nil {
 		return nil, fmt.Errorf("decoding routes: %w", err)
 	}
+	routes := make([]json.RawMessage, 0, len(byDomain))
+	for _, r := range byDomain {
+		routes = append(routes, r)
+	}
 	return routes, nil
+}
+
+// hostFromRoute extracts the first host from a Caddy route's match block so the
+// orchestrator can key routes by domain the same way the agent does.
+func hostFromRoute(raw json.RawMessage) string {
+	var partial struct {
+		Match []struct {
+			Host []string `json:"host"`
+		} `json:"match"`
+	}
+	if err := json.Unmarshal(raw, &partial); err != nil {
+		return ""
+	}
+	if len(partial.Match) > 0 && len(partial.Match[0].Host) > 0 {
+		return partial.Match[0].Host[0]
+	}
+	return ""
 }
 
 func setAuth(req *http.Request, token string) {
