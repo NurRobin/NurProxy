@@ -213,9 +213,20 @@ func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// On success, also return available zones so the frontend can offer selection
+	zones, err := prov.ListZones(context.Background(), req.Config)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"valid":   true,
+			"message": "Token is valid, but failed to list zones: " + err.Error(),
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"valid":   true,
-		"message": "configuration is valid",
+		"message": "Token is valid",
+		"zones":   zones,
 	})
 }
 

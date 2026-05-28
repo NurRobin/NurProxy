@@ -57,7 +57,7 @@ export const api = {
     request<{ message: string }>(`/providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteProvider: (id: string) => request<{ message: string }>(`/providers/${id}`, { method: 'DELETE' }),
   testProvider: (data: { type: string; config: unknown }) =>
-    request<{ valid: boolean; message: string }>('/providers/test', { method: 'POST', body: JSON.stringify(data) }),
+    request<{ valid: boolean; message: string; zones?: Zone[] }>('/providers/test', { method: 'POST', body: JSON.stringify(data) }),
   listZones: (id: string) => request<Zone[]>(`/providers/${id}/zones`),
 
   // Agents

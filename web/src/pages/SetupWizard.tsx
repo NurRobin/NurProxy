@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../lib/api';
 import type { Agent, Provider } from '../lib/types';
+import type { Zone } from '../lib/api';
 import StatusBadge from '../components/StatusBadge';
 
 interface SetupWizardProps {
@@ -18,15 +19,15 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
 
   // Provider step state
   const [provType, setProvType] = useState('cloudflare');
-  const [provName, setProvName] = useState('');
   const [provApiToken, setProvApiToken] = useState('');
-  const [provZoneId, setProvZoneId] = useState('');
-  const [provZoneName, setProvZoneName] = useState('');
-  const [provTestResult, setProvTestResult] = useState<{ valid: boolean; message: string } | null>(null);
   const [provTestLoading, setProvTestLoading] = useState(false);
+  const [provTestError, setProvTestError] = useState('');
+  const [provZones, setProvZones] = useState<Zone[]>([]);
+  const [selectedZones, setSelectedZones] = useState<Set<string>>(new Set());
   const [provSaveLoading, setProvSaveLoading] = useState(false);
   const [provError, setProvError] = useState('');
-  const [providerCreated, setProviderCreated] = useState<{ id: string; name: string } | null>(null);
+  const [providersCreated, setProvidersCreated] = useState<string[]>([]);
+  const [provStep, setProvStep] = useState<'token' | 'zones' | 'saved'>('token');
 
   // Agent step state
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -41,30 +42,21 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   const [adoptError, setAdoptError] = useState('');
   const [agentAdopted, setAgentAdopted] = useState(false);
 
-  // Summary state
   const [completing, setCompleting] = useState(false);
-
-  // Clipboard state
   const [copied, setCopied] = useState(false);
 
-  // Fetch providers when entering agent step
   const fetchProviders = useCallback(async () => {
     try {
       const p = await api.listProviders();
       setProviders(p);
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
   }, []);
 
-  // Poll for agents
   const pollAgents = useCallback(async () => {
     try {
       const a = await api.listAgents();
       setAgents(a);
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
   }, []);
 
   useEffect(() => {
@@ -88,42 +80,74 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     };
   }, [currentStep, fetchProviders, pollAgents]);
 
-  function getProviderConfig() {
-    return { api_token: provApiToken };
-  }
-
-  async function handleTestProvider() {
+  async function handleTestToken() {
     setProvTestLoading(true);
-    setProvTestResult(null);
+    setProvTestError('');
+    setProvZones([]);
     try {
       const result = await api.testProvider({
         type: provType,
-        config: getProviderConfig(),
+        config: { api_token: provApiToken },
       });
-      setProvTestResult(result);
+      if (!result.valid) {
+        setProvTestError(result.message);
+        return;
+      }
+      if (result.zones && result.zones.length > 0) {
+        setProvZones(result.zones);
+        setSelectedZones(new Set(result.zones.map(z => z.id)));
+        setProvStep('zones');
+      } else {
+        setProvTestError('Token is valid but no zones found. Make sure the token has Zone:Read permission.');
+      }
     } catch (err) {
-      setProvTestResult({ valid: false, message: err instanceof Error ? err.message : 'Test failed' });
+      setProvTestError(err instanceof Error ? err.message : 'Connection failed');
     } finally {
       setProvTestLoading(false);
     }
   }
 
-  async function handleSaveProvider() {
-    if (!provName || !provApiToken) return;
+  function toggleZone(id: string) {
+    setSelectedZones(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAllZones() {
+    if (selectedZones.size === provZones.length) {
+      setSelectedZones(new Set());
+    } else {
+      setSelectedZones(new Set(provZones.map(z => z.id)));
+    }
+  }
+
+  async function handleSaveZones() {
+    if (selectedZones.size === 0) return;
     setProvSaveLoading(true);
     setProvError('');
+    const created: string[] = [];
     try {
-      const result = await api.createProvider({
-        type: provType,
-        name: provName,
-        config: getProviderConfig(),
-        zone_id: provZoneId || undefined,
-        zone_name: provZoneName || undefined,
-      });
-      setProviderCreated(result);
-      setCurrentStep(1);
+      for (const zone of provZones) {
+        if (!selectedZones.has(zone.id)) continue;
+        const result = await api.createProvider({
+          type: provType,
+          name: zone.name,
+          config: { api_token: provApiToken },
+          zone_id: zone.id,
+          zone_name: zone.name,
+        });
+        created.push(result.name || zone.name);
+      }
+      setProvidersCreated(created);
+      setProvStep('saved');
     } catch (err) {
-      setProvError(err instanceof Error ? err.message : 'Failed to create provider');
+      setProvError(err instanceof Error ? err.message : 'Failed to save provider');
+      if (created.length > 0) {
+        setProvidersCreated(created);
+      }
     } finally {
       setProvSaveLoading(false);
     }
@@ -161,9 +185,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     setCompleting(true);
     try {
       await api.updateSetting('setup_complete', 'true');
-    } catch {
-      // If the setting fails to save, still proceed
-    }
+    } catch { /* proceed anyway */ }
     onComplete();
   }
 
@@ -176,7 +198,6 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   }
 
   const orchestratorUrl = window.location.origin;
-
   const installCommand = `curl -fsSL https://get.nurproxy.dev | sh -s -- agent \\
   --orchestrator ${orchestratorUrl} \\
   --fqdn your-edge-server.yourdomain.com`;
@@ -186,9 +207,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
       await navigator.clipboard.writeText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // fallback: select text
-    }
+    } catch { /* ignore */ }
   }
 
   const pendingAgents = agents.filter((a) => a.status === 'pending');
@@ -196,12 +215,9 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-gray-950 px-4 py-12">
       <div className="w-full max-w-lg">
-        {/* Header */}
         <div className="mb-8 text-center">
           <h1 className="text-2xl font-bold text-white">NurProxy Setup</h1>
-          <p className="mt-1 text-sm text-gray-400">
-            Let's get your reverse proxy running in a few steps.
-          </p>
+          <p className="mt-1 text-sm text-gray-400">Let's get your reverse proxy running.</p>
         </div>
 
         {/* Step Indicator */}
@@ -210,9 +226,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
             {STEPS.map((step, i) => (
               <div key={step.key} className="flex items-center gap-2">
                 <button
-                  onClick={() => {
-                    if (i < currentStep) setCurrentStep(i);
-                  }}
+                  onClick={() => { if (i < currentStep) setCurrentStep(i); }}
                   disabled={i > currentStep}
                   className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold transition-colors ${
                     i === currentStep
@@ -226,15 +240,9 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                     <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                     </svg>
-                  ) : (
-                    i + 1
-                  )}
+                  ) : (i + 1)}
                 </button>
-                <span
-                  className={`text-xs font-medium ${
-                    i === currentStep ? 'text-gray-200' : i < currentStep ? 'text-gray-400' : 'text-gray-600'
-                  }`}
-                >
+                <span className={`text-xs font-medium ${i === currentStep ? 'text-gray-200' : i < currentStep ? 'text-gray-400' : 'text-gray-600'}`}>
                   {step.label}
                 </span>
                 {i < STEPS.length - 1 && (
@@ -247,128 +255,165 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
 
         {/* Step Content */}
         <div className="rounded-xl border border-gray-800 bg-gray-900 p-6">
+
           {/* Step 1: DNS Provider */}
           {currentStep === 0 && (
             <div>
-              <h2 className="text-lg font-semibold text-white">Add a DNS Provider</h2>
+              <h2 className="text-lg font-semibold text-white">Connect DNS Provider</h2>
               <p className="mt-1 text-sm text-gray-400">
-                Connect a DNS provider so NurProxy can manage DNS records for your domains.
+                Add an API token and we'll auto-detect your zones.
               </p>
 
               <div className="mt-5 space-y-4">
                 {provError && (
-                  <div className="rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">
-                    {provError}
-                  </div>
+                  <div className="rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{provError}</div>
                 )}
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-300">Provider Type</label>
-                  <select
-                    value={provType}
-                    onChange={(e) => setProvType(e.target.value)}
-                    className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  >
-                    <option value="cloudflare">Cloudflare</option>
-                  </select>
-                </div>
+                {/* Sub-step: Enter token */}
+                {provStep === 'token' && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300">Provider</label>
+                      <select
+                        value={provType}
+                        onChange={(e) => setProvType(e.target.value)}
+                        className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        <option value="cloudflare">Cloudflare</option>
+                      </select>
+                    </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-300">Provider Name</label>
-                  <input
-                    value={provName}
-                    onChange={(e) => setProvName(e.target.value)}
-                    className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    placeholder="e.g. My Cloudflare"
-                  />
-                </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300">API Token</label>
+                      <input
+                        type="password"
+                        value={provApiToken}
+                        onChange={(e) => { setProvApiToken(e.target.value); setProvTestError(''); }}
+                        className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        placeholder="Paste your API token"
+                        onKeyDown={(e) => { if (e.key === 'Enter' && provApiToken) handleTestToken(); }}
+                      />
+                      <p className="mt-1 text-xs text-gray-500">Needs Zone:Read and DNS:Edit permissions.</p>
+                    </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-300">API Token</label>
-                  <input
-                    type="password"
-                    value={provApiToken}
-                    onChange={(e) => setProvApiToken(e.target.value)}
-                    className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    placeholder="Your Cloudflare API token"
-                  />
-                  <p className="mt-1 text-xs text-gray-500">
-                    Needs Zone:Read and DNS:Edit permissions.
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300">Zone ID</label>
-                    <input
-                      value={provZoneId}
-                      onChange={(e) => setProvZoneId(e.target.value)}
-                      className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                      placeholder="Optional"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300">Zone Name</label>
-                    <input
-                      value={provZoneName}
-                      onChange={(e) => setProvZoneName(e.target.value)}
-                      className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                      placeholder="e.g. example.com"
-                    />
-                  </div>
-                </div>
-
-                {/* Test Result */}
-                {provTestResult && (
-                  <div
-                    className={`rounded-lg px-3 py-2 text-sm ${
-                      provTestResult.valid
-                        ? 'bg-green-900/30 border border-green-800 text-green-400'
-                        : 'bg-red-900/30 border border-red-800 text-red-400'
-                    }`}
-                  >
-                    {provTestResult.message}
-                  </div>
-                )}
-
-                <div className="flex items-center justify-between pt-2">
-                  <button
-                    onClick={handleTestProvider}
-                    disabled={provTestLoading || !provApiToken}
-                    className="rounded-lg border border-gray-600 px-4 py-2 text-sm font-medium text-gray-300 hover:bg-gray-800 disabled:opacity-50"
-                  >
-                    {provTestLoading ? (
-                      <span className="flex items-center gap-2">
-                        <Spinner />
-                        Testing...
-                      </span>
-                    ) : (
-                      'Test Connection'
+                    {provTestError && (
+                      <div className="rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{provTestError}</div>
                     )}
-                  </button>
-                  <div className="flex gap-3">
-                    <button
-                      onClick={handleSkipStep}
-                      className="rounded-lg border border-gray-700 px-4 py-2 text-sm font-medium text-gray-400 hover:bg-gray-800 hover:text-gray-300"
-                    >
-                      Skip
-                    </button>
-                    <button
-                      onClick={handleSaveProvider}
-                      disabled={provSaveLoading || !provName || !provApiToken}
-                      className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {provSaveLoading ? (
-                        <span className="flex items-center gap-2">
-                          <Spinner />
-                          Saving...
-                        </span>
-                      ) : (
-                        'Save & Continue'
-                      )}
-                    </button>
-                  </div>
-                </div>
+
+                    <div className="flex items-center justify-between pt-2">
+                      <button
+                        onClick={handleSkipStep}
+                        className="rounded-lg border border-gray-700 px-4 py-2 text-sm font-medium text-gray-400 hover:bg-gray-800 hover:text-gray-300"
+                      >
+                        Skip
+                      </button>
+                      <button
+                        onClick={handleTestToken}
+                        disabled={provTestLoading || !provApiToken}
+                        className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        {provTestLoading ? <span className="flex items-center gap-2"><Spinner />Connecting...</span> : 'Connect'}
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {/* Sub-step: Select zones */}
+                {provStep === 'zones' && (
+                  <>
+                    <div className="rounded-lg bg-green-900/30 border border-green-800 px-3 py-2 text-sm text-green-400 flex items-center gap-2">
+                      <svg className="h-4 w-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                      </svg>
+                      Token valid — {provZones.length} zone{provZones.length !== 1 ? 's' : ''} found
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="block text-sm font-medium text-gray-300">Select zones to manage</label>
+                        <button
+                          onClick={toggleAllZones}
+                          className="text-xs text-blue-400 hover:text-blue-300"
+                        >
+                          {selectedZones.size === provZones.length ? 'Deselect all' : 'Select all'}
+                        </button>
+                      </div>
+                      <div className="space-y-1 max-h-48 overflow-y-auto rounded-lg border border-gray-700 bg-gray-800 p-2">
+                        {provZones.map((zone) => (
+                          <label
+                            key={zone.id}
+                            className={`flex items-center gap-3 rounded-md px-3 py-2.5 cursor-pointer transition-colors ${
+                              selectedZones.has(zone.id) ? 'bg-blue-900/30' : 'hover:bg-gray-700/50'
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedZones.has(zone.id)}
+                              onChange={() => toggleZone(zone.id)}
+                              className="accent-blue-500 h-4 w-4"
+                            />
+                            <span className="text-sm text-white font-medium">{zone.name}</span>
+                            <span className="text-xs text-gray-500 ml-auto font-mono">{zone.id.slice(0, 8)}…</span>
+                          </label>
+                        ))}
+                      </div>
+                      <p className="mt-1.5 text-xs text-gray-500">
+                        Each zone becomes a provider entry. You can manage domains under each zone separately.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2">
+                      <button
+                        onClick={() => { setProvStep('token'); setProvZones([]); }}
+                        className="rounded-lg border border-gray-700 px-4 py-2 text-sm font-medium text-gray-400 hover:bg-gray-800 hover:text-gray-300"
+                      >
+                        Back
+                      </button>
+                      <button
+                        onClick={handleSaveZones}
+                        disabled={provSaveLoading || selectedZones.size === 0}
+                        className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        {provSaveLoading
+                          ? <span className="flex items-center gap-2"><Spinner />Adding {selectedZones.size} zone{selectedZones.size !== 1 ? 's' : ''}...</span>
+                          : `Add ${selectedZones.size} zone${selectedZones.size !== 1 ? 's' : ''}`
+                        }
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {/* Sub-step: Saved confirmation */}
+                {provStep === 'saved' && (
+                  <>
+                    <div className="rounded-lg bg-green-900/30 border border-green-800 px-4 py-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <svg className="h-5 w-5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                        </svg>
+                        <p className="text-sm font-medium text-green-400">
+                          {providersCreated.length} zone{providersCreated.length !== 1 ? 's' : ''} added
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5 ml-7">
+                        {providersCreated.map((name) => (
+                          <span key={name} className="rounded-md bg-green-900/40 px-2 py-0.5 text-xs font-medium text-green-300">
+                            {name}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="flex justify-end pt-2">
+                      <button
+                        onClick={() => setCurrentStep(1)}
+                        className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+                      >
+                        Continue
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -378,15 +423,12 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
             <div>
               <h2 className="text-lg font-semibold text-white">Connect an Agent</h2>
               <p className="mt-1 text-sm text-gray-400">
-                Install the NurProxy agent on your edge server. It will register itself with this orchestrator.
+                Install the NurProxy agent on your edge server.
               </p>
 
               <div className="mt-5 space-y-5">
-                {/* Install instructions */}
                 <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Run this on your server:
-                  </label>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Run this on your server:</label>
                   <div className="relative">
                     <pre className="overflow-x-auto rounded-lg border border-gray-700 bg-gray-800 p-4 text-sm text-gray-200 font-mono leading-relaxed">
                       {installCommand}
@@ -399,11 +441,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                     </button>
                   </div>
                   <p className="mt-2 text-xs text-gray-500">
-                    Replace <code className="rounded bg-gray-800 px-1 py-0.5 text-gray-400">your-edge-server.yourdomain.com</code> with the FQDN of your server.
+                    Replace <code className="rounded bg-gray-800 px-1 py-0.5 text-gray-400">your-edge-server.yourdomain.com</code> with your server's FQDN.
                   </p>
                 </div>
 
-                {/* Waiting / Agent list */}
                 {agentAdopted ? (
                   <div className="rounded-lg bg-green-900/30 border border-green-800 px-4 py-3">
                     <div className="flex items-center gap-2">
@@ -415,9 +456,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                   </div>
                 ) : pendingAgents.length === 0 ? (
                   <div className="rounded-lg border border-gray-700 bg-gray-800/50 px-4 py-6 text-center">
-                    <div className="flex justify-center mb-3">
-                      {pollingAgents && <SpinnerLarge />}
-                    </div>
+                    {pollingAgents && <div className="flex justify-center mb-3"><SpinnerLarge /></div>}
                     <p className="text-sm text-gray-400">Waiting for an agent to connect...</p>
                     <p className="mt-1 text-xs text-gray-500">Checking every 3 seconds</p>
                   </div>
@@ -436,7 +475,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                             </div>
                             <p className="mt-0.5 text-xs text-gray-400">
                               {agent.public_ip && `IP: ${agent.public_ip}`}
-                              {agent.version && ` | v${agent.version}`}
+                              {agent.version && ` · v${agent.version}`}
                             </p>
                           </div>
                           {adoptingId !== agent.id && (
@@ -449,13 +488,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                           )}
                         </div>
 
-                        {/* Inline adopt form */}
                         {adoptingId === agent.id && (
                           <div className="mt-4 space-y-3 border-t border-gray-700 pt-4">
                             {adoptError && (
-                              <div className="rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">
-                                {adoptError}
-                              </div>
+                              <div className="rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{adoptError}</div>
                             )}
                             <div>
                               <label className="block text-sm font-medium text-gray-300">Name</label>
@@ -475,9 +511,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                               >
                                 <option value="">None</option>
                                 {providers.map((p) => (
-                                  <option key={p.id} value={p.id}>
-                                    {p.name} ({p.zone_name})
-                                  </option>
+                                  <option key={p.id} value={p.id}>{p.name} ({p.zone_name})</option>
                                 ))}
                               </select>
                             </div>
@@ -485,21 +519,11 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                               <label className="block text-sm font-medium text-gray-300">DNS Mode</label>
                               <div className="mt-1 flex gap-4">
                                 <label className="flex items-center gap-2 text-sm text-gray-300">
-                                  <input
-                                    type="radio"
-                                    checked={adoptDnsMode === 'static'}
-                                    onChange={() => setAdoptDnsMode('static')}
-                                    className="accent-blue-500"
-                                  />
+                                  <input type="radio" checked={adoptDnsMode === 'static'} onChange={() => setAdoptDnsMode('static')} className="accent-blue-500" />
                                   Static
                                 </label>
                                 <label className="flex items-center gap-2 text-sm text-gray-300">
-                                  <input
-                                    type="radio"
-                                    checked={adoptDnsMode === 'ddns'}
-                                    onChange={() => setAdoptDnsMode('ddns')}
-                                    className="accent-blue-500"
-                                  />
+                                  <input type="radio" checked={adoptDnsMode === 'ddns'} onChange={() => setAdoptDnsMode('ddns')} className="accent-blue-500" />
                                   DDNS
                                 </label>
                               </div>
@@ -516,14 +540,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                                 disabled={adoptLoading}
                                 className="rounded-lg bg-green-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
                               >
-                                {adoptLoading ? (
-                                  <span className="flex items-center gap-2">
-                                    <Spinner />
-                                    Adopting...
-                                  </span>
-                                ) : (
-                                  'Confirm Adopt'
-                                )}
+                                {adoptLoading ? <span className="flex items-center gap-2"><Spinner />Adopting...</span> : 'Confirm Adopt'}
                               </button>
                             </div>
                           </div>
@@ -533,7 +550,6 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                   </div>
                 )}
 
-                {/* Navigation */}
                 <div className="flex items-center justify-between pt-2">
                   <button
                     onClick={() => setCurrentStep(0)}
@@ -571,15 +587,13 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                 </svg>
               </div>
               <h2 className="text-lg font-semibold text-white">You're all set!</h2>
-              <p className="mt-2 text-sm text-gray-400">
-                Here's a summary of what was configured:
-              </p>
+              <p className="mt-2 text-sm text-gray-400">Here's what was configured:</p>
 
               <div className="mt-6 space-y-3 text-left">
                 <SummaryItem
-                  label="DNS Provider"
-                  value={providerCreated ? providerCreated.name : null}
-                  skipped={!providerCreated}
+                  label="DNS Zones"
+                  value={providersCreated.length > 0 ? providersCreated.join(', ') : null}
+                  skipped={providersCreated.length === 0}
                 />
                 <SummaryItem
                   label="Agent"
@@ -589,7 +603,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               </div>
 
               <p className="mt-6 text-xs text-gray-500">
-                You can always add more providers and agents from the Settings and Agents pages.
+                You can always add more providers and agents from Settings and Agents pages.
               </p>
 
               <button
@@ -597,14 +611,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                 disabled={completing}
                 className="mt-6 w-full rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
               >
-                {completing ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <Spinner />
-                    Finishing...
-                  </span>
-                ) : (
-                  'Go to Dashboard'
-                )}
+                {completing ? <span className="flex items-center justify-center gap-2"><Spinner />Finishing...</span> : 'Go to Dashboard'}
               </button>
             </div>
           )}
