@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import i18n from '../lib/i18n';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
 import type { Agent, Domain } from '../lib/types';
@@ -7,7 +8,7 @@ import { usePolling } from '../lib/usePolling';
 import { statusMeta } from '../lib/status';
 
 const count = (arr: { status: string }[], s: string) => arr.filter((x) => x.status === s).length;
-const seen = (d?: string) => (d ? formatRelativeTime(d) : 'never');
+const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.neverLower'));
 
 export default function Wallboard() {
   const { t } = useTranslation();

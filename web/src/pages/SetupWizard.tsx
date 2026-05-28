@@ -241,11 +241,15 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                   </Field>
 
                   <Callout tone="info" title={t('setup.whereTitle')}>
-                    In Cloudflare, open{' '}
-                    <a href={CF_TOKEN_URL} target="_blank" rel="noreferrer" className="font-medium underline">My Profile → API Tokens</a>,
-                    click <strong>Create Token</strong>, and use the <strong>“Edit zone DNS”</strong> template. You can scope it to
-                    only the zones you want, or all zones in your account.{' '}
-                    <Link to="/help/cloudflare-token" className="font-medium underline">Full walkthrough →</Link>
+                    <Trans
+                      i18nKey="setup.whereBody"
+                      components={[
+                        <a href={CF_TOKEN_URL} target="_blank" rel="noreferrer" className="font-medium underline" />,
+                        <strong />,
+                        <strong />,
+                        <Link to="/help/cloudflare-token" className="font-medium underline" />,
+                      ]}
+                    />
                   </Callout>
 
                   {provTestError && <Callout tone="danger">{provTestError}</Callout>}

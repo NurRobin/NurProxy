@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import i18n from '../lib/i18n';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
@@ -16,7 +17,7 @@ import { useToast, errMessage } from '../components/toast-context';
 import { useUndoableDelete } from '../lib/undo';
 
 function seen(date?: string) {
-  return date ? formatRelativeTime(date) : 'Never';
+  return date ? formatRelativeTime(date) : i18n.t('time.never');
 }
 
 interface ServerWithAgent extends Server {

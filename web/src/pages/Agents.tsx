@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import i18n from '../lib/i18n';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft } from 'lucide-react';
@@ -16,7 +17,7 @@ import MultiSelect from '../components/MultiSelect';
 import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
 
-const seen = (d?: string) => (d ? formatRelativeTime(d) : 'Never');
+const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.never'));
 
 export default function Agents() {
   const { t } = useTranslation();

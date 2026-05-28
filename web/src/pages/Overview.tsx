@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import i18n from '../lib/i18n';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { CircleCheck, TriangleAlert } from 'lucide-react';
@@ -11,7 +12,7 @@ import StatusBadge from '../components/StatusBadge';
 import EmptyState from '../components/EmptyState';
 
 function seen(date?: string) {
-  return date ? formatRelativeTime(date) : 'Never';
+  return date ? formatRelativeTime(date) : i18n.t('time.never');
 }
 
 export default function Overview() {

@@ -164,11 +164,11 @@ export default function Topology() {
   }
 
   function labelFor(sel: Selection): string {
-    if (sel.kind === 'internet') return 'Internet';
-    if (sel.kind === 'agent') return agents.find((a) => a.id === sel.id)?.name ?? 'Agent';
-    if (sel.kind === 'server') return allServers.find((s) => s.id === sel.id)?.name ?? 'Server';
+    if (sel.kind === 'internet') return t('topology.colInternet');
+    if (sel.kind === 'agent') return agents.find((a) => a.id === sel.id)?.name ?? t('topology.fbAgent');
+    if (sel.kind === 'server') return allServers.find((s) => s.id === sel.id)?.name ?? t('topology.fbServer');
     const d = domains.find((x) => String(x.id) === sel.id);
-    return d ? fqdn(d) : 'Domain';
+    return d ? fqdn(d) : t('topology.fbDomain');
   }
 
   // --- collapse + filter keep large topologies legible ---
@@ -238,7 +238,7 @@ export default function Topology() {
               </p>
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-fg-faint" />
-                <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={t('topology.filter')} aria-label="Filter topology"
+                <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={t('topology.filter')} aria-label={t('topology.filterAria')}
                   className="w-44 rounded-lg border border-border bg-surface py-1.5 pl-9 pr-3 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus-visible:outline-none focus:ring-2 focus:ring-accent/30" />
               </div>
             </div>
@@ -346,7 +346,7 @@ interface InspectorCtx {
 function renderInspector(sel: Selection, ctx: InspectorCtx) {
   const { t } = ctx;
   if (sel.kind === 'internet') {
-    return <Rows rows={[[t('topology.role'), t('topology.entryPoint')], ['Agents', String(ctx.agents.length)]]} note={t('topology.inspectorInternet')} />;
+    return <Rows rows={[[t('topology.role'), t('topology.entryPoint')], [t('nav.agents'), String(ctx.agents.length)]]} note={t('topology.inspectorInternet')} />;
   }
   if (sel.kind === 'agent') {
     const a = ctx.agents.find((x) => x.id === sel.id); if (!a) return null;
@@ -355,8 +355,8 @@ function renderInspector(sel: Selection, ctx: InspectorCtx) {
       <div className="space-y-3">
         <StatusBadge status={a.status} />
         <Rows rows={[
-          ['FQDN', a.fqdn], ['DNS mode', a.dns_mode || 'static'], ['IP', a.public_ip || '—'],
-          ['Version', a.version || '—'], ['Last seen', seen(t, a.last_seen)], ['Servers', String(servers.length)],
+          [t('topology.rowFqdn'), a.fqdn], [t('agents.dnsMode'), a.dns_mode === 'ddns' ? t('setup.ddns') : t('setup.static')], [t('agents.ip'), a.public_ip || '—'],
+          [t('agents.version'), a.version || '—'], [t('agents.lastSeen'), seen(t, a.last_seen)], [t('nav.servers'), String(servers.length)],
         ]} />
       </div>
     );
@@ -367,7 +367,7 @@ function renderInspector(sel: Selection, ctx: InspectorCtx) {
     const doms = ctx.domains.filter((d) => d.server_id === s.id);
     return (
       <div className="space-y-3">
-        <Rows rows={[['Address', s.address], ['Agent', agent?.name ?? '—'], ['Domains', String(doms.length)], ...(s.notes ? [['Notes', s.notes] as [string, string]] : [])]} />
+        <Rows rows={[[t('common.address'), s.address], [t('servers.agent'), agent?.name ?? '—'], [t('nav.domains'), String(doms.length)], ...(s.notes ? [[t('common.notesOptional'), s.notes] as [string, string]] : [])]} />
       </div>
     );
   }
@@ -378,8 +378,8 @@ function renderInspector(sel: Selection, ctx: InspectorCtx) {
       <StatusBadge status={d.status} />
       {d.error_msg && <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2 text-sm text-danger-fg">{d.error_msg}</div>}
       <Rows rows={[
-        [t('topology.target'), srv ? `${srv.address}:${d.port}` : `:${d.port}`], ['Zone', ctx.zoneName(d.zone_id) || '—'],
-        ['Force HTTPS', d.force_https ? 'on' : 'off'], ['WebSocket', d.websocket ? 'on' : 'off'], [t('topology.lastSyncedRow'), seen(t, d.last_synced)],
+        [t('topology.target'), srv ? `${srv.address}:${d.port}` : `:${d.port}`], [t('domains.zone'), ctx.zoneName(d.zone_id) || '—'],
+        [t('domains.forceHttps'), d.force_https ? t('topology.on') : t('topology.off')], [t('domains.websocket'), d.websocket ? t('topology.on') : t('topology.off')], [t('topology.lastSyncedRow'), seen(t, d.last_synced)],
       ]} />
     </div>
   );
@@ -449,11 +449,12 @@ function Rows({ rows, note }: { rows: [string, string][]; note?: string }) {
 function Inspector({ title, body, onClose, onManage, manageLabel }: {
   title: string; body: React.ReactNode; onClose: () => void; onManage: () => void; manageLabel?: string;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="animate-pop-in flex flex-col border-border bg-surface fixed inset-y-0 right-0 z-40 w-full max-w-sm border-l shadow-pop lg:sticky lg:inset-auto lg:top-20 lg:z-auto lg:w-80 lg:max-w-none lg:shrink-0 lg:self-start lg:max-h-[calc(100vh-6rem)] lg:rounded-xl lg:border lg:shadow-card">
       <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
         <h2 className="truncate font-display text-lg font-semibold text-fg">{title}</h2>
-        <button onClick={onClose} aria-label="Close" className="rounded-lg p-1.5 text-fg-faint hover:bg-surface-2 hover:text-fg">
+        <button onClick={onClose} aria-label={t('topology.closeAria')} className="rounded-lg p-1.5 text-fg-faint hover:bg-surface-2 hover:text-fg">
           <X className="h-5 w-5" />
         </button>
       </div>
