@@ -15,27 +15,14 @@ function App() {
 
   const checkSetupWizard = useCallback(async () => {
     try {
-      const [settings, providers, agents] = await Promise.all([
-        api.getSettings(),
-        api.listProviders(),
-        api.listAgents(),
-      ]);
+      const settings = await api.getSettings();
       const setupComplete = settings.find((s) => s.key === 'setup_complete');
       if (setupComplete?.value === 'true') {
         setAuthState('authenticated');
-      } else if (providers.length === 0 && agents.length === 0) {
-        setAuthState('needs_setup_wizard');
       } else {
-        // Resources exist already, mark as complete and skip wizard
-        try {
-          await api.updateSetting('setup_complete', 'true');
-        } catch {
-          // ignore
-        }
-        setAuthState('authenticated');
+        setAuthState('needs_setup_wizard');
       }
     } catch {
-      // If we can't check, just proceed to dashboard
       setAuthState('authenticated');
     }
   }, []);
