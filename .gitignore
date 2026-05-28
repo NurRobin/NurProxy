@@ -39,3 +39,4 @@ coverage.html
 
 # Temp
 /tmp/
+.claude/
