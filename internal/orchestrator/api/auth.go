@@ -8,6 +8,32 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
+// GET /api/v1/auth/status — returns authentication state.
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	// Check if setup is needed
+	hash, err := s.db.GetSetting("admin_password_hash")
+	if err != nil || hash == "" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"setup_required": true,
+			"authenticated":  false,
+		})
+		return
+	}
+
+	// Check if current request has a valid session
+	authenticated := false
+	if cookie, err := r.Cookie("nurproxy_session"); err == nil {
+		if _, err := s.sessions.Verify(cookie.Value); err == nil {
+			authenticated = true
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"setup_required": false,
+		"authenticated":  authenticated,
+	})
+}
+
 // POST /api/v1/auth/setup — first-time admin password setup.
 // Only works when no admin_password_hash exists in settings.
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
