@@ -1,0 +1,42 @@
+# Binaries
+nurproxy
+nurproxy-agent
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build
+/dist/
+/web/dist/
+/web/node_modules/
+
+# Data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/data/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage.out
+coverage.html
+
+# Temp
+/tmp/

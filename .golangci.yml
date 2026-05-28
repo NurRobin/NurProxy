@@ -1,0 +1,68 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - gocritic
+
+linters-settings:
+  gocritic:
+    enabled-checks:
+      - appendAssign
+      - argOrder
+      - badCall
+      - badCond
+      - badLock
+      - badRegexp
+      - builtinShadowDecl
+      - caseOrder
+      - codegenComment
+      - deprecatedComment
+      - dupArg
+      - dupBranchBody
+      - dupCase
+      - dupSubExpr
+      - exitAfterDefer
+      - flagDeref
+      - flagName
+      - nilValReturn
+      - offBy1
+      - regexpPattern
+      - sloppyReassign
+      - sortSlice
+      - sprintfQuotedString
+      - sqlQuery
+      - syncMapLoadAndDelete
+      - truncateCmp
+      - unnecessaryDefer
+      - weakCond
+
+  goimports:
+    local-prefixes: github.com/nurrobin/nurproxy
+
+  misspell:
+    locale: US
+
+issues:
+  exclude-rules:
+    # Allow dot imports in test files (e.g., for table-driven test helpers)
+    - path: _test\.go
+      linters:
+        - gocritic
+
+    # Test files can have longer functions
+    - path: _test\.go
+      linters:
+        - unused
+
+  max-issues-per-linter: 0
+  max-same-issues: 0
