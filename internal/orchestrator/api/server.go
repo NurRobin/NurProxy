@@ -39,6 +39,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 
 	// Auth (no auth required)
+	s.mux.HandleFunc("GET /api/v1/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("POST /api/v1/auth/setup", s.handleSetup)
 	s.mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)

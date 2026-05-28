@@ -14,40 +14,93 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+export interface AuthStatus {
+  setup_required: boolean;
+  authenticated: boolean;
+}
+
+export interface AuditLogResponse {
+  entries: AuditLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface HealthResponse {
+  status: string;
+  version: string;
+}
+
+export interface Zone {
+  id: string;
+  name: string;
+}
+
+export interface DomainConfig {
+  manual: boolean;
+  config: unknown;
+}
+
 export const api = {
+  // Auth
+  authStatus: () => request<AuthStatus>('/auth/status'),
+  setup: (password: string) => request<{ message: string }>('/auth/setup', { method: 'POST', body: JSON.stringify({ password }) }),
+  login: (password: string) => request<{ message: string }>('/auth/login', { method: 'POST', body: JSON.stringify({ password }) }),
+  logout: () => request<{ message: string }>('/auth/logout', { method: 'POST' }),
+
   // Providers
   listProviders: () => request<Provider[]>('/providers'),
-  createProvider: (data: Partial<Provider>) => request<Provider>('/providers', { method: 'POST', body: JSON.stringify(data) }),
-  deleteProvider: (id: string) => request<void>(`/providers/${id}`, { method: 'DELETE' }),
-  testProvider: (data: unknown) => request<void>('/providers/test', { method: 'POST', body: JSON.stringify(data) }),
+  getProvider: (id: string) => request<Provider>(`/providers/${id}`),
+  createProvider: (data: { type: string; name: string; config: unknown; zone_id?: string; zone_name?: string }) =>
+    request<{ id: string; name: string }>('/providers', { method: 'POST', body: JSON.stringify(data) }),
+  updateProvider: (id: string, data: Partial<Provider>) =>
+    request<{ message: string }>(`/providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteProvider: (id: string) => request<{ message: string }>(`/providers/${id}`, { method: 'DELETE' }),
+  testProvider: (data: { type: string; config: unknown }) =>
+    request<{ valid: boolean; message: string }>('/providers/test', { method: 'POST', body: JSON.stringify(data) }),
+  listZones: (id: string) => request<Zone[]>(`/providers/${id}/zones`),
 
   // Agents
   listAgents: () => request<Agent[]>('/agents'),
-  adoptAgent: (id: string, data: unknown) => request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
-  rejectAgent: (id: string) => request<void>(`/agents/${id}/reject`, { method: 'PUT' }),
-  deleteAgent: (id: string) => request<void>(`/agents/${id}`, { method: 'DELETE' }),
+  updateAgent: (id: string, data: Partial<Agent>) =>
+    request<Agent>(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  adoptAgent: (id: string, data: { name?: string; provider_id?: string; dns_mode?: string; ddns_interval?: number }) =>
+    request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
+  rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
+  deleteAgent: (id: string) => request<{ message: string }>(`/agents/${id}`, { method: 'DELETE' }),
 
   // Servers
   listServers: (agentId: string) => request<Server[]>(`/agents/${agentId}/servers`),
-  createServer: (agentId: string, data: Partial<Server>) => request<Server>(`/agents/${agentId}/servers`, { method: 'POST', body: JSON.stringify(data) }),
-  deleteServer: (id: string) => request<void>(`/servers/${id}`, { method: 'DELETE' }),
+  createServer: (agentId: string, data: { name: string; address: string; notes?: string }) =>
+    request<Server>(`/agents/${agentId}/servers`, { method: 'POST', body: JSON.stringify(data) }),
+  updateServer: (id: string, data: Partial<Server>) =>
+    request<Server>(`/servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteServer: (id: string) => request<{ message: string }>(`/servers/${id}`, { method: 'DELETE' }),
 
   // Domains
   listDomains: (params?: Record<string, string>) => {
     const qs = params ? '?' + new URLSearchParams(params).toString() : '';
     return request<Domain[]>(`/domains${qs}`);
   },
-  createDomain: (data: Partial<Domain>) => request<Domain>('/domains', { method: 'POST', body: JSON.stringify(data) }),
+  createDomain: (data: Partial<Domain>) =>
+    request<Domain>('/domains', { method: 'POST', body: JSON.stringify(data) }),
   getDomain: (id: number) => request<Domain>(`/domains/${id}`),
-  updateDomain: (id: number, data: Partial<Domain>) => request<Domain>(`/domains/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  deleteDomain: (id: number) => request<void>(`/domains/${id}`, { method: 'DELETE' }),
+  updateDomain: (id: number, data: Partial<Domain>) =>
+    request<Domain>(`/domains/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteDomain: (id: number) => request<{ message: string }>(`/domains/${id}`, { method: 'DELETE' }),
+  getDomainConfig: (id: number) => request<DomainConfig>(`/domains/${id}/config`),
+  updateDomainConfig: (id: number, config: unknown) =>
+    request<{ message: string }>(`/domains/${id}/config`, { method: 'PUT', body: JSON.stringify({ config }) }),
+  resetDomainConfig: (id: number) =>
+    request<{ message: string }>(`/domains/${id}/config/reset`, { method: 'POST' }),
 
   // System
-  health: () => request<{ status: string }>('/health'),
+  health: () => request<HealthResponse>('/health'),
   getAuditLog: (params?: Record<string, string>) => {
     const qs = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<AuditLogEntry[]>(`/audit-log${qs}`);
+    return request<AuditLogResponse>(`/audit-log${qs}`);
   },
   getSettings: () => request<Setting[]>('/settings'),
-  updateSetting: (key: string, value: string) => request<void>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+  updateSetting: (key: string, value: string) =>
+    request<{ key: string; value: string }>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
 };
