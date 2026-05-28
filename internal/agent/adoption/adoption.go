@@ -24,6 +24,7 @@ type Manager struct {
 	agentID         string
 	dataDir         string
 	apiPort         int
+	version         string
 	client          *http.Client
 }
 
@@ -34,6 +35,7 @@ type registerRequest struct {
 	Token    string `json:"token"`
 	APIURL   string `json:"api_url"`
 	PublicIP string `json:"public_ip"`
+	Version  string `json:"version"`
 }
 
 // statusResponse is the JSON body from GET /api/v1/agents/{id}/status.
@@ -72,6 +74,11 @@ func New(orchestratorURL, fqdn, dataDir string, apiPort int) (*Manager, error) {
 	return m, nil
 }
 
+// SetVersion records the agent build version sent during registration.
+func (m *Manager) SetVersion(v string) {
+	m.version = v
+}
+
 // Token returns the agent token.
 func (m *Manager) Token() string {
 	return m.token
@@ -97,6 +104,7 @@ func (m *Manager) Register(ctx context.Context) error {
 		Token:    m.token,
 		APIURL:   apiURL,
 		PublicIP: publicIP,
+		Version:  m.version,
 	}
 
 	data, err := json.Marshal(body)

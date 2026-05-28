@@ -18,6 +18,7 @@ type Heartbeat struct {
 	orchestratorURL string
 	agentID         string
 	token           string
+	version         string
 	interval        time.Duration
 	client          *http.Client
 	cancel          context.CancelFunc
@@ -28,14 +29,16 @@ type Heartbeat struct {
 type heartbeatPayload struct {
 	AgentID  string `json:"agent_id"`
 	PublicIP string `json:"public_ip"`
+	Version  string `json:"version"`
 }
 
 // New creates a new Heartbeat sender.
-func New(orchestratorURL, agentID, token string, interval time.Duration) *Heartbeat {
+func New(orchestratorURL, agentID, token, version string, interval time.Duration) *Heartbeat {
 	return &Heartbeat{
 		orchestratorURL: strings.TrimRight(orchestratorURL, "/"),
 		agentID:         agentID,
 		token:           token,
+		version:         version,
 		interval:        interval,
 		client: &http.Client{
 			Timeout: 15 * time.Second,
@@ -86,6 +89,7 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 	payload := heartbeatPayload{
 		AgentID:  h.agentID,
 		PublicIP: ip,
+		Version:  h.version,
 	}
 
 	data, err := json.Marshal(payload)

@@ -63,6 +63,8 @@ func main() {
 		log.Fatalf("Failed to initialize adoption manager: %v", err)
 	}
 
+	mgr.SetVersion(version)
+
 	log.Printf("Agent ID: %s", mgr.AgentID())
 	log.Printf("Agent Token: %s...%s", mgr.Token()[:10], mgr.Token()[len(mgr.Token())-4:])
 
@@ -106,7 +108,7 @@ func main() {
 	}
 
 	// Step 4: Start heartbeat loop.
-	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), 60*time.Second)
+	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, 60*time.Second)
 	hb.Start(ctx)
 
 	log.Printf("Agent is running. Press Ctrl+C to stop.")
