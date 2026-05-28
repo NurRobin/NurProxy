@@ -20,11 +20,18 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 		lastSeen = &s
 	}
 
+	// Use SQL NULL for empty provider_id to avoid FK constraint violations
+	// when agent registers without a provider (pre-adoption).
+	var providerID interface{} = a.ProviderID
+	if a.ProviderID == "" {
+		providerID = nil
+	}
+
 	_, err := d.sql.Exec(`
 		INSERT INTO agents (id, name, fqdn, api_url, token_hash, provider_id, dns_mode,
 			ddns_interval, public_ip, dns_record_id, status, last_seen, version, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash, a.ProviderID,
+		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash, providerID,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
@@ -40,11 +47,12 @@ func scanAgent(sc interface {
 	Scan(dest ...any) error
 }) (*models.Agent, error) {
 	var a models.Agent
+	var providerID sql.NullString
 	var lastSeen sql.NullString
 	var createdAt, updatedAt string
 
 	err := sc.Scan(
-		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash, &a.ProviderID,
+		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash, &providerID,
 		&a.DNSMode, &a.DDNSInterval, &a.PublicIP, &a.DNSRecordID,
 		&a.Status, &lastSeen, &a.Version, &createdAt, &updatedAt,
 	)
@@ -52,6 +60,9 @@ func scanAgent(sc interface {
 		return nil, err
 	}
 
+	if providerID.Valid {
+		a.ProviderID = providerID.String
+	}
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	if lastSeen.Valid {
@@ -131,13 +142,19 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		lastSeen = &s
 	}
 
+	// Use SQL NULL for empty provider_id to avoid FK constraint violations.
+	var providerID interface{} = a.ProviderID
+	if a.ProviderID == "" {
+		providerID = nil
+	}
+
 	res, err := d.sql.Exec(`
 		UPDATE agents
 		SET name = ?, fqdn = ?, api_url = ?, token_hash = ?, provider_id = ?,
 			dns_mode = ?, ddns_interval = ?, public_ip = ?, dns_record_id = ?,
 			status = ?, last_seen = ?, version = ?, updated_at = ?
 		WHERE id = ?`,
-		a.Name, a.FQDN, a.APIURL, a.TokenHash, a.ProviderID,
+		a.Name, a.FQDN, a.APIURL, a.TokenHash, providerID,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version, a.UpdatedAt.Format(time.RFC3339),
 		a.ID,

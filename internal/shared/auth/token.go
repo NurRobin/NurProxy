@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 )
@@ -31,4 +32,10 @@ func generatePrefixedToken(prefix string) (string, error) {
 		return "", fmt.Errorf("generating token: %w", err)
 	}
 	return prefix + hex.EncodeToString(b), nil
+}
+
+// HashToken returns the SHA-256 hex digest of a token for storage comparison.
+func HashToken(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
 }

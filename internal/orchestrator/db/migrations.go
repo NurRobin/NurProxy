@@ -96,6 +96,31 @@ var migrations = []string{
 	INSERT OR IGNORE INTO settings (key, value) VALUES ('mcp_enabled', 'false');
 	INSERT OR IGNORE INTO settings (key, value) VALUES ('reconciler_interval', '60');
 	`,
+
+	// Migration 002: allow NULL provider_id on agents (pre-adoption agents have no provider)
+	`
+	CREATE TABLE agents_new (
+		id            TEXT PRIMARY KEY,
+		name          TEXT NOT NULL,
+		fqdn          TEXT NOT NULL UNIQUE,
+		api_url       TEXT NOT NULL DEFAULT '',
+		token_hash    TEXT NOT NULL DEFAULT '',
+		provider_id   TEXT DEFAULT '' REFERENCES providers(id),
+		dns_mode      TEXT NOT NULL DEFAULT 'static',
+		ddns_interval INTEGER NOT NULL DEFAULT 300,
+		public_ip     TEXT NOT NULL DEFAULT '',
+		dns_record_id TEXT NOT NULL DEFAULT '',
+		status        TEXT NOT NULL DEFAULT 'pending',
+		last_seen     TEXT,
+		version       TEXT NOT NULL DEFAULT '',
+		created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+		updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+
+	INSERT INTO agents_new SELECT * FROM agents;
+	DROP TABLE agents;
+	ALTER TABLE agents_new RENAME TO agents;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

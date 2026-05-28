@@ -1,0 +1,244 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"github.com/google/uuid"
+
+	"github.com/NurRobin/NurProxy/internal/provider"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
+)
+
+// GET /api/v1/providers
+func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
+	providers, err := s.db.ListProviders()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list providers")
+		return
+	}
+	if providers == nil {
+		providers = []models.Provider{}
+	}
+	// Strip config from response (it's tagged json:"-" but just to be safe)
+	type providerResponse struct {
+		ID        string `json:"id"`
+		Type      string `json:"type"`
+		Name      string `json:"name"`
+		ZoneID    string `json:"zone_id"`
+		ZoneName  string `json:"zone_name"`
+		IsDefault bool   `json:"is_default"`
+		CreatedAt string `json:"created_at"`
+	}
+	resp := make([]providerResponse, len(providers))
+	for i, p := range providers {
+		resp[i] = providerResponse{
+			ID:        p.ID,
+			Type:      p.Type,
+			Name:      p.Name,
+			ZoneID:    p.ZoneID,
+			ZoneName:  p.ZoneName,
+			IsDefault: p.IsDefault,
+			CreatedAt: p.CreatedAt.String(),
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// POST /api/v1/providers
+func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Type     string          `json:"type"`
+		Name     string          `json:"name"`
+		Config   json.RawMessage `json:"config"`
+		ZoneID   string          `json:"zone_id"`
+		ZoneName string          `json:"zone_name"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if req.Type == "" || req.Name == "" {
+		writeError(w, http.StatusBadRequest, "type and name are required")
+		return
+	}
+	if len(req.Config) == 0 {
+		writeError(w, http.StatusBadRequest, "config is required")
+		return
+	}
+
+	// Validate config via provider
+	prov, err := provider.Get(req.Type)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unknown provider type: "+req.Type)
+		return
+	}
+	if err := prov.ValidateConfig(context.Background(), req.Config); err != nil {
+		writeError(w, http.StatusBadRequest, "config validation failed: "+err.Error())
+		return
+	}
+
+	p := &models.Provider{
+		ID:       uuid.New().String(),
+		Type:     req.Type,
+		Name:     req.Name,
+		Config:   string(req.Config),
+		ZoneID:   req.ZoneID,
+		ZoneName: req.ZoneName,
+	}
+
+	if err := s.db.CreateProvider(p); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create provider")
+		return
+	}
+
+	s.audit(r, "provider", p.ID, "create", p.Name)
+
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"id":   p.ID,
+		"name": p.Name,
+	})
+}
+
+// GET /api/v1/providers/{id}
+func (s *Server) handleGetProvider(w http.ResponseWriter, r *http.Request) {
+	id := pathParam(r, "id")
+	p, err := s.db.GetProvider(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+	// Strip config
+	p.Config = ""
+	writeJSON(w, http.StatusOK, p)
+}
+
+// PUT /api/v1/providers/{id}
+func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
+	id := pathParam(r, "id")
+
+	existing, err := s.db.GetProvider(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+
+	var req struct {
+		Name     *string          `json:"name"`
+		Config   *json.RawMessage `json:"config"`
+		ZoneID   *string          `json:"zone_id"`
+		ZoneName *string          `json:"zone_name"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if req.Name != nil {
+		existing.Name = *req.Name
+	}
+	if req.Config != nil {
+		// Validate new config
+		prov, err := provider.Get(existing.Type)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "unknown provider type")
+			return
+		}
+		if err := prov.ValidateConfig(context.Background(), *req.Config); err != nil {
+			writeError(w, http.StatusBadRequest, "config validation failed: "+err.Error())
+			return
+		}
+		existing.Config = string(*req.Config)
+	}
+	if req.ZoneID != nil {
+		existing.ZoneID = *req.ZoneID
+	}
+	if req.ZoneName != nil {
+		existing.ZoneName = *req.ZoneName
+	}
+
+	if err := s.db.UpdateProvider(existing); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update provider")
+		return
+	}
+
+	s.audit(r, "provider", id, "update", existing.Name)
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "provider updated"})
+}
+
+// DELETE /api/v1/providers/{id}
+func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
+	id := pathParam(r, "id")
+
+	if err := s.db.DeleteProvider(id); err != nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+
+	s.audit(r, "provider", id, "delete", "")
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "provider deleted"})
+}
+
+// POST /api/v1/providers/test
+func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Type   string          `json:"type"`
+		Config json.RawMessage `json:"config"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if req.Type == "" {
+		writeError(w, http.StatusBadRequest, "type is required")
+		return
+	}
+
+	prov, err := provider.Get(req.Type)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unknown provider type: "+req.Type)
+		return
+	}
+
+	if err := prov.ValidateConfig(context.Background(), req.Config); err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"valid":   false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"valid":   true,
+		"message": "configuration is valid",
+	})
+}
+
+// GET /api/v1/providers/{id}/zones
+func (s *Server) handleListZones(w http.ResponseWriter, r *http.Request) {
+	id := pathParam(r, "id")
+	p, err := s.db.GetProvider(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+
+	prov, err := provider.Get(p.Type)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "provider type not registered")
+		return
+	}
+
+	zones, err := prov.ListZones(context.Background(), json.RawMessage(p.Config))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to list zones: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, zones)
+}
