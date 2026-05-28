@@ -212,6 +212,8 @@
     "subtitle": "Subdomains, die an deine Server weitergeleitet werden.",
     "newDomain": "Neue Domain",
     "allAgents": "Alle Agents",
+    "filterAll": "Alle",
+    "manageDomains": "Domains verwalten",
     "selected": "{{count}} ausgewählt",
     "deleteSelected": "Ausgewählte löschen",
     "noneYet": "Noch keine Domains",
@@ -358,6 +360,7 @@
     "internetAria": "Öffentliches Internet, Einstiegspunkt",
     "summaryAria": "Topologie: {{agents}} Agents, {{servers}} Server, {{domains}} Domains.",
     "loading": "Lade Topologie…",
+    "loadFailed": "Topologie konnte nicht geladen werden.",
     "inspect": "Inspizieren",
     "openInAgents": "In Agents öffnen",
     "addServer": "Server hinzufügen",
@@ -417,6 +420,15 @@
     "none": "Keine aktuelle Aktivität.",
     "aria": "Benachrichtigungen",
     "ariaUnseen": "Benachrichtigungen ({{count}} ungelesen)"
+  },
+  "multiSelect": {
+    "selectedOf": "{{selected}} von {{total}} ausgewählt",
+    "selectAll": "Alle auswählen",
+    "deselectAll": "Alle abwählen",
+    "matching": " passende",
+    "search": "{{count}} Einträge durchsuchen…",
+    "noMatches": "Keine Treffer.",
+    "empty": "Nichts anzuzeigen."
   },
   "status": {
     "active": "Aktiv",

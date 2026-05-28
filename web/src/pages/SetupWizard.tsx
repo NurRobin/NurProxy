@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useTranslation, Trans } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Agent, Zone } from '../lib/types';
@@ -17,14 +18,15 @@ interface SetupWizardProps {
 }
 
 const STEPS = [
-  { key: 'provider', label: 'DNS provider' },
-  { key: 'agent', label: 'Connect agent' },
-  { key: 'done', label: 'Done' },
+  { key: 'provider', labelKey: 'setup.stepProvider' },
+  { key: 'agent', labelKey: 'setup.stepAgent' },
+  { key: 'done', labelKey: 'setup.stepDone' },
 ] as const;
 
 const CF_TOKEN_URL = 'https://dash.cloudflare.com/?to=/:account/api-tokens';
 
 export default function SetupWizard({ onComplete }: SetupWizardProps) {
+  const { t } = useTranslation();
   const [currentStep, setCurrentStep] = useState(0);
 
   // Provider step
@@ -91,10 +93,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
         setSelectedZones(new Set(result.zones.map((z) => z.id)));
         setProvStep('zones');
       } else {
-        setProvTestError('Token is valid, but no zones were found. Make sure it has Zone → Read for the domains you want.');
+        setProvTestError(t('setup.noZones'));
       }
     } catch (err) {
-      setProvTestError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : 'Connection failed.');
+      setProvTestError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : t('setup.connFailed'));
     } finally {
       setProvTestLoading(false);
     }
@@ -111,7 +113,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
       setZonesCreated(created.map((z) => z.name));
       setProvStep('saved');
     } catch (err) {
-      setProvError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : 'Failed to save provider.');
+      setProvError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : t('setup.saveFailed'));
     } finally {
       setProvSaveLoading(false);
     }
@@ -139,7 +141,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
       setAdoptingId(null);
       pollAgents();
     } catch (err) {
-      setAdoptError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : 'Failed to adopt agent.');
+      setAdoptError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : t('setup.adoptFailed'));
     } finally {
       setAdoptLoading(false);
     }
@@ -175,10 +177,9 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
       <div className="w-full max-w-lg">
         <div className="mb-8 flex flex-col items-center text-center">
           <BrandMark size={34} />
-          <h1 className="mt-3 font-display text-2xl font-bold tracking-tight text-fg">Set up NurProxy</h1>
+          <h1 className="mt-3 font-display text-2xl font-bold tracking-tight text-fg">{t('setup.title')}</h1>
           <p className="mt-1 text-sm text-fg-muted">
-            Two quick steps. New to this?{' '}
-            <Link to="/help/getting-started" className="font-medium text-accent hover:underline">Read the guide</Link>.
+            <Trans i18nKey="setup.intro" components={[<Link to="/help/getting-started" className="font-medium text-accent hover:underline" />]} />
           </p>
         </div>
 
@@ -199,7 +200,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                   <Check className="h-4 w-4" strokeWidth={3} />
                 ) : (i + 1)}
               </button>
-              <span className={`text-xs font-medium ${i === currentStep ? 'text-fg' : 'text-fg-faint'}`}>{step.label}</span>
+              <span className={`text-xs font-medium ${i === currentStep ? 'text-fg' : 'text-fg-faint'}`}>{t(step.labelKey)}</span>
               {i < STEPS.length - 1 && <span className={`mx-1 h-px w-6 ${i < currentStep ? 'bg-accent' : 'bg-border'}`} />}
             </li>
           ))}
@@ -210,36 +211,36 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
           {currentStep === 0 && (
             <div className="space-y-5">
               <div>
-                <h2 className="text-lg font-semibold text-fg">Connect your DNS provider</h2>
-                <p className="mt-1 text-sm text-fg-muted">Paste an API token and we’ll detect the domains it can manage.</p>
+                <h2 className="text-lg font-semibold text-fg">{t('setup.providerTitle')}</h2>
+                <p className="mt-1 text-sm text-fg-muted">{t('setup.providerSub')}</p>
               </div>
 
               {provError && <Callout tone="danger">{provError}</Callout>}
 
               {provStep === 'token' && (
                 <>
-                  <Field label="Provider">
+                  <Field label={t('setup.provider')}>
                     <div className="flex items-center gap-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-fg">
                       <span className="font-medium">Cloudflare</span>
-                      <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-fg-faint">more coming soon</span>
+                      <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-fg-faint">{t('setup.moreSoon')}</span>
                     </div>
                   </Field>
 
                   <Field
-                    label="API token"
+                    label={t('setup.apiToken')}
                     help="api-token"
-                    hint={<>Needs <strong className="font-semibold">Zone → Read</strong> and <strong className="font-semibold">DNS → Edit</strong>. Stored encrypted at rest.</>}
+                    hint={<Trans i18nKey="setup.tokenHint" components={[<strong className="font-semibold" />, <strong className="font-semibold" />]} />}
                   >
                     <PasswordInput
                       value={provApiToken}
                       onChange={(e) => { setProvApiToken(e.target.value); setProvTestError(''); }}
                       className="font-mono"
-                      placeholder="Paste your Cloudflare API token"
+                      placeholder={t('setup.tokenPlaceholder')}
                       onKeyDown={(e) => { if (e.key === 'Enter' && provApiToken) handleTestToken(); }}
                     />
                   </Field>
 
-                  <Callout tone="info" title="Where do I get this?">
+                  <Callout tone="info" title={t('setup.whereTitle')}>
                     In Cloudflare, open{' '}
                     <a href={CF_TOKEN_URL} target="_blank" rel="noreferrer" className="font-medium underline">My Profile → API Tokens</a>,
                     click <strong>Create Token</strong>, and use the <strong>“Edit zone DNS”</strong> template. You can scope it to
@@ -250,9 +251,9 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                   {provTestError && <Callout tone="danger">{provTestError}</Callout>}
 
                   <div className="flex items-center justify-between pt-1">
-                    <Button variant="ghost" onClick={handleSkipStep}>Skip for now</Button>
+                    <Button variant="ghost" onClick={handleSkipStep}>{t('setup.skipForNow')}</Button>
                     <Button onClick={handleTestToken} loading={provTestLoading} disabled={!provApiToken}>
-                      {provTestLoading ? 'Connecting…' : 'Connect'}
+                      {provTestLoading ? t('common.connecting') : t('common.connect')}
                     </Button>
                   </div>
                 </>
@@ -260,22 +261,22 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
 
               {provStep === 'zones' && (
                 <>
-                  <Callout tone="success">Token valid — {provZones.length} zone{provZones.length !== 1 ? 's' : ''} found.</Callout>
+                  <Callout tone="success">{t('setup.tokenValid', { count: provZones.length })}</Callout>
                   <div>
                     <span className="mb-2 flex items-center gap-1.5 text-sm font-medium text-fg">
-                      Zones to manage <HelpTip term="zone" />
+                      {t('setup.zonesToManage')} <HelpTip term="zone" />
                     </span>
                     <MultiSelect
                       items={provZones.map((z) => ({ id: z.id, label: z.name, meta: `${z.id.slice(0, 8)}…` }))}
                       selected={selectedZones}
                       onChange={setSelectedZones}
                     />
-                    <p className="mt-1.5 text-xs text-fg-faint">You can manage domains under each zone afterwards.</p>
+                    <p className="mt-1.5 text-xs text-fg-faint">{t('setup.manageHint')}</p>
                   </div>
                   <div className="flex items-center justify-between pt-1">
-                    <Button variant="secondary" onClick={() => { setProvStep('token'); setProvZones([]); }}>Back</Button>
+                    <Button variant="secondary" onClick={() => { setProvStep('token'); setProvZones([]); }}>{t('common.back')}</Button>
                     <Button onClick={handleSaveZones} loading={provSaveLoading} disabled={selectedZones.size === 0}>
-                      {provSaveLoading ? 'Adding…' : `Add ${selectedZones.size} zone${selectedZones.size !== 1 ? 's' : ''}`}
+                      {provSaveLoading ? t('setup.adding') : t('setup.addZones', { count: selectedZones.size })}
                     </Button>
                   </div>
                 </>
@@ -283,7 +284,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
 
               {provStep === 'saved' && (
                 <>
-                  <Callout tone="success" title={`${zonesCreated.length} zone${zonesCreated.length !== 1 ? 's' : ''} added`}>
+                  <Callout tone="success" title={t('setup.zonesAdded', { count: zonesCreated.length })}>
                     <div className="mt-1.5 flex flex-wrap gap-1.5">
                       {zonesCreated.map((name) => (
                         <span key={name} className="rounded-md bg-success/15 px-2 py-0.5 text-xs font-medium">{name}</span>
@@ -291,7 +292,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                     </div>
                   </Callout>
                   <div className="flex justify-end">
-                    <Button onClick={() => setCurrentStep(1)}>Continue</Button>
+                    <Button onClick={() => setCurrentStep(1)}>{t('common.continue')}</Button>
                   </div>
                 </>
               )}
@@ -302,52 +303,52 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
           {currentStep === 1 && (
             <div className="space-y-5">
               <div>
-                <h2 className="text-lg font-semibold text-fg">Connect an agent</h2>
-                <p className="mt-1 text-sm text-fg-muted">Run the NurProxy agent on the edge server that will serve your traffic.</p>
+                <h2 className="text-lg font-semibold text-fg">{t('setup.agentTitle')}</h2>
+                <p className="mt-1 text-sm text-fg-muted">{t('setup.agentSub')}</p>
               </div>
 
               <Field
-                label="Orchestrator URL"
+                label={t('setup.orchestratorUrl')}
                 help="orchestrator-url"
-                hint="This is how the agent reaches this dashboard. It must be reachable from the edge server — often a LAN IP, VPN address, or public hostname, not the URL in your browser’s address bar."
+                hint={t('setup.orchestratorHint')}
               >
                 <Input value={orchestratorUrl} onChange={(e) => setOrchestratorUrl(e.target.value)} className="font-mono" placeholder="https://nurproxy.example.com" />
               </Field>
 
               <Field
-                label="Edge server FQDN"
+                label={t('setup.fqdnLabel')}
                 help="fqdn"
-                hint="The public hostname for this edge server. The agent creates an A record for it at your DNS provider pointing to the server’s IP, and every subdomain you add for this agent becomes a CNAME to it. Change it only if you want a different anchor hostname than the server’s own FQDN."
+                hint={t('setup.fqdnHint')}
               >
                 <Input value={agentFqdn} onChange={(e) => setAgentFqdn(e.target.value)} className="font-mono" placeholder="edge1.example.com" />
               </Field>
 
               <div>
-                <p className="mb-2 text-sm font-medium text-fg">Run this on your edge server</p>
+                <p className="mb-2 text-sm font-medium text-fg">{t('setup.runThis')}</p>
                 <div className="relative">
                   <pre className="overflow-x-auto rounded-lg border border-border bg-surface-2 p-4 text-xs leading-relaxed text-fg">{installCommand}</pre>
                   <button onClick={() => copyToClipboard(installCommand)} className="absolute right-2 top-2 rounded-md border border-border bg-surface px-2 py-1 text-xs font-medium text-fg-muted transition-colors hover:text-fg">
-                    {copied ? 'Copied!' : 'Copy'}
+                    {copied ? t('setup.copied') : t('setup.copy')}
                   </button>
                 </div>
               </div>
 
               {agentAdopted ? (
-                <Callout tone="success" title="Agent adopted">It’s connected and ready to serve domains.</Callout>
+                <Callout tone="success" title={t('setup.agentAdopted')}>{t('setup.agentAdoptedBody')}</Callout>
               ) : pendingAgents.length === 0 ? (
                 <div className="rounded-lg border border-border bg-surface-2 px-4 py-6 text-center">
                   {pollingAgents && <div className="mb-3 flex justify-center"><Spinner className="h-7 w-7 text-fg-faint" /></div>}
-                  <p className="text-sm text-fg-muted">Waiting for the agent to connect…</p>
-                  <p className="mt-1 text-xs text-fg-faint">Checking every 3 seconds</p>
+                  <p className="text-sm text-fg-muted">{t('setup.waiting')}</p>
+                  <p className="mt-1 text-xs text-fg-faint">{t('setup.checking')}</p>
                   {waitedLong && (
                     <div className="mt-4 text-left">
-                      <Callout tone="warning" title="Not showing up yet?">
+                      <Callout tone="warning" title={t('setup.notShowing')}>
                         <ul className="mt-1 list-disc space-y-1 pl-4 text-xs">
-                          <li>Make sure <span className="font-mono">{orchestratorUrl || 'the orchestrator URL'}</span> is reachable <em>from the edge server</em> (try <span className="font-mono">curl</span> it there).</li>
-                          <li>Check the server’s firewall isn’t blocking outbound HTTPS.</li>
-                          <li>Look at the agent logs for connection errors.</li>
+                          <li>{t('setup.troubleReach', { url: orchestratorUrl || 'the orchestrator URL' })}</li>
+                          <li>{t('setup.troubleFirewall')}</li>
+                          <li>{t('setup.troubleLogs')}</li>
                         </ul>
-                        <Link to="/help/agent-reachability" className="mt-1.5 inline-block font-medium underline">Troubleshooting guide →</Link>
+                        <Link to="/help/agent-reachability" className="mt-1.5 inline-block font-medium underline">{t('setup.troubleGuide')}</Link>
                       </Callout>
                     </div>
                   )}
@@ -355,7 +356,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               ) : (
                 <div className="space-y-3">
                   <p className="flex items-center gap-1.5 text-sm font-medium text-fg">
-                    {pendingAgents.length} agent{pendingAgents.length !== 1 ? 's' : ''} waiting for approval <HelpTip term="adoption" />
+                    {t('setup.waitingApproval', { count: pendingAgents.length })} <HelpTip term="adoption" />
                   </p>
                   {pendingAgents.map((agent) => (
                     <div key={agent.id} className="rounded-lg border border-border bg-surface-2 p-4">
@@ -369,39 +370,39 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                             {agent.public_ip && `IP ${agent.public_ip}`}{agent.version && ` · v${agent.version}`}
                           </p>
                         </div>
-                        {adoptingId !== agent.id && <Button variant="primary" size="sm" onClick={() => startAdopt(agent)}>Approve</Button>}
+                        {adoptingId !== agent.id && <Button variant="primary" size="sm" onClick={() => startAdopt(agent)}>{t('setup.approve')}</Button>}
                       </div>
 
                       {adoptingId === agent.id && (
                         <div className="mt-4 space-y-3 border-t border-border pt-4">
                           {adoptError && <Callout tone="danger">{adoptError}</Callout>}
-                          <Field label="Display name">
-                            <Input value={adoptName} onChange={(e) => setAdoptName(e.target.value)} placeholder="e.g. Edge — Frankfurt" />
+                          <Field label={t('setup.displayName')}>
+                            <Input value={adoptName} onChange={(e) => setAdoptName(e.target.value)} placeholder={t('setup.displayNamePh')} />
                           </Field>
-                          <Field label="DNS zones" help="zone">
+                          <Field label={t('setup.dnsZones')} help="zone">
                             <MultiSelect
                               items={zones.map((z) => ({ id: z.id, label: z.name }))}
                               selected={adoptZoneIds}
                               onChange={setAdoptZoneIds}
                               maxHeightClass="max-h-36"
-                              emptyHint="No zones yet — add a provider first."
+                              emptyHint={t('setup.noZonesYet')}
                             />
                           </Field>
-                          <Field label="DNS mode" help="dns-mode">
+                          <Field label={t('setup.dnsMode')} help="dns-mode">
                             <div className="flex gap-4">
                               <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
                                 <input type="radio" name="wiz-dns-mode" checked={adoptDnsMode === 'static'} onChange={() => setAdoptDnsMode('static')} className="accent-[var(--accent)]" />
-                                Static
+                                {t('setup.static')}
                               </label>
                               <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
                                 <input type="radio" name="wiz-dns-mode" checked={adoptDnsMode === 'ddns'} onChange={() => setAdoptDnsMode('ddns')} className="accent-[var(--accent)]" />
-                                DDNS
+                                {t('setup.ddns')}
                               </label>
                             </div>
                           </Field>
                           <div className="flex justify-end gap-3">
-                            <Button variant="secondary" size="sm" onClick={() => setAdoptingId(null)}>Cancel</Button>
-                            <Button size="sm" onClick={handleConfirmAdopt} loading={adoptLoading}>Approve agent</Button>
+                            <Button variant="secondary" size="sm" onClick={() => setAdoptingId(null)}>{t('common.cancel')}</Button>
+                            <Button size="sm" onClick={handleConfirmAdopt} loading={adoptLoading}>{t('setup.approveAgent')}</Button>
                           </div>
                         </div>
                       )}
@@ -411,10 +412,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               )}
 
               <div className="flex items-center justify-between pt-1">
-                <Button variant="secondary" onClick={() => setCurrentStep(0)}>Back</Button>
+                <Button variant="secondary" onClick={() => setCurrentStep(0)}>{t('common.back')}</Button>
                 <div className="flex gap-3">
-                  <Button variant="ghost" onClick={handleSkipStep}>Skip</Button>
-                  {agentAdopted && <Button onClick={() => setCurrentStep(2)}>Continue</Button>}
+                  <Button variant="ghost" onClick={handleSkipStep}>{t('common.skip')}</Button>
+                  {agentAdopted && <Button onClick={() => setCurrentStep(2)}>{t('common.continue')}</Button>}
                 </div>
               </div>
             </div>
@@ -426,16 +427,16 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-success-soft text-success-fg">
                 <Check className="h-7 w-7" />
               </div>
-              <h2 className="text-lg font-semibold text-fg">You’re all set</h2>
-              <p className="mt-2 text-sm text-fg-muted">Here’s what’s configured:</p>
+              <h2 className="text-lg font-semibold text-fg">{t('setup.allSet')}</h2>
+              <p className="mt-2 text-sm text-fg-muted">{t('setup.whatConfigured')}</p>
 
               <div className="mt-6 space-y-2 text-left">
-                <SummaryItem label="DNS zones" value={zonesCreated.length > 0 ? zonesCreated.join(', ') : null} />
-                <SummaryItem label="Agent" value={agentAdopted ? 'Connected and adopted' : null} />
+                <SummaryItem label={t('setup.summaryZones')} value={zonesCreated.length > 0 ? zonesCreated.join(', ') : null} />
+                <SummaryItem label={t('setup.summaryAgent')} value={agentAdopted ? t('setup.summaryAgentConnected') : null} />
               </div>
 
-              <p className="mt-6 text-xs text-fg-faint">You can add more providers and agents anytime from Settings and Agents.</p>
-              <Button onClick={handleFinish} loading={completing} className="mt-6 w-full justify-center">Go to dashboard</Button>
+              <p className="mt-6 text-xs text-fg-faint">{t('setup.addLater')}</p>
+              <Button onClick={handleFinish} loading={completing} className="mt-6 w-full justify-center">{t('setup.goDashboard')}</Button>
             </div>
           )}
         </div>
@@ -445,6 +446,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
 }
 
 function SummaryItem({ label, value }: { label: string; value: string | null }) {
+  const { t } = useTranslation();
   return (
     <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-2 px-4 py-3">
       <span className="text-sm font-medium text-fg">{label}</span>
@@ -454,7 +456,7 @@ function SummaryItem({ label, value }: { label: string; value: string | null }) 
           {value}
         </span>
       ) : (
-        <span className="text-sm text-fg-faint">Skipped</span>
+        <span className="text-sm text-fg-faint">{t('setup.summarySkipped')}</span>
       )}
     </div>
   );

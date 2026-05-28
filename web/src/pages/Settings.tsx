@@ -74,11 +74,11 @@ export default function Settings() {
       const rec = s.find((st) => st.key === 'reconciler_interval');
       if (rec) setReconcilerInterval(rec.value);
     } catch (err) {
-      toast.error(errMessage(err, 'Couldn’t load settings.'));
+      toast.error(errMessage(err, t('settings.loadFailed')));
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, t]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -98,10 +98,10 @@ export default function Settings() {
         setSelectedZones(new Set(result.zones.map((z) => z.id)));
         setProvModalStep('zones');
       } else {
-        setProvTestError('Token is valid, but no zones were found. Check Zone → Read permission.');
+        setProvTestError(t('settings.tokenNoZones'));
       }
     } catch (err) {
-      setProvTestError(errMessage(err, 'Connection failed.'));
+      setProvTestError(errMessage(err, t('setup.connFailed')));
     } finally {
       setProvTestLoading(false);
     }
@@ -114,12 +114,12 @@ export default function Settings() {
       const provider = await api.createProvider({ type: provType, name: provType, config: { api_token: provApiToken } });
       const zonesToCreate = provZones.filter((z) => selectedZones.has(z.id)).map((z) => ({ external_id: z.id, name: z.name }));
       await api.createZonesBatch({ provider_id: provider.id, zones: zonesToCreate });
-      toast.success(`${zonesToCreate.length} zone${zonesToCreate.length !== 1 ? 's' : ''} added.`);
+      toast.success(t('setup.zonesAdded', { count: zonesToCreate.length }));
       setShowAddProvider(false);
       resetProviderModal();
       fetchData();
     } catch (err) {
-      setProvTestError(errMessage(err, 'Failed to save provider.'));
+      setProvTestError(errMessage(err, t('setup.saveFailed')));
     } finally {
       setProvSaveLoading(false);
     }
@@ -127,33 +127,33 @@ export default function Settings() {
 
   async function handleDeleteProvider() {
     if (!deleteProviderId) return;
-    try { await api.deleteProvider(deleteProviderId); toast.success('Provider deleted.'); setDeleteProviderId(null); fetchData(); }
-    catch (err) { toast.error(errMessage(err, 'Failed to delete provider.')); }
+    try { await api.deleteProvider(deleteProviderId); toast.success(t('settings.providerDeleted')); setDeleteProviderId(null); fetchData(); }
+    catch (err) { toast.error(errMessage(err, t('settings.providerDeleteFailed'))); }
   }
   async function handleDeleteZone() {
     if (!deleteZoneId) return;
-    try { await api.deleteZone(deleteZoneId); toast.success('Zone removed.'); setDeleteZoneId(null); fetchData(); }
-    catch (err) { toast.error(errMessage(err, 'Failed to remove zone.')); }
+    try { await api.deleteZone(deleteZoneId); toast.success(t('settings.zoneRemoved')); setDeleteZoneId(null); fetchData(); }
+    catch (err) { toast.error(errMessage(err, t('settings.zoneRemoveFailed'))); }
   }
 
   async function handleSaveReconciler() {
     setReconcilerSaving(true);
-    try { await api.updateSetting('reconciler_interval', reconcilerInterval); toast.success('Reconciler interval saved.'); }
-    catch (err) { toast.error(errMessage(err, 'Failed to save.')); }
+    try { await api.updateSetting('reconciler_interval', reconcilerInterval); toast.success(t('settings.intervalSaved')); }
+    catch (err) { toast.error(errMessage(err, t('settings.saveFailedGeneric'))); }
     finally { setReconcilerSaving(false); }
   }
 
   async function handleChangePassword() {
     setPasswordError('');
-    if (newPassword.length < 8) { setPasswordError('New password must be at least 8 characters.'); return; }
-    if (newPassword !== confirmPassword) { setPasswordError('Passwords do not match.'); return; }
+    if (newPassword.length < 8) { setPasswordError(t('settings.pwTooShort')); return; }
+    if (newPassword !== confirmPassword) { setPasswordError(t('settings.pwMismatch')); return; }
     setPasswordLoading(true);
     try {
       await api.changePassword(currentPassword, newPassword);
-      toast.success('Password updated.');
+      toast.success(t('settings.pwUpdated'));
       setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
     } catch (err) {
-      setPasswordError(errMessage(err, 'Failed to change password.'));
+      setPasswordError(errMessage(err, t('settings.pwFailed')));
     } finally {
       setPasswordLoading(false);
     }
@@ -166,16 +166,16 @@ export default function Settings() {
       setApiKeyPlaintext(res.api_key);
       setApiKeyInfo(await api.getAPIKey());
     } catch (err) {
-      toast.error(errMessage(err, 'Failed to generate API key.'));
+      toast.error(errMessage(err, t('settings.keyGenFailed')));
     }
   }
   async function handleRevokeAPIKey() {
     setApiKeyPlaintext('');
-    try { await api.revokeAPIKey(); toast.success('API key revoked.'); setApiKeyInfo({ exists: false }); }
-    catch (err) { toast.error(errMessage(err, 'Failed to revoke API key.')); }
+    try { await api.revokeAPIKey(); toast.success(t('settings.keyRevoked')); setApiKeyInfo({ exists: false }); }
+    catch (err) { toast.error(errMessage(err, t('settings.keyRevokeFailed'))); }
   }
 
-  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading settings…</div>;
+  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
 
   return (
     <div className="space-y-6">
@@ -225,14 +225,14 @@ export default function Settings() {
                       <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-fg-faint">{p.type}</span>
                       {p.is_default && <span className="rounded bg-accent-soft px-1.5 py-0.5 text-xs text-accent">default</span>}
                     </div>
-                    <button onClick={() => setDeleteProviderId(p.id)} className="text-xs font-medium text-danger-fg hover:underline">Delete</button>
+                    <button onClick={() => setDeleteProviderId(p.id)} className="text-xs font-medium text-danger-fg hover:underline">{t('common.delete')}</button>
                   </div>
                   {providerZones.length > 0 ? (
                     <div className="mt-2 space-y-1">
                       {providerZones.map((z) => (
                         <div key={z.id} className="flex items-center justify-between rounded-md bg-surface px-3 py-1.5">
                           <span className="text-sm text-fg-muted">{z.name}</span>
-                          <button onClick={() => setDeleteZoneId(z.id)} className="text-xs font-medium text-danger-fg hover:underline">Remove</button>
+                          <button onClick={() => setDeleteZoneId(z.id)} className="text-xs font-medium text-danger-fg hover:underline">{t('common.remove')}</button>
                         </div>
                       ))}
                     </div>
@@ -294,36 +294,35 @@ export default function Settings() {
       </Section>
 
       {/* Add provider modal */}
-      <Modal open={showAddProvider} onClose={() => setShowAddProvider(false)} title="Add DNS provider" wide>
+      <Modal open={showAddProvider} onClose={() => setShowAddProvider(false)} title={t('settings.addProviderTitle')} wide>
         <div className="space-y-4">
           {provModalStep === 'token' && (
             <>
-              <Field label="Provider">
+              <Field label={t('setup.provider')}>
                 <div className="flex items-center gap-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-fg">
                   <span className="font-medium">Cloudflare</span>
-                  <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-fg-faint">more coming soon</span>
+                  <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-fg-faint">{t('setup.moreSoon')}</span>
                 </div>
               </Field>
-              <Field label="API token" help="api-token" hint={<>Needs <strong>Zone → Read</strong> and <strong>DNS → Edit</strong>. Stored encrypted at rest.</>}>
-                <PasswordInput value={provApiToken} onChange={(e) => { setProvApiToken(e.target.value); setProvTestError(''); }} onKeyDown={(e) => { if (e.key === 'Enter' && provApiToken) handleTestToken(); }} className="font-mono" placeholder="Paste your API token" />
+              <Field label={t('setup.apiToken')} help="api-token" hint={<Trans i18nKey="settings.tokenHint" components={[<strong />, <strong />]} />}>
+                <PasswordInput value={provApiToken} onChange={(e) => { setProvApiToken(e.target.value); setProvTestError(''); }} onKeyDown={(e) => { if (e.key === 'Enter' && provApiToken) handleTestToken(); }} className="font-mono" placeholder={t('settings.tokenPlaceholder')} />
               </Field>
               <Callout tone="info">
-                Create a token in <a href={CF_TOKEN_URL} target="_blank" rel="noreferrer" className="font-medium underline">Cloudflare → API Tokens</a> using the “Edit zone DNS” template.{' '}
-                <Link to="/help/cloudflare-token" className="font-medium underline">Walkthrough →</Link>
+                <Trans i18nKey="settings.providerCallout" components={[<a href={CF_TOKEN_URL} target="_blank" rel="noreferrer" className="font-medium underline" />, <Link to="/help/cloudflare-token" className="font-medium underline" />]} />
               </Callout>
               {provTestError && <Callout tone="danger">{provTestError}</Callout>}
               <div className="flex justify-between pt-1">
-                <Button variant="secondary" onClick={() => setShowAddProvider(false)}>Cancel</Button>
-                <Button onClick={handleTestToken} loading={provTestLoading} disabled={!provApiToken}>Connect</Button>
+                <Button variant="secondary" onClick={() => setShowAddProvider(false)}>{t('common.cancel')}</Button>
+                <Button onClick={handleTestToken} loading={provTestLoading} disabled={!provApiToken}>{t('common.connect')}</Button>
               </div>
             </>
           )}
           {provModalStep === 'zones' && (
             <>
-              <Callout tone="success">Token valid — {provZones.length} zone{provZones.length !== 1 ? 's' : ''} found.</Callout>
+              <Callout tone="success">{t('setup.tokenValid', { count: provZones.length })}</Callout>
               {provTestError && <Callout tone="danger">{provTestError}</Callout>}
               <div>
-                <span className="mb-2 block text-sm font-medium text-fg">Zones to add</span>
+                <span className="mb-2 block text-sm font-medium text-fg">{t('settings.zonesToAdd')}</span>
                 <MultiSelect
                   items={provZones.map((z) => ({ id: z.id, label: z.name, meta: `${z.id.slice(0, 8)}…` }))}
                   selected={selectedZones}
@@ -331,16 +330,16 @@ export default function Settings() {
                 />
               </div>
               <div className="flex justify-between pt-1">
-                <Button variant="secondary" onClick={() => { setProvModalStep('token'); setProvZones([]); }}>Back</Button>
-                <Button onClick={handleSaveZones} loading={provSaveLoading} disabled={selectedZones.size === 0}>Add {selectedZones.size} zone{selectedZones.size !== 1 ? 's' : ''}</Button>
+                <Button variant="secondary" onClick={() => { setProvModalStep('token'); setProvZones([]); }}>{t('common.back')}</Button>
+                <Button onClick={handleSaveZones} loading={provSaveLoading} disabled={selectedZones.size === 0}>{t('setup.addZones', { count: selectedZones.size })}</Button>
               </div>
             </>
           )}
         </div>
       </Modal>
 
-      <ConfirmDialog open={deleteProviderId !== null} onClose={() => setDeleteProviderId(null)} onConfirm={handleDeleteProvider} title="Delete provider" message="Delete this provider? All zones and domains using it will lose DNS management." confirmLabel="Delete" danger confirmText={providers.find((p) => p.id === deleteProviderId)?.name} />
-      <ConfirmDialog open={deleteZoneId !== null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title="Remove zone" message="Remove this zone? Domains using it will lose DNS management." confirmLabel="Remove" danger />
+      <ConfirmDialog open={deleteProviderId !== null} onClose={() => setDeleteProviderId(null)} onConfirm={handleDeleteProvider} title={t('settings.deleteProviderTitle')} message={t('settings.deleteProviderMsg')} confirmLabel={t('common.delete')} danger confirmText={providers.find((p) => p.id === deleteProviderId)?.name} />
+      <ConfirmDialog open={deleteZoneId !== null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title={t('settings.removeZoneTitle')} message={t('settings.removeZoneMsg')} confirmLabel={t('common.remove')} danger />
     </div>
   );
 }

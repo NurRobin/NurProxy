@@ -212,6 +212,8 @@
     "subtitle": "Subdomains proxied to your servers.",
     "newDomain": "New domain",
     "allAgents": "All agents",
+    "filterAll": "All",
+    "manageDomains": "Manage domains",
     "selected": "{{count}} selected",
     "deleteSelected": "Delete selected",
     "noneYet": "No domains yet",
@@ -358,6 +360,7 @@
     "internetAria": "Public internet, entry point",
     "summaryAria": "Topology: {{agents}} agents, {{servers}} servers, {{domains}} domains.",
     "loading": "Loading topology…",
+    "loadFailed": "Couldn’t load topology.",
     "inspect": "Inspect",
     "openInAgents": "Open in Agents",
     "addServer": "Add server",
@@ -417,6 +420,15 @@
     "none": "No recent activity.",
     "aria": "Notifications",
     "ariaUnseen": "Notifications ({{count}} unseen)"
+  },
+  "multiSelect": {
+    "selectedOf": "{{selected}} of {{total}} selected",
+    "selectAll": "Select all",
+    "deselectAll": "Deselect all",
+    "matching": " matching",
+    "search": "Search {{count}} items…",
+    "noMatches": "No matches.",
+    "empty": "Nothing to show."
   },
   "status": {
     "active": "Active",

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
 import type { Agent, Server, Domain } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
@@ -13,6 +14,7 @@ import { Field, Input, Select } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
 
 export default function Servers() {
+  const { t } = useTranslation();
   const toast = useToast();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [serversByAgent, setServersByAgent] = useState<Record<string, Server[]>>({});
@@ -44,11 +46,11 @@ export default function Servers() {
       }));
       setServersByAgent(Object.fromEntries(entries));
     } catch (err) {
-      toast.error(errMessage(err, 'Couldn’t load servers.'));
+      toast.error(errMessage(err, t('servers.loadFailed')));
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, t]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -63,11 +65,11 @@ export default function Servers() {
     setSaving(true); setError('');
     try {
       await api.createServer(formAgent, { name, address, notes: notes || undefined });
-      toast.success('Server added.');
+      toast.success(t('servers.added'));
       setShowAdd(false);
       fetchData();
     } catch (err) {
-      setError(errMessage(err, 'Failed to add server.'));
+      setError(errMessage(err, t('servers.addFailed')));
     } finally {
       setSaving(false);
     }
@@ -76,39 +78,39 @@ export default function Servers() {
   async function handleDelete() {
     if (!deleteId) return;
     setDeleting(true);
-    try { await api.deleteServer(deleteId); toast.success('Server removed.'); setDeleteId(null); fetchData(); }
-    catch (err) { toast.error(errMessage(err, 'Failed to remove server.')); }
+    try { await api.deleteServer(deleteId); toast.success(t('servers.removed')); setDeleteId(null); fetchData(); }
+    catch (err) { toast.error(errMessage(err, t('servers.removeFailed'))); }
     finally { setDeleting(false); }
   }
 
   const domainsForServer = (sid: string) => domains.filter((d) => d.server_id === sid && d.status !== 'deleting').length;
   const totalServers = Object.values(serversByAgent).reduce((n, s) => n + s.length, 0);
 
-  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading servers…</div>;
+  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
 
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="flex items-center gap-2 font-display text-3xl font-bold tracking-tight text-fg">
-            Servers <HelpTip term="server" />
+            {t('servers.title')} <HelpTip term="server" />
           </h1>
-          <p className="mt-1 text-sm text-fg-muted">Backend addresses your agents proxy to. Each belongs to one agent.</p>
+          <p className="mt-1 text-sm text-fg-muted">{t('servers.subtitle')}</p>
         </div>
-        <Button onClick={() => openAdd()} disabled={eligible.length === 0}>Add server</Button>
+        <Button onClick={() => openAdd()} disabled={eligible.length === 0}>{t('servers.addServer')}</Button>
       </div>
 
       {eligible.length === 0 ? (
         <EmptyState
-          title="Approve an agent first"
-          description="Servers live behind an agent. Connect and approve an agent, then register the servers it proxies to."
-          action={<Link to="/agents" className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:bg-accent-hover">Go to Agents</Link>}
+          title={t('servers.approveFirst')}
+          description={t('servers.approveFirstBody')}
+          action={<Link to="/agents" className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:bg-accent-hover">{t('servers.goToAgents')}</Link>}
         />
       ) : totalServers === 0 ? (
         <EmptyState
-          title="No servers yet"
-          description="Register the first backend an agent should forward traffic to — e.g. a web app on your LAN."
-          action={<Button onClick={() => openAdd()}>Add server</Button>}
+          title={t('servers.noneYet')}
+          description={t('servers.noneYetBody')}
+          action={<Button onClick={() => openAdd()}>{t('servers.addServer')}</Button>}
         />
       ) : (
         <div className="space-y-5">
@@ -120,12 +122,12 @@ export default function Servers() {
                   <div className="flex items-center gap-2">
                     <span className="font-medium text-fg">{agent.name}</span>
                     <StatusBadge status={agent.status} />
-                    <span className="text-xs text-fg-faint">{servers.length} server{servers.length !== 1 ? 's' : ''}</span>
+                    <span className="text-xs text-fg-faint">{t('counts.servers', { count: servers.length })}</span>
                   </div>
-                  <button onClick={() => openAdd(agent.id)} className="text-sm font-medium text-accent hover:underline">+ Add server</button>
+                  <button onClick={() => openAdd(agent.id)} className="text-sm font-medium text-accent hover:underline">{t('servers.addServer')}</button>
                 </div>
                 {servers.length === 0 ? (
-                  <p className="px-5 py-4 text-sm text-fg-faint">No servers on this agent yet.</p>
+                  <p className="px-5 py-4 text-sm text-fg-faint">{t('servers.onAgentNone')}</p>
                 ) : (
                   <ul className="divide-y divide-border">
                     {servers.map((s) => {
@@ -137,8 +139,8 @@ export default function Servers() {
                             <p className="truncate font-mono text-xs text-fg-faint">{s.address}{s.notes && <span className="font-sans"> · {s.notes}</span>}</p>
                           </div>
                           <div className="flex flex-shrink-0 items-center gap-4">
-                            <span className="text-xs text-fg-faint">{used} domain{used !== 1 ? 's' : ''}</span>
-                            <button onClick={() => setDeleteId(s.id)} className="text-xs font-medium text-danger-fg hover:underline">Remove</button>
+                            <span className="text-xs text-fg-faint">{t('servers.usedBy', { count: used })}</span>
+                            <button onClick={() => setDeleteId(s.id)} className="text-xs font-medium text-danger-fg hover:underline">{t('common.remove')}</button>
                           </div>
                         </li>
                       );
@@ -151,25 +153,25 @@ export default function Servers() {
         </div>
       )}
 
-      <Modal open={showAdd} onClose={() => setShowAdd(false)} title="Add server" description="A backend address one of your agents forwards traffic to.">
+      <Modal open={showAdd} onClose={() => setShowAdd(false)} title={t('servers.addServer')} description={t('servers.addModalSub')}>
         <div className="space-y-4">
           {error && <Callout tone="danger">{error}</Callout>}
-          <Field label="Agent" hint="The agent that will reach this server.">
+          <Field label={t('servers.agent')} hint={t('servers.agentHint')}>
             <Select value={formAgent} onChange={(e) => setFormAgent(e.target.value)}>
               {eligible.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
             </Select>
           </Field>
-          <Field label="Name"><Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Web app" /></Field>
+          <Field label={t('common.name')}><Input value={name} onChange={(e) => setName(e.target.value)} placeholder={t('servers.namePh')} /></Field>
           <Field
-            label="Address"
-            hint="An IP or hostname reachable from this agent — i.e. how the agent reaches the server (LAN IP, container name, VPN address)."
+            label={t('common.address')}
+            hint={t('servers.addressHint')}
           >
-            <Input value={address} onChange={(e) => setAddress(e.target.value)} className="font-mono" placeholder="10.0.0.4  ·  app.internal" />
+            <Input value={address} onChange={(e) => setAddress(e.target.value)} className="font-mono" placeholder={t('servers.addressPh')} />
           </Field>
-          <Field label="Notes" hint="Optional."><Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Description" /></Field>
+          <Field label={t('common.notesOptional')} hint={t('common.optional')}><Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('servers.notesPh')} /></Field>
           <div className="flex justify-end gap-3 pt-1">
-            <Button variant="secondary" onClick={() => setShowAdd(false)}>Cancel</Button>
-            <Button onClick={handleCreate} loading={saving} disabled={!formAgent || !name || !address}>Add server</Button>
+            <Button variant="secondary" onClick={() => setShowAdd(false)}>{t('common.cancel')}</Button>
+            <Button onClick={handleCreate} loading={saving} disabled={!formAgent || !name || !address}>{t('servers.addServer')}</Button>
           </div>
         </div>
       </Modal>
@@ -178,9 +180,9 @@ export default function Servers() {
         open={deleteId !== null}
         onClose={() => setDeleteId(null)}
         onConfirm={handleDelete}
-        title="Remove server"
-        message="Remove this server? Domains pointing at it will be affected until you repoint them."
-        confirmLabel="Remove"
+        title={t('common.remove')}
+        message={t('servers.removeConfirm')}
+        confirmLabel={t('common.remove')}
         danger
         loading={deleting}
       />

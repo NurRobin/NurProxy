@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
 import type { Domain, Agent, Server, Zone } from '../lib/types';
@@ -26,6 +27,7 @@ type EditTab = 'general' | 'headers' | 'advanced';
 const STATUS_FILTERS = ['all', 'active', 'pending', 'error', 'deleting'];
 
 export default function Domains() {
+  const { t } = useTranslation();
   const toast = useToast();
   const [domains, setDomains] = useState<Domain[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -77,11 +79,11 @@ export default function Domains() {
       );
       setAllServers(serverResults.flat());
     } catch (err) {
-      toast.error(errMessage(err, 'Couldn’t load domains.'));
+      toast.error(errMessage(err, t('domains.loadFailed')));
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, t]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -98,7 +100,7 @@ export default function Domains() {
   });
 
   async function handleCreate() {
-    if (!createZone) { setCreateError('Please select a DNS zone.'); return; }
+    if (!createZone) { setCreateError(t('domains.selectDnsZone')); return; }
     setCreateLoading(true);
     setCreateError('');
     try {
@@ -106,13 +108,13 @@ export default function Domains() {
         subdomain: createSub, zone_id: createZone, server_id: createServer,
         port: parseInt(createPort, 10), websocket: createWebsocket, force_https: createForceHttps,
       });
-      toast.success(`${createSub}.${getZoneName(createZone)} created.`);
+      toast.success(t('domains.created', { fqdn: `${createSub}.${getZoneName(createZone)}` }));
       setShowCreate(false);
       setCreateSub(''); setCreateZone(''); setCreateServer(''); setCreatePort('80');
       setCreateWebsocket(false); setCreateForceHttps(true);
       fetchData();
     } catch (err) {
-      setCreateError(errMessage(err, 'Failed to create domain.'));
+      setCreateError(errMessage(err, t('domains.createFailed')));
     } finally {
       setCreateLoading(false);
     }
@@ -145,11 +147,11 @@ export default function Domains() {
           custom_request_headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
         },
       });
-      toast.success('Domain updated.');
+      toast.success(t('domains.updated'));
       setDetailDomain(null);
       fetchData();
     } catch (err) {
-      toast.error(errMessage(err, 'Failed to save domain.'));
+      toast.error(errMessage(err, t('domains.saveFailed')));
     } finally {
       setEditLoading(false);
     }
@@ -163,7 +165,7 @@ export default function Domains() {
       const cfg = await api.getDomainConfig(detailDomain.id);
       setEditRawConfig(JSON.stringify(cfg.config, null, 2));
     } catch (err) {
-      setAdvancedError(errMessage(err, 'Failed to load config.'));
+      setAdvancedError(errMessage(err, t('domains.loadConfigFailed')));
     }
   }
 
@@ -173,18 +175,18 @@ export default function Domains() {
     try {
       parsed = JSON.parse(editRawConfig);
     } catch (e) {
-      setAdvancedError(`Invalid JSON: ${e instanceof Error ? e.message : 'could not parse'}`);
+      setAdvancedError(t('domains.invalidJson', { msg: e instanceof Error ? e.message : 'could not parse' }));
       return;
     }
     setAdvancedError('');
     setEditLoading(true);
     try {
       await api.updateDomainConfig(detailDomain.id, parsed);
-      toast.success('Manual config saved.');
+      toast.success(t('domains.manualSaved'));
       setDetailDomain(null);
       fetchData();
     } catch (err) {
-      setAdvancedError(errMessage(err, 'Failed to save config.'));
+      setAdvancedError(errMessage(err, t('domains.saveConfigFailed')));
     } finally {
       setEditLoading(false);
     }
@@ -195,11 +197,11 @@ export default function Domains() {
     setEditLoading(true);
     try {
       await api.resetDomainConfig(detailDomain.id);
-      toast.success('Config reset to automatic.');
+      toast.success(t('domains.configReset'));
       setDetailDomain(null);
       fetchData();
     } catch (err) {
-      setAdvancedError(errMessage(err, 'Failed to reset config.'));
+      setAdvancedError(errMessage(err, t('domains.resetFailed')));
     } finally {
       setEditLoading(false);
     }
@@ -210,10 +212,10 @@ export default function Domains() {
     setSelected((prev) => { const n = new Set(prev); n.delete(d.id); return n; });
     if (detailDomain?.id === d.id) setDetailDomain(null);
     undoableDelete({
-      message: `Deleted ${d.subdomain}.${getZoneName(d.zone_id)}`,
+      message: t('domains.deleted', { fqdn: `${d.subdomain}.${getZoneName(d.zone_id)}` }),
       doDelete: async () => { await api.deleteDomain(d.id); },
       onUndo: () => setDomains((prev) => (prev.some((x) => x.id === d.id) ? prev : [...prev, d])),
-      failMessage: 'Failed to delete domain.',
+      failMessage: t('domains.deleteFailed'),
     });
   }
 
@@ -230,20 +232,20 @@ export default function Domains() {
     for (const id of ids) {
       try { await api.deleteDomain(id); ok++; } catch { fail++; }
     }
-    if (fail === 0) toast.success(`Deleted ${ok} domain${ok !== 1 ? 's' : ''}.`);
-    else { toast.error(`Deleted ${ok}, ${fail} failed.`); fetchData(); }
+    if (fail === 0) toast.success(t('domains.bulkDone', { count: ok }));
+    else { toast.error(t('domains.bulkPartial', { ok, fail })); fetchData(); }
   }
 
-  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading domains…</div>;
+  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
 
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Domains</h1>
-          <p className="mt-1 text-sm text-fg-muted">Subdomains proxied to your servers.</p>
+          <h1 className="font-display text-3xl font-bold tracking-tight text-fg">{t('domains.title')}</h1>
+          <p className="mt-1 text-sm text-fg-muted">{t('domains.subtitle')}</p>
         </div>
-        <Button onClick={() => { setShowCreate(true); setCreateError(''); }}>New domain</Button>
+        <Button onClick={() => { setShowCreate(true); setCreateError(''); }}>{t('domains.newDomain')}</Button>
       </div>
 
       {/* Filters */}
@@ -254,19 +256,19 @@ export default function Domains() {
               className={`rounded-full px-3 py-1 text-xs font-medium capitalize transition-colors ${
                 statusFilter === s ? 'bg-accent text-accent-fg' : 'bg-surface-2 text-fg-muted hover:bg-surface-3 hover:text-fg'
               }`}>
-              {s}
+              {s === 'all' ? t('domains.filterAll') : t('status.' + s)}
             </button>
           ))}
         </div>
         <Select value={agentFilter} onChange={(e) => setAgentFilter(e.target.value)} className="w-auto py-1.5 text-xs">
-          <option value="all">All agents</option>
+          <option value="all">{t('domains.allAgents')}</option>
           {agents.filter((a) => a.status !== 'pending').map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
         </Select>
         {selected.size > 0 && (
           <div className="ml-auto flex items-center gap-3">
-            <span className="text-xs text-fg-muted">{selected.size} selected</span>
-            <Button variant="danger" size="sm" onClick={() => setBulkConfirm(true)}>Delete selected</Button>
-            <button onClick={() => setSelected(new Set())} className="text-xs text-fg-faint hover:text-fg">Clear</button>
+            <span className="text-xs text-fg-muted">{t('domains.selected', { count: selected.size })}</span>
+            <Button variant="danger" size="sm" onClick={() => setBulkConfirm(true)}>{t('domains.deleteSelected')}</Button>
+            <button onClick={() => setSelected(new Set())} className="text-xs text-fg-faint hover:text-fg">{t('common.clear')}</button>
           </div>
         )}
       </div>
@@ -274,9 +276,9 @@ export default function Domains() {
       {/* Table */}
       {filtered.length === 0 ? (
         <EmptyState
-          title={domains.length === 0 ? 'No domains yet' : 'No matches'}
-          description={domains.length === 0 ? 'Create your first domain to start proxying traffic to a server.' : 'No domains match the current filters.'}
-          action={domains.length === 0 ? <Button onClick={() => setShowCreate(true)}>Create domain</Button> : undefined}
+          title={domains.length === 0 ? t('domains.noneYet') : t('domains.noMatches')}
+          description={domains.length === 0 ? t('domains.noneYetBody') : t('domains.noMatchesBody')}
+          action={domains.length === 0 ? <Button onClick={() => setShowCreate(true)}>{t('domains.createDomain')}</Button> : undefined}
         />
       ) : (
         <div className="overflow-x-auto rounded-xl border border-border bg-surface shadow-card">
@@ -292,12 +294,12 @@ export default function Domains() {
                     onChange={(e) => setSelected(e.target.checked ? new Set(filtered.map((d) => d.id)) : new Set())}
                   />
                 </th>
-                <th className="px-4 py-3 font-semibold">Domain</th>
-                <th className="px-4 py-3 font-semibold">Target</th>
-                <th className="px-4 py-3 font-semibold">Agent</th>
-                <th className="px-4 py-3 font-semibold">Status</th>
-                <th className="px-4 py-3 font-semibold">Synced</th>
-                <th className="px-4 py-3 font-semibold text-right">Actions</th>
+                <th className="px-4 py-3 font-semibold">{t('domains.colDomain')}</th>
+                <th className="px-4 py-3 font-semibold">{t('domains.colTarget')}</th>
+                <th className="px-4 py-3 font-semibold">{t('domains.colAgent')}</th>
+                <th className="px-4 py-3 font-semibold">{t('domains.colStatus')}</th>
+                <th className="px-4 py-3 font-semibold">{t('domains.colSynced')}</th>
+                <th className="px-4 py-3 font-semibold text-right">{t('domains.colActions')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -322,8 +324,8 @@ export default function Domains() {
                     <td className="px-4 py-3 text-xs text-fg-faint">{seen(d.last_synced)}</td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-3">
-                        <button onClick={() => openDetail(d)} className="text-xs font-medium text-accent hover:underline">Edit</button>
-                        <button onClick={() => removeDomain(d)} className="text-xs font-medium text-danger-fg hover:underline">Delete</button>
+                        <button onClick={() => openDetail(d)} className="text-xs font-medium text-accent hover:underline">{t('domains.edit')}</button>
+                        <button onClick={() => removeDomain(d)} className="text-xs font-medium text-danger-fg hover:underline">{t('common.delete')}</button>
                       </div>
                     </td>
                   </tr>
@@ -335,21 +337,21 @@ export default function Domains() {
       )}
 
       {/* Create modal */}
-      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Create domain">
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title={t('domains.createTitle')}>
         <div className="space-y-4">
           {createError && <Callout tone="danger">{createError}</Callout>}
-          <Field label="Subdomain" hint={createSub && createZone ? `FQDN: ${createSub}.${getZoneName(createZone)}` : undefined}>
-            <Input value={createSub} onChange={(e) => setCreateSub(e.target.value)} placeholder="app, blog, api…" />
+          <Field label={t('domains.subdomain')} hint={createSub && createZone ? t('domains.fqdnPreview', { fqdn: `${createSub}.${getZoneName(createZone)}` }) : undefined}>
+            <Input value={createSub} onChange={(e) => setCreateSub(e.target.value)} placeholder={t('domains.subdomainPh')} />
           </Field>
-          <Field label="Zone" help="zone">
+          <Field label={t('domains.zone')} help="zone">
             <Select value={createZone} onChange={(e) => setCreateZone(e.target.value)}>
-              <option value="">Select a zone</option>
+              <option value="">{t('domains.selectZone')}</option>
               {zones.map((z) => <option key={z.id} value={z.id}>{z.name}</option>)}
             </Select>
           </Field>
-          <Field label="Server" help="server">
+          <Field label={t('domains.server')} help="server">
             <Select value={createServer} onChange={(e) => setCreateServer(e.target.value)}>
-              <option value="">Select a server</option>
+              <option value="">{t('domains.selectServer')}</option>
               {agents.filter((a) => a.status !== 'pending').map((a) => {
                 const agentSrvs = allServers.filter((s) => s.agent_id === a.id);
                 if (agentSrvs.length === 0) return null;
@@ -357,40 +359,40 @@ export default function Domains() {
               })}
             </Select>
           </Field>
-          <Field label="Port">
+          <Field label={t('domains.port')}>
             <Input type="number" value={createPort} onChange={(e) => setCreatePort(e.target.value)} min={1} max={65535} />
           </Field>
           <div className="flex flex-wrap gap-6">
-            <span className="flex items-center gap-1.5"><Checkbox label="WebSocket" checked={createWebsocket} onChange={(e) => setCreateWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
-            <span className="flex items-center gap-1.5"><Checkbox label="Force HTTPS" checked={createForceHttps} onChange={(e) => setCreateForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
+            <span className="flex items-center gap-1.5"><Checkbox label={t('domains.websocket')} checked={createWebsocket} onChange={(e) => setCreateWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
+            <span className="flex items-center gap-1.5"><Checkbox label={t('domains.forceHttps')} checked={createForceHttps} onChange={(e) => setCreateForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
           </div>
           <div className="flex justify-end gap-3 pt-1">
-            <Button variant="secondary" onClick={() => setShowCreate(false)}>Cancel</Button>
-            <Button onClick={handleCreate} loading={createLoading} disabled={!createSub || !createZone || !createServer}>Create</Button>
+            <Button variant="secondary" onClick={() => setShowCreate(false)}>{t('common.cancel')}</Button>
+            <Button onClick={handleCreate} loading={createLoading} disabled={!createSub || !createZone || !createServer}>{t('domains.create')}</Button>
           </div>
         </div>
       </Modal>
 
       {/* Detail / edit modal — tabbed */}
-      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title="Domain settings" description={detailDomain ? `${detailDomain.subdomain}.${getZoneName(detailDomain.zone_id)}` : undefined} wide>
+      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title={t('domains.settingsTitle')} description={detailDomain ? `${detailDomain.subdomain}.${getZoneName(detailDomain.zone_id)}` : undefined} wide>
         {detailDomain && (
           <div className="space-y-5">
             <div className="flex flex-wrap items-center gap-3">
               <StatusBadge status={detailDomain.status} />
-              <span className="text-xs text-fg-faint">Last synced {seen(detailDomain.last_synced)}</span>
-              {detailDomain.dns_record_id && <span className="truncate font-mono text-xs text-fg-faint">DNS {detailDomain.dns_record_id}</span>}
+              <span className="text-xs text-fg-faint">{t('domains.lastSynced', { time: seen(detailDomain.last_synced) })}</span>
+              {detailDomain.dns_record_id && <span className="truncate font-mono text-xs text-fg-faint">{t('domains.dns', { id: detailDomain.dns_record_id })}</span>}
             </div>
 
             {detailDomain.error_msg && <Callout tone="danger">{detailDomain.error_msg}</Callout>}
 
             {/* Tabs */}
             <div className="flex gap-1 border-b border-border">
-              {(['general', 'headers', 'advanced'] as EditTab[]).map((t) => (
-                <button key={t} onClick={() => (t === 'advanced' ? openAdvanced() : setEditTab(t))}
+              {(['general', 'headers', 'advanced'] as EditTab[]).map((tab) => (
+                <button key={tab} onClick={() => (tab === 'advanced' ? openAdvanced() : setEditTab(tab))}
                   className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium capitalize transition-colors ${
-                    editTab === t ? 'border-accent text-accent' : 'border-transparent text-fg-muted hover:text-fg'
+                    editTab === tab ? 'border-accent text-accent' : 'border-transparent text-fg-muted hover:text-fg'
                   }`}>
-                  {t === 'advanced' ? 'Advanced' : t}
+                  {tab === 'general' ? t('domains.tabGeneral') : tab === 'headers' ? t('domains.tabHeaders') : t('domains.tabAdvanced')}
                 </button>
               ))}
             </div>
@@ -398,15 +400,15 @@ export default function Domains() {
             {editTab === 'general' && (
               <div className="space-y-4">
                 <div className="flex flex-wrap gap-6">
-                  <span className="flex items-center gap-1.5"><Checkbox label="WebSocket" checked={editWebsocket} onChange={(e) => setEditWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
-                  <span className="flex items-center gap-1.5"><Checkbox label="Force HTTPS" checked={editForceHttps} onChange={(e) => setEditForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
+                  <span className="flex items-center gap-1.5"><Checkbox label={t('domains.websocket')} checked={editWebsocket} onChange={(e) => setEditWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
+                  <span className="flex items-center gap-1.5"><Checkbox label={t('domains.forceHttps')} checked={editForceHttps} onChange={(e) => setEditForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
                 </div>
-                <Field label="Max body size" help="max-body-size" hint="Leave blank for the default.">
-                  <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder="e.g. 100mb" />
+                <Field label={t('domains.maxBodySize')} help="max-body-size" hint={t('domains.maxBodyHint')}>
+                  <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder={t('domains.maxBodyPh')} />
                 </Field>
                 <div className="flex justify-end gap-3 pt-1">
-                  <Button variant="danger-ghost" onClick={() => removeDomain(detailDomain)}>Delete</Button>
-                  <Button onClick={handleSaveDetail} loading={editLoading}>Save</Button>
+                  <Button variant="danger-ghost" onClick={() => removeDomain(detailDomain)}>{t('common.delete')}</Button>
+                  <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>
                 </div>
               </div>
             )}
@@ -414,35 +416,35 @@ export default function Domains() {
             {editTab === 'headers' && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
-                  <p className="text-sm font-medium text-fg">Custom request headers</p>
-                  <button onClick={() => setEditHeaders([...editHeaders, { key: '', value: '' }])} className="text-xs font-medium text-accent hover:underline">+ Add header</button>
+                  <p className="text-sm font-medium text-fg">{t('domains.customHeaders')}</p>
+                  <button onClick={() => setEditHeaders([...editHeaders, { key: '', value: '' }])} className="text-xs font-medium text-accent hover:underline">{t('domains.addHeader')}</button>
                 </div>
-                {editHeaders.length === 0 && <p className="text-sm text-fg-faint">No custom headers.</p>}
+                {editHeaders.length === 0 && <p className="text-sm text-fg-faint">{t('domains.noHeaders')}</p>}
                 {editHeaders.map((h, i) => (
                   <div key={i} className="flex gap-2">
-                    <Input value={h.key} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], key: e.target.value }; setEditHeaders(n); }} placeholder="Header name" />
-                    <Input value={h.value} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], value: e.target.value }; setEditHeaders(n); }} placeholder="Value" />
+                    <Input value={h.key} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], key: e.target.value }; setEditHeaders(n); }} placeholder={t('domains.headerName')} />
+                    <Input value={h.value} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], value: e.target.value }; setEditHeaders(n); }} placeholder={t('domains.headerValue')} />
                     <button onClick={() => setEditHeaders(editHeaders.filter((_, j) => j !== i))} aria-label="Remove header" className="flex-shrink-0 rounded-lg px-2 text-fg-faint hover:text-danger-fg">
                       <X className="h-4 w-4" />
                     </button>
                   </div>
                 ))}
                 <div className="flex justify-end pt-1">
-                  <Button onClick={handleSaveDetail} loading={editLoading}>Save</Button>
+                  <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>
                 </div>
               </div>
             )}
 
             {editTab === 'advanced' && (
               <div className="space-y-4">
-                <Callout tone="warning" title="Manual config">
-                  Editing the raw Caddy JSON overrides the automatic config for this domain. Reset to automatic anytime.
+                <Callout tone="warning" title={t('domains.manualConfig')}>
+                  {t('domains.manualConfigBody')}
                 </Callout>
                 {advancedError && <Callout tone="danger">{advancedError}</Callout>}
                 <Textarea value={editRawConfig} onChange={(e) => { setEditRawConfig(e.target.value); setAdvancedError(''); }} rows={14} className="font-mono text-xs" spellCheck={false} />
                 <div className="flex justify-between">
-                  <Button variant="secondary" onClick={handleResetConfig} loading={editLoading}>Reset to automatic</Button>
-                  <Button onClick={handleSaveAdvanced} loading={editLoading}>Save manual config</Button>
+                  <Button variant="secondary" onClick={handleResetConfig} loading={editLoading}>{t('domains.resetAuto')}</Button>
+                  <Button onClick={handleSaveAdvanced} loading={editLoading}>{t('domains.saveManual')}</Button>
                 </div>
               </div>
             )}
@@ -454,9 +456,9 @@ export default function Domains() {
         open={bulkConfirm}
         onClose={() => setBulkConfirm(false)}
         onConfirm={handleBulkDelete}
-        title="Delete domains"
-        message={`Delete ${selected.size} domain${selected.size !== 1 ? 's' : ''}? Their DNS records and proxy configs will be removed.`}
-        confirmLabel={`Delete ${selected.size}`}
+        title={t('domains.bulkTitle')}
+        message={t('domains.bulkMsg', { count: selected.size })}
+        confirmLabel={t('domains.bulkConfirm', { count: selected.size })}
         danger
       />
     </div>

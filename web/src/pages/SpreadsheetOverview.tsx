@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Agent, Domain, Server, Zone } from '../lib/types';
@@ -26,6 +27,7 @@ function SortHeader({ label, sortKey, current, dir, onSort, right }: {
 const count = (arr: { status: string }[], s: string) => arr.filter((x) => x.status === s).length;
 
 export default function SpreadsheetOverview() {
+  const { t } = useTranslation();
   const [domains, setDomains] = useState<Domain[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
@@ -69,31 +71,31 @@ export default function SpreadsheetOverview() {
     <SortHeader label={label} sortKey={k} current={sort.key} dir={sort.dir} onSort={toggleSort} right={right} />
   );
 
-  if (!loaded) return <div className="py-12 text-center text-sm text-fg-muted">Loading…</div>;
+  if (!loaded) return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
 
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-fg-muted">
-          <span className="font-medium text-fg">{agents.length}</span> agents ·{' '}
-          <span className="font-medium text-fg">{domains.length}</span> domains ·{' '}
-          {count(domains, 'active')} active{count(domains, 'error') > 0 && <span className="text-danger-fg"> · {count(domains, 'error')} error</span>}
+          <span className="font-medium text-fg">{t('counts.agents', { count: agents.length })}</span> ·{' '}
+          <span className="font-medium text-fg">{t('counts.domains', { count: domains.length })}</span> ·{' '}
+          {count(domains, 'active')} {t('status.active')}{count(domains, 'error') > 0 && <span className="text-danger-fg"> · {count(domains, 'error')} {t('status.error')}</span>}
         </p>
-        <Link to="/domains" className={buttonClass('primary', 'sm')}>Manage domains</Link>
+        <Link to="/domains" className={buttonClass('primary', 'sm')}>{t('domains.manageDomains')}</Link>
       </div>
 
       {domains.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-border py-12 text-center text-sm text-fg-muted">No domains yet.</div>
+        <div className="rounded-xl border border-dashed border-border py-12 text-center text-sm text-fg-muted">{t('domains.noneYet')}</div>
       ) : (
         <div className="overflow-x-auto rounded-xl border border-border bg-surface shadow-card">
           <table className="w-full text-left text-sm">
             <thead className="border-b border-border text-xs uppercase tracking-wide text-fg-faint">
               <tr>
-                {th('fqdn', 'Domain')}
-                {th('target', 'Target')}
-                {th('agent', 'Agent')}
-                {th('status', 'Status')}
-                {th('synced', 'Synced', true)}
+                {th('fqdn', t('domains.colDomain'))}
+                {th('target', t('domains.colTarget'))}
+                {th('agent', t('domains.colAgent'))}
+                {th('status', t('domains.colStatus'))}
+                {th('synced', t('domains.colSynced'), true)}
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -103,7 +105,7 @@ export default function SpreadsheetOverview() {
                   <td className="px-4 py-2.5 font-mono text-xs text-fg-muted">{target(d)}</td>
                   <td className="px-4 py-2.5 text-fg-muted">{srvOf(d.server_id)?.agentName ?? '—'}</td>
                   <td className="px-4 py-2.5"><StatusBadge status={d.status} /></td>
-                  <td className="px-4 py-2.5 text-right text-xs text-fg-faint">{d.last_synced ? formatRelativeTime(d.last_synced) : 'never'}</td>
+                  <td className="px-4 py-2.5 text-right text-xs text-fg-faint">{d.last_synced ? formatRelativeTime(d.last_synced) : t('time.neverLower')}</td>
                 </tr>
               ))}
             </tbody>

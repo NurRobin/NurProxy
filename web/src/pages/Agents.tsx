@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { ChevronLeft } from 'lucide-react';
 import { api } from '../lib/api';
 import type { Agent, Zone, Server, Domain } from '../lib/types';
@@ -18,6 +19,7 @@ import { useToast, errMessage } from '../components/toast-context';
 const seen = (d?: string) => (d ? formatRelativeTime(d) : 'Never');
 
 export default function Agents() {
+  const { t } = useTranslation();
   const toast = useToast();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
@@ -42,11 +44,11 @@ export default function Agents() {
       const [a, z, d] = await Promise.all([api.listAgents(), api.listAllZones(), api.listDomains()]);
       setAgents(a); setZones(z); setDomains(d);
     } catch (err) {
-      toast.error(errMessage(err, 'Couldn’t load agents.'));
+      toast.error(errMessage(err, t('agents.loadFailed')));
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, t]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -55,9 +57,9 @@ export default function Agents() {
       const list = await api.listServers(agentId);
       setServers((prev) => ({ ...prev, [agentId]: list }));
     } catch (err) {
-      toast.error(errMessage(err, 'Couldn’t load servers.'));
+      toast.error(errMessage(err, t('agents.loadServersFailed')));
     }
-  }, [toast]);
+  }, [toast, t]);
 
   function select(agent: Agent) {
     setSelectedId(agent.id);
@@ -79,19 +81,19 @@ export default function Agents() {
         dns_mode: adoptDnsMode,
         ddns_interval: adoptDnsMode === 'ddns' ? adoptDdnsInterval : undefined,
       });
-      toast.success(`${adoptName || adoptAgent.fqdn} adopted.`);
+      toast.success(t('agents.adopted', { name: adoptName || adoptAgent.fqdn }));
       setAdoptAgent(null);
       fetchData();
     } catch (err) {
-      setAdoptError(errMessage(err, 'Failed to adopt agent.'));
+      setAdoptError(errMessage(err, t('setup.adoptFailed')));
     } finally {
       setAdoptLoading(false);
     }
   }
 
   async function handleReject(id: string) {
-    try { await api.rejectAgent(id); toast.success('Agent rejected.'); if (selectedId === id) setSelectedId(null); fetchData(); }
-    catch (err) { toast.error(errMessage(err, 'Failed to reject agent.')); }
+    try { await api.rejectAgent(id); toast.success(t('agents.rejected')); if (selectedId === id) setSelectedId(null); fetchData(); }
+    catch (err) { toast.error(errMessage(err, t('agents.rejectFailed'))); }
   }
 
   async function handleDelete() {
@@ -99,12 +101,12 @@ export default function Agents() {
     setDeleteLoading(true);
     try {
       await api.deleteAgent(deleteAgent.id);
-      toast.success('Agent deleted.');
+      toast.success(t('agents.deleted'));
       if (selectedId === deleteAgent.id) setSelectedId(null);
       setDeleteAgent(null);
       fetchData();
     } catch (err) {
-      toast.error(errMessage(err, 'Failed to delete agent.'));
+      toast.error(errMessage(err, t('agents.deleteFailed')));
     } finally {
       setDeleteLoading(false);
     }
@@ -114,7 +116,7 @@ export default function Agents() {
   const otherAgents = agents.filter((a) => a.status !== 'pending');
   const selected = agents.find((a) => a.id === selectedId) ?? null;
 
-  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading agents…</div>;
+  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
 
   const empty = agents.length === 0;
 
@@ -122,15 +124,15 @@ export default function Agents() {
     <div className="space-y-6">
       <div>
         <h1 className="flex items-center gap-2 font-display text-3xl font-bold tracking-tight text-fg">
-          Agents <HelpTip term="agent" />
+          {t('agents.title')} <HelpTip term="agent" />
         </h1>
-        <p className="mt-1 text-sm text-fg-muted">Edge servers running NurProxy. Select one to inspect it.</p>
+        <p className="mt-1 text-sm text-fg-muted">{t('agents.subtitle')}</p>
       </div>
 
       {empty ? (
         <EmptyState
-          title="No agents registered"
-          description="Install the NurProxy agent on a server and it will appear here for approval. See Setup for the install command."
+          title={t('agents.none')}
+          description={t('agents.noneBody')}
         />
       ) : (
         <div className="grid gap-6 md:grid-cols-[20rem_1fr]">
@@ -139,7 +141,7 @@ export default function Agents() {
             <div className="space-y-4">
               {pendingAgents.length > 0 && (
                 <div>
-                  <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-warning-fg">Pending approval</h2>
+                  <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-warning-fg">{t('agents.pendingApproval')}</h2>
                   <div className="space-y-2">
                     {pendingAgents.map((a) => (
                       <ListRow key={a.id} active={selectedId === a.id} tone="warning" onClick={() => select(a)} agent={a} />
@@ -148,7 +150,7 @@ export default function Agents() {
                 </div>
               )}
               <div>
-                {otherAgents.length > 0 && <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">Agents</h2>}
+                {otherAgents.length > 0 && <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">{t('agents.title')}</h2>}
                 <div className="space-y-2">
                   {otherAgents.map((a) => (
                     <ListRow key={a.id} active={selectedId === a.id} onClick={() => select(a)} agent={a} />
@@ -162,13 +164,13 @@ export default function Agents() {
           <div className={selected ? 'block' : 'hidden md:block'}>
             {!selected ? (
               <div className="flex h-full min-h-48 items-center justify-center rounded-xl border border-dashed border-border text-sm text-fg-faint">
-                Select an agent to see details.
+                {t('agents.select')}
               </div>
             ) : (
               <div className="rounded-xl border border-border bg-surface p-6 shadow-card">
                 <button onClick={() => setSelectedId(null)} className="mb-4 inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg md:hidden">
                   <ChevronLeft className="h-4 w-4" />
-                  Back
+                  {t('common.back')}
                 </button>
 
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -181,40 +183,40 @@ export default function Agents() {
                   </div>
                   {selected.status === 'pending' ? (
                     <div className="flex gap-2">
-                      <Button size="sm" onClick={() => startAdopt(selected)}>Approve</Button>
-                      <Button variant="secondary" size="sm" onClick={() => handleReject(selected.id)}>Reject</Button>
+                      <Button size="sm" onClick={() => startAdopt(selected)}>{t('setup.approve')}</Button>
+                      <Button variant="secondary" size="sm" onClick={() => handleReject(selected.id)}>{t('agents.reject')}</Button>
                     </div>
                   ) : (
-                    <Button variant="danger-ghost" size="sm" onClick={() => setDeleteAgent(selected)}>Delete agent</Button>
+                    <Button variant="danger-ghost" size="sm" onClick={() => setDeleteAgent(selected)}>{t('agents.deleteAgent')}</Button>
                   )}
                 </div>
 
                 {selected.status === 'pending' ? (
-                  <Callout tone="warning" title="Awaiting approval">
-                    Approve this agent to give it zones and a DNS mode, or reject it if you don’t recognize it.
+                  <Callout tone="warning" title={t('agents.awaitingApproval')}>
+                    {t('agents.awaitingBody')}
                   </Callout>
                 ) : (
                   <div className="mt-5 grid gap-6 sm:grid-cols-2">
                     <div className="space-y-3">
-                      <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">Details</h3>
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">{t('agents.details')}</h3>
                       <dl className="space-y-2 text-sm">
-                        <Row label={<span className="flex items-center gap-1">DNS mode <HelpTip term="dns-mode" /></span>} value={selected.dns_mode || 'static'} />
-                        {selected.dns_mode === 'ddns' && <Row label="DDNS interval" value={`${selected.ddns_interval}s`} />}
-                        {selected.zones && selected.zones.length > 0 && <Row label="Zones" value={selected.zones.map((z) => z.name).join(', ')} />}
-                        {selected.public_ip && <Row label="IP" value={selected.public_ip} />}
-                        {selected.version && <Row label="Version" value={selected.version} />}
-                        <Row label="Last seen" value={seen(selected.last_seen)} />
-                        <Row label="ID" value={<span className="font-mono text-xs">{selected.id}</span>} />
+                        <Row label={<span className="flex items-center gap-1">{t('agents.dnsMode')} <HelpTip term="dns-mode" /></span>} value={selected.dns_mode || 'static'} />
+                        {selected.dns_mode === 'ddns' && <Row label={t('agents.ddnsInterval')} value={`${selected.ddns_interval}s`} />}
+                        {selected.zones && selected.zones.length > 0 && <Row label={t('agents.zones')} value={selected.zones.map((z) => z.name).join(', ')} />}
+                        {selected.public_ip && <Row label={t('agents.ip')} value={selected.public_ip} />}
+                        {selected.version && <Row label={t('agents.version')} value={selected.version} />}
+                        <Row label={t('agents.lastSeen')} value={seen(selected.last_seen)} />
+                        <Row label={t('agents.id')} value={<span className="font-mono text-xs">{selected.id}</span>} />
                       </dl>
                     </div>
 
                     <div>
                       <div className="flex items-center justify-between">
-                        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">Servers <HelpTip term="server" /></h3>
-                        <Link to="/servers" className="text-xs font-medium text-accent hover:underline">Manage in Servers →</Link>
+                        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">{t('nav.servers')} <HelpTip term="server" /></h3>
+                        <Link to="/servers" className="text-xs font-medium text-accent hover:underline">{t('agents.manageInServers')}</Link>
                       </div>
                       {(servers[selected.id] ?? []).length === 0 ? (
-                        <p className="mt-2 text-sm text-fg-faint">No servers yet.</p>
+                        <p className="mt-2 text-sm text-fg-faint">{t('agents.noServers')}</p>
                       ) : (
                         <div className="mt-2 space-y-2">
                           {(servers[selected.id] ?? []).map((srv) => (
@@ -232,7 +234,7 @@ export default function Agents() {
                         if (agentDomains.length === 0) return null;
                         return (
                           <div className="mt-4">
-                            <h4 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">Domains</h4>
+                            <h4 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">{t('nav.domains')}</h4>
                             <div className="mt-2 space-y-1">
                               {agentDomains.map((d) => (
                                 <div key={d.id} className="flex items-center justify-between text-sm">
@@ -254,41 +256,41 @@ export default function Agents() {
       )}
 
       {/* Adopt modal */}
-      <Modal open={adoptAgent !== null} onClose={() => setAdoptAgent(null)} title="Approve agent" description={adoptAgent?.fqdn}>
+      <Modal open={adoptAgent !== null} onClose={() => setAdoptAgent(null)} title={t('setup.approveAgent')} description={adoptAgent?.fqdn}>
         {adoptAgent && (
           <div className="space-y-4">
             {adoptError && <Callout tone="danger">{adoptError}</Callout>}
-            <Field label="Display name">
-              <Input value={adoptName} onChange={(e) => setAdoptName(e.target.value)} placeholder="e.g. Edge — Frankfurt" />
+            <Field label={t('setup.displayName')}>
+              <Input value={adoptName} onChange={(e) => setAdoptName(e.target.value)} placeholder={t('setup.displayNamePh')} />
             </Field>
-            <Field label="DNS zones" help="zone">
+            <Field label={t('setup.dnsZones')} help="zone">
               <MultiSelect
                 items={zones.map((z) => ({ id: z.id, label: z.name }))}
                 selected={adoptZoneIds}
                 onChange={setAdoptZoneIds}
                 maxHeightClass="max-h-40"
-                emptyHint="No zones available. Add a provider in Settings first."
+                emptyHint={t('setup.noZonesYet')}
               />
             </Field>
-            <Field label="DNS mode" help="dns-mode">
+            <Field label={t('setup.dnsMode')} help="dns-mode">
               <div className="flex gap-4">
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
-                  <input type="radio" name="adopt-dns-mode" checked={adoptDnsMode === 'static'} onChange={() => setAdoptDnsMode('static')} className="accent-[var(--accent)]" /> Static
+                  <input type="radio" name="adopt-dns-mode" checked={adoptDnsMode === 'static'} onChange={() => setAdoptDnsMode('static')} className="accent-[var(--accent)]" /> {t('setup.static')}
                 </label>
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
-                  <input type="radio" name="adopt-dns-mode" checked={adoptDnsMode === 'ddns'} onChange={() => setAdoptDnsMode('ddns')} className="accent-[var(--accent)]" /> DDNS
+                  <input type="radio" name="adopt-dns-mode" checked={adoptDnsMode === 'ddns'} onChange={() => setAdoptDnsMode('ddns')} className="accent-[var(--accent)]" /> {t('setup.ddns')}
                 </label>
               </div>
             </Field>
             {adoptDnsMode === 'ddns' && (
-              <Field label={`DDNS interval — ${adoptDdnsInterval}s`}>
+              <Field label={t('agents.ddnsIntervalLabel', { seconds: adoptDdnsInterval })}>
                 <input type="range" min={30} max={600} step={10} value={adoptDdnsInterval} onChange={(e) => setAdoptDdnsInterval(Number(e.target.value))} className="w-full accent-[var(--accent)]" />
                 <div className="flex justify-between text-xs text-fg-faint"><span>30s</span><span>600s</span></div>
               </Field>
             )}
             <div className="flex justify-end gap-3 pt-1">
-              <Button variant="secondary" onClick={() => setAdoptAgent(null)}>Cancel</Button>
-              <Button onClick={handleAdopt} loading={adoptLoading}>Approve agent</Button>
+              <Button variant="secondary" onClick={() => setAdoptAgent(null)}>{t('common.cancel')}</Button>
+              <Button onClick={handleAdopt} loading={adoptLoading}>{t('setup.approveAgent')}</Button>
             </div>
           </div>
         )}
@@ -298,9 +300,9 @@ export default function Agents() {
         open={deleteAgent !== null}
         onClose={() => setDeleteAgent(null)}
         onConfirm={handleDelete}
-        title="Delete agent"
-        message={`Delete “${deleteAgent?.name}”? This removes all of its servers and domains too.`}
-        confirmLabel="Delete"
+        title={t('agents.deleteAgent')}
+        message={t('agents.deleteConfirm', { name: deleteAgent?.name })}
+        confirmLabel={t('common.delete')}
         danger
         loading={deleteLoading}
         confirmText={deleteAgent?.name}

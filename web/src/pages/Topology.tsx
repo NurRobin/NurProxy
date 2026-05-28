@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { useNavigate } from 'react-router-dom';
 import { Search, ChevronDown, X, Globe, Server as ServerGlyph } from 'lucide-react';
 import { api } from '../lib/api';
@@ -19,9 +21,10 @@ type NodeKind = 'internet' | 'agent' | 'server' | 'domain';
 interface Selection { kind: NodeKind; id: string }
 interface Edge { from: string; to: string; active: boolean }
 
-const seen = (d?: string) => (d ? formatRelativeTime(d) : 'never');
+const seen = (t: TFunction, d?: string) => (d ? formatRelativeTime(d) : t('time.neverLower'));
 
 export default function Topology() {
+  const { t } = useTranslation();
   const toast = useToast();
   const undoableDelete = useUndoableDelete();
   const navigate = useNavigate();
@@ -49,11 +52,11 @@ export default function Topology() {
       }));
       setServersByAgent(Object.fromEntries(entries));
     } catch (err) {
-      toast.error(errMessage(err, 'Couldn’t load topology.'));
+      toast.error(errMessage(err, t('topology.loadFailed')));
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, t]);
 
   usePolling(fetchData, 30000);
 
@@ -118,42 +121,42 @@ export default function Topology() {
 
   // ---- actions ----
   async function rejectAgent(id: string) {
-    try { await api.rejectAgent(id); toast.success('Agent rejected.'); fetchData(); }
-    catch (err) { toast.error(errMessage(err, 'Failed to reject.')); }
+    try { await api.rejectAgent(id); toast.success(t('agents.rejected')); fetchData(); }
+    catch (err) { toast.error(errMessage(err, t('agents.rejectFailed'))); }
   }
   function confirmDelete(title: string, message: string, run: () => Promise<void>, confirmText?: string) { setDel({ title, message, run, confirmText }); }
 
   function openMenu(e: React.MouseEvent, sel: Selection) {
     e.preventDefault();
     setSelected(sel);
-    const items: MenuState['items'] = [{ label: 'Inspect', onSelect: () => setSelected(sel), icon: <Dot /> }];
+    const items: MenuState['items'] = [{ label: t('topology.inspect'), onSelect: () => setSelected(sel), icon: <Dot /> }];
     if (sel.kind === 'agent') {
       const a = agents.find((x) => x.id === sel.id);
-      items.push({ label: 'Open in Agents', onSelect: () => navigate('/agents') });
+      items.push({ label: t('topology.openInAgents'), onSelect: () => navigate('/agents') });
       if (a?.status === 'adopted' || a?.status === 'offline') {
-        items.push({ label: 'Add server', onSelect: () => navigate('/servers') });
+        items.push({ label: t('topology.addServer'), onSelect: () => navigate('/servers') });
       }
       if (a?.status === 'pending') {
-        items.push({ label: 'Approve…', onSelect: () => navigate('/agents') });
-        items.push({ label: 'Reject', danger: true, onSelect: () => rejectAgent(sel.id) });
+        items.push({ label: t('topology.approveDots'), onSelect: () => navigate('/agents') });
+        items.push({ label: t('agents.reject'), danger: true, onSelect: () => rejectAgent(sel.id) });
       } else {
-        items.push({ label: 'Delete agent', danger: true, onSelect: () => confirmDelete('Delete agent', `Delete “${a?.name}”? Removes its servers and domains too.`, async () => { await api.deleteAgent(sel.id); }, a?.name) });
+        items.push({ label: t('topology.deleteAgentMenu'), danger: true, onSelect: () => confirmDelete(t('topology.deleteAgentMenu'), t('topology.deleteAgentMsg', { name: a?.name }), async () => { await api.deleteAgent(sel.id); }, a?.name) });
       }
     } else if (sel.kind === 'server') {
       const s = allServers.find((x) => x.id === sel.id);
-      items.push({ label: 'Add domain here', onSelect: () => navigate('/domains') });
-      items.push({ label: 'Remove server', danger: true, onSelect: () => confirmDelete('Remove server', `Remove “${s?.name}”? Domains using it are affected.`, async () => { await api.deleteServer(sel.id); }) });
+      items.push({ label: t('topology.addDomainHere'), onSelect: () => navigate('/domains') });
+      items.push({ label: t('topology.removeServer'), danger: true, onSelect: () => confirmDelete(t('topology.removeServer'), t('topology.removeServerMsg', { name: s?.name }), async () => { await api.deleteServer(sel.id); }) });
     } else if (sel.kind === 'domain') {
       const d = domains.find((x) => String(x.id) === sel.id);
-      items.push({ label: 'Edit in Domains', onSelect: () => navigate('/domains') });
-      if (d) items.push({ label: 'Delete domain', danger: true, onSelect: () => {
+      items.push({ label: t('topology.editInDomains'), onSelect: () => navigate('/domains') });
+      if (d) items.push({ label: t('topology.deleteDomainMenu'), danger: true, onSelect: () => {
         setDomains((prev) => prev.filter((x) => x.id !== d.id));
         if (selected?.kind === 'domain' && selected.id === String(d.id)) setSelected(null);
         undoableDelete({
-          message: `Deleted ${fqdn(d)}`,
+          message: t('domains.deleted', { fqdn: fqdn(d) }),
           doDelete: async () => { await api.deleteDomain(d.id); },
           onUndo: () => setDomains((prev) => (prev.some((x) => x.id === d.id) ? prev : [...prev, d])),
-          failMessage: 'Failed to delete domain.',
+          failMessage: t('domains.deleteFailed'),
         });
       } });
     }
@@ -198,11 +201,11 @@ export default function Topology() {
   const errorCount = agents.filter((a) => a.status === 'error').length + domains.filter((d) => d.status === 'error').length;
 
   // Accessible names (the connector SVG is decorative, so relationships live here).
-  const agentLabel = (a: Agent) => `Agent ${a.name}, ${a.status}, ${serversOf(a.id).length} server${serversOf(a.id).length !== 1 ? 's' : ''}`;
-  const serverLabel = (s: Server) => { const a = agentOf(s); return `Server ${s.name} at ${s.address}${a ? ` on agent ${a.name}` : ''}, ${domainsOfServer(s.id).length} domain${domainsOfServer(s.id).length !== 1 ? 's' : ''}`; };
-  const domainLabel = (d: Domain) => { const s = allServers.find((x) => x.id === d.server_id); const a = s ? agentOf(s) : undefined; return `Domain ${fqdn(d)}, ${d.status}, proxied to ${s ? `${s.address}:${d.port}` : `port ${d.port}`}${a ? ` on agent ${a.name}` : ''}`; };
+  const agentLabel = (a: Agent) => t('topology.agentAria', { name: a.name, status: t(`status.${a.status}`), count: serversOf(a.id).length });
+  const serverLabel = (s: Server) => { const a = agentOf(s); return t('topology.serverAria', { name: s.name, address: s.address, agent: a ? ` on agent ${a.name}` : '', count: domainsOfServer(s.id).length }); };
+  const domainLabel = (d: Domain) => { const s = allServers.find((x) => x.id === d.server_id); const a = s ? agentOf(s) : undefined; return t('topology.domainAria', { fqdn: fqdn(d), status: t(`status.${d.status}`), target: s ? `${s.address}:${d.port}` : `port ${d.port}`, agent: a ? ` on agent ${a.name}` : '' }); };
 
-  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading topology…</div>;
+  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">{t('topology.loading')}</div>;
 
   const hasAnything = agents.length > 0;
 
@@ -210,17 +213,17 @@ export default function Topology() {
     <div className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Topology</h1>
-          <p className="mt-1 text-sm text-fg-muted">Your edge agents, upstreams, and domains. Click to inspect · right-click for actions.</p>
+          <h1 className="font-display text-3xl font-bold tracking-tight text-fg">{t('topology.title')}</h1>
+          <p className="mt-1 text-sm text-fg-muted">{t('topology.subtitle')}</p>
         </div>
-        <button onClick={() => navigate('/domains')} className={buttonClass('primary')}>New domain</button>
+        <button onClick={() => navigate('/domains')} className={buttonClass('primary')}>{t('topology.newDomain')}</button>
       </div>
 
       {!hasAnything ? (
         <EmptyState
-          title="Nothing to map yet"
-          description="Connect an agent and add a domain — they’ll appear here as a live graph of your setup."
-          action={<button onClick={() => navigate('/agents')} className={buttonClass('primary')}>Connect an agent</button>}
+          title={t('topology.nothing')}
+          description={t('topology.nothingBody')}
+          action={<button onClick={() => navigate('/agents')} className={buttonClass('primary')}>{t('topology.connectAgent')}</button>}
         />
       ) : (
         <div className="flex gap-4">
@@ -228,21 +231,21 @@ export default function Topology() {
             {/* Aggregate health + filter */}
             <div className="flex flex-wrap items-center justify-between gap-3">
               <p className="text-sm text-fg-muted">
-                <span className="font-medium text-fg">{agents.length}</span> agent{agents.length !== 1 ? 's' : ''} ·{' '}
-                <span className="font-medium text-fg">{allServers.length}</span> server{allServers.length !== 1 ? 's' : ''} ·{' '}
-                <span className="font-medium text-fg">{domains.length}</span> domain{domains.length !== 1 ? 's' : ''}
-                {errorCount > 0 && <> · <span className="font-medium text-danger-fg">{errorCount} error{errorCount !== 1 ? 's' : ''}</span></>}
+                <span className="font-medium text-fg">{t('counts.agents', { count: agents.length })}</span> ·{' '}
+                <span className="font-medium text-fg">{t('counts.servers', { count: allServers.length })}</span> ·{' '}
+                <span className="font-medium text-fg">{t('counts.domains', { count: domains.length })}</span>
+                {errorCount > 0 && <> · <span className="font-medium text-danger-fg">{t('counts.errors', { count: errorCount })}</span></>}
               </p>
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-fg-faint" />
-                <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter nodes…" aria-label="Filter topology"
+                <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={t('topology.filter')} aria-label="Filter topology"
                   className="w-44 rounded-lg border border-border bg-surface py-1.5 pl-9 pr-3 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus-visible:outline-none focus:ring-2 focus:ring-accent/30" />
               </div>
             </div>
 
             {/* Screen-reader summary — the connector lines are decorative. */}
             <div className="sr-only">
-              Topology: {agents.length} agents, {allServers.length} servers, {domains.length} domains.
+              {t('topology.summaryAria', { agents: agents.length, servers: allServers.length, domains: domains.length })}
               <ul>{domains.map((d) => <li key={d.id}>{domainLabel(d)}</li>)}</ul>
             </div>
 
@@ -254,15 +257,15 @@ export default function Topology() {
               </svg>
 
               <div className="relative z-10 flex min-w-[44rem] items-start gap-10">
-                <Column title="Internet">
-                  <NodeCard innerRef={setNodeRef('internet')} ariaLabel="Public internet, entry point" selected={selected?.kind === 'internet'}
+                <Column title={t('topology.colInternet')}>
+                  <NodeCard innerRef={setNodeRef('internet')} ariaLabel={t('topology.internetAria')} selected={selected?.kind === 'internet'}
                     onClick={() => setSelected({ kind: 'internet', id: 'internet' })}
                     onContextMenu={(e) => openMenu(e, { kind: 'internet', id: 'internet' })}
-                    icon={<GlobeIcon />} title="Public internet" sub="inbound traffic" />
+                    icon={<GlobeIcon />} title={t('topology.internet')} sub={t('topology.inbound')} />
                 </Column>
 
-                <Column title="Edge agents">
-                  {visibleAgents.length === 0 ? <Hint>No matches</Hint> : visibleAgents.map((a) => {
+                <Column title={t('topology.colAgents')}>
+                  {visibleAgents.length === 0 ? <Hint>{t('topology.noMatches')}</Hint> : visibleAgents.map((a) => {
                     const hasChildren = serversOf(a.id).length > 0;
                     const isCollapsed = collapsed.has(a.id);
                     return (
@@ -273,7 +276,7 @@ export default function Topology() {
                           status={a.status} title={a.name} sub={a.fqdn} />
                         {hasChildren && (
                           <button onClick={(e) => { e.stopPropagation(); toggleCollapse(a.id); }}
-                            aria-label={isCollapsed ? `Expand ${a.name}` : `Collapse ${a.name}`}
+                            aria-label={isCollapsed ? t('topology.expand', { name: a.name }) : t('topology.collapse', { name: a.name })}
                             className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-md text-fg-faint hover:bg-surface-2 hover:text-fg">
                             <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
                           </button>
@@ -283,8 +286,8 @@ export default function Topology() {
                   })}
                 </Column>
 
-                <Column title="Upstreams">
-                  {visibleServers.length === 0 ? <Hint>{q ? 'No matches' : 'No servers'}</Hint> : visibleServers.map((s) => (
+                <Column title={t('topology.colUpstreams')}>
+                  {visibleServers.length === 0 ? <Hint>{q ? t('topology.noMatches') : t('topology.noServers')}</Hint> : visibleServers.map((s) => (
                     <NodeCard key={s.id} innerRef={setNodeRef(`server:${s.id}`)} ariaLabel={serverLabel(s)} selected={selected?.kind === 'server' && selected.id === s.id}
                       onClick={() => setSelected({ kind: 'server', id: s.id })}
                       onContextMenu={(e) => openMenu(e, { kind: 'server', id: s.id })}
@@ -292,8 +295,8 @@ export default function Topology() {
                   ))}
                 </Column>
 
-                <Column title="Domains">
-                  {visibleDomains.length === 0 ? <Hint>{q ? 'No matches' : 'No domains'}</Hint> : visibleDomains.map((d) => (
+                <Column title={t('topology.colDomains')}>
+                  {visibleDomains.length === 0 ? <Hint>{q ? t('topology.noMatches') : t('topology.noDomains')}</Hint> : visibleDomains.map((d) => (
                     <NodeCard key={d.id} innerRef={setNodeRef(`domain:${d.id}`)} ariaLabel={domainLabel(d)} selected={selected?.kind === 'domain' && selected.id === String(d.id)}
                       onClick={() => setSelected({ kind: 'domain', id: String(d.id) })}
                       onContextMenu={(e) => openMenu(e, { kind: 'domain', id: String(d.id) })}
@@ -308,9 +311,9 @@ export default function Topology() {
             <Inspector
               onClose={() => setSelected(null)}
               title={labelFor(selected)}
-              body={renderInspector(selected, { agents, allServers, domains, serversByAgent, zoneName, fqdn })}
+              body={renderInspector(selected, { agents, allServers, domains, serversByAgent, zoneName, fqdn, t })}
               onManage={() => navigate(selected.kind === 'domain' ? '/domains' : selected.kind === 'server' ? '/domains' : '/agents')}
-              manageLabel={selected.kind === 'internet' ? undefined : selected.kind === 'domain' ? 'Edit in Domains' : selected.kind === 'server' ? 'Manage in Domains' : 'Manage in Agents'}
+              manageLabel={selected.kind === 'internet' ? undefined : selected.kind === 'domain' ? t('topology.editInDomains') : selected.kind === 'server' ? t('topology.manageInDomains') : t('topology.manageInAgents')}
             />
           )}
         </div>
@@ -321,10 +324,10 @@ export default function Topology() {
       <ConfirmDialog
         open={del !== null}
         onClose={() => setDel(null)}
-        onConfirm={async () => { if (!del) return; try { await del.run(); toast.success('Done.'); setSelected(null); fetchData(); } catch (err) { toast.error(errMessage(err)); } finally { setDel(null); } }}
+        onConfirm={async () => { if (!del) return; try { await del.run(); toast.success(t('topology.done')); setSelected(null); fetchData(); } catch (err) { toast.error(errMessage(err)); } finally { setDel(null); } }}
         title={del?.title ?? ''}
         message={del?.message ?? ''}
-        confirmLabel="Delete"
+        confirmLabel={t('common.delete')}
         danger
         confirmText={del?.confirmText}
       />
@@ -337,11 +340,13 @@ interface InspectorCtx {
   agents: Agent[]; allServers: Server[]; domains: Domain[];
   serversByAgent: Record<string, Server[]>;
   zoneName: (id: string) => string; fqdn: (d: Domain) => string;
+  t: TFunction;
 }
 
 function renderInspector(sel: Selection, ctx: InspectorCtx) {
+  const { t } = ctx;
   if (sel.kind === 'internet') {
-    return <Rows rows={[['Role', 'Entry point'], ['Agents', String(ctx.agents.length)]]} note="Inbound requests resolve via DNS to an edge agent." />;
+    return <Rows rows={[[t('topology.role'), t('topology.entryPoint')], ['Agents', String(ctx.agents.length)]]} note={t('topology.inspectorInternet')} />;
   }
   if (sel.kind === 'agent') {
     const a = ctx.agents.find((x) => x.id === sel.id); if (!a) return null;
@@ -351,7 +356,7 @@ function renderInspector(sel: Selection, ctx: InspectorCtx) {
         <StatusBadge status={a.status} />
         <Rows rows={[
           ['FQDN', a.fqdn], ['DNS mode', a.dns_mode || 'static'], ['IP', a.public_ip || '—'],
-          ['Version', a.version || '—'], ['Last seen', seen(a.last_seen)], ['Servers', String(servers.length)],
+          ['Version', a.version || '—'], ['Last seen', seen(t, a.last_seen)], ['Servers', String(servers.length)],
         ]} />
       </div>
     );
@@ -373,8 +378,8 @@ function renderInspector(sel: Selection, ctx: InspectorCtx) {
       <StatusBadge status={d.status} />
       {d.error_msg && <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2 text-sm text-danger-fg">{d.error_msg}</div>}
       <Rows rows={[
-        ['Target', srv ? `${srv.address}:${d.port}` : `:${d.port}`], ['Zone', ctx.zoneName(d.zone_id) || '—'],
-        ['Force HTTPS', d.force_https ? 'on' : 'off'], ['WebSocket', d.websocket ? 'on' : 'off'], ['Last synced', seen(d.last_synced)],
+        [t('topology.target'), srv ? `${srv.address}:${d.port}` : `:${d.port}`], ['Zone', ctx.zoneName(d.zone_id) || '—'],
+        ['Force HTTPS', d.force_https ? 'on' : 'off'], ['WebSocket', d.websocket ? 'on' : 'off'], [t('topology.lastSyncedRow'), seen(t, d.last_synced)],
       ]} />
     </div>
   );

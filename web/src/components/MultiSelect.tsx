@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Search } from 'lucide-react';
 
 export interface MultiSelectItem {
@@ -28,8 +29,9 @@ export default function MultiSelect({
   onChange,
   searchThreshold = 6,
   maxHeightClass = 'max-h-52',
-  emptyHint = 'Nothing to show.',
+  emptyHint,
 }: Props) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState('');
   const q = query.trim().toLowerCase();
   const filtered = q
@@ -57,11 +59,11 @@ export default function MultiSelect({
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs text-fg-faint">
-          {selected.size} of {items.length} selected
+          {t('multiSelect.selectedOf', { selected: selected.size, total: items.length })}
         </span>
         {filtered.length > 0 && (
           <button type="button" onClick={toggleAllFiltered} className="text-xs font-medium text-accent hover:underline">
-            {allFilteredSelected ? 'Deselect all' : 'Select all'}{q && ' matching'}
+            {allFilteredSelected ? t('multiSelect.deselectAll') : t('multiSelect.selectAll')}{q && t('multiSelect.matching')}
           </button>
         )}
       </div>
@@ -72,7 +74,7 @@ export default function MultiSelect({
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={`Search ${items.length} items…`}
+            placeholder={t('multiSelect.search', { count: items.length })}
             className="block w-full rounded-lg border border-border bg-surface py-2 pl-9 pr-3 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus-visible:outline-none focus:ring-2 focus:ring-accent/30"
           />
         </div>
@@ -80,7 +82,7 @@ export default function MultiSelect({
 
       <div className={`${maxHeightClass} space-y-1 overflow-y-auto rounded-lg border border-border bg-surface-2 p-2`}>
         {filtered.length === 0 ? (
-          <p className="px-3 py-2 text-sm text-fg-faint">{q ? 'No matches.' : emptyHint}</p>
+          <p className="px-3 py-2 text-sm text-fg-faint">{q ? t('multiSelect.noMatches') : (emptyHint ?? t('multiSelect.empty'))}</p>
         ) : (
           filtered.map((item) => (
             <label
