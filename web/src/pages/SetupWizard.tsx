@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../lib/api';
-import type { Agent, Provider } from '../lib/types';
-import type { Zone } from '../lib/api';
+import type { Agent, Zone } from '../lib/types';
+import type { TestProviderZone } from '../lib/api';
 import StatusBadge from '../components/StatusBadge';
 
 interface SetupWizardProps {
@@ -22,21 +22,21 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   const [provApiToken, setProvApiToken] = useState('');
   const [provTestLoading, setProvTestLoading] = useState(false);
   const [provTestError, setProvTestError] = useState('');
-  const [provZones, setProvZones] = useState<Zone[]>([]);
+  const [provZones, setProvZones] = useState<TestProviderZone[]>([]);
   const [selectedZones, setSelectedZones] = useState<Set<string>>(new Set());
   const [provSaveLoading, setProvSaveLoading] = useState(false);
   const [provError, setProvError] = useState('');
-  const [providersCreated, setProvidersCreated] = useState<string[]>([]);
+  const [zonesCreated, setZonesCreated] = useState<string[]>([]);
   const [provStep, setProvStep] = useState<'token' | 'zones' | 'saved'>('token');
 
   // Agent step state
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [providers, setProviders] = useState<Provider[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
   const [pollingAgents, setPollingAgents] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [adoptingId, setAdoptingId] = useState<string | null>(null);
   const [adoptName, setAdoptName] = useState('');
-  const [adoptProvider, setAdoptProvider] = useState('');
+  const [adoptZoneIds, setAdoptZoneIds] = useState<Set<string>>(new Set());
   const [adoptDnsMode, setAdoptDnsMode] = useState<'static' | 'ddns'>('static');
   const [adoptLoading, setAdoptLoading] = useState(false);
   const [adoptError, setAdoptError] = useState('');
@@ -45,10 +45,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   const [completing, setCompleting] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const fetchProviders = useCallback(async () => {
+  const fetchZones = useCallback(async () => {
     try {
-      const p = await api.listProviders();
-      setProviders(p);
+      const z = await api.listAllZones();
+      setZones(z);
     } catch { /* ignore */ }
   }, []);
 
@@ -62,7 +62,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   useEffect(() => {
     if (currentStep === 1) {
       setPollingAgents(true);
-      fetchProviders();
+      fetchZones();
       pollAgents();
       pollRef.current = setInterval(pollAgents, 3000);
     } else {
@@ -78,7 +78,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
         pollRef.current = null;
       }
     };
-  }, [currentStep, fetchProviders, pollAgents]);
+  }, [currentStep, fetchZones, pollAgents]);
 
   async function handleTestToken() {
     setProvTestLoading(true);
@@ -128,26 +128,28 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     if (selectedZones.size === 0) return;
     setProvSaveLoading(true);
     setProvError('');
-    const created: string[] = [];
     try {
-      for (const zone of provZones) {
-        if (!selectedZones.has(zone.id)) continue;
-        const result = await api.createProvider({
-          type: provType,
-          name: zone.name,
-          config: { api_token: provApiToken },
-          zone_id: zone.id,
-          zone_name: zone.name,
-        });
-        created.push(result.name || zone.name);
-      }
-      setProvidersCreated(created);
+      // Step 1: Create a single provider
+      const provider = await api.createProvider({
+        type: provType,
+        name: provType,
+        config: { api_token: provApiToken },
+      });
+
+      // Step 2: Batch-create selected zones
+      const zonesToCreate = provZones
+        .filter(z => selectedZones.has(z.id))
+        .map(z => ({ external_id: z.id, name: z.name }));
+
+      const created = await api.createZonesBatch({
+        provider_id: provider.id,
+        zones: zonesToCreate,
+      });
+
+      setZonesCreated(created.map(z => z.name));
       setProvStep('saved');
     } catch (err) {
       setProvError(err instanceof Error ? err.message : 'Failed to save provider');
-      if (created.length > 0) {
-        setProvidersCreated(created);
-      }
     } finally {
       setProvSaveLoading(false);
     }
@@ -156,7 +158,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   async function handleAdoptAgent(agent: Agent) {
     setAdoptingId(agent.id);
     setAdoptName(agent.fqdn);
-    setAdoptProvider(providers[0]?.id ?? '');
+    setAdoptZoneIds(new Set());
     setAdoptDnsMode('static');
     setAdoptError('');
   }
@@ -168,7 +170,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     try {
       await api.adoptAgent(adoptingId, {
         name: adoptName || undefined,
-        provider_id: adoptProvider || undefined,
+        zone_ids: adoptZoneIds.size > 0 ? [...adoptZoneIds] : undefined,
         dns_mode: adoptDnsMode,
       });
       setAgentAdopted(true);
@@ -358,7 +360,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                         ))}
                       </div>
                       <p className="mt-1.5 text-xs text-gray-500">
-                        Each zone becomes a provider entry. You can manage domains under each zone separately.
+                        Selected zones will be added to your provider. You can manage domains under each zone separately.
                       </p>
                     </div>
 
@@ -392,11 +394,11 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                           <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                         </svg>
                         <p className="text-sm font-medium text-green-400">
-                          {providersCreated.length} zone{providersCreated.length !== 1 ? 's' : ''} added
+                          {zonesCreated.length} zone{zonesCreated.length !== 1 ? 's' : ''} added
                         </p>
                       </div>
                       <div className="flex flex-wrap gap-1.5 ml-7">
-                        {providersCreated.map((name) => (
+                        {zonesCreated.map((name) => (
                           <span key={name} className="rounded-md bg-green-900/40 px-2 py-0.5 text-xs font-medium text-green-300">
                             {name}
                           </span>
@@ -503,17 +505,36 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                               />
                             </div>
                             <div>
-                              <label className="block text-sm font-medium text-gray-300">DNS Provider</label>
-                              <select
-                                value={adoptProvider}
-                                onChange={(e) => setAdoptProvider(e.target.value)}
-                                className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                              >
-                                <option value="">None</option>
-                                {providers.map((p) => (
-                                  <option key={p.id} value={p.id}>{p.name} ({p.zone_name})</option>
-                                ))}
-                              </select>
+                              <label className="block text-sm font-medium text-gray-300">DNS Zones</label>
+                              {zones.length === 0 ? (
+                                <p className="mt-1 text-sm text-gray-500">No zones available. Add a provider first.</p>
+                              ) : (
+                                <div className="mt-1 space-y-1 max-h-36 overflow-y-auto rounded-lg border border-gray-700 bg-gray-900 p-2">
+                                  {zones.map((z) => (
+                                    <label
+                                      key={z.id}
+                                      className={`flex items-center gap-3 rounded-md px-3 py-2 cursor-pointer transition-colors ${
+                                        adoptZoneIds.has(z.id) ? 'bg-blue-900/30' : 'hover:bg-gray-800/50'
+                                      }`}
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        checked={adoptZoneIds.has(z.id)}
+                                        onChange={() => {
+                                          setAdoptZoneIds(prev => {
+                                            const next = new Set(prev);
+                                            if (next.has(z.id)) next.delete(z.id);
+                                            else next.add(z.id);
+                                            return next;
+                                          });
+                                        }}
+                                        className="accent-blue-500 h-4 w-4"
+                                      />
+                                      <span className="text-sm text-white">{z.name}</span>
+                                    </label>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                             <div>
                               <label className="block text-sm font-medium text-gray-300">DNS Mode</label>
@@ -592,8 +613,8 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               <div className="mt-6 space-y-3 text-left">
                 <SummaryItem
                   label="DNS Zones"
-                  value={providersCreated.length > 0 ? providersCreated.join(', ') : null}
-                  skipped={providersCreated.length === 0}
+                  value={zonesCreated.length > 0 ? zonesCreated.join(', ') : null}
+                  skipped={zonesCreated.length === 0}
                 />
                 <SummaryItem
                   label="Agent"

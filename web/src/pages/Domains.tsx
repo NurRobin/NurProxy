@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../lib/api';
-import type { Domain, Agent, Server, Provider } from '../lib/types';
+import type { Domain, Agent, Server, Zone } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -25,7 +25,7 @@ interface ServerWithAgent extends Server {
 export default function Domains() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [providers, setProviders] = useState<Provider[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
   const [allServers, setAllServers] = useState<ServerWithAgent[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -36,6 +36,7 @@ export default function Domains() {
   // Create modal
   const [showCreate, setShowCreate] = useState(false);
   const [createSub, setCreateSub] = useState('');
+  const [createZone, setCreateZone] = useState('');
   const [createServer, setCreateServer] = useState('');
   const [createPort, setCreatePort] = useState('80');
   const [createWebsocket, setCreateWebsocket] = useState(false);
@@ -58,14 +59,14 @@ export default function Domains() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [d, a, p] = await Promise.all([
+      const [d, a, z] = await Promise.all([
         api.listDomains(),
         api.listAgents(),
-        api.listProviders(),
+        api.listAllZones(),
       ]);
       setDomains(d);
       setAgents(a);
-      setProviders(p);
+      setZones(z);
 
       // Load servers for all adopted agents
       const adopted = a.filter((ag) => ag.status === 'adopted' || ag.status === 'offline');
@@ -91,9 +92,9 @@ export default function Domains() {
     fetchData();
   }, [fetchData]);
 
-  function getProviderZone(providerId: string): string {
-    const p = providers.find((pr) => pr.id === providerId);
-    return p?.zone_name ?? '';
+  function getZoneName(zoneId: string): string {
+    const z = zones.find((zn) => zn.id === zoneId);
+    return z?.name ?? '';
   }
 
   function getServerInfo(serverId: string): ServerWithAgent | undefined {
@@ -111,13 +112,8 @@ export default function Domains() {
   });
 
   async function handleCreate() {
-    const srv = allServers.find((s) => s.id === createServer);
-    if (!srv) return;
-    // Find the provider — use the agent's provider or the default
-    const agent = agents.find((a) => a.id === srv.agent_id);
-    const providerId = agent?.provider_id || providers.find((p) => p.is_default)?.id || providers[0]?.id;
-    if (!providerId) {
-      setCreateError('No DNS provider available. Set up a provider in Settings first.');
+    if (!createZone) {
+      setCreateError('Please select a DNS zone.');
       return;
     }
 
@@ -126,7 +122,7 @@ export default function Domains() {
     try {
       await api.createDomain({
         subdomain: createSub,
-        provider_id: providerId,
+        zone_id: createZone,
         server_id: createServer,
         port: parseInt(createPort, 10),
         websocket: createWebsocket,
@@ -134,6 +130,7 @@ export default function Domains() {
       });
       setShowCreate(false);
       setCreateSub('');
+      setCreateZone('');
       setCreateServer('');
       setCreatePort('80');
       setCreateWebsocket(false);
@@ -321,7 +318,7 @@ export default function Domains() {
             </thead>
             <tbody className="divide-y divide-gray-800 bg-gray-900">
               {filtered.map((d) => {
-                const zone = getProviderZone(d.provider_id);
+                const zone = getZoneName(d.zone_id);
                 const srv = getServerInfo(d.server_id);
                 return (
                   <tr key={d.id} className="hover:bg-gray-800/50">
@@ -372,6 +369,25 @@ export default function Domains() {
               className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none"
               placeholder="e.g. app, blog, api"
             />
+            {createSub && createZone && (
+              <p className="mt-1 text-xs text-gray-500">
+                FQDN: {createSub}.{getZoneName(createZone)}
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-300">Zone</label>
+            <select
+              value={createZone}
+              onChange={(e) => setCreateZone(e.target.value)}
+              className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none"
+            >
+              <option value="">Select a zone</option>
+              {zones.map((z) => (
+                <option key={z.id} value={z.id}>{z.name}</option>
+              ))}
+            </select>
           </div>
 
           <div>
@@ -440,7 +456,7 @@ export default function Domains() {
             </button>
             <button
               onClick={handleCreate}
-              disabled={createLoading || !createSub || !createServer}
+              disabled={createLoading || !createSub || !createZone || !createServer}
               className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
             >
               {createLoading ? 'Creating...' : 'Create'}
@@ -455,7 +471,7 @@ export default function Domains() {
           <div className="space-y-5">
             {/* Info */}
             <div className="flex items-center gap-3">
-              <span className="text-lg font-medium text-white">{detailDomain.subdomain}.{getProviderZone(detailDomain.provider_id)}</span>
+              <span className="text-lg font-medium text-white">{detailDomain.subdomain}.{getZoneName(detailDomain.zone_id)}</span>
               <StatusBadge status={detailDomain.status} />
             </div>
 

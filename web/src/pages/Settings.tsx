@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../lib/api';
-import type { Provider, Setting } from '../lib/types';
-import type { HealthResponse, Zone } from '../lib/api';
+import type { Provider, Zone, Setting } from '../lib/types';
+import type { HealthResponse, TestProviderZone } from '../lib/api';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
 
 export default function Settings() {
   const [providers, setProviders] = useState<Provider[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
   const [, setSettings] = useState<Setting[]>([]);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -17,7 +18,7 @@ export default function Settings() {
   const [provApiToken, setProvApiToken] = useState('');
   const [provTestLoading, setProvTestLoading] = useState(false);
   const [provTestError, setProvTestError] = useState('');
-  const [provZones, setProvZones] = useState<Zone[]>([]);
+  const [provZones, setProvZones] = useState<TestProviderZone[]>([]);
   const [selectedZones, setSelectedZones] = useState<Set<string>>(new Set());
   const [provSaveLoading, setProvSaveLoading] = useState(false);
   const [provError, setProvError] = useState('');
@@ -25,6 +26,9 @@ export default function Settings() {
 
   // Delete provider
   const [deleteProviderId, setDeleteProviderId] = useState<string | null>(null);
+
+  // Delete zone
+  const [deleteZoneId, setDeleteZoneId] = useState<string | null>(null);
 
   // Reconciler
   const [reconcilerInterval, setReconcilerInterval] = useState('');
@@ -40,12 +44,14 @@ export default function Settings() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [p, s, h] = await Promise.all([
+      const [p, z, s, h] = await Promise.all([
         api.listProviders(),
+        api.listAllZones(),
         api.getSettings(),
         api.health(),
       ]);
       setProviders(p);
+      setZones(z);
       setSettings(s);
       setHealth(h);
       const rec = s.find((st) => st.key === 'reconciler_interval');
@@ -113,16 +119,23 @@ export default function Settings() {
     setProvSaveLoading(true);
     setProvError('');
     try {
-      for (const zone of provZones) {
-        if (!selectedZones.has(zone.id)) continue;
-        await api.createProvider({
-          type: provType,
-          name: zone.name,
-          config: { api_token: provApiToken },
-          zone_id: zone.id,
-          zone_name: zone.name,
-        });
-      }
+      // Step 1: Create the provider
+      const provider = await api.createProvider({
+        type: provType,
+        name: provType,
+        config: { api_token: provApiToken },
+      });
+
+      // Step 2: Batch-create selected zones
+      const zonesToCreate = provZones
+        .filter(z => selectedZones.has(z.id))
+        .map(z => ({ external_id: z.id, name: z.name }));
+
+      await api.createZonesBatch({
+        provider_id: provider.id,
+        zones: zonesToCreate,
+      });
+
       setShowAddProvider(false);
       resetProviderModal();
       fetchData();
@@ -138,6 +151,15 @@ export default function Settings() {
     try {
       await api.deleteProvider(deleteProviderId);
       setDeleteProviderId(null);
+      fetchData();
+    } catch { /* ignore */ }
+  }
+
+  async function handleDeleteZone() {
+    if (!deleteZoneId) return;
+    try {
+      await api.deleteZone(deleteZoneId);
+      setDeleteZoneId(null);
       fetchData();
     } catch { /* ignore */ }
   }
@@ -191,19 +213,34 @@ export default function Settings() {
           <p className="mt-4 text-sm text-gray-500">No DNS providers configured.</p>
         ) : (
           <div className="mt-4 space-y-3">
-            {providers.map((p) => (
-              <div key={p.id} className="flex items-center justify-between rounded-lg bg-gray-800 px-4 py-3">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <p className="font-medium text-white">{p.name}</p>
-                    <span className="rounded bg-gray-700 px-1.5 py-0.5 text-xs text-gray-400">{p.type}</span>
-                    {p.is_default && <span className="rounded bg-blue-900/40 px-1.5 py-0.5 text-xs text-blue-400">default</span>}
+            {providers.map((p) => {
+              const providerZones = zones.filter(z => z.provider_id === p.id);
+              return (
+                <div key={p.id} className="rounded-lg bg-gray-800 px-4 py-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <p className="font-medium text-white">{p.name}</p>
+                      <span className="rounded bg-gray-700 px-1.5 py-0.5 text-xs text-gray-400">{p.type}</span>
+                      {p.is_default && <span className="rounded bg-blue-900/40 px-1.5 py-0.5 text-xs text-blue-400">default</span>}
+                    </div>
+                    <button onClick={() => setDeleteProviderId(p.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
                   </div>
-                  <p className="mt-0.5 text-sm text-gray-500">{p.zone_name || 'No zone'}</p>
+                  {providerZones.length > 0 && (
+                    <div className="mt-2 space-y-1 ml-2">
+                      {providerZones.map((z) => (
+                        <div key={z.id} className="flex items-center justify-between rounded-md bg-gray-900/60 px-3 py-1.5">
+                          <span className="text-sm text-gray-300">{z.name}</span>
+                          <button onClick={() => setDeleteZoneId(z.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {providerZones.length === 0 && (
+                    <p className="mt-1 text-xs text-gray-500">No zones</p>
+                  )}
                 </div>
-                <button onClick={() => setDeleteProviderId(p.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
@@ -323,7 +360,7 @@ export default function Settings() {
                     </label>
                   ))}
                 </div>
-                <p className="mt-1.5 text-xs text-gray-500">Each zone becomes a separate provider entry.</p>
+                <p className="mt-1.5 text-xs text-gray-500">Selected zones will be added to the provider.</p>
               </div>
               <div className="flex justify-between pt-2">
                 <button onClick={() => { setProvModalStep('token'); setProvZones([]); }}
@@ -343,7 +380,17 @@ export default function Settings() {
         onClose={() => setDeleteProviderId(null)}
         onConfirm={handleDeleteProvider}
         title="Delete Provider"
-        message="Are you sure? Domains using this provider will lose DNS management."
+        message="Are you sure? All zones and domains using this provider will lose DNS management."
+        confirmLabel="Delete"
+        danger
+      />
+
+      <ConfirmDialog
+        open={deleteZoneId !== null}
+        onClose={() => setDeleteZoneId(null)}
+        onConfirm={handleDeleteZone}
+        title="Delete Zone"
+        message="Are you sure? Domains using this zone will lose DNS management."
         confirmLabel="Delete"
         danger
       />

@@ -1,4 +1,4 @@
-import type { Provider, Agent, Server, Domain, AuditLogEntry, Setting } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting } from './types';
 
 const BASE = '/api/v1';
 
@@ -31,7 +31,7 @@ export interface HealthResponse {
   version: string;
 }
 
-export interface Zone {
+export interface TestProviderZone {
   id: string;
   name: string;
 }
@@ -51,20 +51,26 @@ export const api = {
   // Providers
   listProviders: () => request<Provider[]>('/providers'),
   getProvider: (id: string) => request<Provider>(`/providers/${id}`),
-  createProvider: (data: { type: string; name: string; config: unknown; zone_id?: string; zone_name?: string }) =>
+  createProvider: (data: { type: string; name: string; config: unknown }) =>
     request<{ id: string; name: string }>('/providers', { method: 'POST', body: JSON.stringify(data) }),
   updateProvider: (id: string, data: Partial<Provider>) =>
     request<{ message: string }>(`/providers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteProvider: (id: string) => request<{ message: string }>(`/providers/${id}`, { method: 'DELETE' }),
   testProvider: (data: { type: string; config: unknown }) =>
-    request<{ valid: boolean; message: string; zones?: Zone[] }>('/providers/test', { method: 'POST', body: JSON.stringify(data) }),
-  listZones: (id: string) => request<Zone[]>(`/providers/${id}/zones`),
+    request<{ valid: boolean; message: string; zones?: TestProviderZone[] }>('/providers/test', { method: 'POST', body: JSON.stringify(data) }),
+  listProviderZones: (id: string) => request<Zone[]>(`/providers/${id}/zones`),
+
+  // Zones
+  listAllZones: () => request<Zone[]>('/zones'),
+  createZonesBatch: (data: { provider_id: string; zones: Array<{ external_id: string; name: string }> }) =>
+    request<Array<{ id: string; name: string }>>('/zones/batch', { method: 'POST', body: JSON.stringify(data) }),
+  deleteZone: (id: string) => request<{ message: string }>(`/zones/${id}`, { method: 'DELETE' }),
 
   // Agents
   listAgents: () => request<Agent[]>('/agents'),
-  updateAgent: (id: string, data: Partial<Agent>) =>
+  updateAgent: (id: string, data: { name?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
     request<Agent>(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  adoptAgent: (id: string, data: { name?: string; provider_id?: string; dns_mode?: string; ddns_interval?: number }) =>
+  adoptAgent: (id: string, data: { name?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
     request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
   rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
   deleteAgent: (id: string) => request<{ message: string }>(`/agents/${id}`, { method: 'DELETE' }),

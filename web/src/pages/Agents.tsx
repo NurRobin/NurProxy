@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../lib/api';
-import type { Agent, Provider, Server, Domain } from '../lib/types';
+import type { Agent, Zone, Server, Domain } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -20,7 +20,7 @@ function timeAgo(dateStr: string | undefined): string {
 
 export default function Agents() {
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [providers, setProviders] = useState<Provider[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
   const [domains, setDomains] = useState<Domain[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -29,7 +29,7 @@ export default function Agents() {
   // Adopt modal state
   const [adoptAgent, setAdoptAgent] = useState<Agent | null>(null);
   const [adoptName, setAdoptName] = useState('');
-  const [adoptProvider, setAdoptProvider] = useState('');
+  const [adoptZoneIds, setAdoptZoneIds] = useState<Set<string>>(new Set());
   const [adoptDnsMode, setAdoptDnsMode] = useState<'static' | 'ddns'>('static');
   const [adoptDdnsInterval, setAdoptDdnsInterval] = useState(60);
   const [adoptLoading, setAdoptLoading] = useState(false);
@@ -52,13 +52,13 @@ export default function Agents() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [a, p, d] = await Promise.all([
+      const [a, z, d] = await Promise.all([
         api.listAgents(),
-        api.listProviders(),
+        api.listAllZones(),
         api.listDomains(),
       ]);
       setAgents(a);
-      setProviders(p);
+      setZones(z);
       setDomains(d);
     } catch {
       // ignore
@@ -98,7 +98,7 @@ export default function Agents() {
     try {
       await api.adoptAgent(adoptAgent.id, {
         name: adoptName || undefined,
-        provider_id: adoptProvider || undefined,
+        zone_ids: adoptZoneIds.size > 0 ? [...adoptZoneIds] : undefined,
         dns_mode: adoptDnsMode,
         ddns_interval: adoptDnsMode === 'ddns' ? adoptDdnsInterval : undefined,
       });
@@ -200,7 +200,7 @@ export default function Agents() {
                     onClick={() => {
                       setAdoptAgent(agent);
                       setAdoptName(agent.fqdn);
-                      setAdoptProvider(providers[0]?.id ?? '');
+                      setAdoptZoneIds(new Set());
                       setAdoptDnsMode('static');
                       setAdoptDdnsInterval(60);
                       setError('');
@@ -282,6 +282,12 @@ export default function Agents() {
                             <div className="flex justify-between">
                               <dt className="text-gray-500">DDNS Interval</dt>
                               <dd className="text-gray-200">{agent.ddns_interval}s</dd>
+                            </div>
+                          )}
+                          {agent.zones && agent.zones.length > 0 && (
+                            <div className="flex justify-between">
+                              <dt className="text-gray-500">Zones</dt>
+                              <dd className="text-gray-200">{agent.zones.map(z => z.name).join(', ')}</dd>
                             </div>
                           )}
                           {agent.version && (
@@ -387,17 +393,36 @@ export default function Agents() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-300">DNS Provider</label>
-              <select
-                value={adoptProvider}
-                onChange={(e) => setAdoptProvider(e.target.value)}
-                className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none"
-              >
-                <option value="">None</option>
-                {providers.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name} ({p.zone_name})</option>
-                ))}
-              </select>
+              <label className="block text-sm font-medium text-gray-300">DNS Zones</label>
+              {zones.length === 0 ? (
+                <p className="mt-1 text-sm text-gray-500">No zones available. Add a provider in Settings first.</p>
+              ) : (
+                <div className="mt-1 space-y-1 max-h-36 overflow-y-auto rounded-lg border border-gray-700 bg-gray-800 p-2">
+                  {zones.map((z) => (
+                    <label
+                      key={z.id}
+                      className={`flex items-center gap-3 rounded-md px-3 py-2 cursor-pointer transition-colors ${
+                        adoptZoneIds.has(z.id) ? 'bg-blue-900/30' : 'hover:bg-gray-700/50'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={adoptZoneIds.has(z.id)}
+                        onChange={() => {
+                          setAdoptZoneIds(prev => {
+                            const next = new Set(prev);
+                            if (next.has(z.id)) next.delete(z.id);
+                            else next.add(z.id);
+                            return next;
+                          });
+                        }}
+                        className="accent-blue-500 h-4 w-4"
+                      />
+                      <span className="text-sm text-white">{z.name}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div>

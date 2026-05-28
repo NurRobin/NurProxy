@@ -2,9 +2,15 @@ export interface Provider {
   id: string;
   type: string;
   name: string;
-  zone_id: string;
-  zone_name: string;
   is_default: boolean;
+  created_at: string;
+}
+
+export interface Zone {
+  id: string;
+  provider_id: string;
+  external_id: string;
+  name: string;
   created_at: string;
 }
 
@@ -13,7 +19,7 @@ export interface Agent {
   name: string;
   fqdn: string;
   api_url: string;
-  provider_id?: string;
+  zones?: Zone[];
   dns_mode: 'static' | 'ddns';
   ddns_interval: number;
   public_ip?: string;
@@ -37,7 +43,7 @@ export interface Server {
 export interface Domain {
   id: number;
   subdomain: string;
-  provider_id: string;
+  zone_id: string;
   server_id: string;
   port: number;
   proxy_config: ProxyConfig;
