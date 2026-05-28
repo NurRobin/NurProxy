@@ -40,3 +40,8 @@ coverage.html
 # Temp
 /tmp/
 .claude/
+
+# Root-level markdown: ignore all except whitelisted
+/*.md
+!/README.md
+!/CLAUDE.md
