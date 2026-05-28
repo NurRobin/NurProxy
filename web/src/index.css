@@ -1,1 +1,211 @@
 @import "tailwindcss";
+
+/* Dark mode is class-driven (toggle + system default), not media-only. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * NurProxy design tokens.
+ * Warm, grounded palette for a self-hosted infrastructure tool.
+ * OKLCH throughout; neutrals are tinted toward the terracotta accent hue
+ * so brand and surfaces feel related. Chroma is pulled back near the
+ * lightness extremes so nothing goes garish.
+ */
+:root {
+  color-scheme: light;
+
+  --bg:            oklch(0.975 0.006 70);
+  --surface:       oklch(0.995 0.004 70);
+  --surface-2:     oklch(0.955 0.008 70);
+  --surface-3:     oklch(0.920 0.010 70);
+  --border:        oklch(0.900 0.010 70);
+  --border-strong: oklch(0.830 0.013 70);
+
+  --fg:            oklch(0.270 0.015 60);
+  --fg-muted:      oklch(0.480 0.012 60);
+  --fg-faint:      oklch(0.610 0.010 60);
+
+  --accent:        oklch(0.575 0.150 45);
+  --accent-hover:  oklch(0.515 0.155 45);
+  --accent-fg:     oklch(0.990 0.010 70);
+  --accent-soft:   oklch(0.935 0.040 50);
+  --accent-ring:   oklch(0.575 0.150 45 / 0.45);
+
+  --success:       oklch(0.560 0.130 150);
+  --success-soft:  oklch(0.945 0.040 150);
+  --success-fg:    oklch(0.430 0.120 150);
+
+  --warning:       oklch(0.700 0.120 75);
+  --warning-soft:  oklch(0.950 0.055 82);
+  --warning-fg:    oklch(0.500 0.100 70);
+
+  --danger:        oklch(0.555 0.180 27);
+  --danger-soft:   oklch(0.945 0.045 27);
+  --danger-fg:     oklch(0.500 0.185 27);
+
+  --info:          oklch(0.580 0.100 250);
+  --info-soft:     oklch(0.945 0.035 250);
+  --info-fg:       oklch(0.470 0.100 250);
+
+  --shadow-card:   0 1px 2px oklch(0.4 0.02 60 / 0.06), 0 4px 12px oklch(0.4 0.02 60 / 0.05);
+  --shadow-pop:    0 8px 30px oklch(0.3 0.02 60 / 0.14), 0 2px 6px oklch(0.3 0.02 60 / 0.08);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --bg:            oklch(0.190 0.008 65);
+  --surface:       oklch(0.225 0.009 65);
+  --surface-2:     oklch(0.265 0.010 65);
+  --surface-3:     oklch(0.310 0.012 65);
+  --border:        oklch(0.320 0.012 65);
+  --border-strong: oklch(0.400 0.014 65);
+
+  --fg:            oklch(0.950 0.006 70);
+  --fg-muted:      oklch(0.730 0.010 70);
+  --fg-faint:      oklch(0.580 0.010 70);
+
+  --accent:        oklch(0.705 0.140 48);
+  --accent-hover:  oklch(0.765 0.140 48);
+  --accent-fg:     oklch(0.200 0.020 48);
+  --accent-soft:   oklch(0.305 0.055 48);
+  --accent-ring:   oklch(0.705 0.140 48 / 0.50);
+
+  --success:       oklch(0.720 0.150 150);
+  --success-soft:  oklch(0.300 0.060 150);
+  --success-fg:    oklch(0.800 0.150 150);
+
+  --warning:       oklch(0.790 0.130 80);
+  --warning-soft:  oklch(0.320 0.060 80);
+  --warning-fg:    oklch(0.850 0.120 82);
+
+  --danger:        oklch(0.660 0.190 27);
+  --danger-soft:   oklch(0.315 0.080 27);
+  --danger-fg:     oklch(0.790 0.160 27);
+
+  --info:          oklch(0.705 0.110 250);
+  --info-soft:     oklch(0.305 0.050 250);
+  --info-fg:       oklch(0.800 0.100 250);
+
+  --shadow-card:   0 1px 2px oklch(0 0 0 / 0.30), 0 6px 16px oklch(0 0 0 / 0.30);
+  --shadow-pop:    0 12px 40px oklch(0 0 0 / 0.50), 0 2px 8px oklch(0 0 0 / 0.40);
+}
+
+/* `inline` keeps utilities pointing at the live CSS var, so the
+   light/dark toggle works at runtime instead of being baked in. */
+@theme inline {
+  --color-bg:            var(--bg);
+  --color-surface:       var(--surface);
+  --color-surface-2:     var(--surface-2);
+  --color-surface-3:     var(--surface-3);
+  --color-border:        var(--border);
+  --color-border-strong: var(--border-strong);
+
+  --color-fg:            var(--fg);
+  --color-fg-muted:      var(--fg-muted);
+  --color-fg-faint:      var(--fg-faint);
+
+  --color-accent:        var(--accent);
+  --color-accent-hover:  var(--accent-hover);
+  --color-accent-fg:     var(--accent-fg);
+  --color-accent-soft:   var(--accent-soft);
+
+  --color-success:       var(--success);
+  --color-success-soft:  var(--success-soft);
+  --color-success-fg:    var(--success-fg);
+
+  --color-warning:       var(--warning);
+  --color-warning-soft:  var(--warning-soft);
+  --color-warning-fg:    var(--warning-fg);
+
+  --color-danger:        var(--danger);
+  --color-danger-soft:   var(--danger-soft);
+  --color-danger-fg:     var(--danger-fg);
+
+  --color-info:          var(--info);
+  --color-info-soft:     var(--info-soft);
+  --color-info-fg:       var(--info-fg);
+
+  --font-sans:    "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Bricolage Grotesque", "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--border);
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1, h2, h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+
+  code, pre, kbd {
+    font-family: var(--font-mono);
+  }
+
+  ::selection {
+    background-color: var(--accent-soft);
+    color: var(--fg);
+  }
+
+  /* One consistent focus ring everywhere keyboard users land.
+     The outline follows each element's own border-radius. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* Tame the heavy autofill yellow in light mode. */
+  input:-webkit-autofill {
+    -webkit-text-fill-color: var(--fg);
+    transition: background-color 9999s ease-out;
+  }
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes pop-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@layer utilities {
+  .shadow-card { box-shadow: var(--shadow-card); }
+  .shadow-pop  { box-shadow: var(--shadow-pop); }
+
+  .animate-toast-in { animation: toast-in 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
+  .animate-fade-in  { animation: fade-in 0.18s ease-out; }
+  .animate-pop-in   { animation: pop-in 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, ::before, ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
