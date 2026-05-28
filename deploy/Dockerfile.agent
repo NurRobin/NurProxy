@@ -1,0 +1,7 @@
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates caddy
+COPY nurproxy-agent /usr/local/bin/nurproxy-agent
+EXPOSE 80 443 8780
+VOLUME /data
+ENTRYPOINT ["nurproxy-agent"]
+CMD ["--data-dir", "/data"]

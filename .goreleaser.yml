@@ -1,0 +1,111 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: nurproxy
+    main: ./cmd/nurproxy
+    binary: nurproxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+  - id: nurproxy-agent
+    main: ./cmd/nurproxy-agent
+    binary: nurproxy-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: nurproxy
+    builds: [nurproxy]
+    name_template: "nurproxy_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    format: tar.gz
+  - id: nurproxy-agent
+    builds: [nurproxy-agent]
+    name_template: "nurproxy-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    format: tar.gz
+
+dockers:
+  - image_templates:
+      - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-amd64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    ids: [nurproxy]
+    dockerfile: deploy/Dockerfile
+  - image_templates:
+      - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-arm64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    ids: [nurproxy]
+    dockerfile: deploy/Dockerfile
+    goarch: arm64
+
+  - image_templates:
+      - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-amd64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    ids: [nurproxy-agent]
+    dockerfile: deploy/Dockerfile.agent
+  - image_templates:
+      - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-arm64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    ids: [nurproxy-agent]
+    dockerfile: deploy/Dockerfile.agent
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/nurrobin/nurproxy:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-amd64"
+      - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/nurrobin/nurproxy:latest"
+    image_templates:
+      - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-amd64"
+      - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-amd64"
+      - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/nurrobin/nurproxy-agent:latest"
+    image_templates:
+      - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-amd64"
+      - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-arm64"
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
