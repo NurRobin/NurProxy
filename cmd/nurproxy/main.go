@@ -12,10 +12,14 @@ import (
 	"strconv"
 	"syscall"
 
+	"io/fs"
+	"strings"
+
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
-	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare" // register CF provider
+	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
+	"github.com/NurRobin/NurProxy/web"
 )
 
 var version = "dev"
@@ -61,10 +65,38 @@ func main() {
 	// Create API server
 	srv := api.NewServer(database, version)
 
+	// Serve embedded dashboard + API
+	mux := http.NewServeMux()
+	mux.Handle("/api/", srv.Handler())
+
+	distFS, err := fs.Sub(web.Assets, "dist")
+	if err != nil {
+		log.Fatalf("failed to load embedded assets: %v", err)
+	}
+	fileServer := http.FileServer(http.FS(distFS))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Try to serve the file directly
+		if r.URL.Path != "/" && !strings.HasPrefix(r.URL.Path, "/api/") {
+			f, err := distFS.Open(strings.TrimPrefix(r.URL.Path, "/"))
+			if err == nil {
+				f.Close()
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+		}
+		// SPA fallback: serve index.html for all non-file routes
+		if r.URL.Path == "/" || !strings.Contains(r.URL.Path, ".") {
+			r.URL.Path = "/"
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	})
+
 	// Start HTTP server
 	httpSrv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *port),
-		Handler: srv.Handler(),
+		Handler: mux,
 	}
 
 	// Graceful shutdown
