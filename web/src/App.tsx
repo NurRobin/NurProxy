@@ -8,7 +8,7 @@ import SetupWizard from './pages/SetupWizard';
 import ClassicShell from './shells/Classic';
 import WorkbenchShell from './shells/Workbench';
 
-type AuthState = 'loading' | 'setup_required' | 'unauthenticated' | 'needs_setup_wizard' | 'authenticated';
+type AuthState = 'loading' | 'error' | 'setup_required' | 'unauthenticated' | 'needs_setup_wizard' | 'authenticated';
 
 function App() {
   const [authState, setAuthState] = useState<AuthState>('loading');
@@ -20,7 +20,8 @@ function App() {
       const setupComplete = settings.find((s) => s.key === 'setup_complete');
       setAuthState(setupComplete?.value === 'true' ? 'authenticated' : 'needs_setup_wizard');
     } catch {
-      setAuthState('authenticated');
+      // Don't fail open into the dashboard — surface the outage and let the user retry.
+      setAuthState('error');
     }
   }, []);
 
@@ -46,6 +47,23 @@ function App() {
     return (
       <div className="flex min-h-screen items-center justify-center bg-bg text-fg-muted">
         <Spinner className="h-6 w-6" />
+      </div>
+    );
+  }
+
+  if (authState === 'error') {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-bg px-4">
+        <div className="w-full max-w-sm rounded-xl border border-border bg-surface p-6 text-center shadow-card">
+          <h1 className="font-display text-lg font-semibold text-fg">Can’t reach the orchestrator</h1>
+          <p className="mt-1 text-sm text-fg-muted">We couldn’t verify the dashboard state. Check that the orchestrator is running, then try again.</p>
+          <button
+            onClick={() => { setAuthState('loading'); checkAuth(); }}
+            className="mt-5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:bg-accent-hover"
+          >
+            Retry
+          </button>
+        </div>
       </div>
     );
   }

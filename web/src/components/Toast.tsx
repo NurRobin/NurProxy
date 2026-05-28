@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState, type ReactNode } from 'react';
-import { ToastContext, type ToastVariant } from './toast-context';
+import { ToastContext, type ToastVariant, type ToastRecord } from './toast-context';
 
 interface Toast {
   id: number;
@@ -7,8 +7,12 @@ interface Toast {
   variant: ToastVariant;
 }
 
+const HISTORY_CAP = 50;
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [history, setHistory] = useState<ToastRecord[]>([]);
+  const [unseen, setUnseen] = useState(0);
   const counter = useRef(0);
 
   const remove = useCallback((id: number) => {
@@ -18,14 +22,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const push = useCallback((message: string, variant: ToastVariant = 'info') => {
     const id = ++counter.current;
     setToasts((prev) => [...prev, { id, message, variant }]);
+    setHistory((prev) => [{ id, message, variant, at: new Date().toISOString() }, ...prev].slice(0, HISTORY_CAP));
+    if (variant === 'error') setUnseen((n) => n + 1);
     window.setTimeout(() => remove(id), variant === 'error' ? 7000 : 4000);
   }, [remove]);
 
   const error = useCallback((message: string) => push(message, 'error'), [push]);
   const success = useCallback((message: string) => push(message, 'success'), [push]);
+  const markSeen = useCallback(() => setUnseen(0), []);
+  const clearHistory = useCallback(() => { setHistory([]); setUnseen(0); }, []);
 
   return (
-    <ToastContext.Provider value={{ push, error, success }}>
+    <ToastContext.Provider value={{ push, error, success, history, unseen, markSeen, clearHistory }}>
       {children}
       <div className="pointer-events-none fixed bottom-4 right-4 z-[100] flex w-full max-w-sm flex-col gap-2">
         {toasts.map((t) => (

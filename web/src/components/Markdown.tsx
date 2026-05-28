@@ -35,13 +35,15 @@ function renderInline(text: string, keyBase: string, onLink?: (slug: string) => 
       const label = mm[1];
       const href = mm[2];
       const linkCls = 'font-medium text-accent hover:underline';
-      if (/^(https?:|mailto:|\/)/.test(href)) {
+      const external = /^(https?:|mailto:)/.test(href);
+      if (external) {
         out.push(<a key={key} href={href} target="_blank" rel="noreferrer" className={linkCls}>{label}</a>);
       } else if (onLink) {
         // In-panel: switch topic without leaving the current page/form.
         out.push(<button key={key} type="button" onClick={() => onLink(href)} className={linkCls}>{label}</button>);
       } else {
-        out.push(<Link key={key} to={`/help/${href}`} className={linkCls}>{label}</Link>);
+        // Same-origin: bare slug -> /help/<slug>; an absolute path is used as-is.
+        out.push(<Link key={key} to={href.startsWith('/') ? href : `/help/${href}`} className={linkCls}>{label}</Link>);
       }
     }
     last = m.index + token.length;

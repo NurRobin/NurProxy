@@ -329,7 +329,7 @@ export default function Settings() {
         </div>
       </Modal>
 
-      <ConfirmDialog open={deleteProviderId !== null} onClose={() => setDeleteProviderId(null)} onConfirm={handleDeleteProvider} title="Delete provider" message="Delete this provider? All zones and domains using it will lose DNS management." confirmLabel="Delete" danger />
+      <ConfirmDialog open={deleteProviderId !== null} onClose={() => setDeleteProviderId(null)} onConfirm={handleDeleteProvider} title="Delete provider" message="Delete this provider? All zones and domains using it will lose DNS management." confirmLabel="Delete" danger confirmText={providers.find((p) => p.id === deleteProviderId)?.name} />
       <ConfirmDialog open={deleteZoneId !== null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title="Remove zone" message="Remove this zone? Domains using it will lose DNS management." confirmLabel="Remove" danger />
     </div>
   );

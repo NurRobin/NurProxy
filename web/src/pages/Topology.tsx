@@ -29,7 +29,7 @@ export default function Topology() {
 
   const [selected, setSelected] = useState<Selection | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
-  const [del, setDel] = useState<{ title: string; message: string; run: () => Promise<void> } | null>(null);
+  const [del, setDel] = useState<{ title: string; message: string; run: () => Promise<void>; confirmText?: string } | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -114,7 +114,7 @@ export default function Topology() {
     try { await api.rejectAgent(id); toast.success('Agent rejected.'); fetchData(); }
     catch (err) { toast.error(errMessage(err, 'Failed to reject.')); }
   }
-  function confirmDelete(title: string, message: string, run: () => Promise<void>) { setDel({ title, message, run }); }
+  function confirmDelete(title: string, message: string, run: () => Promise<void>, confirmText?: string) { setDel({ title, message, run, confirmText }); }
 
   function openMenu(e: React.MouseEvent, sel: Selection) {
     e.preventDefault();
@@ -130,7 +130,7 @@ export default function Topology() {
         items.push({ label: 'Approve…', onSelect: () => navigate('/agents') });
         items.push({ label: 'Reject', danger: true, onSelect: () => rejectAgent(sel.id) });
       } else {
-        items.push({ label: 'Delete agent', danger: true, onSelect: () => confirmDelete('Delete agent', `Delete “${a?.name}”? Removes its servers and domains too.`, async () => { await api.deleteAgent(sel.id); }) });
+        items.push({ label: 'Delete agent', danger: true, onSelect: () => confirmDelete('Delete agent', `Delete “${a?.name}”? Removes its servers and domains too.`, async () => { await api.deleteAgent(sel.id); }, a?.name) });
       }
     } else if (sel.kind === 'server') {
       const s = allServers.find((x) => x.id === sel.id);
@@ -240,6 +240,7 @@ export default function Topology() {
         message={del?.message ?? ''}
         confirmLabel="Delete"
         danger
+        confirmText={del?.confirmText}
       />
     </div>
   );

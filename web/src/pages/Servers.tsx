@@ -29,6 +29,7 @@ export default function Servers() {
   const [error, setError] = useState('');
 
   const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const eligible = agents.filter((a) => a.status === 'adopted' || a.status === 'offline');
 
@@ -74,8 +75,10 @@ export default function Servers() {
 
   async function handleDelete() {
     if (!deleteId) return;
+    setDeleting(true);
     try { await api.deleteServer(deleteId); toast.success('Server removed.'); setDeleteId(null); fetchData(); }
     catch (err) { toast.error(errMessage(err, 'Failed to remove server.')); }
+    finally { setDeleting(false); }
   }
 
   const domainsForServer = (sid: string) => domains.filter((d) => d.server_id === sid && d.status !== 'deleting').length;
@@ -179,6 +182,7 @@ export default function Servers() {
         message="Remove this server? Domains pointing at it will be affected until you repoint them."
         confirmLabel="Remove"
         danger
+        loading={deleting}
       />
     </div>
   );

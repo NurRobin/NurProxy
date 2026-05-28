@@ -1,6 +1,7 @@
 import { BrowserRouter, NavLink } from 'react-router-dom';
 import { ThemeToggle } from '../lib/theme';
 import BrandMark from '../components/BrandMark';
+import NotificationBell from '../components/NotificationBell';
 import Overview from '../pages/Overview';
 import { AppRoutes } from './appRoutes';
 import { NAV } from './nav';
@@ -31,6 +32,7 @@ export default function ClassicShell({ onLogout }: { onLogout: () => void }) {
               </div>
               <div className="flex items-center gap-1">
                 <NavLink to="/help" className={navLinkClass}>Docs</NavLink>
+                <NotificationBell />
                 <ThemeToggle />
                 <button onClick={onLogout} className="rounded-lg px-3 py-2 text-sm font-medium text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg">Logout</button>
               </div>

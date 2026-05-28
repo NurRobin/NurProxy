@@ -14,9 +14,7 @@ import MultiSelect from '../components/MultiSelect';
 import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
 
-function seen(date?: string) {
-  return date ? formatRelativeTime(date) : 'Never';
-}
+const seen = (d?: string) => (d ? formatRelativeTime(d) : 'Never');
 
 export default function Agents() {
   const toast = useToast();
@@ -24,7 +22,7 @@ export default function Agents() {
   const [zones, setZones] = useState<Zone[]>([]);
   const [domains, setDomains] = useState<Domain[]>([]);
   const [loading, setLoading] = useState(true);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [servers, setServers] = useState<Record<string, Server[]>>({});
 
   const [adoptAgent, setAdoptAgent] = useState<Agent | null>(null);
@@ -60,16 +58,19 @@ export default function Agents() {
     }
   }, [toast]);
 
-  function toggleExpand(agentId: string) {
-    if (expandedId === agentId) { setExpandedId(null); return; }
-    setExpandedId(agentId);
-    if (!servers[agentId]) loadServers(agentId);
+  function select(agent: Agent) {
+    setSelectedId(agent.id);
+    if ((agent.status === 'adopted' || agent.status === 'offline') && !servers[agent.id]) loadServers(agent.id);
+  }
+
+  function startAdopt(agent: Agent) {
+    setAdoptAgent(agent); setAdoptName(agent.fqdn); setAdoptZoneIds(new Set());
+    setAdoptDnsMode('static'); setAdoptDdnsInterval(60); setAdoptError('');
   }
 
   async function handleAdopt() {
     if (!adoptAgent) return;
-    setAdoptLoading(true);
-    setAdoptError('');
+    setAdoptLoading(true); setAdoptError('');
     try {
       await api.adoptAgent(adoptAgent.id, {
         name: adoptName || undefined,
@@ -88,7 +89,7 @@ export default function Agents() {
   }
 
   async function handleReject(id: string) {
-    try { await api.rejectAgent(id); toast.success('Agent rejected.'); fetchData(); }
+    try { await api.rejectAgent(id); toast.success('Agent rejected.'); if (selectedId === id) setSelectedId(null); fetchData(); }
     catch (err) { toast.error(errMessage(err, 'Failed to reject agent.')); }
   }
 
@@ -98,7 +99,7 @@ export default function Agents() {
     try {
       await api.deleteAgent(deleteAgent.id);
       toast.success('Agent deleted.');
-      if (expandedId === deleteAgent.id) setExpandedId(null);
+      if (selectedId === deleteAgent.id) setSelectedId(null);
       setDeleteAgent(null);
       fetchData();
     } catch (err) {
@@ -110,106 +111,125 @@ export default function Agents() {
 
   const pendingAgents = agents.filter((a) => a.status === 'pending');
   const otherAgents = agents.filter((a) => a.status !== 'pending');
+  const selected = agents.find((a) => a.id === selectedId) ?? null;
 
   if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading agents…</div>;
+
+  const empty = agents.length === 0;
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Agents</h1>
-        <p className="mt-1 flex items-center gap-1.5 text-sm text-fg-muted">
-          Edge servers running NurProxy <HelpTip term="agent" />
-        </p>
+        <h1 className="flex items-center gap-2 font-display text-3xl font-bold tracking-tight text-fg">
+          Agents <HelpTip term="agent" />
+        </h1>
+        <p className="mt-1 text-sm text-fg-muted">Edge servers running NurProxy. Select one to inspect it.</p>
       </div>
 
-      {pendingAgents.length > 0 && (
-        <section className="rounded-xl border border-warning/40 bg-warning-soft/60 p-4">
-          <h2 className="mb-3 flex items-center gap-1.5 text-sm font-semibold text-warning-fg">
-            {pendingAgents.length} agent{pendingAgents.length !== 1 ? 's' : ''} waiting for approval <HelpTip term="adoption" />
-          </h2>
-          <div className="space-y-3">
-            {pendingAgents.map((agent) => (
-              <div key={agent.id} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-surface px-4 py-3">
-                <div className="min-w-0">
-                  <p className="truncate font-medium text-fg">{agent.fqdn}</p>
-                  <p className="text-xs text-fg-faint">
-                    {agent.public_ip && `IP ${agent.public_ip}`}{agent.version && ` · v${agent.version}`}
-                  </p>
-                </div>
-                <div className="flex flex-shrink-0 gap-2">
-                  <Button size="sm" onClick={() => { setAdoptAgent(agent); setAdoptName(agent.fqdn); setAdoptZoneIds(new Set()); setAdoptDnsMode('static'); setAdoptDdnsInterval(60); setAdoptError(''); }}>Approve</Button>
-                  <Button variant="secondary" size="sm" onClick={() => handleReject(agent.id)}>Reject</Button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {otherAgents.length === 0 && pendingAgents.length === 0 ? (
+      {empty ? (
         <EmptyState
           title="No agents registered"
           description="Install the NurProxy agent on a server and it will appear here for approval. See Setup for the install command."
         />
       ) : (
-        <div className="space-y-3">
-          {otherAgents.map((agent) => {
-            const expanded = expandedId === agent.id;
-            const agentServers = servers[agent.id] ?? [];
-            const agentDomains = domains.filter((d) => agentServers.some((s) => s.id === d.server_id) && d.status !== 'deleting');
+        <div className="grid gap-6 md:grid-cols-[20rem_1fr]">
+          {/* Master list */}
+          <div className={selected ? 'hidden md:block' : 'block'}>
+            <div className="space-y-4">
+              {pendingAgents.length > 0 && (
+                <div>
+                  <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-warning-fg">Pending approval</h2>
+                  <div className="space-y-2">
+                    {pendingAgents.map((a) => (
+                      <ListRow key={a.id} active={selectedId === a.id} tone="warning" onClick={() => select(a)} agent={a} />
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div>
+                {otherAgents.length > 0 && <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">Agents</h2>}
+                <div className="space-y-2">
+                  {otherAgents.map((a) => (
+                    <ListRow key={a.id} active={selectedId === a.id} onClick={() => select(a)} agent={a} />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
 
-            return (
-              <div key={agent.id} className="overflow-hidden rounded-xl border border-border bg-surface shadow-card">
-                <button onClick={() => toggleExpand(agent.id)} className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left transition-colors hover:bg-surface-2">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <p className="truncate font-medium text-fg">{agent.name}</p>
-                      <StatusBadge status={agent.status} />
-                    </div>
-                    <p className="mt-0.5 truncate text-sm text-fg-muted">{agent.fqdn}</p>
-                  </div>
-                  <div className="flex flex-shrink-0 items-center gap-5 text-xs text-fg-faint">
-                    {agent.public_ip && <span className="hidden font-mono sm:inline">{agent.public_ip}</span>}
-                    <span className="hidden sm:inline">Seen {seen(agent.last_seen)}</span>
-                    <span>{agentServers.length} server{agentServers.length !== 1 ? 's' : ''}</span>
-                    <svg className={`h-4 w-4 transition-transform ${expanded ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
-                  </div>
+          {/* Detail */}
+          <div className={selected ? 'block' : 'hidden md:block'}>
+            {!selected ? (
+              <div className="flex h-full min-h-48 items-center justify-center rounded-xl border border-dashed border-border text-sm text-fg-faint">
+                Select an agent to see details.
+              </div>
+            ) : (
+              <div className="rounded-xl border border-border bg-surface p-6 shadow-card">
+                <button onClick={() => setSelectedId(null)} className="mb-4 inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg md:hidden">
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" /></svg>
+                  Back
                 </button>
 
-                {expanded && (
-                  <div className="border-t border-border px-5 py-4">
-                    <div className="grid gap-6 sm:grid-cols-2">
-                      <div className="space-y-3">
-                        <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">Details</h3>
-                        <dl className="space-y-2 text-sm">
-                          <Row label={<span className="flex items-center gap-1">DNS mode <HelpTip term="dns-mode" /></span>} value={agent.dns_mode || 'static'} />
-                          {agent.dns_mode === 'ddns' && <Row label="DDNS interval" value={`${agent.ddns_interval}s`} />}
-                          {agent.zones && agent.zones.length > 0 && <Row label="Zones" value={agent.zones.map((z) => z.name).join(', ')} />}
-                          {agent.version && <Row label="Version" value={agent.version} />}
-                          <Row label="ID" value={<span className="font-mono text-xs">{agent.id}</span>} />
-                        </dl>
-                        <Button variant="danger-ghost" size="sm" onClick={() => setDeleteAgent(agent)}>Delete agent</Button>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h2 className="truncate font-display text-xl font-semibold text-fg">{selected.name}</h2>
+                      <StatusBadge status={selected.status} />
+                    </div>
+                    <p className="truncate text-sm text-fg-muted">{selected.fqdn}</p>
+                  </div>
+                  {selected.status === 'pending' ? (
+                    <div className="flex gap-2">
+                      <Button size="sm" onClick={() => startAdopt(selected)}>Approve</Button>
+                      <Button variant="secondary" size="sm" onClick={() => handleReject(selected.id)}>Reject</Button>
+                    </div>
+                  ) : (
+                    <Button variant="danger-ghost" size="sm" onClick={() => setDeleteAgent(selected)}>Delete agent</Button>
+                  )}
+                </div>
+
+                {selected.status === 'pending' ? (
+                  <Callout tone="warning" title="Awaiting approval">
+                    Approve this agent to give it zones and a DNS mode, or reject it if you don’t recognize it.
+                  </Callout>
+                ) : (
+                  <div className="mt-5 grid gap-6 sm:grid-cols-2">
+                    <div className="space-y-3">
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">Details</h3>
+                      <dl className="space-y-2 text-sm">
+                        <Row label={<span className="flex items-center gap-1">DNS mode <HelpTip term="dns-mode" /></span>} value={selected.dns_mode || 'static'} />
+                        {selected.dns_mode === 'ddns' && <Row label="DDNS interval" value={`${selected.ddns_interval}s`} />}
+                        {selected.zones && selected.zones.length > 0 && <Row label="Zones" value={selected.zones.map((z) => z.name).join(', ')} />}
+                        {selected.public_ip && <Row label="IP" value={selected.public_ip} />}
+                        {selected.version && <Row label="Version" value={selected.version} />}
+                        <Row label="Last seen" value={seen(selected.last_seen)} />
+                        <Row label="ID" value={<span className="font-mono text-xs">{selected.id}</span>} />
+                      </dl>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">Servers <HelpTip term="server" /></h3>
+                        <Link to="/servers" className="text-xs font-medium text-accent hover:underline">Manage in Servers →</Link>
                       </div>
-
-                      <div>
-                        <div className="flex items-center justify-between">
-                          <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">Servers <HelpTip term="server" /></h3>
-                          <Link to="/servers" className="text-xs font-medium text-accent hover:underline">Manage in Servers →</Link>
+                      {(servers[selected.id] ?? []).length === 0 ? (
+                        <p className="mt-2 text-sm text-fg-faint">No servers yet.</p>
+                      ) : (
+                        <div className="mt-2 space-y-2">
+                          {(servers[selected.id] ?? []).map((srv) => (
+                            <div key={srv.id} className="rounded-lg bg-surface-2 px-3 py-2">
+                              <p className="truncate text-sm font-medium text-fg">{srv.name}</p>
+                              <p className="truncate font-mono text-xs text-fg-faint">{srv.address}</p>
+                            </div>
+                          ))}
                         </div>
-                        {agentServers.length === 0 ? (
-                          <p className="mt-2 text-sm text-fg-faint">No servers yet.</p>
-                        ) : (
-                          <div className="mt-2 space-y-2">
-                            {agentServers.map((srv) => (
-                              <div key={srv.id} className="rounded-lg bg-surface-2 px-3 py-2">
-                                <p className="truncate text-sm font-medium text-fg">{srv.name}</p>
-                                <p className="truncate font-mono text-xs text-fg-faint">{srv.address}</p>
-                              </div>
-                            ))}
-                          </div>
-                        )}
+                      )}
 
-                        {agentDomains.length > 0 && (
+                      {(() => {
+                        const agentServers = servers[selected.id] ?? [];
+                        const agentDomains = domains.filter((d) => agentServers.some((s) => s.id === d.server_id) && d.status !== 'deleting');
+                        if (agentDomains.length === 0) return null;
+                        return (
                           <div className="mt-4">
                             <h4 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">Domains</h4>
                             <div className="mt-2 space-y-1">
@@ -221,14 +241,14 @@ export default function Agents() {
                               ))}
                             </div>
                           </div>
-                        )}
-                      </div>
+                        );
+                      })()}
                     </div>
                   </div>
                 )}
               </div>
-            );
-          })}
+            )}
+          </div>
         </div>
       )}
 
@@ -273,8 +293,35 @@ export default function Agents() {
         )}
       </Modal>
 
-      <ConfirmDialog open={deleteAgent !== null} onClose={() => setDeleteAgent(null)} onConfirm={handleDelete} title="Delete agent" message={`Delete “${deleteAgent?.name}”? This removes all of its servers and domains too.`} confirmLabel="Delete" danger loading={deleteLoading} />
+      <ConfirmDialog
+        open={deleteAgent !== null}
+        onClose={() => setDeleteAgent(null)}
+        onConfirm={handleDelete}
+        title="Delete agent"
+        message={`Delete “${deleteAgent?.name}”? This removes all of its servers and domains too.`}
+        confirmLabel="Delete"
+        danger
+        loading={deleteLoading}
+        confirmText={deleteAgent?.name}
+      />
     </div>
+  );
+}
+
+function ListRow({ agent, active, tone, onClick }: { agent: Agent; active: boolean; tone?: 'warning'; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex w-full items-center justify-between gap-3 rounded-lg border px-4 py-3 text-left transition-colors ${
+        active ? 'border-accent bg-accent-soft' : tone === 'warning' ? 'border-warning/40 bg-warning-soft/50 hover:border-warning/60' : 'border-border bg-surface hover:border-border-strong'
+      }`}
+    >
+      <div className="min-w-0">
+        <p className="truncate font-medium text-fg">{agent.name}</p>
+        <p className="truncate text-xs text-fg-faint">{agent.fqdn}</p>
+      </div>
+      <StatusBadge status={agent.status} />
+    </button>
   );
 }
 

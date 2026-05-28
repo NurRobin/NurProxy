@@ -2,10 +2,23 @@ import { createContext, useContext } from 'react';
 
 export type ToastVariant = 'error' | 'success' | 'info';
 
+export interface ToastRecord {
+  id: number;
+  message: string;
+  variant: ToastVariant;
+  at: string; // ISO timestamp
+}
+
 export interface ToastContextValue {
   push: (message: string, variant?: ToastVariant) => void;
   error: (message: string) => void;
   success: (message: string) => void;
+  /** Recent notifications (newest first), retained after the transient toast fades. */
+  history: ToastRecord[];
+  /** Count of unseen errors since the notification center was last opened. */
+  unseen: number;
+  markSeen: () => void;
+  clearHistory: () => void;
 }
 
 export const ToastContext = createContext<ToastContextValue | null>(null);

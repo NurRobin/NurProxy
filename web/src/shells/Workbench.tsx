@@ -3,6 +3,7 @@ import { BrowserRouter, NavLink } from 'react-router-dom';
 import { api } from '../lib/api';
 import { ThemeToggle } from '../lib/theme';
 import BrandMark from '../components/BrandMark';
+import NotificationBell from '../components/NotificationBell';
 import Topology from '../pages/Topology';
 import { AppRoutes } from './appRoutes';
 import { NAV } from './nav';
@@ -15,7 +16,10 @@ function useCounts() {
       try {
         const [a, d] = await Promise.all([api.listAgents(), api.listDomains()]);
         if (live) setCounts({ '/agents': a.length, '/domains': d.length });
-      } catch { /* ignore */ }
+      } catch (e) {
+        // Non-critical (nav badges); don't toast every 30s, but don't swallow silently.
+        console.warn('nav counts refresh failed', e);
+      }
     };
     load();
     const t = setInterval(load, 30000);
@@ -60,7 +64,7 @@ export default function WorkbenchShell({ onLogout }: { onLogout: () => void }) {
             </NavLink>
             <div className="flex items-center justify-between px-3 pt-1">
               <button onClick={onLogout} className="text-sm font-medium text-fg-muted transition-colors hover:text-fg">Logout</button>
-              <ThemeToggle />
+              <div className="flex items-center gap-1"><NotificationBell /><ThemeToggle /></div>
             </div>
           </div>
         </aside>
@@ -70,7 +74,7 @@ export default function WorkbenchShell({ onLogout }: { onLogout: () => void }) {
           <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur md:hidden">
             <div className="flex h-14 items-center justify-between px-4">
               <span className="flex items-center gap-2"><BrandMark /><span className="font-display text-lg font-bold text-fg">NurProxy</span></span>
-              <div className="flex items-center gap-1"><ThemeToggle /><button onClick={onLogout} className="rounded-lg px-2 py-2 text-sm font-medium text-fg-muted hover:text-fg">Logout</button></div>
+              <div className="flex items-center gap-1"><NotificationBell /><ThemeToggle /><button onClick={onLogout} className="rounded-lg px-2 py-2 text-sm font-medium text-fg-muted hover:text-fg">Logout</button></div>
             </div>
             <nav className="-mx-1 flex gap-1 overflow-x-auto px-3 pb-2">
               {[...NAV, { to: '/help', label: 'Docs', icon: null }].map(({ to, label }) => (
