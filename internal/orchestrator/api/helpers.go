@@ -21,7 +21,6 @@ func readJSON(r *http.Request, v interface{}) error {
 		return fmt.Errorf("empty request body")
 	}
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)
 	}

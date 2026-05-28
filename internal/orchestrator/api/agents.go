@@ -95,9 +95,10 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name       string          `json:"name"`
-		ProviderID string          `json:"provider_id"`
-		DNSMode    models.DNSMode  `json:"dns_mode"`
+		Name         string          `json:"name"`
+		ProviderID   string          `json:"provider_id"`
+		DNSMode      models.DNSMode  `json:"dns_mode"`
+		DDNSInterval int             `json:"ddns_interval"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -108,7 +109,6 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 		agent.Name = req.Name
 	}
 	if req.ProviderID != "" {
-		// Validate provider exists
 		if _, err := s.db.GetProvider(req.ProviderID); err != nil {
 			writeError(w, http.StatusBadRequest, "provider not found")
 			return
@@ -117,6 +117,9 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DNSMode != "" {
 		agent.DNSMode = req.DNSMode
+	}
+	if req.DDNSInterval > 0 {
+		agent.DDNSInterval = req.DDNSInterval
 	}
 	agent.Status = models.AgentStatusAdopted
 
