@@ -579,6 +579,173 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 	}
 }
 
+func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	// Give the domain an existing DNS record and a route on the agent.
+	recID, err := mp.CreateRecord(context.Background(), nil, provider.Record{
+		Type: "CNAME", Name: "app.example.com", Content: "agent1.example.com",
+	})
+	if err != nil {
+		t.Fatalf("CreateRecord: %v", err)
+	}
+	if err := d.UpdateDomainDNSRecord(dom.ID, recID); err != nil {
+		t.Fatalf("UpdateDomainDNSRecord: %v", err)
+	}
+	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatalf("UpdateDomainStatus: %v", err)
+	}
+
+	mc := newMockAgentClient()
+	mc.setHealthy(agent.APIURL, true)
+	mc.setRoutes(agent.APIURL, []json.RawMessage{
+		json.RawMessage(`{"@id":"domain-app-example-com","match":[{"host":["app.example.com"]}],"terminal":true}`),
+	})
+
+	r := New(d, mc, time.Minute)
+	if err := r.reconcileDeletions(context.Background()); err != nil {
+		t.Fatalf("reconcileDeletions: %v", err)
+	}
+
+	// DNS record gone.
+	if _, ok := mp.getRecord(recID); ok {
+		t.Error("expected DNS record to be deleted")
+	}
+	// Route gone from agent.
+	if len(mc.getRoutes(agent.APIURL)) != 0 {
+		t.Errorf("expected route removed, got %d routes", len(mc.getRoutes(agent.APIURL)))
+	}
+	// Domain row gone.
+	if _, err := d.GetDomain(dom.ID); err == nil {
+		t.Error("expected domain row to be deleted")
+	}
+	// Audit trail recorded the deletion.
+	entries, _, _ := d.ListAuditLog(20, 0)
+	found := false
+	for _, e := range entries {
+		if e.Action == "deleted" && e.EntityType == "domain" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected audit entry with action deleted")
+	}
+}
+
+func TestReconcileAgentDNS_CreateAndDDNSUpdate(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, zone, agent, _, _ := setupScenario(t, d)
+
+	// Put the agent in DDNS mode, give it a public IP and an assigned zone.
+	agent.DNSMode = models.DNSModeDDNS
+	agent.PublicIP = "203.0.113.10"
+	if err := d.UpdateAgent(agent); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	if err := d.AddAgentZone(agent.ID, zone.ID); err != nil {
+		t.Fatalf("AddAgentZone: %v", err)
+	}
+
+	mc := newMockAgentClient()
+	r := New(d, mc, time.Minute)
+
+	// First cycle: create the A record.
+	if err := r.reconcileAgentDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileAgentDNS: %v", err)
+	}
+	got, _ := d.GetAgent(agent.ID)
+	if got.DNSRecordID == "" {
+		t.Fatal("expected agent to have an A record id")
+	}
+	rec, ok := mp.getRecord(got.DNSRecordID)
+	if !ok || rec.Type != "A" || rec.Content != "203.0.113.10" || rec.Name != "agent1.example.com" {
+		t.Fatalf("unexpected A record: %+v (ok=%v)", rec, ok)
+	}
+
+	// IP changes — a DDNS cycle should update the record.
+	got.PublicIP = "203.0.113.99"
+	if err := d.UpdateAgent(got); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	if err := r.reconcileAgentDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileAgentDNS (update): %v", err)
+	}
+	rec, _ = mp.getRecord(got.DNSRecordID)
+	if rec.Content != "203.0.113.99" {
+		t.Errorf("DDNS did not update record: got %q, want 203.0.113.99", rec.Content)
+	}
+
+	entries, _, _ := d.ListAuditLog(20, 0)
+	found := false
+	for _, e := range entries {
+		if e.Action == "ddns_updated" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected ddns_updated audit entry")
+	}
+}
+
+func TestReconcileAgentDNS_StaticModeNoUpdate(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, zone, agent, _, _ := setupScenario(t, d)
+
+	agent.DNSMode = models.DNSModeStatic
+	agent.PublicIP = "203.0.113.10"
+	if err := d.UpdateAgent(agent); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	if err := d.AddAgentZone(agent.ID, zone.ID); err != nil {
+		t.Fatalf("AddAgentZone: %v", err)
+	}
+
+	mc := newMockAgentClient()
+	r := New(d, mc, time.Minute)
+
+	if err := r.reconcileAgentDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileAgentDNS: %v", err)
+	}
+	got, _ := d.GetAgent(agent.ID)
+	recID := got.DNSRecordID
+	if recID == "" {
+		t.Fatal("expected A record created in static mode too")
+	}
+
+	// IP changes, but static mode must NOT auto-update.
+	got.PublicIP = "203.0.113.99"
+	if err := d.UpdateAgent(got); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	if err := r.reconcileAgentDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileAgentDNS (2): %v", err)
+	}
+	rec, _ := mp.getRecord(recID)
+	if rec.Content != "203.0.113.10" {
+		t.Errorf("static mode should not auto-update: got %q, want 203.0.113.10", rec.Content)
+	}
+}
+
+func TestMatchZoneForFQDN(t *testing.T) {
+	zones := []models.Zone{
+		{ID: "z1", Name: "example.com"},
+		{ID: "z2", Name: "sub.example.com"},
+	}
+	if z := matchZoneForFQDN("host.sub.example.com", zones); z == nil || z.ID != "z2" {
+		t.Errorf("expected longest-suffix match z2, got %+v", z)
+	}
+	if z := matchZoneForFQDN("host.example.com", zones); z == nil || z.ID != "z1" {
+		t.Errorf("expected z1, got %+v", z)
+	}
+	if z := matchZoneForFQDN("agent.other.org", zones); z != nil {
+		t.Errorf("expected no match, got %+v", z)
+	}
+}
+
 func TestReconcileAgents_MarkOffline(t *testing.T) {
 	d := testDB(t)
 	_, _, agent, _, _ := setupScenario(t, d)
