@@ -1,1 +1,60 @@
+// Package db provides the SQLite persistence layer for the orchestrator.
 package db
+
+import (
+	"database/sql"
+	"fmt"
+
+	_ "modernc.org/sqlite"
+)
+
+// DB wraps a SQLite connection and an encryption key for provider configs.
+type DB struct {
+	sql       *sql.DB
+	cryptoKey []byte
+}
+
+// Open opens (or creates) a SQLite database at dbPath, enables recommended
+// pragmas, and runs any pending schema migrations. cryptoKey is the AES-256
+// key used to encrypt/decrypt provider configurations at rest.
+func Open(dbPath string, cryptoKey []byte) (*DB, error) {
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening database: %w", err)
+	}
+
+	// Enable WAL mode for better concurrent read performance.
+	if _, err := sqlDB.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("enabling WAL: %w", err)
+	}
+
+	// Enforce foreign key constraints.
+	if _, err := sqlDB.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("enabling foreign keys: %w", err)
+	}
+
+	// Set a busy timeout to avoid "database is locked" under contention.
+	if _, err := sqlDB.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("setting busy timeout: %w", err)
+	}
+
+	d := &DB{
+		sql:       sqlDB,
+		cryptoKey: cryptoKey,
+	}
+
+	if err := d.migrate(); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("running migrations: %w", err)
+	}
+
+	return d, nil
+}
+
+// Close closes the underlying database connection.
+func (d *DB) Close() error {
+	return d.sql.Close()
+}
