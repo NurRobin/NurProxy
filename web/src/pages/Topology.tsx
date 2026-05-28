@@ -34,6 +34,8 @@ export default function Topology() {
   const [selected, setSelected] = useState<Selection | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [del, setDel] = useState<{ title: string; message: string; run: () => Promise<void>; confirmText?: string } | null>(null);
+  const [filter, setFilter] = useState('');
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
   const fetchData = useCallback(async () => {
     try {
@@ -103,7 +105,7 @@ export default function Topology() {
     setSize({ w: c.scrollWidth, h: c.scrollHeight });
   }, [edges]);
 
-  useLayoutEffect(() => { measure(); }, [measure, agents, orderedServers, orderedDomains]);
+  useLayoutEffect(() => { measure(); }, [measure, agents, orderedServers, orderedDomains, collapsed, filter]);
   useEffect(() => {
     const c = containerRef.current; if (!c) return;
     const ro = new ResizeObserver(() => measure());
@@ -165,6 +167,40 @@ export default function Topology() {
     return d ? fqdn(d) : 'Domain';
   }
 
+  // --- collapse + filter keep large topologies legible ---
+  function toggleCollapse(id: string) {
+    setCollapsed((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  }
+  const q = filter.trim().toLowerCase();
+  const mAgent = (a: Agent) => !q || a.name.toLowerCase().includes(q) || a.fqdn.toLowerCase().includes(q);
+  const mServer = (s: Server) => !q || s.name.toLowerCase().includes(q) || s.address.toLowerCase().includes(q);
+  const mDomain = (d: Domain) => !q || fqdn(d).toLowerCase().includes(q);
+  const agentOf = (s: Server) => agents.find((a) => a.id === s.agent_id);
+  const serversOf = (id: string) => serversByAgent[id] ?? [];
+  const domainsOfServer = (sid: string) => domains.filter((d) => d.server_id === sid);
+
+  const visibleAgents = agents.filter((a) => mAgent(a) || serversOf(a.id).some((s) => mServer(s) || domainsOfServer(s.id).some(mDomain)));
+  const visibleAgentIds = new Set(visibleAgents.map((a) => a.id));
+  const visibleServers = orderedServers.filter((s) => {
+    const a = agentOf(s);
+    if (!a || !visibleAgentIds.has(a.id) || collapsed.has(a.id)) return false;
+    return !q || mServer(s) || mAgent(a) || domainsOfServer(s.id).some(mDomain);
+  });
+  const visibleServerIds = new Set(visibleServers.map((s) => s.id));
+  const visibleDomains = orderedDomains.filter((d) => {
+    const s = allServers.find((x) => x.id === d.server_id);
+    if (s && !visibleServerIds.has(s.id)) return false;
+    if (!q) return true;
+    const a = s ? agentOf(s) : undefined;
+    return mDomain(d) || (!!s && mServer(s)) || (!!a && mAgent(a));
+  });
+  const errorCount = agents.filter((a) => a.status === 'error').length + domains.filter((d) => d.status === 'error').length;
+
+  // Accessible names (the connector SVG is decorative, so relationships live here).
+  const agentLabel = (a: Agent) => `Agent ${a.name}, ${a.status}, ${serversOf(a.id).length} server${serversOf(a.id).length !== 1 ? 's' : ''}`;
+  const serverLabel = (s: Server) => { const a = agentOf(s); return `Server ${s.name} at ${s.address}${a ? ` on agent ${a.name}` : ''}, ${domainsOfServer(s.id).length} domain${domainsOfServer(s.id).length !== 1 ? 's' : ''}`; };
+  const domainLabel = (d: Domain) => { const s = allServers.find((x) => x.id === d.server_id); const a = s ? agentOf(s) : undefined; return `Domain ${fqdn(d)}, ${d.status}, proxied to ${s ? `${s.address}:${d.port}` : `port ${d.port}`}${a ? ` on agent ${a.name}` : ''}`; };
+
   if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading topology…</div>;
 
   const hasAnything = agents.length > 0;
@@ -186,61 +222,97 @@ export default function Topology() {
           action={<button onClick={() => navigate('/agents')} className={buttonClass('primary')}>Connect an agent</button>}
         />
       ) : (
-        <div ref={containerRef} className="relative overflow-x-auto rounded-xl border border-border bg-surface/40 p-5">
-          <svg width={size.w} height={size.h} className="pointer-events-none absolute left-0 top-0" style={{ overflow: 'visible' }}>
-            {paths.map((p) => (
-              <path key={p.id} d={p.d} fill="none" strokeWidth={1.5}
-                stroke={p.active ? 'var(--accent)' : 'var(--border-strong)'} strokeOpacity={p.active ? 0.7 : 0.9} />
-            ))}
-          </svg>
+        <div className="flex gap-4">
+          <div className="min-w-0 flex-1 space-y-3">
+            {/* Aggregate health + filter */}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-fg-muted">
+                <span className="font-medium text-fg">{agents.length}</span> agent{agents.length !== 1 ? 's' : ''} ·{' '}
+                <span className="font-medium text-fg">{allServers.length}</span> server{allServers.length !== 1 ? 's' : ''} ·{' '}
+                <span className="font-medium text-fg">{domains.length}</span> domain{domains.length !== 1 ? 's' : ''}
+                {errorCount > 0 && <> · <span className="font-medium text-danger-fg">{errorCount} error{errorCount !== 1 ? 's' : ''}</span></>}
+              </p>
+              <div className="relative">
+                <svg className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-fg-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}><path strokeLinecap="round" strokeLinejoin="round" d="m21 21-4.3-4.3M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z" /></svg>
+                <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter nodes…" aria-label="Filter topology"
+                  className="w-44 rounded-lg border border-border bg-surface py-1.5 pl-9 pr-3 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus-visible:outline-none focus:ring-2 focus:ring-accent/30" />
+              </div>
+            </div>
 
-          <div className="relative z-10 flex min-w-[44rem] items-start gap-10">
-            <Column title="Internet">
-              <NodeCard innerRef={setNodeRef('internet')} selected={selected?.kind === 'internet'}
-                onClick={() => setSelected({ kind: 'internet', id: 'internet' })}
-                onContextMenu={(e) => openMenu(e, { kind: 'internet', id: 'internet' })}
-                icon={<GlobeIcon />} title="Public internet" sub="inbound traffic" />
-            </Column>
+            {/* Screen-reader summary — the connector lines are decorative. */}
+            <div className="sr-only">
+              Topology: {agents.length} agents, {allServers.length} servers, {domains.length} domains.
+              <ul>{domains.map((d) => <li key={d.id}>{domainLabel(d)}</li>)}</ul>
+            </div>
 
-            <Column title="Edge agents">
-              {agents.map((a) => (
-                <NodeCard key={a.id} innerRef={setNodeRef(`agent:${a.id}`)} selected={selected?.kind === 'agent' && selected.id === a.id}
-                  onClick={() => setSelected({ kind: 'agent', id: a.id })}
-                  onContextMenu={(e) => openMenu(e, { kind: 'agent', id: a.id })}
-                  status={a.status} title={a.name} sub={a.fqdn} />
-              ))}
-            </Column>
+            <div ref={containerRef} className="relative overflow-x-auto rounded-xl border border-border bg-surface/40 p-5">
+              <svg aria-hidden="true" width={size.w} height={size.h} className="pointer-events-none absolute left-0 top-0" style={{ overflow: 'visible' }}>
+                {paths.map((p) => (
+                  <path key={p.id} d={p.d} fill="none" strokeWidth={1.5} stroke={p.active ? 'var(--accent)' : 'var(--border-strong)'} strokeOpacity={p.active ? 0.7 : 0.9} />
+                ))}
+              </svg>
 
-            <Column title="Upstreams">
-              {orderedServers.length === 0 ? <Hint>No servers</Hint> : orderedServers.map((s) => (
-                <NodeCard key={s.id} innerRef={setNodeRef(`server:${s.id}`)} selected={selected?.kind === 'server' && selected.id === s.id}
-                  onClick={() => setSelected({ kind: 'server', id: s.id })}
-                  onContextMenu={(e) => openMenu(e, { kind: 'server', id: s.id })}
-                  icon={<ServerIcon />} title={s.name} sub={s.address} />
-              ))}
-            </Column>
+              <div className="relative z-10 flex min-w-[44rem] items-start gap-10">
+                <Column title="Internet">
+                  <NodeCard innerRef={setNodeRef('internet')} ariaLabel="Public internet, entry point" selected={selected?.kind === 'internet'}
+                    onClick={() => setSelected({ kind: 'internet', id: 'internet' })}
+                    onContextMenu={(e) => openMenu(e, { kind: 'internet', id: 'internet' })}
+                    icon={<GlobeIcon />} title="Public internet" sub="inbound traffic" />
+                </Column>
 
-            <Column title="Domains">
-              {orderedDomains.length === 0 ? <Hint>No domains</Hint> : orderedDomains.map((d) => (
-                <NodeCard key={d.id} innerRef={setNodeRef(`domain:${d.id}`)} selected={selected?.kind === 'domain' && selected.id === String(d.id)}
-                  onClick={() => setSelected({ kind: 'domain', id: String(d.id) })}
-                  onContextMenu={(e) => openMenu(e, { kind: 'domain', id: String(d.id) })}
-                  status={d.status} title={fqdn(d)} sub={`:${d.port}`} />
-              ))}
-            </Column>
+                <Column title="Edge agents">
+                  {visibleAgents.length === 0 ? <Hint>No matches</Hint> : visibleAgents.map((a) => {
+                    const hasChildren = serversOf(a.id).length > 0;
+                    const isCollapsed = collapsed.has(a.id);
+                    return (
+                      <div key={a.id} className="relative">
+                        <NodeCard innerRef={setNodeRef(`agent:${a.id}`)} ariaLabel={agentLabel(a)} selected={selected?.kind === 'agent' && selected.id === a.id}
+                          onClick={() => setSelected({ kind: 'agent', id: a.id })}
+                          onContextMenu={(e) => openMenu(e, { kind: 'agent', id: a.id })}
+                          status={a.status} title={a.name} sub={a.fqdn} />
+                        {hasChildren && (
+                          <button onClick={(e) => { e.stopPropagation(); toggleCollapse(a.id); }}
+                            aria-label={isCollapsed ? `Expand ${a.name}` : `Collapse ${a.name}`}
+                            className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-md text-fg-faint hover:bg-surface-2 hover:text-fg">
+                            <svg className={`h-3.5 w-3.5 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" /></svg>
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </Column>
+
+                <Column title="Upstreams">
+                  {visibleServers.length === 0 ? <Hint>{q ? 'No matches' : 'No servers'}</Hint> : visibleServers.map((s) => (
+                    <NodeCard key={s.id} innerRef={setNodeRef(`server:${s.id}`)} ariaLabel={serverLabel(s)} selected={selected?.kind === 'server' && selected.id === s.id}
+                      onClick={() => setSelected({ kind: 'server', id: s.id })}
+                      onContextMenu={(e) => openMenu(e, { kind: 'server', id: s.id })}
+                      icon={<ServerIcon />} title={s.name} sub={s.address} />
+                  ))}
+                </Column>
+
+                <Column title="Domains">
+                  {visibleDomains.length === 0 ? <Hint>{q ? 'No matches' : 'No domains'}</Hint> : visibleDomains.map((d) => (
+                    <NodeCard key={d.id} innerRef={setNodeRef(`domain:${d.id}`)} ariaLabel={domainLabel(d)} selected={selected?.kind === 'domain' && selected.id === String(d.id)}
+                      onClick={() => setSelected({ kind: 'domain', id: String(d.id) })}
+                      onContextMenu={(e) => openMenu(e, { kind: 'domain', id: String(d.id) })}
+                      status={d.status} title={fqdn(d)} sub={`:${d.port}`} />
+                  ))}
+                </Column>
+              </div>
+            </div>
           </div>
-        </div>
-      )}
 
-      {/* Inspector drawer (fixed, does not reflow the map) */}
-      {selected && (
-        <Inspector
-          onClose={() => setSelected(null)}
-          title={labelFor(selected)}
-          body={renderInspector(selected, { agents, allServers, domains, serversByAgent, zoneName, fqdn })}
-          onManage={() => navigate(selected.kind === 'domain' ? '/domains' : selected.kind === 'server' ? '/domains' : '/agents')}
-          manageLabel={selected.kind === 'internet' ? undefined : selected.kind === 'domain' ? 'Edit in Domains' : selected.kind === 'server' ? 'Manage in Domains' : 'Manage in Agents'}
-        />
+          {selected && (
+            <Inspector
+              onClose={() => setSelected(null)}
+              title={labelFor(selected)}
+              body={renderInspector(selected, { agents, allServers, domains, serversByAgent, zoneName, fqdn })}
+              onManage={() => navigate(selected.kind === 'domain' ? '/domains' : selected.kind === 'server' ? '/domains' : '/agents')}
+              manageLabel={selected.kind === 'internet' ? undefined : selected.kind === 'domain' ? 'Edit in Domains' : selected.kind === 'server' ? 'Manage in Domains' : 'Manage in Agents'}
+            />
+          )}
+        </div>
       )}
 
       <ContextMenu menu={menu} onClose={() => setMenu(null)} />
@@ -317,9 +389,9 @@ function Column({ title, children }: { title: string; children: React.ReactNode 
   );
 }
 
-function NodeCard({ innerRef, title, sub, icon, status, selected, onClick, onContextMenu }: {
+function NodeCard({ innerRef, title, sub, icon, status, selected, ariaLabel, onClick, onContextMenu }: {
   innerRef: (el: HTMLElement | null) => void;
-  title: string; sub?: string; icon?: React.ReactNode; status?: string;
+  title: string; sub?: string; icon?: React.ReactNode; status?: string; ariaLabel?: string;
   selected?: boolean; onClick: () => void; onContextMenu: (e: React.MouseEvent) => void;
 }) {
   const dot = status ? statusDot(status) : null;
@@ -328,11 +400,13 @@ function NodeCard({ innerRef, title, sub, icon, status, selected, onClick, onCon
       ref={innerRef as (el: HTMLButtonElement | null) => void}
       onClick={onClick}
       onContextMenu={onContextMenu}
-      className={`group flex w-full items-center gap-2.5 rounded-lg border bg-surface px-3 py-2.5 text-left shadow-card transition-colors ${
+      aria-label={ariaLabel}
+      aria-pressed={selected}
+      className={`group flex w-full items-center gap-2.5 rounded-lg border bg-surface px-3 py-2.5 pr-7 text-left shadow-card transition-colors ${
         selected ? 'border-accent ring-2 ring-accent/30' : 'border-border hover:border-border-strong'
       }`}
     >
-      {dot ?? (icon && <span className="flex h-4 w-4 items-center justify-center text-fg-faint">{icon}</span>)}
+      <span aria-hidden="true" className="contents">{dot ?? (icon && <span className="flex h-4 w-4 items-center justify-center text-fg-faint">{icon}</span>)}</span>
       <span className="min-w-0">
         <span className="block truncate text-sm font-medium text-fg">{title}</span>
         {sub && <span className="block truncate font-mono text-xs text-fg-faint">{sub}</span>}
@@ -370,7 +444,7 @@ function Inspector({ title, body, onClose, onManage, manageLabel }: {
   title: string; body: React.ReactNode; onClose: () => void; onManage: () => void; manageLabel?: string;
 }) {
   return (
-    <div className="fixed inset-y-0 right-0 z-40 flex w-full max-w-sm flex-col border-l border-border bg-surface shadow-pop animate-pop-in">
+    <div className="animate-pop-in flex flex-col border-border bg-surface fixed inset-y-0 right-0 z-40 w-full max-w-sm border-l shadow-pop lg:sticky lg:inset-auto lg:top-20 lg:z-auto lg:w-80 lg:max-w-none lg:shrink-0 lg:self-start lg:max-h-[calc(100vh-6rem)] lg:rounded-xl lg:border lg:shadow-card">
       <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
         <h2 className="truncate font-display text-lg font-semibold text-fg">{title}</h2>
         <button onClick={onClose} aria-label="Close" className="rounded-lg p-1.5 text-fg-faint hover:bg-surface-2 hover:text-fg">
