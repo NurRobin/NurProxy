@@ -32,7 +32,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   // Agent step state
   const [agents, setAgents] = useState<Agent[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
-  const [pollingAgents, setPollingAgents] = useState(false);
+  const pollingAgents = currentStep === 1;
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [adoptingId, setAdoptingId] = useState<string | null>(null);
   const [adoptName, setAdoptName] = useState('');
@@ -61,12 +61,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
 
   useEffect(() => {
     if (currentStep === 1) {
-      setPollingAgents(true);
       fetchZones();
       pollAgents();
       pollRef.current = setInterval(pollAgents, 3000);
     } else {
-      setPollingAgents(false);
       if (pollRef.current) {
         clearInterval(pollRef.current);
         pollRef.current = null;
