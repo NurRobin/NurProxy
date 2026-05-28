@@ -9,6 +9,8 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    // Allow importing the repo-root wiki/ markdown into the SPA.
+    fs: { allow: ['..'] },
     proxy: {
       '/api': {
         target: 'http://localhost:8080',

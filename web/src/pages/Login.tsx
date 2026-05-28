@@ -1,8 +1,28 @@
 import { useState, useEffect } from 'react';
 import { api } from '../lib/api';
+import Button, { Spinner } from '../components/Button';
+import { Field, PasswordInput } from '../components/Field';
 
 interface LoginProps {
   onAuth: () => void;
+}
+
+function BrandMark() {
+  return (
+    <svg width="40" height="40" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <rect width="32" height="32" rx="8" fill="var(--accent)" />
+      <g stroke="var(--accent-fg)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" fill="none">
+        <path d="M9 16 H15" />
+        <path d="M15 16 C19 16 19 10 23 10" />
+        <path d="M15 16 C19 16 19 22 23 22" />
+      </g>
+      <g fill="var(--accent-fg)">
+        <circle cx="9" cy="16" r="2.6" />
+        <circle cx="23" cy="10" r="2.4" />
+        <circle cx="23" cy="22" r="2.4" />
+      </g>
+    </svg>
+  );
 }
 
 export default function Login({ onAuth }: LoginProps) {
@@ -19,28 +39,17 @@ export default function Login({ onAuth }: LoginProps) {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError('');
-
     if (setupRequired) {
-      if (password.length < 8) {
-        setError('Password must be at least 8 characters');
-        return;
-      }
-      if (password !== confirmPassword) {
-        setError('Passwords do not match');
-        return;
-      }
+      if (password.length < 8) { setError('Password must be at least 8 characters.'); return; }
+      if (password !== confirmPassword) { setError('Passwords do not match.'); return; }
     }
-
     setLoading(true);
     try {
-      if (setupRequired) {
-        await api.setup(password);
-      } else {
-        await api.login(password);
-      }
+      if (setupRequired) await api.setup(password);
+      else await api.login(password);
       onAuth();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Authentication failed');
+      setError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : 'Authentication failed.');
     } finally {
       setLoading(false);
     }
@@ -48,71 +57,67 @@ export default function Login({ onAuth }: LoginProps) {
 
   if (setupRequired === null) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-gray-950">
-        <div className="text-gray-400">Loading...</div>
+      <div className="flex min-h-screen items-center justify-center bg-bg text-fg-muted">
+        <Spinner className="h-6 w-6" />
       </div>
     );
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gray-950 px-4">
+    <div className="flex min-h-screen items-center justify-center bg-bg px-4">
       <div className="w-full max-w-sm">
-        <div className="mb-8 text-center">
-          <h1 className="text-2xl font-bold text-white">NurProxy</h1>
-          <p className="mt-1 text-sm text-gray-400">
-            {setupRequired ? 'Set up your admin password' : 'Sign in to continue'}
+        <div className="mb-8 flex flex-col items-center text-center">
+          <BrandMark />
+          <h1 className="mt-4 font-display text-2xl font-bold tracking-tight text-fg">
+            {setupRequired ? 'Welcome to NurProxy' : 'NurProxy'}
+          </h1>
+          <p className="mt-1 text-sm text-fg-muted">
+            {setupRequired ? 'Create the admin password to get started.' : 'Sign in to continue.'}
           </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="rounded-xl border border-gray-800 bg-gray-900 p-6">
+        <form onSubmit={handleSubmit} className="rounded-xl border border-border bg-surface p-6 shadow-card">
           {error && (
-            <div className="mb-4 rounded-lg bg-red-900/30 border border-red-800 px-4 py-3 text-sm text-red-400">
+            <div className="mb-4 rounded-lg border border-danger/40 bg-danger-soft px-4 py-3 text-sm text-danger-fg">
               {error}
             </div>
           )}
 
           <div className="space-y-4">
-            <div>
-              <label htmlFor="password" className="block text-sm font-medium text-gray-300">
-                {setupRequired ? 'Admin Password' : 'Password'}
-              </label>
-              <input
+            <Field label={setupRequired ? 'Admin password' : 'Password'} htmlFor="password">
+              <PasswordInput
                 id="password"
-                type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                placeholder={setupRequired ? 'Minimum 8 characters' : 'Enter password'}
+                placeholder={setupRequired ? 'At least 8 characters' : 'Enter password'}
                 autoFocus
                 required
               />
-            </div>
+            </Field>
 
             {setupRequired && (
-              <div>
-                <label htmlFor="confirm" className="block text-sm font-medium text-gray-300">
-                  Confirm Password
-                </label>
-                <input
+              <Field label="Confirm password" htmlFor="confirm">
+                <PasswordInput
                   id="confirm"
-                  type="password"
                   value={confirmPassword}
                   onChange={(e) => setConfirmPassword(e.target.value)}
-                  className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                   placeholder="Re-enter password"
                   required
                 />
-              </div>
+              </Field>
             )}
           </div>
 
-          <button
-            type="submit"
-            disabled={loading}
-            className="mt-6 w-full rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-          >
-            {loading ? 'Please wait...' : setupRequired ? 'Set Up' : 'Sign In'}
-          </button>
+          <Button type="submit" loading={loading} className="mt-6 w-full justify-center">
+            {setupRequired ? 'Create password & continue' : 'Sign in'}
+          </Button>
+
+          {setupRequired && (
+            <p className="mt-4 text-xs leading-relaxed text-fg-faint">
+              This is the only admin account. There’s no email reset — store this password
+              somewhere safe.
+            </p>
+          )}
         </form>
       </div>
     </div>

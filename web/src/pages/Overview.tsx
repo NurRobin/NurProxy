@@ -2,20 +2,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Agent, Domain, AuditLogEntry } from '../lib/types';
+import { formatRelativeTime } from '../lib/utils';
+import { buttonClass } from '../components/button-styles';
 import StatusBadge from '../components/StatusBadge';
 import EmptyState from '../components/EmptyState';
 
-function timeAgo(dateStr: string | undefined): string {
-  if (!dateStr) return 'Never';
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const secs = Math.floor(diff / 1000);
-  if (secs < 60) return `${secs}s ago`;
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
+function seen(date?: string) {
+  return date ? formatRelativeTime(date) : 'Never';
 }
 
 export default function Overview() {
@@ -23,19 +16,23 @@ export default function Overview() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
       const [a, d, log] = await Promise.all([
         api.listAgents(),
         api.listDomains(),
-        api.getAuditLog({ limit: '20' }),
+        api.getAuditLog({ limit: '15' }),
       ]);
       setAgents(a);
       setDomains(d);
       setAuditLog(log.entries ?? []);
+      setUpdatedAt(new Date().toISOString());
+      setStale(false);
     } catch {
-      // silently fail on refresh
+      setStale(true); // surface the outage instead of showing stale data as fresh
     } finally {
       setLoading(false);
     }
@@ -47,117 +44,125 @@ export default function Overview() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  const agentsByStatus = (s: string) => agents.filter((a) => a.status === s).length;
-  const domainsByStatus = (s: string) => domains.filter((d) => d.status === s).length;
+  const count = (arr: { status: string }[], s: string) => arr.filter((x) => x.status === s).length;
+  const errors = count(agents, 'error') + count(domains, 'error');
+  const offline = count(agents, 'offline');
+  const pendingAgents = count(agents, 'pending');
+  const healthy = errors === 0 && offline === 0;
 
   if (loading) {
-    return <div className="text-gray-400">Loading...</div>;
+    return <div className="py-12 text-center text-sm text-fg-muted">Loading your dashboard…</div>;
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-white">Overview</h1>
-        <Link
-          to="/domains"
-          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
-        >
-          New Domain
-        </Link>
+    <div className="space-y-8">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Overview</h1>
+          <p className="mt-1 text-sm text-fg-muted">
+            {updatedAt && !stale ? `Updated ${seen(updatedAt)}` : 'Your proxy at a glance'}
+            {stale && <span className="text-danger-fg"> · couldn’t refresh — check the orchestrator</span>}
+          </p>
+        </div>
+        <Link to="/domains" className={buttonClass('primary')}>New domain</Link>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <StatCard label="Agents" value={agents.length} sub={`${agentsByStatus('adopted')} adopted, ${agentsByStatus('pending')} pending`} />
-        <StatCard label="Domains" value={domains.length} sub={`${domainsByStatus('active')} active, ${domainsByStatus('pending')} pending`} />
-        <StatCard label="Errors" value={agentsByStatus('error') + domainsByStatus('error')} sub="agents + domains" alert={agentsByStatus('error') + domainsByStatus('error') > 0} />
-        <StatCard label="Offline" value={agentsByStatus('offline')} sub="agents" />
-      </div>
+      {/* Health summary — one panel, not a wall of identical metric cards. */}
+      <section className="rounded-xl border border-border bg-surface p-5 shadow-card">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <span className={`flex h-9 w-9 items-center justify-center rounded-full ${healthy ? 'bg-success-soft text-success-fg' : 'bg-warning-soft text-warning-fg'}`}>
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                {healthy
+                  ? <path strokeLinecap="round" strokeLinejoin="round" d="m9 12.75 2.25 2.25L15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />
+                  : <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m0 3.75h.007M12 3l9 16H3l9-16z" />}
+              </svg>
+            </span>
+            <div>
+              <p className="font-medium text-fg">
+                {healthy ? 'All systems normal' : `${errors + offline} thing${errors + offline !== 1 ? 's' : ''} need attention`}
+              </p>
+              <p className="text-sm text-fg-muted">
+                {agents.length} agent{agents.length !== 1 ? 's' : ''} · {domains.length} domain{domains.length !== 1 ? 's' : ''}
+                {pendingAgents > 0 && <> · {pendingAgents} awaiting adoption</>}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {errors > 0 && (
+              <Link to="/domains" className="rounded-lg bg-danger-soft px-3 py-1.5 text-sm font-medium text-danger-fg hover:brightness-105">
+                {errors} error{errors !== 1 ? 's' : ''} →
+              </Link>
+            )}
+            {offline > 0 && (
+              <Link to="/agents" className="rounded-lg bg-surface-2 px-3 py-1.5 text-sm font-medium text-fg-muted hover:text-fg">
+                {offline} offline →
+              </Link>
+            )}
+            {pendingAgents > 0 && (
+              <Link to="/agents" className="rounded-lg bg-warning-soft px-3 py-1.5 text-sm font-medium text-warning-fg hover:brightness-105">
+                Review {pendingAgents} pending →
+              </Link>
+            )}
+          </div>
+        </div>
+      </section>
 
       {/* Agents */}
       {agents.length === 0 ? (
         <EmptyState
-          title="No agents connected"
-          description="Install an agent to get started. Agents register themselves and appear here for adoption."
-          action={
-            <Link to="/agents" className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
-              Go to Agents
-            </Link>
-          }
+          title="No agents connected yet"
+          description="Install the NurProxy agent on an edge server. It registers itself and shows up here for approval."
+          action={<Link to="/agents" className={buttonClass('primary')}>Connect an agent</Link>}
         />
       ) : (
-        <div>
-          <h2 className="mb-3 text-lg font-semibold text-white">Agents</h2>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {agents.map((agent) => {
-              const agentDomains = domains.filter((d) => {
-                // match via servers would be ideal, but we don't have server->agent mapping on domain
-                // so we just show overall count
-                return d.status !== 'deleting';
-              });
-              return (
-                <Link
-                  key={agent.id}
-                  to="/agents"
-                  className="rounded-xl border border-gray-800 bg-gray-900 p-4 transition-colors hover:border-gray-700"
-                >
-                  <div className="flex items-start justify-between">
-                    <div className="min-w-0">
-                      <p className="truncate font-medium text-white">{agent.name}</p>
-                      <p className="truncate text-sm text-gray-400">{agent.fqdn}</p>
-                    </div>
-                    <StatusBadge status={agent.status} />
+        <section>
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-fg-faint">Agents</h2>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {agents.map((agent) => (
+              <Link
+                key={agent.id}
+                to="/agents"
+                className="group rounded-xl border border-border bg-surface p-4 shadow-card transition-colors hover:border-border-strong"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate font-medium text-fg">{agent.name}</p>
+                    <p className="truncate text-sm text-fg-muted">{agent.fqdn}</p>
                   </div>
-                  <div className="mt-3 flex items-center gap-4 text-xs text-gray-500">
-                    {agent.public_ip && <span>IP: {agent.public_ip}</span>}
-                    <span>Seen: {timeAgo(agent.last_seen)}</span>
-                    {agent.version && <span>v{agent.version}</span>}
-                  </div>
-                  <div className="mt-2 text-xs text-gray-500">
-                    {agentDomains.length} domain{agentDomains.length !== 1 ? 's' : ''}
-                  </div>
-                </Link>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* Recent Activity */}
-      {auditLog.length > 0 && (
-        <div>
-          <h2 className="mb-3 text-lg font-semibold text-white">Recent Activity</h2>
-          <div className="rounded-xl border border-gray-800 bg-gray-900 divide-y divide-gray-800">
-            {auditLog.map((entry) => (
-              <div key={entry.id} className="flex items-center justify-between px-4 py-3">
-                <div className="min-w-0">
-                  <p className="text-sm text-gray-200">
-                    <span className="font-medium text-white">{entry.action}</span>
-                    {' '}
-                    <span className="text-gray-400">{entry.entity_type}</span>
-                    {entry.details && (
-                      <span className="text-gray-500"> — {entry.details}</span>
-                    )}
-                  </p>
+                  <StatusBadge status={agent.status} />
                 </div>
-                <div className="ml-4 flex-shrink-0 text-xs text-gray-500">
-                  {timeAgo(entry.created_at)}
+                <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-fg-faint">
+                  {agent.public_ip && <span className="font-mono">{agent.public_ip}</span>}
+                  <span>Seen {seen(agent.last_seen)}</span>
+                  {agent.version && <span>v{agent.version}</span>}
                 </div>
-              </div>
+              </Link>
             ))}
           </div>
-        </div>
+        </section>
       )}
-    </div>
-  );
-}
 
-function StatCard({ label, value, sub, alert }: { label: string; value: number; sub: string; alert?: boolean }) {
-  return (
-    <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
-      <p className="text-sm text-gray-400">{label}</p>
-      <p className={`mt-1 text-2xl font-bold ${alert ? 'text-red-400' : 'text-white'}`}>{value}</p>
-      <p className="mt-0.5 text-xs text-gray-500">{sub}</p>
+      {/* Recent activity */}
+      {auditLog.length > 0 && (
+        <section>
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-fg-faint">Recent activity</h2>
+          <div className="overflow-hidden rounded-xl border border-border bg-surface shadow-card">
+            <ul className="divide-y divide-border">
+              {auditLog.map((entry) => (
+                <li key={entry.id} className="flex items-center justify-between gap-4 px-4 py-3">
+                  <p className="min-w-0 truncate text-sm text-fg-muted">
+                    <span className="font-medium text-fg">{entry.action}</span>{' '}
+                    <span>{entry.entity_type}</span>
+                    {entry.details && <span className="text-fg-faint"> — {entry.details}</span>}
+                  </p>
+                  <span className="flex-shrink-0 text-xs text-fg-faint">{seen(entry.created_at)}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </section>
+      )}
     </div>
   );
 }

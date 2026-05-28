@@ -1,11 +1,35 @@
 import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Provider, Zone, Setting } from '../lib/types';
 import type { HealthResponse, TestProviderZone } from '../lib/api';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
+import Button from '../components/Button';
+import Callout from '../components/Callout';
+import HelpTip from '../components/HelpTip';
+import { Field, Input, PasswordInput } from '../components/Field';
+import MultiSelect from '../components/MultiSelect';
+import { useToast, errMessage } from '../components/toast-context';
+import { useUIVariant, UI_VARIANTS } from '../lib/ui-variant-context';
+
+const CF_TOKEN_URL = 'https://dash.cloudflare.com/?to=/:account/api-tokens';
+
+function Section({ title, help, action, children }: { title: string; help?: string; action?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <section className="rounded-xl border border-border bg-surface p-6 shadow-card">
+      <div className="flex items-center justify-between gap-4">
+        <h2 className="flex items-center gap-1.5 text-lg font-semibold text-fg">{title}{help && <HelpTip term={help} />}</h2>
+        {action}
+      </div>
+      <div className="mt-4">{children}</div>
+    </section>
+  );
+}
 
 export default function Settings() {
+  const toast = useToast();
+  const { variant, setVariant } = useUIVariant();
   const [providers, setProviders] = useState<Provider[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
   const [, setSettings] = useState<Setting[]>([]);
@@ -14,140 +38,85 @@ export default function Settings() {
 
   // Add provider modal
   const [showAddProvider, setShowAddProvider] = useState(false);
-  const [provType, setProvType] = useState('cloudflare');
   const [provApiToken, setProvApiToken] = useState('');
   const [provTestLoading, setProvTestLoading] = useState(false);
   const [provTestError, setProvTestError] = useState('');
   const [provZones, setProvZones] = useState<TestProviderZone[]>([]);
   const [selectedZones, setSelectedZones] = useState<Set<string>>(new Set());
   const [provSaveLoading, setProvSaveLoading] = useState(false);
-  const [provError, setProvError] = useState('');
   const [provModalStep, setProvModalStep] = useState<'token' | 'zones'>('token');
+  const provType = 'cloudflare';
 
-  // Delete provider
   const [deleteProviderId, setDeleteProviderId] = useState<string | null>(null);
-
-  // Delete zone
   const [deleteZoneId, setDeleteZoneId] = useState<string | null>(null);
 
-  // Reconciler
   const [reconcilerInterval, setReconcilerInterval] = useState('');
   const [reconcilerSaving, setReconcilerSaving] = useState(false);
 
-  // Password
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordError, setPasswordError] = useState('');
-  const [passwordSuccess, setPasswordSuccess] = useState('');
   const [passwordLoading, setPasswordLoading] = useState(false);
 
-  // Admin API key
   const [apiKeyInfo, setApiKeyInfo] = useState<{ exists: boolean; masked?: string }>({ exists: false });
   const [apiKeyPlaintext, setApiKeyPlaintext] = useState('');
-  const [apiKeyError, setApiKeyError] = useState('');
 
   const fetchData = useCallback(async () => {
     try {
       const [p, z, s, h, k] = await Promise.all([
-        api.listProviders(),
-        api.listAllZones(),
-        api.getSettings(),
-        api.health(),
-        api.getAPIKey(),
+        api.listProviders(), api.listAllZones(), api.getSettings(), api.health(), api.getAPIKey(),
       ]);
-      setProviders(p);
-      setZones(z);
-      setSettings(s);
-      setHealth(h);
-      setApiKeyInfo(k);
+      setProviders(p); setZones(z); setSettings(s); setHealth(h); setApiKeyInfo(k);
       const rec = s.find((st) => st.key === 'reconciler_interval');
       if (rec) setReconcilerInterval(rec.value);
-    } catch { /* ignore */ } finally {
+    } catch (err) {
+      toast.error(errMessage(err, 'Couldn’t load settings.'));
+    } finally {
       setLoading(false);
     }
-  }, []);
+  }, [toast]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
   function resetProviderModal() {
-    setProvType('cloudflare');
-    setProvApiToken('');
-    setProvTestLoading(false);
-    setProvTestError('');
-    setProvZones([]);
-    setSelectedZones(new Set());
-    setProvSaveLoading(false);
-    setProvError('');
-    setProvModalStep('token');
+    setProvApiToken(''); setProvTestLoading(false); setProvTestError('');
+    setProvZones([]); setSelectedZones(new Set()); setProvSaveLoading(false); setProvModalStep('token');
   }
 
   async function handleTestToken() {
     setProvTestLoading(true);
     setProvTestError('');
     try {
-      const result = await api.testProvider({
-        type: provType,
-        config: { api_token: provApiToken },
-      });
-      if (!result.valid) {
-        setProvTestError(result.message);
-        return;
-      }
+      const result = await api.testProvider({ type: provType, config: { api_token: provApiToken } });
+      if (!result.valid) { setProvTestError(result.message); return; }
       if (result.zones && result.zones.length > 0) {
         setProvZones(result.zones);
-        setSelectedZones(new Set(result.zones.map(z => z.id)));
+        setSelectedZones(new Set(result.zones.map((z) => z.id)));
         setProvModalStep('zones');
       } else {
-        setProvTestError('Token is valid but no zones found. Check Zone:Read permission.');
+        setProvTestError('Token is valid, but no zones were found. Check Zone → Read permission.');
       }
     } catch (err) {
-      setProvTestError(err instanceof Error ? err.message : 'Connection failed');
+      setProvTestError(errMessage(err, 'Connection failed.'));
     } finally {
       setProvTestLoading(false);
     }
   }
 
-  function toggleZone(id: string) {
-    setSelectedZones(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  }
-
-  function toggleAllZones() {
-    if (selectedZones.size === provZones.length) setSelectedZones(new Set());
-    else setSelectedZones(new Set(provZones.map(z => z.id)));
-  }
-
   async function handleSaveZones() {
     if (selectedZones.size === 0) return;
     setProvSaveLoading(true);
-    setProvError('');
     try {
-      // Step 1: Create the provider
-      const provider = await api.createProvider({
-        type: provType,
-        name: provType,
-        config: { api_token: provApiToken },
-      });
-
-      // Step 2: Batch-create selected zones
-      const zonesToCreate = provZones
-        .filter(z => selectedZones.has(z.id))
-        .map(z => ({ external_id: z.id, name: z.name }));
-
-      await api.createZonesBatch({
-        provider_id: provider.id,
-        zones: zonesToCreate,
-      });
-
+      const provider = await api.createProvider({ type: provType, name: provType, config: { api_token: provApiToken } });
+      const zonesToCreate = provZones.filter((z) => selectedZones.has(z.id)).map((z) => ({ external_id: z.id, name: z.name }));
+      await api.createZonesBatch({ provider_id: provider.id, zones: zonesToCreate });
+      toast.success(`${zonesToCreate.length} zone${zonesToCreate.length !== 1 ? 's' : ''} added.`);
       setShowAddProvider(false);
       resetProviderModal();
       fetchData();
     } catch (err) {
-      setProvError(err instanceof Error ? err.message : 'Failed to save');
+      setProvTestError(errMessage(err, 'Failed to save provider.'));
     } finally {
       setProvSaveLoading(false);
     }
@@ -155,301 +124,213 @@ export default function Settings() {
 
   async function handleDeleteProvider() {
     if (!deleteProviderId) return;
-    try {
-      await api.deleteProvider(deleteProviderId);
-      setDeleteProviderId(null);
-      fetchData();
-    } catch { /* ignore */ }
+    try { await api.deleteProvider(deleteProviderId); toast.success('Provider deleted.'); setDeleteProviderId(null); fetchData(); }
+    catch (err) { toast.error(errMessage(err, 'Failed to delete provider.')); }
   }
-
   async function handleDeleteZone() {
     if (!deleteZoneId) return;
-    try {
-      await api.deleteZone(deleteZoneId);
-      setDeleteZoneId(null);
-      fetchData();
-    } catch { /* ignore */ }
+    try { await api.deleteZone(deleteZoneId); toast.success('Zone removed.'); setDeleteZoneId(null); fetchData(); }
+    catch (err) { toast.error(errMessage(err, 'Failed to remove zone.')); }
   }
 
   async function handleSaveReconciler() {
     setReconcilerSaving(true);
-    try {
-      await api.updateSetting('reconciler_interval', reconcilerInterval);
-    } catch { /* ignore */ } finally {
-      setReconcilerSaving(false);
-    }
+    try { await api.updateSetting('reconciler_interval', reconcilerInterval); toast.success('Reconciler interval saved.'); }
+    catch (err) { toast.error(errMessage(err, 'Failed to save.')); }
+    finally { setReconcilerSaving(false); }
   }
 
   async function handleChangePassword() {
     setPasswordError('');
-    setPasswordSuccess('');
-    if (newPassword.length < 8) { setPasswordError('Password must be at least 8 characters'); return; }
-    if (newPassword !== confirmPassword) { setPasswordError('Passwords do not match'); return; }
+    if (newPassword.length < 8) { setPasswordError('New password must be at least 8 characters.'); return; }
+    if (newPassword !== confirmPassword) { setPasswordError('Passwords do not match.'); return; }
     setPasswordLoading(true);
     try {
       await api.changePassword(currentPassword, newPassword);
-      setPasswordSuccess('Password updated');
+      toast.success('Password updated.');
       setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
     } catch (err) {
-      setPasswordError(err instanceof Error ? err.message : 'Failed to change password');
+      setPasswordError(errMessage(err, 'Failed to change password.'));
     } finally {
       setPasswordLoading(false);
     }
   }
 
   async function handleGenerateAPIKey() {
-    setApiKeyError('');
     setApiKeyPlaintext('');
     try {
       const res = await api.generateAPIKey();
       setApiKeyPlaintext(res.api_key);
-      const info = await api.getAPIKey();
-      setApiKeyInfo(info);
+      setApiKeyInfo(await api.getAPIKey());
     } catch (err) {
-      setApiKeyError(err instanceof Error ? err.message : 'Failed to generate API key');
+      toast.error(errMessage(err, 'Failed to generate API key.'));
     }
   }
-
   async function handleRevokeAPIKey() {
-    setApiKeyError('');
     setApiKeyPlaintext('');
-    try {
-      await api.revokeAPIKey();
-      setApiKeyInfo({ exists: false });
-    } catch (err) {
-      setApiKeyError(err instanceof Error ? err.message : 'Failed to revoke API key');
-    }
+    try { await api.revokeAPIKey(); toast.success('API key revoked.'); setApiKeyInfo({ exists: false }); }
+    catch (err) { toast.error(errMessage(err, 'Failed to revoke API key.')); }
   }
 
-  if (loading) return <div className="text-gray-400">Loading...</div>;
+  if (loading) return <div className="py-12 text-center text-sm text-fg-muted">Loading settings…</div>;
 
   return (
-    <div className="space-y-8">
-      <h1 className="text-2xl font-bold text-white">Settings</h1>
+    <div className="space-y-6">
+      <h1 className="font-display text-3xl font-bold tracking-tight text-fg">Settings</h1>
 
-      {/* DNS Providers */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-6">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-white">DNS Providers</h2>
-          <button
-            onClick={() => { resetProviderModal(); setShowAddProvider(true); }}
-            className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700"
-          >
-            Add Provider
-          </button>
+      <Section title="Appearance">
+        <p className="-mt-1 text-sm text-fg-muted">Pick the interface that suits you. Switch light/dark from the toggle in the navigation.</p>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          {UI_VARIANTS.map((v) => {
+            const active = v.id === variant;
+            return (
+              <button
+                key={v.id}
+                onClick={() => setVariant(v.id)}
+                className={`rounded-xl border p-4 text-left transition-colors ${active ? 'border-accent bg-accent-soft' : 'border-border bg-surface-2 hover:border-border-strong'}`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-fg">{v.name}</span>
+                  {active && <span className="rounded-full bg-accent px-2 py-0.5 text-xs font-semibold text-accent-fg">Active</span>}
+                </div>
+                <p className="mt-1 text-sm text-fg-muted">{v.description}</p>
+              </button>
+            );
+          })}
         </div>
+      </Section>
 
+      <Section title="DNS providers" action={<Button size="sm" onClick={() => { resetProviderModal(); setShowAddProvider(true); }}>Add provider</Button>}>
         {providers.length === 0 ? (
-          <p className="mt-4 text-sm text-gray-500">No DNS providers configured.</p>
+          <p className="text-sm text-fg-faint">No DNS providers configured.</p>
         ) : (
-          <div className="mt-4 space-y-3">
+          <div className="space-y-3">
             {providers.map((p) => {
-              const providerZones = zones.filter(z => z.provider_id === p.id);
+              const providerZones = zones.filter((z) => z.provider_id === p.id);
               return (
-                <div key={p.id} className="rounded-lg bg-gray-800 px-4 py-3">
-                  <div className="flex items-center justify-between">
+                <div key={p.id} className="rounded-lg border border-border bg-surface-2 px-4 py-3">
+                  <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <p className="font-medium text-white">{p.name}</p>
-                      <span className="rounded bg-gray-700 px-1.5 py-0.5 text-xs text-gray-400">{p.type}</span>
-                      {p.is_default && <span className="rounded bg-blue-900/40 px-1.5 py-0.5 text-xs text-blue-400">default</span>}
+                      <span className="font-medium text-fg">{p.name}</span>
+                      <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-fg-faint">{p.type}</span>
+                      {p.is_default && <span className="rounded bg-accent-soft px-1.5 py-0.5 text-xs text-accent">default</span>}
                     </div>
-                    <button onClick={() => setDeleteProviderId(p.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                    <button onClick={() => setDeleteProviderId(p.id)} className="text-xs font-medium text-danger-fg hover:underline">Delete</button>
                   </div>
-                  {providerZones.length > 0 && (
-                    <div className="mt-2 space-y-1 ml-2">
+                  {providerZones.length > 0 ? (
+                    <div className="mt-2 space-y-1">
                       {providerZones.map((z) => (
-                        <div key={z.id} className="flex items-center justify-between rounded-md bg-gray-900/60 px-3 py-1.5">
-                          <span className="text-sm text-gray-300">{z.name}</span>
-                          <button onClick={() => setDeleteZoneId(z.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                        <div key={z.id} className="flex items-center justify-between rounded-md bg-surface px-3 py-1.5">
+                          <span className="text-sm text-fg-muted">{z.name}</span>
+                          <button onClick={() => setDeleteZoneId(z.id)} className="text-xs font-medium text-danger-fg hover:underline">Remove</button>
                         </div>
                       ))}
                     </div>
-                  )}
-                  {providerZones.length === 0 && (
-                    <p className="mt-1 text-xs text-gray-500">No zones</p>
+                  ) : (
+                    <p className="mt-1 text-xs text-fg-faint">No zones</p>
                   )}
                 </div>
               );
             })}
           </div>
         )}
-      </section>
+      </Section>
 
-      {/* Reconciler */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-6">
-        <h2 className="text-lg font-semibold text-white">Reconciler</h2>
-        <p className="mt-1 text-sm text-gray-400">How often the system syncs DNS and proxy configs.</p>
+      <Section title="Reconciler" help="reconciler">
+        <p className="-mt-1 text-sm text-fg-muted">How often NurProxy syncs DNS records and proxy configs.</p>
         <div className="mt-4 flex items-end gap-3">
-          <div>
-            <label className="block text-sm font-medium text-gray-300">Interval (seconds)</label>
-            <input type="number" value={reconcilerInterval} onChange={(e) => setReconcilerInterval(e.target.value)} min={5}
-              className="mt-1 block w-32 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none" />
-          </div>
-          <button onClick={handleSaveReconciler} disabled={reconcilerSaving}
-            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">
-            {reconcilerSaving ? 'Saving...' : 'Save'}
-          </button>
+          <Field label="Interval (seconds)" className="w-40">
+            <Input type="number" value={reconcilerInterval} onChange={(e) => setReconcilerInterval(e.target.value)} min={5} />
+          </Field>
+          <Button onClick={handleSaveReconciler} loading={reconcilerSaving} className="mb-0.5">Save</Button>
         </div>
-      </section>
+      </Section>
 
-      {/* Auth */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-6">
-        <h2 className="text-lg font-semibold text-white">Authentication</h2>
-        {passwordError && <div className="mt-3 rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{passwordError}</div>}
-        {passwordSuccess && <div className="mt-3 rounded-lg bg-green-900/30 border border-green-800 px-3 py-2 text-sm text-green-400">{passwordSuccess}</div>}
-        <div className="mt-4 max-w-sm space-y-3">
-          <div>
-            <label className="block text-sm font-medium text-gray-300">Current Password</label>
-            <input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)}
-              className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-300">New Password</label>
-            <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="Minimum 8 characters"
-              className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-300">Confirm New Password</label>
-            <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
-              className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none" />
-          </div>
-          <button onClick={handleChangePassword} disabled={passwordLoading || !currentPassword || !newPassword}
-            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">
-            {passwordLoading ? 'Updating...' : 'Change Password'}
-          </button>
+      <Section title="Authentication">
+        {passwordError && <Callout tone="danger">{passwordError}</Callout>}
+        <div className="mt-3 max-w-sm space-y-3">
+          <Field label="Current password"><PasswordInput value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} /></Field>
+          <Field label="New password"><PasswordInput value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="At least 8 characters" /></Field>
+          <Field label="Confirm new password"><PasswordInput value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} /></Field>
+          <Button onClick={handleChangePassword} loading={passwordLoading} disabled={!currentPassword || !newPassword}>Change password</Button>
         </div>
-      </section>
+      </Section>
 
-      {/* Admin API Key */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-6">
-        <h2 className="text-lg font-semibold text-white">Admin API Key</h2>
-        <p className="mt-1 text-sm text-gray-400">
-          Use this key as a <code className="text-gray-300">Bearer</code> token for programmatic access and the MCP server.
-        </p>
-        {apiKeyError && <div className="mt-3 rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{apiKeyError}</div>}
+      <Section title="Admin API key" help="admin-api-key">
+        <p className="-mt-1 text-sm text-fg-muted">Use this as a <code className="rounded bg-surface-2 px-1 text-fg">Bearer</code> token for programmatic access and the MCP server.</p>
         {apiKeyPlaintext && (
-          <div className="mt-3 rounded-lg bg-green-900/30 border border-green-800 px-3 py-2 text-sm text-green-300">
-            <p className="font-medium">New API key (copy it now — it won't be shown again):</p>
-            <code className="mt-1 block break-all font-mono text-green-200">{apiKeyPlaintext}</code>
-          </div>
+          <Callout tone="success" title="Copy this now — it won’t be shown again">
+            <code className="mt-1 block break-all font-mono text-xs">{apiKeyPlaintext}</code>
+          </Callout>
         )}
-        <div className="mt-4 flex items-center gap-3">
+        <div className="mt-4 flex flex-wrap items-center gap-3">
           {apiKeyInfo.exists ? (
             <>
-              <span className="text-sm text-gray-300">Active key: <code className="font-mono text-gray-200">{apiKeyInfo.masked ?? '••••'}</code></span>
-              <button onClick={handleGenerateAPIKey} className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700">Regenerate</button>
-              <button onClick={handleRevokeAPIKey} className="rounded-lg border border-red-700 px-3 py-1.5 text-sm font-medium text-red-400 hover:bg-red-900/30">Revoke</button>
+              <span className="text-sm text-fg-muted">Active key: <code className="font-mono text-fg">{apiKeyInfo.masked ?? '••••'}</code></span>
+              <Button size="sm" onClick={handleGenerateAPIKey}>Regenerate</Button>
+              <Button variant="danger-ghost" size="sm" onClick={handleRevokeAPIKey}>Revoke</Button>
             </>
           ) : (
-            <button onClick={handleGenerateAPIKey} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Generate API Key</button>
+            <Button onClick={handleGenerateAPIKey}>Generate API key</Button>
           )}
         </div>
-      </section>
+      </Section>
 
-      {/* System Info */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-6">
-        <h2 className="text-lg font-semibold text-white">System Info</h2>
-        <dl className="mt-4 space-y-2 text-sm">
-          <div className="flex justify-between"><dt className="text-gray-500">Version</dt><dd className="text-gray-200">{health?.version ?? 'unknown'}</dd></div>
-          <div className="flex justify-between"><dt className="text-gray-500">Status</dt><dd className="text-green-400">{health?.status ?? 'unknown'}</dd></div>
+      <Section title="System">
+        <dl className="-mt-1 space-y-2 text-sm">
+          <div className="flex justify-between"><dt className="text-fg-faint">Version</dt><dd className="text-fg">{health?.version ?? 'unknown'}</dd></div>
+          <div className="flex justify-between"><dt className="text-fg-faint">Status</dt><dd className="capitalize text-success-fg">{health?.status ?? 'unknown'}</dd></div>
         </dl>
-      </section>
+      </Section>
 
-      {/* Add Provider Modal — same zone-auto-detect flow as wizard */}
-      <Modal open={showAddProvider} onClose={() => setShowAddProvider(false)} title="Add DNS Provider" wide>
+      {/* Add provider modal */}
+      <Modal open={showAddProvider} onClose={() => setShowAddProvider(false)} title="Add DNS provider" wide>
         <div className="space-y-4">
-          {provError && <div className="rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{provError}</div>}
-
           {provModalStep === 'token' && (
             <>
-              <div>
-                <label className="block text-sm font-medium text-gray-300">Provider</label>
-                <select value={provType} onChange={(e) => setProvType(e.target.value)}
-                  className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none">
-                  <option value="cloudflare">Cloudflare</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300">API Token</label>
-                <input type="password" value={provApiToken} onChange={(e) => { setProvApiToken(e.target.value); setProvTestError(''); }}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && provApiToken) handleTestToken(); }}
-                  className="mt-1 block w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none"
-                  placeholder="Paste your API token" />
-                <p className="mt-1 text-xs text-gray-500">Needs Zone:Read and DNS:Edit permissions.</p>
-              </div>
-              {provTestError && <div className="rounded-lg bg-red-900/30 border border-red-800 px-3 py-2 text-sm text-red-400">{provTestError}</div>}
-              <div className="flex justify-between pt-2">
-                <button onClick={() => setShowAddProvider(false)}
-                  className="rounded-lg border border-gray-600 px-4 py-2 text-sm font-medium text-gray-300 hover:bg-gray-800">Cancel</button>
-                <button onClick={handleTestToken} disabled={provTestLoading || !provApiToken}
-                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">
-                  {provTestLoading ? 'Connecting...' : 'Connect'}
-                </button>
+              <Field label="Provider">
+                <div className="flex items-center gap-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-fg">
+                  <span className="font-medium">Cloudflare</span>
+                  <span className="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-fg-faint">more coming soon</span>
+                </div>
+              </Field>
+              <Field label="API token" help="api-token" hint={<>Needs <strong>Zone → Read</strong> and <strong>DNS → Edit</strong>. Stored encrypted at rest.</>}>
+                <PasswordInput value={provApiToken} onChange={(e) => { setProvApiToken(e.target.value); setProvTestError(''); }} onKeyDown={(e) => { if (e.key === 'Enter' && provApiToken) handleTestToken(); }} className="font-mono" placeholder="Paste your API token" />
+              </Field>
+              <Callout tone="info">
+                Create a token in <a href={CF_TOKEN_URL} target="_blank" rel="noreferrer" className="font-medium underline">Cloudflare → API Tokens</a> using the “Edit zone DNS” template.{' '}
+                <Link to="/help/cloudflare-token" className="font-medium underline">Walkthrough →</Link>
+              </Callout>
+              {provTestError && <Callout tone="danger">{provTestError}</Callout>}
+              <div className="flex justify-between pt-1">
+                <Button variant="secondary" onClick={() => setShowAddProvider(false)}>Cancel</Button>
+                <Button onClick={handleTestToken} loading={provTestLoading} disabled={!provApiToken}>Connect</Button>
               </div>
             </>
           )}
-
           {provModalStep === 'zones' && (
             <>
-              <div className="rounded-lg bg-green-900/30 border border-green-800 px-3 py-2 text-sm text-green-400 flex items-center gap-2">
-                <svg className="h-4 w-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
-                Token valid — {provZones.length} zone{provZones.length !== 1 ? 's' : ''} found
-              </div>
+              <Callout tone="success">Token valid — {provZones.length} zone{provZones.length !== 1 ? 's' : ''} found.</Callout>
+              {provTestError && <Callout tone="danger">{provTestError}</Callout>}
               <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="block text-sm font-medium text-gray-300">Select zones to add</label>
-                  <button onClick={toggleAllZones} className="text-xs text-blue-400 hover:text-blue-300">
-                    {selectedZones.size === provZones.length ? 'Deselect all' : 'Select all'}
-                  </button>
-                </div>
-                <div className="space-y-1 max-h-48 overflow-y-auto rounded-lg border border-gray-700 bg-gray-800 p-2">
-                  {provZones.map((zone) => (
-                    <label key={zone.id}
-                      className={`flex items-center gap-3 rounded-md px-3 py-2.5 cursor-pointer transition-colors ${
-                        selectedZones.has(zone.id) ? 'bg-blue-900/30' : 'hover:bg-gray-700/50'
-                      }`}>
-                      <input type="checkbox" checked={selectedZones.has(zone.id)} onChange={() => toggleZone(zone.id)} className="accent-blue-500 h-4 w-4" />
-                      <span className="text-sm text-white font-medium">{zone.name}</span>
-                      <span className="text-xs text-gray-500 ml-auto font-mono">{zone.id.slice(0, 8)}…</span>
-                    </label>
-                  ))}
-                </div>
-                <p className="mt-1.5 text-xs text-gray-500">Selected zones will be added to the provider.</p>
+                <span className="mb-2 block text-sm font-medium text-fg">Zones to add</span>
+                <MultiSelect
+                  items={provZones.map((z) => ({ id: z.id, label: z.name, meta: `${z.id.slice(0, 8)}…` }))}
+                  selected={selectedZones}
+                  onChange={setSelectedZones}
+                />
               </div>
-              <div className="flex justify-between pt-2">
-                <button onClick={() => { setProvModalStep('token'); setProvZones([]); }}
-                  className="rounded-lg border border-gray-600 px-4 py-2 text-sm font-medium text-gray-300 hover:bg-gray-800">Back</button>
-                <button onClick={handleSaveZones} disabled={provSaveLoading || selectedZones.size === 0}
-                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">
-                  {provSaveLoading ? `Adding...` : `Add ${selectedZones.size} zone${selectedZones.size !== 1 ? 's' : ''}`}
-                </button>
+              <div className="flex justify-between pt-1">
+                <Button variant="secondary" onClick={() => { setProvModalStep('token'); setProvZones([]); }}>Back</Button>
+                <Button onClick={handleSaveZones} loading={provSaveLoading} disabled={selectedZones.size === 0}>Add {selectedZones.size} zone{selectedZones.size !== 1 ? 's' : ''}</Button>
               </div>
             </>
           )}
         </div>
       </Modal>
 
-      <ConfirmDialog
-        open={deleteProviderId !== null}
-        onClose={() => setDeleteProviderId(null)}
-        onConfirm={handleDeleteProvider}
-        title="Delete Provider"
-        message="Are you sure? All zones and domains using this provider will lose DNS management."
-        confirmLabel="Delete"
-        danger
-      />
-
-      <ConfirmDialog
-        open={deleteZoneId !== null}
-        onClose={() => setDeleteZoneId(null)}
-        onConfirm={handleDeleteZone}
-        title="Delete Zone"
-        message="Are you sure? Domains using this zone will lose DNS management."
-        confirmLabel="Delete"
-        danger
-      />
+      <ConfirmDialog open={deleteProviderId !== null} onClose={() => setDeleteProviderId(null)} onConfirm={handleDeleteProvider} title="Delete provider" message="Delete this provider? All zones and domains using it will lose DNS management." confirmLabel="Delete" danger />
+      <ConfirmDialog open={deleteZoneId !== null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title="Remove zone" message="Remove this zone? Domains using it will lose DNS management." confirmLabel="Remove" danger />
     </div>
   );
 }

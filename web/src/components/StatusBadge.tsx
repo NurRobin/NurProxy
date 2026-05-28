@@ -1,19 +1,20 @@
 type Status = 'active' | 'adopted' | 'pending' | 'error' | 'offline' | 'deleting';
 
-const statusConfig: Record<Status, { bg: string; text: string; dot: string; label: string }> = {
-  active:   { bg: 'bg-green-900/40',  text: 'text-green-400',  dot: 'bg-green-400',  label: 'Active' },
-  adopted:  { bg: 'bg-green-900/40',  text: 'text-green-400',  dot: 'bg-green-400',  label: 'Adopted' },
-  pending:  { bg: 'bg-yellow-900/40', text: 'text-yellow-400', dot: 'bg-yellow-400', label: 'Pending' },
-  error:    { bg: 'bg-red-900/40',    text: 'text-red-400',    dot: 'bg-red-400',    label: 'Error' },
-  offline:  { bg: 'bg-gray-800',      text: 'text-gray-400',   dot: 'bg-gray-500',   label: 'Offline' },
-  deleting: { bg: 'bg-orange-900/40', text: 'text-orange-400', dot: 'bg-orange-400', label: 'Deleting' },
+const statusConfig: Record<Status, { cls: string; dot: string; label: string }> = {
+  active:   { cls: 'bg-success-soft text-success-fg', dot: 'bg-success',  label: 'Active' },
+  adopted:  { cls: 'bg-success-soft text-success-fg', dot: 'bg-success',  label: 'Adopted' },
+  pending:  { cls: 'bg-warning-soft text-warning-fg', dot: 'bg-warning',  label: 'Pending' },
+  error:    { cls: 'bg-danger-soft text-danger-fg',   dot: 'bg-danger',   label: 'Error' },
+  offline:  { cls: 'bg-surface-2 text-fg-muted',      dot: 'bg-fg-faint', label: 'Offline' },
+  deleting: { cls: 'bg-info-soft text-info-fg',       dot: 'bg-info',     label: 'Deleting' },
 };
 
 export default function StatusBadge({ status }: { status: string }) {
   const config = statusConfig[status as Status] ?? statusConfig.offline;
+  const pulse = status === 'pending' || status === 'deleting';
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${config.bg} ${config.text}`}>
-      <span className={`h-1.5 w-1.5 rounded-full ${config.dot}`} />
+    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${config.cls}`}>
+      <span className={`h-1.5 w-1.5 rounded-full ${config.dot} ${pulse ? 'animate-pulse' : ''}`} />
       {config.label}
     </span>
   );
