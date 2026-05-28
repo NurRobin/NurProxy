@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react';
 import { BrowserRouter, NavLink } from 'react-router-dom';
+import { HelpCircle } from 'lucide-react';
 import { api } from '../lib/api';
 import { usePolling } from '../lib/usePolling';
 import { ThemeToggle } from '../lib/theme';
@@ -56,7 +57,7 @@ export default function WorkbenchShell({ onLogout }: { onLogout: () => void }) {
           </nav>
           <div className="space-y-0.5 border-t border-border px-3 py-3">
             <NavLink to="/help" className={railClass}>
-              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.7}><path strokeLinecap="round" strokeLinejoin="round" d="M9.879 7.519a3 3 0 1 1 4.04 2.829c-.68.252-1.171.836-1.33 1.546l-.149.66M12 17h.007M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" /></svg>
+              <HelpCircle className="h-5 w-5" />
               <span className="flex-1">Docs</span>
             </NavLink>
             <div className="flex items-center justify-between px-3 pt-1">

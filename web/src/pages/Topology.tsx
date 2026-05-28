@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Search, ChevronDown, X, Globe, Server as ServerGlyph } from 'lucide-react';
 import { api } from '../lib/api';
 import type { Agent, Server, Domain, Zone } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
@@ -233,7 +234,7 @@ export default function Topology() {
                 {errorCount > 0 && <> · <span className="font-medium text-danger-fg">{errorCount} error{errorCount !== 1 ? 's' : ''}</span></>}
               </p>
               <div className="relative">
-                <svg className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-fg-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}><path strokeLinecap="round" strokeLinejoin="round" d="m21 21-4.3-4.3M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z" /></svg>
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-fg-faint" />
                 <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter nodes…" aria-label="Filter topology"
                   className="w-44 rounded-lg border border-border bg-surface py-1.5 pl-9 pr-3 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus-visible:outline-none focus:ring-2 focus:ring-accent/30" />
               </div>
@@ -274,7 +275,7 @@ export default function Topology() {
                           <button onClick={(e) => { e.stopPropagation(); toggleCollapse(a.id); }}
                             aria-label={isCollapsed ? `Expand ${a.name}` : `Collapse ${a.name}`}
                             className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-md text-fg-faint hover:bg-surface-2 hover:text-fg">
-                            <svg className={`h-3.5 w-3.5 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" /></svg>
+                            <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
                           </button>
                         )}
                       </div>
@@ -448,7 +449,7 @@ function Inspector({ title, body, onClose, onManage, manageLabel }: {
       <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
         <h2 className="truncate font-display text-lg font-semibold text-fg">{title}</h2>
         <button onClick={onClose} aria-label="Close" className="rounded-lg p-1.5 text-fg-faint hover:bg-surface-2 hover:text-fg">
-          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+          <X className="h-5 w-5" />
         </button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">{body}</div>
@@ -462,5 +463,5 @@ function Inspector({ title, body, onClose, onManage, manageLabel }: {
 }
 
 function Dot() { return <span className="h-2 w-2 rounded-full bg-fg-faint" />; }
-function GlobeIcon() { return <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.7}><path strokeLinecap="round" strokeLinejoin="round" d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zm0 0a8.95 8.95 0 0 0 0-18M3.6 9h16.8M3.6 15h16.8" /></svg>; }
-function ServerIcon() { return <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.7}><path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3h13.5a3 3 0 0 1 3 3v5.25a3 3 0 0 1-3 3M8.25 6.75h.008v.008H8.25z" /></svg>; }
+function GlobeIcon() { return <Globe className="h-4 w-4" />; }
+function ServerIcon() { return <ServerGlyph className="h-4 w-4" />; }

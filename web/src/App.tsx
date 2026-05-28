@@ -7,14 +7,12 @@ import Login from './pages/Login';
 import SetupWizard from './pages/SetupWizard';
 import ClassicShell from './shells/Classic';
 import WorkbenchShell from './shells/Workbench';
-import TerminalShell from './shells/Terminal';
 import WallboardShell from './shells/Wallboard';
 import SpreadsheetShell from './shells/Spreadsheet';
 
 const SHELLS = {
   classic: ClassicShell,
   workbench: WorkbenchShell,
-  terminal: TerminalShell,
   wallboard: WallboardShell,
   spreadsheet: SpreadsheetShell,
 } as const;

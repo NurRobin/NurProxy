@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { X } from 'lucide-react';
 import { api } from '../lib/api';
 import type { Domain, Agent, Server, Zone } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
@@ -422,7 +423,7 @@ export default function Domains() {
                     <Input value={h.key} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], key: e.target.value }; setEditHeaders(n); }} placeholder="Header name" />
                     <Input value={h.value} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], value: e.target.value }; setEditHeaders(n); }} placeholder="Value" />
                     <button onClick={() => setEditHeaders(editHeaders.filter((_, j) => j !== i))} aria-label="Remove header" className="flex-shrink-0 rounded-lg px-2 text-fg-faint hover:text-danger-fg">
-                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+                      <X className="h-4 w-4" />
                     </button>
                   </div>
                 ))}

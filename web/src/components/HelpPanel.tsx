@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { HelpCircle, ChevronDown, X } from 'lucide-react';
 import { HelpContext } from './help-context';
 import { TOPICS, getTopic, DEFAULT_SLUG } from '../lib/wiki';
 import Markdown from './Markdown';
@@ -97,7 +98,7 @@ export function HelpProvider({ children }: { children: ReactNode }) {
             >
               <header className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
                 <div ref={menuRef} className="relative flex items-center gap-2">
-                  <svg className="h-4 w-4 flex-shrink-0 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}><path strokeLinecap="round" strokeLinejoin="round" d="M9.879 7.519a3 3 0 1 1 4.04 2.829c-.68.252-1.171.836-1.33 1.546l-.149.66M12 17h.007M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" /></svg>
+                  <HelpCircle className="h-4 w-4 flex-shrink-0 text-accent" />
                   <button
                     type="button"
                     onClick={() => setMenuOpen((v) => !v)}
@@ -107,7 +108,7 @@ export function HelpProvider({ children }: { children: ReactNode }) {
                     className="flex items-center gap-1 rounded-md px-2 py-1 text-sm font-semibold text-fg transition-colors hover:bg-surface-2"
                   >
                     {topic.title}
-                    <svg className={`h-4 w-4 text-fg-faint transition-transform ${menuOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" /></svg>
+                    <ChevronDown className={`h-4 w-4 text-fg-faint transition-transform ${menuOpen ? 'rotate-180' : ''}`} />
                   </button>
                   {menuOpen && (
                     <div role="listbox" className="absolute left-6 top-full z-10 mt-1 max-h-80 w-60 overflow-y-auto rounded-lg border border-border bg-surface p-1 shadow-pop">
@@ -129,7 +130,7 @@ export function HelpProvider({ children }: { children: ReactNode }) {
                   )}
                 </div>
                 <button onClick={closeHelp} aria-label="Close help" className="rounded-lg p-1.5 text-fg-faint transition-colors hover:bg-surface-2 hover:text-fg">
-                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+                  <X className="h-5 w-5" />
                 </button>
               </header>
               <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">

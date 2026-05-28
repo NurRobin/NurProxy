@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import { CircleCheck, TriangleAlert } from 'lucide-react';
 import { api } from '../lib/api';
 import { usePolling } from '../lib/usePolling';
 import type { Agent, Domain, AuditLogEntry } from '../lib/types';
@@ -69,11 +70,7 @@ export default function Overview() {
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <span className={`flex h-9 w-9 items-center justify-center rounded-full ${healthy ? 'bg-success-soft text-success-fg' : 'bg-warning-soft text-warning-fg'}`}>
-              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-                {healthy
-                  ? <path strokeLinecap="round" strokeLinejoin="round" d="m9 12.75 2.25 2.25L15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />
-                  : <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m0 3.75h.007M12 3l9 16H3l9-16z" />}
-              </svg>
+              {healthy ? <CircleCheck className="h-5 w-5" /> : <TriangleAlert className="h-5 w-5" />}
             </span>
             <div>
               <p className="font-medium text-fg">

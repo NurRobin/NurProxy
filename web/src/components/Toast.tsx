@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState, type ReactNode } from 'react';
+import { TriangleAlert, CircleCheck, Info, X, type LucideIcon } from 'lucide-react';
 import { ToastContext, type ToastVariant, type ToastRecord, type ToastAction, type ToastOptions } from './toast-context';
 
 interface Toast {
@@ -46,19 +47,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 }
 
-const styles: Record<ToastVariant, { box: string; icon: ReactNode }> = {
-  error: {
-    box: 'border-danger/40 bg-danger-soft text-danger-fg',
-    icon: <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m0 3.75h.007M12 3l9 16H3l9-16z" />,
-  },
-  success: {
-    box: 'border-success/40 bg-success-soft text-success-fg',
-    icon: <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
-  },
-  info: {
-    box: 'border-info/40 bg-info-soft text-info-fg',
-    icon: <path strokeLinecap="round" strokeLinejoin="round" d="M11.25 11.25h1.5v5.25M12 7.5h.007M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
-  },
+const styles: Record<ToastVariant, { box: string; Icon: LucideIcon }> = {
+  error: { box: 'border-danger/40 bg-danger-soft text-danger-fg', Icon: TriangleAlert },
+  success: { box: 'border-success/40 bg-success-soft text-success-fg', Icon: CircleCheck },
+  info: { box: 'border-info/40 bg-info-soft text-info-fg', Icon: Info },
 };
 
 function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
@@ -68,9 +60,7 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
       role="status"
       className={`animate-toast-in pointer-events-auto flex items-start gap-3 rounded-lg border px-4 py-3 shadow-pop ${s.box}`}
     >
-      <svg className="mt-0.5 h-5 w-5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-        {s.icon}
-      </svg>
+      <s.Icon className="mt-0.5 h-5 w-5 flex-shrink-0" aria-hidden="true" />
       <p className="flex-1 break-words text-sm">{toast.message}</p>
       {toast.action && (
         <button
@@ -81,9 +71,7 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
         </button>
       )}
       <button onClick={onClose} aria-label="Dismiss" className="-mr-1 -mt-0.5 rounded p-1 opacity-70 hover:opacity-100">
-        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
-        </svg>
+        <X className="h-4 w-4" />
       </button>
     </div>
   );

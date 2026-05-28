@@ -3,7 +3,7 @@ import { UIVariantContext, type UIVariant } from './ui-variant-context';
 
 const STORAGE_KEY = 'nurproxy-ui';
 
-const VALID: UIVariant[] = ['classic', 'workbench', 'terminal', 'wallboard', 'spreadsheet'];
+const VALID: UIVariant[] = ['classic', 'workbench', 'wallboard', 'spreadsheet'];
 
 function readInitial(): UIVariant {
   try {

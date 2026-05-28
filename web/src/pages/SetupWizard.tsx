@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Agent, Zone } from '../lib/types';
 import type { TestProviderZone } from '../lib/api';
+import { Check } from 'lucide-react';
 import Button, { Spinner } from '../components/Button';
 import { Field, Input, PasswordInput } from '../components/Field';
 import Callout from '../components/Callout';
@@ -195,7 +196,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                 }`}
               >
                 {i < currentStep ? (
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                  <Check className="h-4 w-4" strokeWidth={3} />
                 ) : (i + 1)}
               </button>
               <span className={`text-xs font-medium ${i === currentStep ? 'text-fg' : 'text-fg-faint'}`}>{step.label}</span>
@@ -423,7 +424,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
           {currentStep === 2 && (
             <div className="text-center">
               <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-success-soft text-success-fg">
-                <svg className="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                <Check className="h-7 w-7" />
               </div>
               <h2 className="text-lg font-semibold text-fg">You’re all set</h2>
               <p className="mt-2 text-sm text-fg-muted">Here’s what’s configured:</p>
@@ -449,7 +450,7 @@ function SummaryItem({ label, value }: { label: string; value: string | null }) 
       <span className="text-sm font-medium text-fg">{label}</span>
       {value ? (
         <span className="flex items-center gap-1.5 text-sm text-success-fg">
-          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+          <Check className="h-4 w-4" />
           {value}
         </span>
       ) : (
