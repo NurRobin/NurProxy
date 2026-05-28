@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
@@ -99,11 +100,13 @@ func (s *Server) audit(r *http.Request, entityType, entityID, action, details st
 	if a, ok := r.Context().Value(ctxActor).(string); ok {
 		actor = a
 	}
-	s.db.InsertAuditLog(&models.AuditLogEntry{
+	if err := s.db.InsertAuditLog(&models.AuditLogEntry{
 		EntityType: entityType,
 		EntityID:   entityID,
 		Action:     action,
 		Actor:      actor,
 		Details:    details,
-	})
+	}); err != nil {
+		log.Printf("failed to insert audit log: %v", err)
+	}
 }

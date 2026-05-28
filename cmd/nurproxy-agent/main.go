@@ -59,6 +59,7 @@ func main() {
 	// Step 1: Adoption flow.
 	mgr, err := adoption.New(cfg.OrchestratorURL, cfg.FQDN, cfg.DataDir, cfg.APIPort)
 	if err != nil {
+		cancel()
 		log.Fatalf("Failed to initialize adoption manager: %v", err)
 	}
 

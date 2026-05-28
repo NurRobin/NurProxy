@@ -146,8 +146,8 @@ func TestSessionManager_TamperedToken(t *testing.T) {
 	signed := sm.Sign("mytoken")
 
 	tests := []struct {
-		name    string
-		tamper  func(string) string
+		name   string
+		tamper func(string) string
 	}{
 		{"modified token", func(s string) string {
 			return "tampered" + s[8:]

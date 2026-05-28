@@ -54,7 +54,7 @@ func (c *Client) Health(ctx context.Context, agentURL, token string) error {
 func (c *Client) PushRoute(ctx context.Context, agentURL, token string, route json.RawMessage) error {
 	body, err := json.Marshal(route)
 	if err != nil {
-		return fmt.Errorf("marshalling route: %w", err)
+		return fmt.Errorf("marshaling route: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, trimSlash(agentURL)+"/routes", bytes.NewReader(body))
@@ -102,7 +102,7 @@ func (c *Client) DeleteRoute(ctx context.Context, agentURL, token, domain string
 func (c *Client) SyncRoutes(ctx context.Context, agentURL, token string, routes []json.RawMessage) error {
 	body, err := json.Marshal(routes)
 	if err != nil {
-		return fmt.Errorf("marshalling routes: %w", err)
+		return fmt.Errorf("marshaling routes: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, trimSlash(agentURL)+"/routes/sync", bytes.NewReader(body))

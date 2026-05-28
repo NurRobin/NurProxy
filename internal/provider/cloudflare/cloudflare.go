@@ -56,10 +56,6 @@ type cfError struct {
 	Message string `json:"message"`
 }
 
-type cfTokenVerify struct {
-	Status string `json:"status"`
-}
-
 type cfZone struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

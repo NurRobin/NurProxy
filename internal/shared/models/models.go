@@ -102,7 +102,7 @@ type ProxyConfig struct {
 	PathStrip             string            `json:"path_strip,omitempty"`
 	PathRewrite           string            `json:"path_rewrite,omitempty"`
 	UpstreamScheme        string            `json:"upstream_scheme,omitempty"` // "http" or "https"
-	TimeoutRead           int               `json:"timeout_read,omitempty"`   // seconds
+	TimeoutRead           int               `json:"timeout_read,omitempty"`    // seconds
 	TimeoutWrite          int               `json:"timeout_write,omitempty"`
 	TimeoutIdle           int               `json:"timeout_idle,omitempty"`
 	BasicAuth             *BasicAuthConfig  `json:"basic_auth,omitempty"`

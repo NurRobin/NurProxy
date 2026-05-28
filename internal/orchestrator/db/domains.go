@@ -16,7 +16,7 @@ type DomainFilter struct {
 	Status   string
 }
 
-// CreateDomain inserts a new domain record. ProxyConfig is marshalled to JSON.
+// CreateDomain inserts a new domain record. ProxyConfig is marshaled to JSON.
 func (d *DB) CreateDomain(dom *models.Domain) error {
 	now := time.Now().UTC()
 	dom.CreatedAt = now
@@ -24,7 +24,7 @@ func (d *DB) CreateDomain(dom *models.Domain) error {
 
 	pcJSON, err := json.Marshal(dom.ProxyConfig)
 	if err != nil {
-		return fmt.Errorf("marshalling proxy config: %w", err)
+		return fmt.Errorf("marshaling proxy config: %w", err)
 	}
 
 	var lastSynced *string
@@ -94,7 +94,7 @@ func scanDomain(sc interface {
 	}
 
 	if err := json.Unmarshal([]byte(pcJSON), &dom.ProxyConfig); err != nil {
-		return nil, fmt.Errorf("unmarshalling proxy config: %w", err)
+		return nil, fmt.Errorf("unmarshaling proxy config: %w", err)
 	}
 
 	return &dom, nil
@@ -174,7 +174,7 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 
 	pcJSON, err := json.Marshal(dom.ProxyConfig)
 	if err != nil {
-		return fmt.Errorf("marshalling proxy config: %w", err)
+		return fmt.Errorf("marshaling proxy config: %w", err)
 	}
 
 	var lastSynced *string

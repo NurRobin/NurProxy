@@ -17,8 +17,8 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
-	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
+	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/web"
 )
 
@@ -71,6 +71,7 @@ func main() {
 
 	distFS, err := fs.Sub(web.Assets, "dist")
 	if err != nil {
+		_ = database.Close()
 		log.Fatalf("failed to load embedded assets: %v", err)
 	}
 	fileServer := http.FileServer(http.FS(distFS))

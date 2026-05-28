@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
@@ -289,7 +290,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		agent, err := s.db.GetAgent(id)
 		if err == nil && agent.Version != req.Version {
 			agent.Version = req.Version
-			s.db.UpdateAgent(agent)
+			if uerr := s.db.UpdateAgent(agent); uerr != nil {
+				log.Printf("failed to update agent version: %v", uerr)
+			}
 		}
 	}
 

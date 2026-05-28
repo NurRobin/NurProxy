@@ -86,14 +86,21 @@ func TestMockClientClearRoutes(t *testing.T) {
 
 	route1 := json.RawMessage(`{"@id":"domain-a-com"}`)
 	route2 := json.RawMessage(`{"@id":"domain-b-com"}`)
-	c.AddRoute(ctx, route1)
-	c.AddRoute(ctx, route2)
+	if err := c.AddRoute(ctx, route1); err != nil {
+		t.Fatalf("AddRoute route1 failed: %v", err)
+	}
+	if err := c.AddRoute(ctx, route2); err != nil {
+		t.Fatalf("AddRoute route2 failed: %v", err)
+	}
 
 	if err := c.ClearRoutes(ctx); err != nil {
 		t.Fatalf("ClearRoutes failed: %v", err)
 	}
 
-	routes, _ := c.ListRoutes(ctx)
+	routes, err := c.ListRoutes(ctx)
+	if err != nil {
+		t.Fatalf("ListRoutes failed: %v", err)
+	}
 	if len(routes) != 0 {
 		t.Errorf("route count = %d, want 0 after clear", len(routes))
 	}

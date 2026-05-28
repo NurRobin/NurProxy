@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
@@ -78,7 +79,6 @@ func TestValidateConfig_InvalidToken(t *testing.T) {
 		t.Fatal("expected error for invalid token, got nil")
 	}
 }
-
 
 func TestValidateConfig_MissingToken(t *testing.T) {
 	p := &CloudflareProvider{}
@@ -303,7 +303,7 @@ func TestAPIErrorHandling(t *testing.T) {
 		t.Fatal("expected non-empty error message")
 	}
 	// Check that multiple errors are included
-	if !contains(errMsg, "9109") || !contains(errMsg, "7003") {
+	if !strings.Contains(errMsg, "9109") || !strings.Contains(errMsg, "7003") {
 		t.Errorf("expected error to include both error codes, got: %s", errMsg)
 	}
 }
@@ -314,17 +314,4 @@ func TestInvalidConfigJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

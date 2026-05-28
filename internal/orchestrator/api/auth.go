@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -75,13 +76,15 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	s.setSessionCookie(w)
 
 	// Audit log
-	s.db.InsertAuditLog(&models.AuditLogEntry{
+	if err := s.db.InsertAuditLog(&models.AuditLogEntry{
 		EntityType: "system",
 		EntityID:   "setup",
 		Action:     "setup",
 		Actor:      "admin",
 		Details:    "initial admin password configured",
-	})
+	}); err != nil {
+		log.Printf("failed to insert audit log: %v", err)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "setup complete"})
 }

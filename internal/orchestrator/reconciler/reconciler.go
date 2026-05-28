@@ -504,7 +504,7 @@ func extractHostFromRoute(raw json.RawMessage) string {
 }
 
 // routesMatch compares two route JSON blobs for semantic equality.
-// It normalises by unmarshalling into maps and re-marshalling.
+// It normalizes by unmarshaling into maps and re-marshaling.
 func routesMatch(a, b json.RawMessage) bool {
 	var ma, mb interface{}
 	if err := json.Unmarshal(a, &ma); err != nil {

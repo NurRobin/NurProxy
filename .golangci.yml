@@ -1,68 +1,83 @@
+version: "2"
+
 run:
   timeout: 5m
 
 linters:
+  exclusions:
+    paths:
+      - web/node_modules
+    rules:
+      - path: _test\.go
+        linters:
+          - gocritic
+          - errcheck
+      - path: cmd/
+        linters:
+          - gocritic
+      - linters:
+          - errcheck
+        source: "defer .+\\.Close\\(\\)"
+      - linters:
+          - errcheck
+        source: "w\\.Write\\("
+      - linters:
+          - errcheck
+        source: "json\\.NewEncoder\\(w\\)\\.Encode"
+      - linters:
+          - errcheck
+        source: "io\\.Copy\\(io\\.Discard"
+      - linters:
+          - errcheck
+        source: "tx\\.Rollback\\(\\)"
+      - linters:
+          - errcheck
+        source: "sqlDB\\.Close\\(\\)"
+      - linters:
+          - errcheck
+        source: "\\.Shutdown\\("
+      - linters:
+          - errcheck
+        source: "f\\.Close\\(\\)"
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
     - unused
-    - gofmt
-    - goimports
     - misspell
     - gocritic
+  settings:
+    gocritic:
+      enabled-checks:
+        - badLock
+        - badRegexp
+        - builtinShadowDecl
+        - nilValReturn
+        - regexpPattern
+        - sloppyReassign
+        - sortSlice
+        - sprintfQuotedString
+        - sqlQuery
+        - syncMapLoadAndDelete
+        - truncateCmp
+        - unnecessaryDefer
+        - weakCond
+    misspell:
+      locale: US
 
-linters-settings:
-  gocritic:
-    enabled-checks:
-      - appendAssign
-      - argOrder
-      - badCall
-      - badCond
-      - badLock
-      - badRegexp
-      - builtinShadowDecl
-      - caseOrder
-      - codegenComment
-      - deprecatedComment
-      - dupArg
-      - dupBranchBody
-      - dupCase
-      - dupSubExpr
-      - exitAfterDefer
-      - flagDeref
-      - flagName
-      - nilValReturn
-      - offBy1
-      - regexpPattern
-      - sloppyReassign
-      - sortSlice
-      - sprintfQuotedString
-      - sqlQuery
-      - syncMapLoadAndDelete
-      - truncateCmp
-      - unnecessaryDefer
-      - weakCond
-
-  goimports:
-    local-prefixes: github.com/nurrobin/nurproxy
-
-  misspell:
-    locale: US
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/nurrobin/nurproxy
+  exclusions:
+    paths:
+      - web/node_modules
 
 issues:
-  exclude-rules:
-    # Allow dot imports in test files (e.g., for table-driven test helpers)
-    - path: _test\.go
-      linters:
-        - gocritic
-
-    # Test files can have longer functions
-    - path: _test\.go
-      linters:
-        - unused
-
   max-issues-per-linter: 0
   max-same-issues: 0

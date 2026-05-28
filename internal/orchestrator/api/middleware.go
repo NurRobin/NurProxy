@@ -114,24 +114,6 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// setupCheck redirects to setup if no admin password configured.
-func (s *Server) setupCheck(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, err := s.db.GetSetting("admin_password_hash")
-		if err != nil {
-			// No admin password set — only allow setup and health endpoints
-			if r.URL.Path != "/api/v1/auth/setup" && r.URL.Path != "/api/v1/health" {
-				writeJSON(w, http.StatusPreconditionRequired, map[string]string{
-					"error": "initial setup required",
-					"setup": "/api/v1/auth/setup",
-				})
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	}
-}
-
 // bearerToken extracts the token from the Authorization header.
 func bearerToken(r *http.Request) string {
 	h := r.Header.Get("Authorization")

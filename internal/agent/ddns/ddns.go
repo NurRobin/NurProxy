@@ -43,7 +43,7 @@ func New(orchestratorURL, agentID, token string, interval time.Duration) *Heartb
 	}
 }
 
-// Start begins the heartbeat loop. It blocks until the context is cancelled.
+// Start begins the heartbeat loop. It blocks until the context is canceled.
 func (h *Heartbeat) Start(ctx context.Context) {
 	ctx, h.cancel = context.WithCancel(ctx)
 	h.wg.Add(1)
