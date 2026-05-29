@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
+	"strings"
 
 	agentcaddy "github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
@@ -28,6 +30,12 @@ import (
 
 // backendName is the registry key for the bundled Caddy backend.
 const backendName = "caddy"
+
+// rateLimitModule is the Caddy module ID provided by the caddy-ratelimit plugin
+// (https://github.com/mholt/caddy-ratelimit). Its presence in `caddy
+// list-modules` is what tells us rate limiting is actually compiled into this
+// build, rather than assuming it (§8 module probing).
+const rateLimitModule = "http.handlers.rate_limit"
 
 func init() {
 	proxy.Register(backendName, func(cfg proxy.Config) (proxy.Proxy, error) {
@@ -41,13 +49,21 @@ func init() {
 // pre-interface agent.
 type Backend struct {
 	client *agentcaddy.Client
+	// listModules returns the module IDs compiled into the live caddy binary,
+	// used by Capabilities to probe optional modules (e.g. caddy-ratelimit). It is
+	// a field so tests can inject captured `caddy list-modules` output without a
+	// real binary; the default shells out to the caddy binary (§8). An error or a
+	// missing binary yields a nil list — the probe degrades gracefully.
+	listModules func(ctx context.Context) ([]string, error)
 }
 
 // New wraps an already-constructed admin-API client (real or mock) as a Proxy
 // backend. The agent uses this so the mock-fallback decision (no caddy binary)
 // is made once at startup and preserved here.
 func New(client *agentcaddy.Client) *Backend {
-	return &Backend{client: client}
+	b := &Backend{client: client}
+	b.listModules = listInstalledModules
+	return b
 }
 
 // Info reports the backend's static identity. The bundled Caddy is admin-API
@@ -65,10 +81,15 @@ func (b *Backend) Detect(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// Capabilities reports the options the bundled Caddy supports (§8). Rate
-// limiting requires the caddy-ratelimit module; without live module probing we
-// report it as available, matching what the renderer emits today (a rate_limit
-// handler). Module probing is a later refinement.
+// Capabilities reports the options the bundled Caddy supports (§8). The core
+// reverse-proxy, header, rewrite, auth, IP-filter and TLS features are part of
+// standard Caddy, so they are always true. Rate limiting is the one
+// module-dependent option: it requires the caddy-ratelimit plugin, so we probe
+// the live binary's module list (§8 module probing) and report RateLimit only
+// when http.handlers.rate_limit is actually compiled in. A probe failure (no
+// binary, mock mode, command error) reports RateLimit=false rather than guessing
+// true — the dashboard greys it out and the renderer drops it with an audited
+// warning rather than emitting config the binary can't load.
 func (b *Backend) Capabilities() proxy.Capabilities {
 	return proxy.Capabilities{
 		ReverseProxy:  true,
@@ -78,9 +99,71 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		PathRewrite:   true,
 		BasicAuth:     true,
 		IPFilter:      true,
-		RateLimit:     true,
+		RateLimit:     b.hasRateLimitModule(),
 		CentralTLS:    true,
 	}
+}
+
+// hasRateLimitModule probes whether the caddy-ratelimit module is compiled into
+// the live binary. It tolerates the absence of a prober or any probe error by
+// reporting false (no rate-limit support advertised).
+func (b *Backend) hasRateLimitModule() bool {
+	if b.listModules == nil {
+		return false
+	}
+	mods, err := b.listModules(context.Background())
+	if err != nil {
+		return false
+	}
+	return moduleListHas(mods, rateLimitModule)
+}
+
+// moduleListHas reports whether want is present in the module ID list. It is a
+// pure helper so the probe-parsing path is table-driven testable.
+func moduleListHas(mods []string, want string) bool {
+	for _, m := range mods {
+		if m == want {
+			return true
+		}
+	}
+	return false
+}
+
+// parseListModules extracts module IDs from `caddy list-modules` output. Caddy
+// prints one module ID per line, with an optional trailing summary section
+// separated by a blank line (e.g. "  Standard modules: 123"); those non-module
+// lines are skipped. It is a pure function so it can be unit-tested against
+// captured output, no caddy binary required.
+func parseListModules(out string) []string {
+	var mods []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Summary/section lines contain spaces or colons; real module IDs are a
+		// single dotted token (e.g. "http.handlers.rate_limit").
+		if strings.ContainsAny(line, " \t:") {
+			continue
+		}
+		mods = append(mods, line)
+	}
+	return mods
+}
+
+// listInstalledModules shells out to `caddy list-modules` and parses the result.
+// A missing binary or a command error yields a nil list (no modules probed), so
+// Capabilities degrades to "no optional modules" rather than failing.
+func listInstalledModules(ctx context.Context) ([]string, error) {
+	bin, err := exec.LookPath("caddy")
+	if err != nil {
+		return nil, fmt.Errorf("caddy binary not found: %w", err)
+	}
+	out, err := exec.CommandContext(ctx, bin, "list-modules").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("running caddy list-modules: %w", err)
+	}
+	return parseListModules(string(out)), nil
 }
 
 // Render turns a backend-neutral route into a caddy-route Artifact: the content

@@ -68,6 +68,25 @@ type ProxyPortConflict struct {
 	PID     int    `json:"pid,omitempty"`
 }
 
+// ProxyCapabilities reports which proxy options the agent's selected backend
+// supports on this host (§8). It is the wire/storage counterpart of the
+// agent-side proxy.Capabilities, carried in the adoption + heartbeat payloads and
+// stored on the agent row. A false field means the dashboard greys out that
+// option and the agent drops it during Render with a logged + audited warning,
+// never failing the whole apply. Module-dependent fields (e.g. RateLimit) are
+// resolved by probing at detection time (is caddy-ratelimit compiled in?).
+type ProxyCapabilities struct {
+	ReverseProxy  bool `json:"reverse_proxy"`
+	WebSocket     bool `json:"websocket"`
+	ForceHTTPS    bool `json:"force_https"`
+	CustomHeaders bool `json:"custom_headers"`
+	PathRewrite   bool `json:"path_rewrite"`
+	BasicAuth     bool `json:"basic_auth"`
+	IPFilter      bool `json:"ip_filter"`
+	RateLimit     bool `json:"rate_limit"`
+	CentralTLS    bool `json:"central_tls"`
+}
+
 // ProxyDetection is the agent's read-only Phase-0 detection result (§13.0, §2.1,
 // §9): which proxy is installed on the host, its version, the discovered config
 // dir / binary / log paths, and which process (if any) holds :80/:443. The agent
@@ -124,8 +143,14 @@ type Agent struct {
 	ProxyDetection *ProxyDetection `json:"proxy_detection,omitempty"`
 	// ProxyDetectedAt is when the orchestrator last received a detection report.
 	ProxyDetectedAt *time.Time `json:"proxy_detected_at,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	// ProxyCapabilities is the agent's last-reported capability matrix (§8) for its
+	// selected backend, including module probing (e.g. caddy-ratelimit present?).
+	// Owned by the agent via the adoption/heartbeat payload; the orchestrator only
+	// stores and exposes it so the dashboard can grey out unsupported options. Nil
+	// when the agent has not yet reported capabilities.
+	ProxyCapabilities *ProxyCapabilities `json:"proxy_capabilities,omitempty"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.

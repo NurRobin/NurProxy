@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -107,6 +108,24 @@ type Capabilities struct {
 	// CentralTLS reports support for orchestrator-provisioned (DNS-01) certs
 	// installed via InstallCerts (§7).
 	CentralTLS bool `json:"central_tls"`
+}
+
+// ToModel converts the agent-side Capabilities into the shared wire/storage
+// model carried in the adoption + heartbeat payloads (§8). The agent dials out
+// only; this is the shape the orchestrator persists on the agent row and exposes
+// read-only so the dashboard can grey out unsupported options per backend.
+func (c Capabilities) ToModel() *models.ProxyCapabilities {
+	return &models.ProxyCapabilities{
+		ReverseProxy:  c.ReverseProxy,
+		WebSocket:     c.WebSocket,
+		ForceHTTPS:    c.ForceHTTPS,
+		CustomHeaders: c.CustomHeaders,
+		PathRewrite:   c.PathRewrite,
+		BasicAuth:     c.BasicAuth,
+		IPFilter:      c.IPFilter,
+		RateLimit:     c.RateLimit,
+		CentralTLS:    c.CentralTLS,
+	}
 }
 
 // TargetKind distinguishes a file-on-disk artifact from the built-in Caddy's
