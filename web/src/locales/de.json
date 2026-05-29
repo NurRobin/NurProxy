@@ -193,7 +193,21 @@
     "edit": "Bearbeiten",
     "save": "Speichern",
     "updated": "{{name}} aktualisiert.",
-    "updateFailed": "Agent konnte nicht aktualisiert werden."
+    "updateFailed": "Agent konnte nicht aktualisiert werden.",
+    "detectedProxy": "Erkannter Proxy",
+    "detectedAt": "erkannt {{when}}",
+    "detectPending": "Noch keine Erkennung gemeldet.",
+    "noProxyDetected": "Kein unterstützter Reverse-Proxy auf diesem Host erkannt.",
+    "proxyAt": "{{name}} unter {{dir}}",
+    "proxyKind": "Proxy",
+    "proxyVersion": "Version",
+    "proxyBinary": "Binärdatei",
+    "proxyConfigDir": "Konfigurationsverzeichnis",
+    "proxyLogPaths": "Log-Pfade",
+    "bindConflict": "Port-Konflikt",
+    "bindConflictBody": "Ein anderer Prozess belegt die Ports, die der integrierte Proxy benötigt. Stelle diesen Agent auf ein bestehendes Proxy-Setup um oder gib den Port frei.",
+    "bindConflictItem": ":{{port}} belegt von {{process}}{{pid}}",
+    "unknownProcess": "einem unbekannten Prozess"
   },
   "servers": {
     "title": "Server",

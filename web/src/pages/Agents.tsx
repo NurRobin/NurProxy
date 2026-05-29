@@ -314,6 +314,8 @@ export default function Agents() {
                     </div>
                   </div>
                 )}
+
+                {selected.status !== 'pending' && <DetectedProxy agent={selected} />}
               </div>
             )}
           </div>
@@ -443,6 +445,83 @@ function ListRow({ agent, active, tone, onClick }: { agent: Agent; active: boole
       </div>
       <StatusBadge status={agent.status} />
     </button>
+  );
+}
+
+// DetectedProxy renders the agent's read-only Phase-0 detection: which proxy is
+// installed on the host, its version, the discovered paths, and any bind
+// conflict on :80/:443. Phase 0 manages nothing — this is purely informational.
+function DetectedProxy({ agent }: { agent: Agent }) {
+  const { t } = useTranslation();
+  const d = agent.proxy_detection;
+
+  // Compose a one-line summary like "nginx 1.24 at /etc/nginx".
+  const summary = () => {
+    if (!d || !d.installed || !d.kind) return null;
+    const name = d.version ? `${d.kind} ${d.version}` : d.kind;
+    return d.config_dir ? t('agents.proxyAt', { name, dir: d.config_dir }) : name;
+  };
+
+  const conflicts = d?.port_conflicts ?? [];
+
+  return (
+    <div className="mt-6 border-t border-border pt-5">
+      <div className="flex items-center justify-between">
+        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">
+          {t('agents.detectedProxy')} <HelpTip term="proxy-detection" />
+        </h3>
+        {agent.proxy_detected_at && (
+          <span className="text-xs text-fg-faint">{t('agents.detectedAt', { when: seen(agent.proxy_detected_at) })}</span>
+        )}
+      </div>
+
+      {!d ? (
+        <p className="mt-2 text-sm text-fg-faint">{t('agents.detectPending')}</p>
+      ) : !d.installed || !d.kind ? (
+        <p className="mt-2 text-sm text-fg-muted">{t('agents.noProxyDetected')}</p>
+      ) : (
+        <div className="mt-3 space-y-3">
+          <p className="text-sm font-medium text-fg">{summary()}</p>
+          <dl className="space-y-2 text-sm">
+            <Row label={t('agents.proxyKind')} value={d.kind} />
+            {d.version && <Row label={t('agents.proxyVersion')} value={d.version} />}
+            {d.binary_path && <Row label={t('agents.proxyBinary')} value={<span className="font-mono text-xs">{d.binary_path}</span>} />}
+            {d.config_dir && <Row label={t('agents.proxyConfigDir')} value={<span className="font-mono text-xs">{d.config_dir}</span>} />}
+            {d.log_paths && d.log_paths.length > 0 && (
+              <Row
+                label={t('agents.proxyLogPaths')}
+                value={
+                  <span className="font-mono text-xs">
+                    {d.log_paths.map((p) => (
+                      <span key={p} className="block">{p}</span>
+                    ))}
+                  </span>
+                }
+              />
+            )}
+          </dl>
+        </div>
+      )}
+
+      {conflicts.length > 0 && (
+        <div className="mt-3">
+          <Callout tone="warning" title={t('agents.bindConflict')}>
+            <p>{t('agents.bindConflictBody')}</p>
+            <ul className="mt-2 space-y-1">
+              {conflicts.map((c) => (
+                <li key={`${c.port}-${c.pid}`} className="font-mono text-xs">
+                  {t('agents.bindConflictItem', {
+                    port: c.port,
+                    process: c.process || t('agents.unknownProcess'),
+                    pid: c.pid ? ` (pid ${c.pid})` : '',
+                  })}
+                </li>
+              ))}
+            </ul>
+          </Callout>
+        </div>
+      )}
+    </div>
   );
 }
 
