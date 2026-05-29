@@ -70,9 +70,9 @@ export const api = {
 
   // Agents
   listAgents: () => request<Agent[]>('/agents'),
-  updateAgent: (id: string, data: { name?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
+  updateAgent: (id: string, data: { name?: string; fqdn?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
     request<Agent>(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  adoptAgent: (id: string, data: { name?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
+  adoptAgent: (id: string, data: { name?: string; fqdn?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
     request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
   rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
   deleteAgent: (id: string) => request<{ message: string }>(`/agents/${id}`, { method: 'DELETE' }),

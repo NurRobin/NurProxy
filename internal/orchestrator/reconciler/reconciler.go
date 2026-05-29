@@ -28,11 +28,19 @@ type AgentClient interface {
 	Health(ctx context.Context, agentURL, token string) error
 }
 
+// RouteHub is the subset of the agent connection hub the reconciler uses to
+// push routes to agents over their live (outbound-initiated) stream.
+type RouteHub interface {
+	Connected(agentID string) bool
+	PublishRoutes(agentID string, routes []json.RawMessage) bool
+}
+
 // Reconciler periodically syncs desired state (database) with actual state
 // (agent routes and DNS records).
 type Reconciler struct {
 	db          *db.DB
 	agentClient AgentClient
+	hub         RouteHub
 	interval    time.Duration
 	mu          sync.Mutex
 	cancel      context.CancelFunc
@@ -46,6 +54,37 @@ func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reco
 		agentClient: agentClient,
 		interval:    interval,
 	}
+}
+
+// SetHub attaches the agent connection hub so the reconciler can push routes to
+// agents over their live stream. Without it, the reconciler falls back to the
+// inbound agent client.
+func (r *Reconciler) SetHub(hub RouteHub) {
+	r.hub = hub
+}
+
+// PushAgentRoutes computes an agent's desired route set and delivers it over its
+// live stream. It's the instant-push entry point: API handlers call it the
+// moment a domain changes, so connected agents apply config without waiting for
+// the next reconcile tick. A no-op if the agent isn't currently connected.
+func (r *Reconciler) PushAgentRoutes(agentID string) error {
+	if r.hub == nil || !r.hub.Connected(agentID) {
+		return nil
+	}
+	agent, err := r.db.GetAgent(agentID)
+	if err != nil {
+		return fmt.Errorf("loading agent %s: %w", agentID, err)
+	}
+	desired, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		return err
+	}
+	routes := make([]json.RawMessage, 0, len(desired))
+	for _, d := range desired {
+		routes = append(routes, d.route)
+	}
+	r.hub.PublishRoutes(agentID, routes)
+	return nil
 }
 
 // Start launches the periodic reconciliation loop in a background goroutine.
@@ -167,11 +206,20 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 // Agents
 // ---------------------------------------------------------------------------
 
-func (r *Reconciler) reconcileAgents(ctx context.Context) error {
+// reconcileAgents derives each adopted agent's online/offline state from the
+// freshness of its last heartbeat — NOT from whether the orchestrator can reach
+// the agent inbound. Agents live behind NAT/firewalls and dial home; an inbound
+// probe would (wrongly) report every such agent as offline. The agent proves it
+// is alive by heartbeating out; if those stop arriving for longer than the
+// configured timeout, we mark it offline.
+func (r *Reconciler) reconcileAgents(_ context.Context) error {
 	agents, err := r.db.ListAgents()
 	if err != nil {
 		return fmt.Errorf("listing agents: %w", err)
 	}
+
+	timeout := r.offlineTimeout()
+	now := time.Now().UTC()
 
 	for i := range agents {
 		a := &agents[i]
@@ -179,54 +227,66 @@ func (r *Reconciler) reconcileAgents(ctx context.Context) error {
 			continue
 		}
 
-		err := r.agentClient.Health(ctx, a.APIURL, a.TokenHash)
-		if err != nil {
-			// Agent unreachable — mark offline if not already.
+		stale := a.LastSeen == nil || now.Sub(a.LastSeen.UTC()) > timeout
+
+		if stale {
 			if a.Status != models.AgentStatusOffline {
 				if dbErr := r.db.UpdateAgentStatus(a.ID, models.AgentStatusOffline); dbErr != nil {
 					log.Printf("reconciler: failed to mark agent %s offline: %v", a.ID, dbErr)
 				}
-				r.audit("agent", a.ID, "status_change", fmt.Sprintf("marked offline: %v", err))
+				r.audit("agent", a.ID, "status_change", fmt.Sprintf("marked offline: no heartbeat for > %s", timeout))
 			}
 			continue
 		}
 
-		// Agent is reachable.
+		// Heartbeat is fresh. The heartbeat handler normally flips offline->adopted
+		// on receipt; this covers the case where last_seen was refreshed by another
+		// path (e.g. a live event stream) while the row still read offline.
 		if a.Status == models.AgentStatusOffline {
-			// Came back online.
 			if dbErr := r.db.UpdateAgentStatus(a.ID, models.AgentStatusAdopted); dbErr != nil {
 				log.Printf("reconciler: failed to mark agent %s adopted: %v", a.ID, dbErr)
 			}
 			r.audit("agent", a.ID, "status_change", "agent came back online")
-		}
-
-		// Update last_seen.
-		if dbErr := r.db.UpdateAgentHeartbeat(a.ID, a.PublicIP); dbErr != nil {
-			log.Printf("reconciler: failed to update heartbeat for agent %s: %v", a.ID, dbErr)
 		}
 	}
 
 	return nil
 }
 
+// offlineTimeout is how long an agent may go without a heartbeat before it is
+// considered offline. It reads the agent_offline_timeout setting (seconds),
+// clamped to a sane floor so a misconfiguration can't make agents flap.
+func (r *Reconciler) offlineTimeout() time.Duration {
+	const def = 90 * time.Second
+	const floor = 15 * time.Second
+	if v, err := r.db.GetSetting("agent_offline_timeout"); err == nil && v != "" {
+		if secs, err := strconv.Atoi(v); err == nil {
+			d := time.Duration(secs) * time.Second
+			if d < floor {
+				return floor
+			}
+			return d
+		}
+	}
+	return def
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
-func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) error {
-	// Get desired routes from DB.
+// buildDesiredRoutes computes the route set an agent should be serving, keyed by
+// FQDN, straight from the database. It is shared by the inbound reconcile path
+// and by PushAgentRoutes (which delivers the same set over the agent's stream),
+// so both paths always agree on desired state.
+func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desiredRoute, error) {
 	domains, err := r.db.ListDomainsByAgent(agent.ID)
 	if err != nil {
-		return fmt.Errorf("listing domains for agent %s: %w", agent.ID, err)
+		return nil, fmt.Errorf("listing domains for agent %s: %w", agent.ID, err)
 	}
 
-	// Look up zone names for FQDN construction.
-	type zoneCache struct {
-		zoneName string
-	}
-	zCache := make(map[string]zoneCache)
+	zoneNames := make(map[string]string) // zoneID -> name
 
-	// Build the expected set of routes keyed by FQDN.
 	desiredByFQDN := make(map[string]desiredRoute)
 	for i := range domains {
 		dom := &domains[i]
@@ -238,17 +298,17 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		}
 
 		// Resolve zone name from the domain's zone.
-		zc, ok := zCache[dom.ZoneID]
+		zoneName, ok := zoneNames[dom.ZoneID]
 		if !ok {
 			zone, zErr := r.db.GetZone(dom.ZoneID)
 			if zErr != nil {
 				log.Printf("reconciler: cannot resolve zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
 				continue
 			}
-			zc = zoneCache{zoneName: zone.Name}
-			zCache[dom.ZoneID] = zc
+			zoneName = zone.Name
+			zoneNames[dom.ZoneID] = zoneName
 		}
-		fqdn := dom.FQDN(zc.zoneName)
+		fqdn := dom.FQDN(zoneName)
 
 		// Resolve server address.
 		srv, sErr := r.db.GetServer(dom.ServerID)
@@ -271,6 +331,30 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 			fqdn:   fqdn,
 			route:  route,
 		}
+	}
+
+	return desiredByFQDN, nil
+}
+
+func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) error {
+	desiredByFQDN, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		return err
+	}
+
+	// Prefer the live stream: if the agent holds an open connection, push the
+	// desired set down it and stop. This is the path that works behind NAT (the
+	// agent dialed us) and the one to rely on in production; the agent applies
+	// the set locally and reports domain status back via its ACK. The inbound
+	// diff below is the fallback for same-host / port-forwarded setups where the
+	// orchestrator can reach the agent directly.
+	if r.hub != nil && r.hub.Connected(agent.ID) {
+		routes := make([]json.RawMessage, 0, len(desiredByFQDN))
+		for _, d := range desiredByFQDN {
+			routes = append(routes, d.route)
+		}
+		r.hub.PublishRoutes(agent.ID, routes)
+		return nil
 	}
 
 	// Get actual routes from the agent.
@@ -515,9 +599,15 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 		}
 		zone := matchZoneForFQDN(a.FQDN, zones)
 		if zone == nil {
-			// FQDN not covered by any assigned zone — can't manage its A record.
+			// FQDN not covered by any assigned zone — we can't create its A record,
+			// and every domain CNAME pointing at this FQDN will dangle. Surface a
+			// clear, actionable error instead of failing silently.
+			msg := fmt.Sprintf("FQDN %q is not inside any assigned DNS zone — set the agent's anchor to a host within one of its zones (e.g. host.%s) or assign the matching zone", a.FQDN, firstZoneName(zones))
+			r.setAgentDNSError(a, msg)
 			continue
 		}
+		// FQDN is inside a managed zone — clear any prior "outside zone" error.
+		r.setAgentDNSError(a, "")
 
 		prov, pErr := r.db.GetProvider(zone.ProviderID)
 		if pErr != nil {
@@ -576,6 +666,35 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// setAgentDNSError persists an orchestrator-side DNS error for the agent, but
+// only when it actually changed — avoiding a write (and audit-log spam) on every
+// reconcile cycle for a steady-state condition. It keeps the in-memory agent in
+// sync so later phases in the same cycle see the new value.
+func (r *Reconciler) setAgentDNSError(a *models.Agent, msg string) {
+	if a.DNSError == msg {
+		return
+	}
+	if err := r.db.SetAgentDNSError(a.ID, msg); err != nil {
+		log.Printf("reconciler: failed to set dns_error for agent %s: %v", a.ID, err)
+		return
+	}
+	a.DNSError = msg
+	if msg != "" {
+		r.audit("agent", a.ID, "dns_error", msg)
+	} else {
+		r.audit("agent", a.ID, "dns_error_cleared", "FQDN now resolves to an assigned zone")
+	}
+}
+
+// firstZoneName returns a representative zone name for use in hints, or a
+// placeholder when the agent has no assigned zones.
+func firstZoneName(zones []models.Zone) string {
+	if len(zones) > 0 {
+		return zones[0].Name
+	}
+	return "example.com"
 }
 
 // matchZoneForFQDN returns the zone whose name is the longest suffix of fqdn

@@ -180,7 +180,20 @@
     "deleted": "Agent deleted.",
     "deleteFailed": "Failed to delete agent.",
     "loadFailed": "Couldn’t load agents.",
-    "loadServersFailed": "Couldn’t load servers."
+    "loadServersFailed": "Couldn’t load servers.",
+    "anchorFqdn": "Anchor hostname (FQDN)",
+    "anchorFqdnHelp": "The DNS name that points at this server. It must live inside one of the agent’s zones — every domain you add becomes a CNAME to it.",
+    "anchorFqdnWarn": "This hostname isn’t inside any selected zone. DNS for it can’t be managed until you pick the matching zone or change the hostname.",
+    "caddyStatus": "Local proxy",
+    "running": "running",
+    "notRunning": "not running",
+    "agentError": "Agent problem",
+    "dnsProblem": "DNS problem",
+    "editAgent": "Edit agent",
+    "edit": "Edit",
+    "save": "Save",
+    "updated": "{{name}} updated.",
+    "updateFailed": "Failed to update agent."
   },
   "servers": {
     "title": "Servers",

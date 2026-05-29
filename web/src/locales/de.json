@@ -180,7 +180,20 @@
     "deleted": "Agent gelöscht.",
     "deleteFailed": "Agent konnte nicht gelöscht werden.",
     "loadFailed": "Agents konnten nicht geladen werden.",
-    "loadServersFailed": "Server konnten nicht geladen werden."
+    "loadServersFailed": "Server konnten nicht geladen werden.",
+    "anchorFqdn": "Anker-Hostname (FQDN)",
+    "anchorFqdnHelp": "Der DNS-Name, der auf diesen Server zeigt. Er muss in einer der Zonen des Agenten liegen — jede Domain, die du hinzufügst, wird ein CNAME darauf.",
+    "anchorFqdnWarn": "Dieser Hostname liegt in keiner ausgewählten Zone. DNS dafür kann erst verwaltet werden, wenn du die passende Zone wählst oder den Hostnamen änderst.",
+    "caddyStatus": "Lokaler Proxy",
+    "running": "läuft",
+    "notRunning": "läuft nicht",
+    "agentError": "Agent-Problem",
+    "dnsProblem": "DNS-Problem",
+    "editAgent": "Agent bearbeiten",
+    "edit": "Bearbeiten",
+    "save": "Speichern",
+    "updated": "{{name}} aktualisiert.",
+    "updateFailed": "Agent konnte nicht aktualisiert werden."
   },
   "servers": {
     "title": "Server",

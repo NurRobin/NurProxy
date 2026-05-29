@@ -107,20 +107,44 @@ func TestMockClientClearRoutes(t *testing.T) {
 }
 
 func TestClientEnsureServer(t *testing.T) {
-	// Mock Caddy Admin API server.
-	serverCreated := false
+	// Mock Caddy Admin API server. It emulates the real admin API's path
+	// semantics: GET 404s on a missing path, and the admin API does NOT create
+	// intermediate parents — so a fresh instance (only admin configured) has no
+	// apps/http/servers, and EnsureServer must build the structure top-down.
+	var appsExists, httpExists, srv0Exists bool
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http/servers/srv0":
-			if serverCreated {
+		exists := func(b bool) {
+			if b {
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"listen":[":443",":80"]}`))
+				w.Write([]byte(`{}`))
 			} else {
 				w.WriteHeader(http.StatusNotFound)
-				w.Write([]byte(`{"error":"not found"}`))
 			}
-		case r.Method == http.MethodPost && r.URL.Path == "/config/apps/http/servers/srv0":
-			serverCreated = true
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http/servers/srv0":
+			exists(srv0Exists)
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http":
+			exists(httpExists)
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps":
+			exists(appsExists)
+		// PUT creates the value at a path whose immediate parent already exists.
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps":
+			appsExists, httpExists, srv0Exists = true, true, true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http":
+			if !appsExists {
+				w.WriteHeader(http.StatusInternalServerError) // no parent
+				return
+			}
+			httpExists, srv0Exists = true, true
+			w.WriteHeader(http.StatusOK)
+		case (r.Method == http.MethodPut || r.Method == http.MethodPost) && r.URL.Path == "/config/apps/http/servers/srv0":
+			if !httpExists {
+				w.WriteHeader(http.StatusInternalServerError) // no parent
+				return
+			}
+			srv0Exists = true
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -138,7 +162,7 @@ func TestClientEnsureServer(t *testing.T) {
 		t.Fatalf("EnsureServer failed: %v", err)
 	}
 
-	if !serverCreated {
+	if !srv0Exists {
 		t.Error("server should have been created")
 	}
 

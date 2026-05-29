@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agentclient"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
@@ -69,14 +70,21 @@ func main() {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
 
+	// Live agent connection hub: agents dial out and hold a stream open, and the
+	// orchestrator pushes config down it the instant it changes (works behind NAT).
+	hub := agenthub.New()
+
 	// Start the reconciliation engine: it syncs desired state (DB) with the
 	// actual state on agents (routes) and at DNS providers (records).
 	rec := reconciler.New(database, agentclient.New(), reconcilerInterval(database))
+	rec.SetHub(hub)
 	rec.Start(rootCtx)
 	defer rec.Stop()
 
-	// Create API server
+	// Create API server, wiring in the hub + reconciler so the stream endpoint
+	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
+	srv.SetAgentHub(hub, rec)
 
 	// Serve embedded dashboard + API
 	mux := http.NewServeMux()

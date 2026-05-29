@@ -72,8 +72,20 @@ type Agent struct {
 	Status       AgentStatus `json:"status"`
 	LastSeen     *time.Time  `json:"last_seen,omitempty"`
 	Version      string      `json:"version,omitempty"`
-	CreatedAt    time.Time   `json:"created_at"`
-	UpdatedAt    time.Time   `json:"updated_at"`
+	// CaddyRunning reports whether the agent's embedded Caddy is serving
+	// traffic. It can be false (e.g. ports 80/443 are taken by another service)
+	// while the agent itself is perfectly healthy and connected.
+	CaddyRunning bool `json:"caddy_running"`
+	// LastError is the most recent operational error the agent reported about
+	// itself (e.g. a Caddy bind failure). Owned by the agent via heartbeat.
+	LastError string `json:"last_error,omitempty"`
+	// DNSError is an orchestrator-side problem managing this agent's DNS (e.g.
+	// its FQDN is outside every assigned zone, so no A record can be created).
+	// Owned by the reconciler. Kept separate from LastError so the two never
+	// overwrite one another.
+	DNSError  string    `json:"dns_error,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.

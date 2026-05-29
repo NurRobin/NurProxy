@@ -20,6 +20,7 @@ type Heartbeat struct {
 	token           string
 	version         string
 	interval        time.Duration
+	healthFn        func() (caddyRunning bool, lastError string)
 	client          *http.Client
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -27,19 +28,24 @@ type Heartbeat struct {
 
 // heartbeatPayload is the JSON body sent to the orchestrator.
 type heartbeatPayload struct {
-	AgentID  string `json:"agent_id"`
-	PublicIP string `json:"public_ip"`
-	Version  string `json:"version"`
+	AgentID      string `json:"agent_id"`
+	PublicIP     string `json:"public_ip"`
+	Version      string `json:"version"`
+	CaddyRunning bool   `json:"caddy_running"`
+	LastError    string `json:"last_error"`
 }
 
-// New creates a new Heartbeat sender.
-func New(orchestratorURL, agentID, token, version string, interval time.Duration) *Heartbeat {
+// New creates a new Heartbeat sender. healthFn supplies the agent's current
+// operational state (Caddy running? last error?) on each beat; it may be nil,
+// in which case the agent is reported as healthy.
+func New(orchestratorURL, agentID, token, version string, interval time.Duration, healthFn func() (bool, string)) *Heartbeat {
 	return &Heartbeat{
 		orchestratorURL: strings.TrimRight(orchestratorURL, "/"),
 		agentID:         agentID,
 		token:           token,
 		version:         version,
 		interval:        interval,
+		healthFn:        healthFn,
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -80,16 +86,26 @@ func (h *Heartbeat) Stop() {
 }
 
 func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
+	caddyRunning, lastError := true, ""
+	if h.healthFn != nil {
+		caddyRunning, lastError = h.healthFn()
+	}
+
+	// A failed IP lookup must not skip the heartbeat: liveness and health
+	// reporting matter even when we can't refresh the public IP. Send a blank IP
+	// (the orchestrator keeps the last known value) and carry on.
 	ip, err := DetectPublicIP(ctx)
 	if err != nil {
 		log.Printf("Heartbeat: failed to detect public IP: %v", err)
-		return
+		ip = ""
 	}
 
 	payload := heartbeatPayload{
-		AgentID:  h.agentID,
-		PublicIP: ip,
-		Version:  h.version,
+		AgentID:      h.agentID,
+		PublicIP:     ip,
+		Version:      h.version,
+		CaddyRunning: caddyRunning,
+		LastError:    lastError,
 	}
 
 	data, err := json.Marshal(payload)

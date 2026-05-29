@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
+	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
 
@@ -27,9 +28,16 @@ type Server struct {
 	port        int
 	caddyClient *caddy.Client
 	token       string
+	health      *health.State
 	routes      map[string]json.RawMessage // domain -> route config
 	mu          sync.RWMutex
 	server      *http.Server
+}
+
+// SetHealth attaches the shared health state so the server can report problems
+// (e.g. failing to bind its own port) to the orchestrator via heartbeat.
+func (s *Server) SetHealth(h *health.State) {
+	s.health = h
 }
 
 // New creates a new agent API server.
@@ -64,6 +72,9 @@ func (s *Server) Start(ctx context.Context) error {
 		log.Printf("Agent API listening on :%d", s.port)
 		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Agent API error: %v", err)
+			if s.health != nil {
+				s.health.SetError(fmt.Sprintf("agent API failed to listen on :%d: %v", s.port, err))
+			}
 		}
 	}()
 
