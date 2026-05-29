@@ -309,6 +309,8 @@
     "maxBodySize": "Max body size",
     "maxBodyHint": "Leave blank for the default.",
     "maxBodyPh": "e.g. 100mb",
+    "capUnsupported": "The {{backend}} backend on this agent does not support this option — it will be ignored.",
+    "capBackendGeneric": "selected",
     "customHeaders": "Custom request headers",
     "addHeader": "+ Add header",
     "noHeaders": "No custom headers.",

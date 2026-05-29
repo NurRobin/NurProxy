@@ -3,7 +3,7 @@ import i18n from '../lib/i18n';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Domain, Agent, Server, Zone } from '../lib/types';
+import type { Domain, Agent, Server, Zone, ProxyCapabilities } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
@@ -90,6 +90,26 @@ export default function Domains() {
 
   const getZoneName = (zoneId: string) => zones.find((z) => z.id === zoneId)?.name ?? '';
   const getServerInfo = (serverId: string) => allServers.find((s) => s.id === serverId);
+
+  // Resolve the agent that will serve a domain (via its server) so the edit form
+  // can grey out options the agent's selected backend can't honor (§8). Returns
+  // undefined when the agent is unknown or hasn't reported its capability matrix
+  // yet — in which case every option stays enabled (no false negatives).
+  const getAgentForDomain = (d: Domain): Agent | undefined => {
+    const srv = getServerInfo(d.server_id);
+    if (!srv) return undefined;
+    return agents.find((a) => a.id === srv.agent_id);
+  };
+  const detailAgent = detailDomain ? getAgentForDomain(detailDomain) : undefined;
+  const caps = detailAgent?.proxy_capabilities;
+  // A capability is "supported" unless the agent reported it false. With no
+  // reported matrix we leave everything enabled.
+  const supports = (key: keyof ProxyCapabilities) => !caps || caps[key];
+  const backendName = detailAgent?.proxy_capabilities
+    ? detailAgent.proxy_detection?.kind ?? t('domains.capBackendGeneric')
+    : '';
+  const unsupportedHint = (key: keyof ProxyCapabilities) =>
+    supports(key) ? undefined : t('domains.capUnsupported', { backend: backendName });
 
   const filtered = domains.filter((d) => {
     if (statusFilter !== 'all' && d.status !== statusFilter) return false;
@@ -401,10 +421,10 @@ export default function Domains() {
             {editTab === 'general' && (
               <div className="space-y-4">
                 <div className="flex flex-wrap gap-6">
-                  <span className="flex items-center gap-1.5"><Checkbox label={t('domains.websocket')} checked={editWebsocket} onChange={(e) => setEditWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
-                  <span className="flex items-center gap-1.5"><Checkbox label={t('domains.forceHttps')} checked={editForceHttps} onChange={(e) => setEditForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
+                  <span className="flex items-center gap-1.5" title={unsupportedHint('websocket')}><Checkbox label={t('domains.websocket')} checked={editWebsocket} disabled={!supports('websocket')} onChange={(e) => setEditWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
+                  <span className="flex items-center gap-1.5" title={unsupportedHint('force_https')}><Checkbox label={t('domains.forceHttps')} checked={editForceHttps} disabled={!supports('force_https')} onChange={(e) => setEditForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
                 </div>
-                <Field label={t('domains.maxBodySize')} help="max-body-size" hint={t('domains.maxBodyHint')}>
+                <Field label={t('domains.maxBodySize')} help="max-body-size" hint={supports('reverse_proxy') ? t('domains.maxBodyHint') : unsupportedHint('reverse_proxy')}>
                   <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder={t('domains.maxBodyPh')} />
                 </Field>
                 <div className="flex justify-end gap-3 pt-1">
@@ -416,15 +436,18 @@ export default function Domains() {
 
             {editTab === 'headers' && (
               <div className="space-y-4">
+                {!supports('custom_headers') && (
+                  <Callout tone="warning">{unsupportedHint('custom_headers')}</Callout>
+                )}
                 <div className="flex items-center justify-between">
                   <p className="text-sm font-medium text-fg">{t('domains.customHeaders')}</p>
-                  <button onClick={() => setEditHeaders([...editHeaders, { key: '', value: '' }])} className="text-xs font-medium text-accent hover:underline">{t('domains.addHeader')}</button>
+                  <button onClick={() => setEditHeaders([...editHeaders, { key: '', value: '' }])} disabled={!supports('custom_headers')} className="text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:no-underline">{t('domains.addHeader')}</button>
                 </div>
                 {editHeaders.length === 0 && <p className="text-sm text-fg-faint">{t('domains.noHeaders')}</p>}
                 {editHeaders.map((h, i) => (
                   <div key={i} className="flex gap-2">
-                    <Input value={h.key} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], key: e.target.value }; setEditHeaders(n); }} placeholder={t('domains.headerName')} />
-                    <Input value={h.value} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], value: e.target.value }; setEditHeaders(n); }} placeholder={t('domains.headerValue')} />
+                    <Input value={h.key} disabled={!supports('custom_headers')} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], key: e.target.value }; setEditHeaders(n); }} placeholder={t('domains.headerName')} />
+                    <Input value={h.value} disabled={!supports('custom_headers')} onChange={(e) => { const n = [...editHeaders]; n[i] = { ...n[i], value: e.target.value }; setEditHeaders(n); }} placeholder={t('domains.headerValue')} />
                     <button onClick={() => setEditHeaders(editHeaders.filter((_, j) => j !== i))} aria-label="Remove header" className="flex-shrink-0 rounded-lg px-2 text-fg-faint hover:text-danger-fg">
                       <X className="h-4 w-4" />
                     </button>
