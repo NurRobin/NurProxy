@@ -537,6 +537,87 @@ func TestAgent_UpdateStatus(t *testing.T) {
 	}
 }
 
+func TestAgent_Detection_freshAgentIsNil(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	got, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if got.ProxyDetection != nil {
+		t.Errorf("ProxyDetection: got %+v, want nil for an agent that never reported", got.ProxyDetection)
+	}
+	if got.ProxyDetectedAt != nil {
+		t.Errorf("ProxyDetectedAt: got %v, want nil", got.ProxyDetectedAt)
+	}
+}
+
+func TestAgent_UpdateDetection_roundTrips(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	tests := []struct {
+		name string
+		det  *models.ProxyDetection
+	}{
+		{
+			name: "nginx with conflict",
+			det: &models.ProxyDetection{
+				Installed:  true,
+				Kind:       "nginx",
+				Version:    "1.24.0",
+				BinaryPath: "/usr/sbin/nginx",
+				ConfigDir:  "/etc/nginx/sites-available",
+				LogPaths:   []string{"/var/log/nginx/error.log", "/var/log/nginx/access.log"},
+				PortConflicts: []models.ProxyPortConflict{
+					{Port: 443, Process: "nginx", PID: 1234},
+				},
+			},
+		},
+		{
+			name: "nothing installed, no lists",
+			det:  &models.ProxyDetection{Installed: false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := d.UpdateAgentDetection(a.ID, tt.det); err != nil {
+				t.Fatalf("UpdateAgentDetection: %v", err)
+			}
+			got, err := d.GetAgent(a.ID)
+			if err != nil {
+				t.Fatalf("GetAgent: %v", err)
+			}
+			if got.ProxyDetection == nil {
+				t.Fatalf("ProxyDetection: got nil after update, want non-nil")
+			}
+			if got.ProxyDetection.Installed != tt.det.Installed {
+				t.Errorf("Installed: got %t, want %t", got.ProxyDetection.Installed, tt.det.Installed)
+			}
+			if got.ProxyDetection.Kind != tt.det.Kind {
+				t.Errorf("Kind: got %q, want %q", got.ProxyDetection.Kind, tt.det.Kind)
+			}
+			if got.ProxyDetection.Version != tt.det.Version {
+				t.Errorf("Version: got %q, want %q", got.ProxyDetection.Version, tt.det.Version)
+			}
+			if got.ProxyDetection.ConfigDir != tt.det.ConfigDir {
+				t.Errorf("ConfigDir: got %q, want %q", got.ProxyDetection.ConfigDir, tt.det.ConfigDir)
+			}
+			if len(got.ProxyDetection.LogPaths) != len(tt.det.LogPaths) {
+				t.Errorf("LogPaths: got %v, want %v", got.ProxyDetection.LogPaths, tt.det.LogPaths)
+			}
+			if len(got.ProxyDetection.PortConflicts) != len(tt.det.PortConflicts) {
+				t.Errorf("PortConflicts: got %v, want %v", got.ProxyDetection.PortConflicts, tt.det.PortConflicts)
+			}
+			if got.ProxyDetectedAt == nil {
+				t.Error("ProxyDetectedAt should be set after a detection update")
+			}
+		})
+	}
+}
+
 func TestAgent_Heartbeat(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)

@@ -58,6 +58,39 @@ type Zone struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// ProxyPortConflict identifies which process holds a listening port the built-in
+// Caddy needs (:80/:443). It is what turns "Caddy can't bind" into the
+// actionable "nginx is holding :443" signal (§2.1). It mirrors the agent-side
+// proxy.PortConflict, carried over the wire in the adoption/heartbeat payload.
+type ProxyPortConflict struct {
+	Port    int    `json:"port"`
+	Process string `json:"process,omitempty"`
+	PID     int    `json:"pid,omitempty"`
+}
+
+// ProxyDetection is the agent's read-only Phase-0 detection result (§13.0, §2.1,
+// §9): which proxy is installed on the host, its version, the discovered config
+// dir / binary / log paths, and which process (if any) holds :80/:443. The agent
+// dials out and carries this in its adoption + heartbeat payloads; the
+// orchestrator persists it on the agent row and exposes it read-only so the
+// dashboard can show "nginx 1.24 at /etc/nginx".
+type ProxyDetection struct {
+	// Installed reports whether a supported proxy binary was found on the host.
+	Installed bool `json:"installed"`
+	// Kind is the detected proxy type (caddy / nginx / apache), empty if none.
+	Kind string `json:"kind,omitempty"`
+	// Version is the parsed version string (e.g. "1.24.0"), empty if unknown.
+	Version string `json:"version,omitempty"`
+	// BinaryPath is the absolute path to the resolved proxy binary.
+	BinaryPath string `json:"binary_path,omitempty"`
+	// ConfigDir is the resolved primary config directory (§9 OS defaults).
+	ConfigDir string `json:"config_dir,omitempty"`
+	// LogPaths are the discovered error/access log paths (§9 OS defaults).
+	LogPaths []string `json:"log_paths,omitempty"`
+	// PortConflicts lists the holders of :80/:443 when those ports are occupied.
+	PortConflicts []ProxyPortConflict `json:"port_conflicts,omitempty"`
+}
+
 // Agent represents a registered proxy agent.
 type Agent struct {
 	ID           string      `json:"id"`
@@ -83,9 +116,16 @@ type Agent struct {
 	// its FQDN is outside every assigned zone, so no A record can be created).
 	// Owned by the reconciler. Kept separate from LastError so the two never
 	// overwrite one another.
-	DNSError  string    `json:"dns_error,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	DNSError string `json:"dns_error,omitempty"`
+	// ProxyDetection is the agent's last-reported read-only detection result
+	// (installed proxy + version + paths + bind-conflict holder, §13.0/§2.1/§9).
+	// Owned by the agent via the adoption/heartbeat payload; the orchestrator only
+	// stores and exposes it. Nil when the agent has not yet reported detection.
+	ProxyDetection *ProxyDetection `json:"proxy_detection,omitempty"`
+	// ProxyDetectedAt is when the orchestrator last received a detection report.
+	ProxyDetectedAt *time.Time `json:"proxy_detected_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.

@@ -247,6 +247,26 @@ var migrations = []string{
 	`
 	ALTER TABLE audit_log ADD COLUMN source TEXT NOT NULL DEFAULT '';
 	`,
+
+	// Migration 006: store the agent's Phase-0 read-only proxy detection (§13.0,
+	// §2.1, §9) on the agent row. The agent dials out and reports which proxy is
+	// installed (kind + version), the discovered config dir / binary / log paths,
+	// and which process holds :80/:443; the orchestrator persists it here and
+	// exposes it read-only so the dashboard can show "nginx 1.24 at /etc/nginx".
+	//
+	// Scalars get their own columns (queryable); the list-valued fields
+	// (log_paths, port_conflicts) are stored as JSON. detected_at records when the
+	// last detection report arrived (NULL until the first one).
+	`
+	ALTER TABLE agents ADD COLUMN detected_proxy_kind     TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN detected_proxy_version  TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN detected_binary_path    TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN detected_config_dir     TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN detected_log_paths      TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN detected_port_conflicts TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN detected_installed      INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE agents ADD COLUMN detected_at             TEXT;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
