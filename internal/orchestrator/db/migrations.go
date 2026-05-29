@@ -278,6 +278,57 @@ var migrations = []string{
 	`
 	ALTER TABLE agents ADD COLUMN detected_capabilities TEXT;
 	`,
+
+	// Migration 008: the central managed-config store (§4, §11, Phase 3). The
+	// agent renders native config and round-trips the rendered artifact back here
+	// (B1, §3); the orchestrator versions, diffs, backs up, rolls back, and
+	// drift-reviews it. Built-in Caddy participates with target_kind ==
+	// "caddy-route" and content == route JSON.
+	//
+	// config_artifacts holds the live/accepted state of each artifact (one row
+	// per managed config); config_artifact_versions is the append-only full
+	// content history (a new row only on semantic change, §4 — no pruning).
+	// domain_id is nullable: set for generated (model-backed) artifacts, NULL for
+	// manual/adopted ones. live_version references the version currently on disk.
+	`
+	CREATE TABLE IF NOT EXISTS config_artifacts (
+		id            TEXT PRIMARY KEY,
+		agent_id      TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		backend       TEXT NOT NULL,
+		target_kind   TEXT NOT NULL,
+		target_path   TEXT NOT NULL,
+		source        TEXT NOT NULL DEFAULT 'generated',
+		domain_id     INTEGER REFERENCES domains(id) ON DELETE SET NULL,
+		content       TEXT NOT NULL DEFAULT '',
+		checksum      TEXT NOT NULL DEFAULT '',
+		live_version  INTEGER NOT NULL DEFAULT 0,
+		enabled       INTEGER NOT NULL DEFAULT 1,
+		drifted       INTEGER NOT NULL DEFAULT 0,
+		apply_state   TEXT NOT NULL DEFAULT 'live',
+		last_error    TEXT NOT NULL DEFAULT '',
+		updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(agent_id, target_kind, target_path)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_config_artifacts_agent  ON config_artifacts(agent_id);
+	CREATE INDEX IF NOT EXISTS idx_config_artifacts_domain ON config_artifacts(domain_id);
+
+	CREATE TABLE IF NOT EXISTS config_artifact_versions (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		artifact_id TEXT NOT NULL REFERENCES config_artifacts(id) ON DELETE CASCADE,
+		version     INTEGER NOT NULL,
+		content     TEXT NOT NULL DEFAULT '',
+		checksum    TEXT NOT NULL DEFAULT '',
+		source      TEXT NOT NULL DEFAULT 'generated',
+		actor       TEXT NOT NULL DEFAULT '',
+		note        TEXT NOT NULL DEFAULT '',
+		created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(artifact_id, version)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_config_artifact_versions_artifact
+		ON config_artifact_versions(artifact_id);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

@@ -257,6 +257,115 @@ type AuditLogEntry struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ArtifactSource records whether a managed config artifact is model-backed
+// (rendered from a domain's intent) or hand-edited/adopted (§4, §6). Editing a
+// generated artifact raw flips it to manual; a "reset to model" re-renders it.
+type ArtifactSource = string
+
+const (
+	// ArtifactSourceGenerated means the content was rendered from a domain's
+	// intent and can be re-rendered (DomainID is set).
+	ArtifactSourceGenerated ArtifactSource = "generated"
+	// ArtifactSourceManual means the content was hand-edited or adopted from an
+	// existing on-disk config and must not be blindly re-rendered.
+	ArtifactSourceManual ArtifactSource = "manual"
+)
+
+// ArtifactApplyState is the per-artifact lifecycle status surfaced in the UI
+// without extra joins (§4, §15).
+type ArtifactApplyState = string
+
+const (
+	// ArtifactStateLive means the on-disk content matches the accepted state.
+	ArtifactStateLive ArtifactApplyState = "live"
+	// ArtifactStateApplyFailed means the last apply (write/validate/reload)
+	// failed; see LastError.
+	ArtifactStateApplyFailed ArtifactApplyState = "apply_failed"
+	// ArtifactStateDrifted means the on-disk content diverged from the accepted
+	// state and is awaiting operator review (§11).
+	ArtifactStateDrifted ArtifactApplyState = "drifted"
+)
+
+// TargetKind names where an artifact lives on the host (§4).
+type TargetKind = string
+
+const (
+	// TargetKindFile is a config file on disk (nginx/apache/external caddy).
+	TargetKindFile TargetKind = "file"
+	// TargetKindCaddyRoute is the virtual target for built-in Caddy: the route
+	// JSON applied via the admin API rather than a file on disk.
+	TargetKindCaddyRoute TargetKind = "caddy-route"
+)
+
+// Target is where a managed config artifact lives on the host (§4). For file
+// backends Path is the absolute file path; for built-in Caddy the artifact is a
+// route in the admin API and Path is the virtual "caddy:route:<id>".
+type Target struct {
+	Kind TargetKind `json:"kind"`
+	Path string     `json:"path"`
+}
+
+// ConfigArtifact is the unit of the central managed-config store (§4). The agent
+// renders native config and round-trips it here so the orchestrator can version,
+// diff, back up, roll back, and drift-review it across hosts (B1, §3). Built-in
+// Caddy participates with Target.Kind == "caddy-route" and Content == route JSON.
+type ConfigArtifact struct {
+	ID      string `json:"id"`
+	AgentID string `json:"agent_id"`
+	// Backend names the proxy this artifact targets ("caddy" | "nginx" |
+	// "apache").
+	Backend string `json:"backend"`
+	// Target is where the artifact lives on the host.
+	Target Target `json:"target"`
+	// Source is "generated" (model-backed) or "manual" (hand-edited/adopted).
+	Source ArtifactSource `json:"source"`
+	// DomainID is set when Source == generated, linking the artifact to the
+	// domain whose intent produced it. Nil for manual/adopted artifacts.
+	DomainID *int64 `json:"domain_id,omitempty"`
+	// Content is the native config text (or Caddy route JSON for built-in).
+	Content string `json:"content"`
+	// Checksum is of the live/accepted content; the agent reports the on-disk
+	// checksum on heartbeat and divergence flags drift (§11).
+	Checksum string `json:"checksum"`
+	// LiveVersion is the version number of the currently accepted content. It
+	// matches a row in config_artifact_versions.
+	LiveVersion int `json:"live_version"`
+	// Enabled reflects whether the artifact is active on the host (e.g. an nginx
+	// sites-enabled symlink is present).
+	Enabled bool `json:"enabled"`
+	// Drifted is true when on-disk content diverges from the accepted state and
+	// the artifact awaits review (§11). Mirrors ApplyState == drifted.
+	Drifted bool `json:"drifted"`
+	// ApplyState is the lifecycle status (live | apply_failed | drifted).
+	ApplyState ArtifactApplyState `json:"apply_state"`
+	// LastError is the most recent apply/validate/reload error, if any.
+	LastError string    `json:"last_error,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ConfigArtifactVersion is one entry in the append-only version history of a
+// config artifact (§4, §11). A new version is written only on semantic change so
+// re-serialization (Caddy) does not spawn phantom versions; history is never
+// pruned.
+type ConfigArtifactVersion struct {
+	ID         int64  `json:"id"`
+	ArtifactID string `json:"artifact_id"`
+	// Version is the 1-indexed sequence number within the artifact's history.
+	Version int `json:"version"`
+	// Content is the full config text at this version (full content history).
+	Content string `json:"content"`
+	// Checksum is of Content, for cheap equality checks.
+	Checksum string `json:"checksum"`
+	// Source records whether this version was generated or manual at the time it
+	// was written (e.g. an accepted drift is manual).
+	Source ArtifactSource `json:"source"`
+	// Actor and Note describe who/what wrote this version and why, for audit
+	// (apply/accept/reject/rollback).
+	Actor     string    `json:"actor,omitempty"`
+	Note      string    `json:"note,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // Setting is a key-value configuration pair.
 type Setting struct {
 	Key       string    `json:"key"`
