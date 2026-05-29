@@ -396,3 +396,33 @@ func TestFactory_registered(t *testing.T) {
 		t.Errorf("Info().Kind = %q, want nginx", p.Info().Kind)
 	}
 }
+
+func TestProbeDirs_debianLayout_includesEnabledDir(t *testing.T) {
+	b := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available"})
+	dirs := b.ProbeDirs()
+	if len(dirs) != 2 {
+		t.Fatalf("Debian layout should probe sites-available + sites-enabled, got %v", dirs)
+	}
+	if dirs[0] != "/etc/nginx/sites-available" || dirs[1] != "/etc/nginx/sites-enabled" {
+		t.Fatalf("unexpected probe dirs: %v", dirs)
+	}
+}
+
+func TestProbeDirs_confDLayout_onlyAvailableDir(t *testing.T) {
+	b := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/conf.d"})
+	dirs := b.ProbeDirs()
+	if len(dirs) != 1 || dirs[0] != "/etc/nginx/conf.d" {
+		t.Fatalf("conf.d layout should probe only the one dir, got %v", dirs)
+	}
+}
+
+func TestReloadHint_default_andOverride(t *testing.T) {
+	b := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available", Binary: "/usr/sbin/nginx"})
+	if got := b.ReloadHint(); got != "/usr/sbin/nginx -s reload" {
+		t.Fatalf("default ReloadHint = %q", got)
+	}
+	o := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available", ReloadCmd: "sudo systemctl reload nginx"})
+	if got := o.ReloadHint(); got != "sudo systemctl reload nginx" {
+		t.Fatalf("override ReloadHint = %q", got)
+	}
+}

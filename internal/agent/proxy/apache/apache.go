@@ -470,6 +470,38 @@ func primaryTarget(arts []proxy.Artifact) string {
 	return arts[0].Target.Path
 }
 
+// ProbeDirs reports the directories the agent must be able to write to manage
+// apache (§12): the Available dir always, plus sites-enabled on the Debian
+// layout (the a2ensite symlink dir). The RHEL conf.d layout has no separate
+// enable dir, so only the one directory is returned. The startup permission
+// probe (permcheck) writes a throwaway file in each to confirm the
+// group/ownership grant before any real apply.
+func (b *Backend) ProbeDirs() []string {
+	if b.layout.IsConfD() {
+		return []string{b.layout.Available}
+	}
+	return []string{b.layout.Available, b.layout.Enabled}
+}
+
+// Runner exposes the backend's configtest/reload runner so the startup
+// permission probe can confirm the scoped-sudoers reload grant (§12) without the
+// backend depending on the probe package. It satisfies permcheck.TestRunner.
+func (b *Backend) Runner() Runner { return b.runner }
+
+// ReloadHint returns the reload command the operator must allow via a scoped
+// sudoers entry (§12), woven into the probe's actionable health message. It is
+// the per-agent override when set, else the default apachectl graceful reload.
+func (b *Backend) ReloadHint() string {
+	if r, ok := b.runner.(*execRunner); ok && r.reloadCmd != "" {
+		return r.reloadCmd
+	}
+	bin := b.binary
+	if bin == "" {
+		bin = "apachectl"
+	}
+	return bin + " graceful"
+}
+
 // execRunner is the default Runner: it shells out to the apachectl binary for
 // configtest and graceful reload, honoring per-agent command overrides (§9,
 // scoped sudoers). The integration tests exercise this against a real apache;
