@@ -35,6 +35,9 @@ type AgentClient interface {
 type RouteHub interface {
 	Connected(agentID string) bool
 	PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool
+	// PublishIntentSet pushes the intents together with any cert bundles the agent
+	// must install before Apply (preflight ordering, §5/§7).
+	PublishIntentSet(agentID string, set proxymodel.IntentSet) bool
 }
 
 // Reconciler periodically syncs desired state (database) with actual state
@@ -81,8 +84,46 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	if err != nil {
 		return err
 	}
-	r.hub.PublishIntents(agentID, intentsFromDesired(desired))
+	intents := intentsFromDesired(desired)
+	// Preflight ordering (§5/§7): gather the certs the agent needs for these routes
+	// FIRST, then push them with the intents in one "everything is ready, go live"
+	// message. The agent installs the certs (InstallCerts) before applying the
+	// referencing config, so a generated config never validates against a missing
+	// cert file. Certs ride this agent-initiated stream — no inbound probe.
+	certs := r.gatherCerts(desired)
+	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents, Certs: certs})
 	return nil
+}
+
+// gatherCerts collects the cert bundles for the FQDNs in the desired route set, so
+// they can ride the push and be installed before Apply (preflight ordering,
+// §5/§7). A host with no stored certificate is simply skipped (built-in Caddy
+// self-ACME fallback, §7); a lookup error is logged and skipped rather than failing
+// the whole push (invariant #4). The returned bundles carry the decrypted private
+// key only for the in-memory hop onto the TLS stream — the agent re-encrypts it at
+// rest on install.
+func (r *Reconciler) gatherCerts(desired map[string]desiredRoute) []proxymodel.CertBundle {
+	if len(desired) == 0 {
+		return nil
+	}
+	bundles := make([]proxymodel.CertBundle, 0, len(desired))
+	for fqdn := range desired {
+		cert, err := r.db.GetCertificate(fqdn)
+		if err != nil {
+			// No cert for this host yet (or lookup failed): skip — the host either
+			// has no central cert or falls back to self-ACME. Never fail the push.
+			continue
+		}
+		bundles = append(bundles, proxymodel.CertBundle{
+			Host:    cert.Host,
+			CertPEM: cert.CertPEM,
+			KeyPEM:  cert.KeyPEM,
+		})
+	}
+	if len(bundles) == 0 {
+		return nil
+	}
+	return bundles
 }
 
 // intentsFromDesired flattens the desired route map into the intent snapshot

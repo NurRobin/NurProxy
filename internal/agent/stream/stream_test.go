@@ -12,6 +12,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -122,5 +123,97 @@ func TestStreamReconnectsOnError(t *testing.T) {
 		// Reconnected successfully after the initial failure.
 	case <-time.After(5 * time.Second):
 		t.Fatal("client did not reconnect after an error")
+	}
+}
+
+// orderingBackend records the order of InstallCerts vs route-apply calls so the
+// preflight ordering (§5) can be asserted: certs must be installed BEFORE Apply of
+// the referencing config.
+type orderingBackend struct {
+	calls       []string
+	installedCN string
+}
+
+func (o *orderingBackend) EnsureServer(ctx context.Context) error { return nil }
+func (o *orderingBackend) ClearRoutes(ctx context.Context) error  { return nil }
+func (o *orderingBackend) AddRoute(ctx context.Context, route json.RawMessage) error {
+	o.calls = append(o.calls, "apply")
+	return nil
+}
+func (o *orderingBackend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
+	return proxy.Artifact{
+		Target:  proxy.Target{Kind: proxy.TargetKindCaddyRoute, Path: "caddy:route:r1"},
+		Content: `{"@id":"r1"}`,
+		Enabled: true,
+	}, nil
+}
+func (o *orderingBackend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) error {
+	o.calls = append(o.calls, "install")
+	if len(certs) > 0 {
+		o.installedCN = certs[0].Host
+	}
+	return nil
+}
+
+func TestApplyIntents_installsCertsBeforeApply(t *testing.T) {
+	be := &orderingBackend{}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	set := proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1",
+			Backend:    "caddy",
+			Route:      proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+		Certs: []proxymodel.CertBundle{{
+			Host:    "app.example.com",
+			CertPEM: "CERT",
+			KeyPEM:  "KEY",
+		}},
+	}
+
+	// sendAck POSTs to a dead URL; that is fine — we only assert call ordering.
+	c.applyIntents(context.Background(), set)
+
+	if be.installedCN != "app.example.com" {
+		t.Errorf("installed cert host = %q, want app.example.com", be.installedCN)
+	}
+	// The first cert-related/apply call must be the install, and it must precede
+	// every apply.
+	firstInstall, firstApply := -1, -1
+	for i, call := range be.calls {
+		if call == "install" && firstInstall == -1 {
+			firstInstall = i
+		}
+		if call == "apply" && firstApply == -1 {
+			firstApply = i
+		}
+	}
+	if firstInstall == -1 {
+		t.Fatal("InstallCerts was never called")
+	}
+	if firstApply == -1 {
+		t.Fatal("Apply was never called")
+	}
+	if firstInstall > firstApply {
+		t.Errorf("preflight violated: install at %d came after apply at %d (calls=%v)", firstInstall, firstApply, be.calls)
+	}
+}
+
+func TestApplyIntents_noCerts_doesNotInstall(t *testing.T) {
+	be := &orderingBackend{}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "caddy",
+			Route: proxymodel.Route{Host: "h.example.com", Upstream: proxymodel.Upstream{Addr: "1.1.1.1", Port: 80}},
+		}},
+	})
+
+	for _, call := range be.calls {
+		if call == "install" {
+			t.Error("InstallCerts should not run when no certs are pushed")
+		}
 	}
 }
