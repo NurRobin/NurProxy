@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	agentcaddy "github.com/NurRobin/NurProxy/internal/agent/caddy"
@@ -9,6 +10,9 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
+
+// errProbe is a sentinel module-probe failure used by the capability tests.
+var errProbe = errors.New("probe failed")
 
 // sampleRoute is a representative structured route used across the table tests.
 func sampleRoute() proxymodel.Route {
@@ -39,11 +43,117 @@ func TestBackend_Detect_alwaysAvailable(t *testing.T) {
 	}
 }
 
-func TestBackend_Capabilities_allEnabled(t *testing.T) {
-	caps := New(agentcaddy.NewMockClient()).Capabilities()
+// TestBackend_Capabilities_coreAlwaysEnabled verifies the non-module-dependent
+// options are always advertised; RateLimit is covered separately since it is
+// gated on module probing.
+func TestBackend_Capabilities_coreAlwaysEnabled(t *testing.T) {
+	b := New(agentcaddy.NewMockClient())
+	// Force a deterministic "module present" probe so the core check is isolated.
+	b.listModules = func(context.Context) ([]string, error) {
+		return []string{rateLimitModule}, nil
+	}
+	caps := b.Capabilities()
 	if !caps.ReverseProxy || !caps.WebSocket || !caps.ForceHTTPS || !caps.CustomHeaders ||
-		!caps.PathRewrite || !caps.BasicAuth || !caps.IPFilter || !caps.RateLimit || !caps.CentralTLS {
-		t.Fatalf("Capabilities = %+v, want all true", caps)
+		!caps.PathRewrite || !caps.BasicAuth || !caps.IPFilter || !caps.CentralTLS {
+		t.Fatalf("Capabilities core options = %+v, want all true", caps)
+	}
+}
+
+// TestBackend_Capabilities_rateLimitProbe drives the §8 module probe: RateLimit
+// is true only when caddy-ratelimit (http.handlers.rate_limit) is in the module
+// list, and a probe error / missing prober degrades to false rather than
+// guessing true.
+func TestBackend_Capabilities_rateLimitProbe(t *testing.T) {
+	tests := []struct {
+		name   string
+		prober func(context.Context) ([]string, error)
+		want   bool
+	}{
+		{
+			name: "module present",
+			prober: func(context.Context) ([]string, error) {
+				return []string{"http.handlers.reverse_proxy", rateLimitModule}, nil
+			},
+			want: true,
+		},
+		{
+			name:   "module absent",
+			prober: func(context.Context) ([]string, error) { return []string{"http.handlers.reverse_proxy"}, nil },
+			want:   false,
+		},
+		{
+			name:   "probe error",
+			prober: func(context.Context) ([]string, error) { return nil, errProbe },
+			want:   false,
+		},
+		{
+			name:   "nil prober",
+			prober: nil,
+			want:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := New(agentcaddy.NewMockClient())
+			b.listModules = tt.prober
+			if got := b.Capabilities().RateLimit; got != tt.want {
+				t.Errorf("Capabilities().RateLimit = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseListModules(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want []string
+	}{
+		{
+			name: "module ids and summary",
+			out: "http.handlers.reverse_proxy\n" +
+				"http.handlers.rate_limit\n" +
+				"\n" +
+				"  Standard modules: 123\n" +
+				"  Non-standard modules: 1\n",
+			want: []string{"http.handlers.reverse_proxy", "http.handlers.rate_limit"},
+		},
+		{
+			name: "empty output",
+			out:  "",
+			want: nil,
+		},
+		{
+			name: "whitespace padded ids",
+			out:  "  http.handlers.encode  \n\tcaddy.logging.encoders.json\n",
+			want: []string{"http.handlers.encode", "caddy.logging.encoders.json"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseListModules(tt.out)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseListModules = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("parseListModules = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestModuleListHas(t *testing.T) {
+	mods := []string{"a", "b", rateLimitModule}
+	if !moduleListHas(mods, rateLimitModule) {
+		t.Error("moduleListHas = false, want true for present module")
+	}
+	if moduleListHas(mods, "missing") {
+		t.Error("moduleListHas = true, want false for absent module")
+	}
+	if moduleListHas(nil, "x") {
+		t.Error("moduleListHas(nil) = true, want false")
 	}
 }
 
