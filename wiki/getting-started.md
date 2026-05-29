@@ -35,6 +35,29 @@ The agent registers itself and shows up here for **approval** (we also call this
 > often different from the URL you use in your browser. If your agent never shows
 > up, that's almost always why. See [Agent can't connect](agent-reachability).
 
+## Run it as a service (systemd)
+
+Install the binaries from the latest release, then register each component as a
+hardened systemd service:
+
+```
+# Download nurproxy + nurproxy-agent into /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/NurRobin/NurProxy/main/scripts/install.sh | bash
+
+# Orchestrator (on the dashboard host)
+sudo nurproxy install --port 8080
+
+# Agent (on each edge server)
+sudo nurproxy-agent install \
+  --orchestrator https://your-dashboard-url \
+  --fqdn edge1.example.com
+```
+
+Each `install` writes config + a systemd unit (auto-restart, `NoNewPrivileges`,
+`ProtectSystem=strict`), then enables and starts the service. Follow logs with
+`journalctl -u nurproxy -f` (or `-u nurproxy-agent`). Remove a component with
+`sudo nurproxy uninstall` (add `--purge` to also delete its data).
+
 ## After setup
 
 - **Domains** — point a subdomain at a server and port. NurProxy creates the DNS

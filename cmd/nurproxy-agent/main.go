@@ -36,6 +36,18 @@ var (
 )
 
 func main() {
+	// Subcommands are dispatched before flag parsing so they can own their flags.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "install":
+			cmdInstall(os.Args[2:])
+			return
+		case "uninstall":
+			cmdUninstall(os.Args[2:])
+			return
+		}
+	}
+
 	flag.Parse()
 
 	if *showVersion {
