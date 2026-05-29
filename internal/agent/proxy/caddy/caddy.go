@@ -351,6 +351,77 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 	return nil
 }
 
+// EnsureServerTLS configures the bundled Caddy's TLS strategy for the given set
+// of host TLS intents (§7). It is the built-in counterpart of "run on provided
+// certs": for every central-policy host it resolves the installed cert+key paths
+// from the cert store and feeds them into Caddy's tls app, then disables (or
+// scopes) Caddy's automatic_https accordingly. Self-ACME hosts are left to
+// Caddy's own ACME (the explicit fallback for zones not in a configured DNS
+// provider and orchestrator-down resilience); off hosts get no TLS material and
+// are excluded from ACME.
+//
+// The TLS strategy decision is made by the pure caddygen.GenerateServerTLS so it
+// is table-driven testable; this method only resolves cert paths and PUTs the
+// result through the admin API. It must run AFTER InstallCerts (the cert files
+// must exist) and is safe to call before route Apply.
+//
+// A central host whose cert is not yet installed is dropped from load_files with
+// a logged + audited warning rather than failing the whole apply (invariant #4):
+// it is still skipped from automatic_https (we do not want Caddy to ACME a host
+// the orchestrator owns), so it simply has no cert until the next push installs
+// one. When no cert store is configured the backend cannot serve provided certs;
+// every host falls back to whatever policy GenerateServerTLS yields from paths
+// left empty (no load_files), and Caddy self-ACME covers TLS.
+func (b *Backend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error {
+	hosts := make([]caddygen.TLSHost, 0, len(intents))
+	for _, in := range intents {
+		h := caddygen.TLSHost{Host: in.Host, Policy: in.Policy}
+		// Resolve provided-cert paths for the central path only.
+		if in.Policy == proxymodel.TLSPolicySelfACME || in.Policy == proxymodel.TLSPolicyOff {
+			hosts = append(hosts, h)
+			continue
+		}
+		if b.certs == nil {
+			// No cert store: cannot serve a provided cert. Leave paths empty;
+			// GenerateServerTLS will still skip ACME for this host (the orchestrator
+			// owns it) but load no file.
+			slog.WarnContext(ctx, "caddy: no cert store; central host has no provided cert (self-ACME fallback applies)",
+				slog.String("host", in.Host))
+			hosts = append(hosts, h)
+			continue
+		}
+		paths, err := b.certs.CertPaths(in.Host)
+		if err != nil {
+			// Cert not installed yet: drop the file, keep the host skipped from ACME.
+			slog.WarnContext(ctx, "caddy: provided cert not available; dropping from tls load (apply continues)",
+				slog.String("host", in.Host), slog.String("error", err.Error()))
+			hosts = append(hosts, h)
+			continue
+		}
+		h.CertPath = paths.CertPath
+		h.KeyPath = paths.KeyPath
+		hosts = append(hosts, h)
+	}
+
+	strategy := caddygen.GenerateServerTLS(hosts)
+	loadFiles, err := json.Marshal(strategy.LoadFiles)
+	if err != nil {
+		return fmt.Errorf("marshaling tls load_files: %w", err)
+	}
+	autoHTTPS, err := json.Marshal(strategy.AutomaticHTTPS)
+	if err != nil {
+		return fmt.Errorf("marshaling automatic_https: %w", err)
+	}
+	if err := b.client.ApplyTLS(ctx, loadFiles, autoHTTPS); err != nil {
+		return fmt.Errorf("applying caddy tls strategy: %w", err)
+	}
+	slog.InfoContext(ctx, "caddy: applied tls strategy",
+		slog.Int("provided_certs", len(strategy.LoadFiles)),
+		slog.Bool("automatic_https_disabled", strategy.AutomaticHTTPS.Disable),
+		slog.Int("automatic_https_skip", len(strategy.AutomaticHTTPS.Skip)))
+	return nil
+}
+
 // targetPrefix namespaces the virtual caddy-route target handle (§4): the
 // admin-API @id is stored as "caddy:route:<id>".
 const targetPrefix = "caddy:route:"

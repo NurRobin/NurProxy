@@ -157,6 +157,56 @@ func (s *Store) ReadKey(host string) ([]byte, error) {
 	return pt, nil
 }
 
+// ProxyPaths reports the file paths a proxy must reference to serve a host's
+// provided cert: the public leaf+chain and a PLAINTEXT private key the proxy can
+// read directly. When keys are encrypted at rest, the plaintext key does not
+// exist as a stored artifact; CertPaths materializes it on demand.
+type ProxyPaths struct {
+	// CertPath is the public leaf+chain PEM file (always plaintext on disk).
+	CertPath string
+	// KeyPath is a plaintext private-key PEM file the proxy can load. When at-rest
+	// encryption is configured, this is a decrypted copy materialized next to the
+	// ciphertext (mode 0600); otherwise it is the stored plaintext key itself.
+	KeyPath string
+}
+
+// CertPaths returns the cert and a proxy-readable plaintext key path for a host
+// (§7, built-in Caddy on provided certs). Built-in Caddy loads cert/key files via
+// its tls app, but the key is stored encrypted at rest; this decrypts it into a
+// sibling plaintext file (mode 0600, atomic write) and returns that path so Caddy
+// can read it. When no at-rest key is configured the stored key is already
+// plaintext and is returned as-is.
+//
+// The cert file must already exist (written by Install); a missing cert is an
+// error so the caller withholds the load_files entry rather than pointing Caddy
+// at a missing file.
+func (s *Store) CertPaths(host string) (ProxyPaths, error) {
+	if host == "" {
+		return ProxyPaths{}, fmt.Errorf("certstore: empty host")
+	}
+	base := SanitizeHost(host)
+	certPath := filepath.Join(s.dir, base+certSuffix)
+	if _, err := os.Stat(certPath); err != nil {
+		return ProxyPaths{}, fmt.Errorf("certstore: cert for %q not found: %w", host, err)
+	}
+
+	if len(s.encryptKey) == 0 {
+		// Stored key is already plaintext PEM.
+		return ProxyPaths{CertPath: certPath, KeyPath: filepath.Join(s.dir, base+keyPlainSuffix)}, nil
+	}
+
+	// Decrypt the at-rest key into a sibling plaintext file the proxy can read.
+	plain, err := s.ReadKey(host)
+	if err != nil {
+		return ProxyPaths{}, err
+	}
+	plainPath := filepath.Join(s.dir, base+".key.plain")
+	if err := writeAtomic(plainPath, plain, keyMode); err != nil {
+		return ProxyPaths{}, fmt.Errorf("certstore: materializing plaintext key for %q: %w", host, err)
+	}
+	return ProxyPaths{CertPath: certPath, KeyPath: plainPath}, nil
+}
+
 // SanitizeHost turns an FQDN into a safe file-name base, mapping a leading
 // wildcard label "*." to "_wildcard." and dropping any path separators so a
 // crafted host can never escape the cert directory.

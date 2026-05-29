@@ -158,3 +158,66 @@ func TestSanitizeHost(t *testing.T) {
 		}
 	}
 }
+
+// TestCertPaths_encrypted_materializesPlaintextKey verifies that with at-rest
+// encryption, CertPaths decrypts the key into a sibling plaintext file the proxy
+// can read (§7, built-in Caddy loads cert/key files).
+func TestCertPaths_encrypted_materializesPlaintextKey(t *testing.T) {
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	s := New(dir, key)
+
+	keyPEM := []byte("-----BEGIN PRIVATE KEY-----\ntopsecret\n-----END PRIVATE KEY-----\n")
+	if _, err := s.Install(Bundle{Host: "app.example.com", CertPEM: []byte("CERT"), KeyPEM: keyPEM}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	paths, err := s.CertPaths("app.example.com")
+	if err != nil {
+		t.Fatalf("CertPaths: %v", err)
+	}
+	if _, err := os.Stat(paths.CertPath); err != nil {
+		t.Errorf("cert path missing: %v", err)
+	}
+	got, err := os.ReadFile(paths.KeyPath)
+	if err != nil {
+		t.Fatalf("reading materialized key: %v", err)
+	}
+	if !bytes.Equal(got, keyPEM) {
+		t.Errorf("materialized key = %q, want original plaintext", got)
+	}
+	if paths.KeyPath == filepath.Join(dir, "app.example.com.key.enc") {
+		t.Error("materialized key must not be the ciphertext file")
+	}
+}
+
+// TestCertPaths_plaintext_returnsStoredKey verifies that without at-rest
+// encryption, CertPaths returns the stored plaintext key path directly.
+func TestCertPaths_plaintext_returnsStoredKey(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir, nil)
+
+	if _, err := s.Install(Bundle{Host: "app.example.com", CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	paths, err := s.CertPaths("app.example.com")
+	if err != nil {
+		t.Fatalf("CertPaths: %v", err)
+	}
+	if paths.KeyPath != filepath.Join(dir, "app.example.com.key") {
+		t.Errorf("key path = %q, want stored plaintext key", paths.KeyPath)
+	}
+}
+
+// TestCertPaths_missingCert_errors verifies a not-yet-installed cert is an error
+// so the caller withholds the load_files entry rather than pointing at a missing
+// file.
+func TestCertPaths_missingCert_errors(t *testing.T) {
+	s := New(t.TempDir(), nil)
+	if _, err := s.CertPaths("never.installed.example.com"); err == nil {
+		t.Fatal("CertPaths for a missing cert returned nil error, want error")
+	}
+}

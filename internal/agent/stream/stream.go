@@ -51,6 +51,11 @@ type caddyBackend interface {
 	// config is applied (preflight ordering, §5). It is called first in
 	// applyIntents so a generated config never validates against a missing file.
 	InstallCerts(ctx context.Context, certs []proxy.CertBundle) error
+	// EnsureServerTLS configures the bundled Caddy's TLS strategy from each host's
+	// policy (§7): central provided certs (automatic_https disabled, bundle fed in)
+	// vs Caddy self-ACME fallback. It runs after InstallCerts (cert files must
+	// exist) and before route apply, so the server already serves the right certs.
+	EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error
 }
 
 // Client manages the agent's stream connection and applies pushed routes.
@@ -242,6 +247,15 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		log.Printf("Stream: failed to clear routes: %v", err)
 	}
 
+	// Configure the server's TLS strategy from each host's policy (§7): central
+	// provided certs run with automatic_https disabled and the installed bundle
+	// fed in; self-ACME hosts keep Caddy's own ACME (the explicit fallback). This
+	// runs after the certs are installed and the server exists, before routes are
+	// applied. A failure is logged + surfaced via health but never aborts the
+	// apply (invariant #1: the running Caddy path keeps serving; self-ACME still
+	// covers TLS).
+	c.applyServerTLS(ctx, intents)
+
 	for _, in := range intents {
 		host := in.Route.Host
 
@@ -319,6 +333,36 @@ func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle
 		return
 	}
 	log.Printf("Stream: installed %d cert bundle(s) before apply", len(bundles))
+}
+
+// applyServerTLS derives each host's TLS policy from its pushed intent and asks
+// the backend to configure the bundled Caddy's TLS strategy (§7). The default
+// policy is central provided certs (automatic_https disabled, the installed
+// bundle fed in); a host whose Route.TLS.Policy is self-acme keeps Caddy's own
+// ACME as the explicit fallback. Raw-escape-hatch routes carry no structured TLS
+// policy, so they are left out (the operator's raw config owns its own TLS).
+//
+// A failure is logged and surfaced via health but never aborts the apply: the
+// already-running Caddy keeps serving and self-ACME still covers TLS, preserving
+// invariant #1.
+func (c *Client) applyServerTLS(ctx context.Context, intents []proxymodel.RouteIntent) {
+	tlsIntents := make([]proxy.TLSIntent, 0, len(intents))
+	for _, in := range intents {
+		if in.Route.IsRaw() || in.Route.Host == "" {
+			continue
+		}
+		policy := in.Route.TLS.Policy
+		if policy == "" {
+			policy = proxymodel.TLSPolicyCentral
+		}
+		tlsIntents = append(tlsIntents, proxy.TLSIntent{Host: in.Route.Host, Policy: policy})
+	}
+	if err := c.caddy.EnsureServerTLS(ctx, tlsIntents); err != nil {
+		log.Printf("Stream: failed to configure TLS strategy: %v", err)
+		if c.health != nil {
+			c.health.SetError(fmt.Sprintf("failed to configure TLS strategy: %v", err))
+		}
+	}
 }
 
 // checksum returns the hex-encoded SHA-256 of the rendered content. It matches

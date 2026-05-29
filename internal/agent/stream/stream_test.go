@@ -132,6 +132,7 @@ func TestStreamReconnectsOnError(t *testing.T) {
 type orderingBackend struct {
 	calls       []string
 	installedCN string
+	tlsIntents  []proxy.TLSIntent
 }
 
 func (o *orderingBackend) EnsureServer(ctx context.Context) error { return nil }
@@ -152,6 +153,11 @@ func (o *orderingBackend) InstallCerts(ctx context.Context, certs []proxy.CertBu
 	if len(certs) > 0 {
 		o.installedCN = certs[0].Host
 	}
+	return nil
+}
+func (o *orderingBackend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error {
+	o.calls = append(o.calls, "tls")
+	o.tlsIntents = intents
 	return nil
 }
 
@@ -197,6 +203,52 @@ func TestApplyIntents_installsCertsBeforeApply(t *testing.T) {
 	}
 	if firstInstall > firstApply {
 		t.Errorf("preflight violated: install at %d came after apply at %d (calls=%v)", firstInstall, firstApply, be.calls)
+	}
+
+	// TLS strategy must be configured after the certs are installed and before any
+	// route is applied (§7: built-in Caddy serves provided certs from the start).
+	firstTLS := -1
+	for i, call := range be.calls {
+		if call == "tls" {
+			firstTLS = i
+			break
+		}
+	}
+	if firstTLS == -1 {
+		t.Fatal("EnsureServerTLS was never called")
+	}
+	if firstTLS < firstInstall {
+		t.Errorf("TLS configured at %d before cert install at %d (calls=%v)", firstTLS, firstInstall, be.calls)
+	}
+	if firstTLS > firstApply {
+		t.Errorf("TLS configured at %d after route apply at %d (calls=%v)", firstTLS, firstApply, be.calls)
+	}
+	// A host with no explicit policy defaults to central provided certs (§7).
+	if len(be.tlsIntents) != 1 || be.tlsIntents[0].Policy != proxymodel.TLSPolicyCentral {
+		t.Errorf("tls intents = %+v, want one central-policy host", be.tlsIntents)
+	}
+}
+
+func TestApplyIntents_selfACMEPolicyFlowsToBackend(t *testing.T) {
+	be := &orderingBackend{}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "caddy",
+			Route: proxymodel.Route{
+				Host:     "fallback.example.com",
+				Upstream: proxymodel.Upstream{Addr: "1.1.1.1", Port: 80},
+				TLS:      proxymodel.TLSConfig{Policy: proxymodel.TLSPolicySelfACME},
+			},
+		}},
+	})
+
+	if len(be.tlsIntents) != 1 {
+		t.Fatalf("expected 1 tls intent, got %d", len(be.tlsIntents))
+	}
+	if be.tlsIntents[0].Policy != proxymodel.TLSPolicySelfACME {
+		t.Errorf("policy = %q, want self-acme (the explicit fallback)", be.tlsIntents[0].Policy)
 	}
 }
 
