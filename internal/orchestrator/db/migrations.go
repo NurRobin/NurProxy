@@ -362,6 +362,30 @@ var migrations = []string{
 
 	CREATE INDEX IF NOT EXISTS idx_certificates_expires ON certificates(expires_at);
 	`,
+
+	// Migration 11: agent admin-change channel (§19). A generic "pending agent
+	// admin op" gated by a short-lived, single-use confirmation code. Only the
+	// hash of the code is ever stored; the plaintext is shown once at mint time.
+	// op_type drives the payload schema (e.g. set_proxy_mode). status walks
+	// pending -> applied | expired | canceled.
+	`
+	CREATE TABLE IF NOT EXISTS agent_admin_ops (
+		id         TEXT PRIMARY KEY,
+		agent_id   TEXT NOT NULL,
+		op_type    TEXT NOT NULL,
+		payload    TEXT NOT NULL DEFAULT '{}',
+		code_hash  TEXT NOT NULL,
+		status     TEXT NOT NULL DEFAULT 'pending',
+		result     TEXT NOT NULL DEFAULT '',
+		created_by TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		applied_at TEXT
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_agent_admin_ops_agent_status
+		ON agent_admin_ops(agent_id, status);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

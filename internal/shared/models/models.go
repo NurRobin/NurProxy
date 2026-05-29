@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // AgentStatus represents the lifecycle state of an agent.
 type AgentStatus string
@@ -415,4 +418,100 @@ type Certificate struct {
 	IssuedAt  time.Time `json:"issued_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// AdminOpType names a kind of pending agent admin op (§19). It drives the
+// payload schema and the agent-side handler.
+type AdminOpType = string
+
+const (
+	// AdminOpSetProxyMode switches an agent between built-in and existing proxy
+	// modes (hot-switch). Payload is a SetProxyModePayload.
+	AdminOpSetProxyMode AdminOpType = "set_proxy_mode"
+)
+
+// AdminOpStatus is the lifecycle of a pending agent admin op (§19). It walks
+// pending -> applied | expired | canceled.
+type AdminOpStatus = string
+
+const (
+	// AdminOpPending means the op is minted and awaiting a matching confirmation
+	// code from the agent (not yet expired).
+	AdminOpPending AdminOpStatus = "pending"
+	// AdminOpApplied means the op was claimed (correct code) and carried out.
+	AdminOpApplied AdminOpStatus = "applied"
+	// AdminOpExpired means the TTL elapsed before the op was claimed.
+	AdminOpExpired AdminOpStatus = "expired"
+	// AdminOpCanceled means an operator revoked the op before it was claimed.
+	AdminOpCanceled AdminOpStatus = "canceled"
+)
+
+// AgentAdminOp is a pending out-of-band administrative operation for an agent,
+// gated by a short-lived, single-use confirmation code (§19). The plaintext
+// code is shown once at mint time and never stored — only CodeHash (sha256 hex)
+// persists. The agent claims the op by presenting the matching code, which
+// atomically transitions it pending -> applied.
+type AgentAdminOp struct {
+	ID      string `json:"id"`
+	AgentID string `json:"agent_id"`
+	// OpType drives the payload schema and the agent-side handler.
+	OpType AdminOpType `json:"op_type"`
+	// Payload is the op-type-specific JSON arguments (e.g. SetProxyModePayload).
+	Payload string `json:"payload"`
+	// CodeHash is the sha256 hex of the confirmation code. The plaintext is never
+	// stored.
+	CodeHash string `json:"-"`
+	// Status walks pending -> applied | expired | canceled.
+	Status AdminOpStatus `json:"status"`
+	// Result is free-form text describing the outcome once applied (e.g. the
+	// agent's apply report or error).
+	Result string `json:"result,omitempty"`
+	// CreatedBy records the actor that minted the op (for audit).
+	CreatedBy string    `json:"created_by,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+	// AppliedAt is set when the op is claimed and applied; nil otherwise.
+	AppliedAt *time.Time `json:"applied_at,omitempty"`
+}
+
+// SetProxyModePayload is the typed payload for an AdminOpSetProxyMode op (§19).
+// It instructs an agent to switch proxy mode and (for existing-mode) describes
+// how to manage the external proxy: where its config lives, how to reload/test
+// it, the service unit, and which logs to surface in the dashboard.
+type SetProxyModePayload struct {
+	// ProxyMode is "built-in" or "existing".
+	ProxyMode string `json:"proxy_mode"`
+	// ProxyType names the external proxy ("nginx" | "apache" | ...) when
+	// ProxyMode is "existing".
+	ProxyType string `json:"proxy_type,omitempty"`
+	// ProxyConfigDir is the directory the agent renders managed config into.
+	ProxyConfigDir string `json:"proxy_config_dir,omitempty"`
+	// ProxyReloadCmd overrides the detected reload command.
+	ProxyReloadCmd string `json:"proxy_reload_cmd,omitempty"`
+	// ProxyTestCmd overrides the detected config-validate command.
+	ProxyTestCmd string `json:"proxy_test_cmd,omitempty"`
+	// ProxyService is the service unit (systemd/openrc/launchd).
+	ProxyService string `json:"proxy_service,omitempty"`
+	// ProxyLogPaths are the error/access logs to surface in the dashboard.
+	ProxyLogPaths []string `json:"proxy_log_paths,omitempty"`
+}
+
+// MarshalSetProxyModePayload serializes a SetProxyModePayload to the JSON stored
+// in AgentAdminOp.Payload.
+func MarshalSetProxyModePayload(p SetProxyModePayload) (string, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// UnmarshalSetProxyModePayload parses an AgentAdminOp.Payload (op_type ==
+// set_proxy_mode) into a SetProxyModePayload.
+func UnmarshalSetProxyModePayload(payload string) (SetProxyModePayload, error) {
+	var p SetProxyModePayload
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return SetProxyModePayload{}, err
+	}
+	return p, nil
 }
