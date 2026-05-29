@@ -20,6 +20,8 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // register the nginx backend in the proxy registry
+
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
