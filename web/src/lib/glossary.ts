@@ -85,4 +85,9 @@ export const glossary: Record<string, GlossaryEntry> = {
     short: 'The NurProxy daemon running on an edge server. It runs Caddy and applies the configs you set here.',
     doc: 'agents',
   },
+  'config-artifact': {
+    term: 'Config artifact',
+    short: 'A versioned unit of proxy config NurProxy manages on a host — built-in Caddy routes or a file. Every change is versioned so you can diff, roll back, and review drift.',
+    doc: 'glossary',
+  },
 };
