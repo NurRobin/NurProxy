@@ -27,6 +27,7 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 		s := a.ProxyDetectedAt.UTC().Format(time.RFC3339)
 		detectedAt = &s
 	}
+	caps := encodeCapabilities(a.ProxyCapabilities)
 
 	_, err := d.sql.Exec(`
 		INSERT INTO agents (id, name, fqdn, api_url, token_hash, dns_mode,
@@ -34,15 +35,15 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 			caddy_running, last_error, dns_error,
 			detected_proxy_kind, detected_proxy_version, detected_binary_path,
 			detected_config_dir, detected_log_paths, detected_port_conflicts,
-			detected_installed, detected_at,
+			detected_installed, detected_at, detected_capabilities,
 			created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version,
 		boolToInt(a.CaddyRunning), a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
-		det.logPaths, det.portConflicts, det.installed, detectedAt,
+		det.logPaths, det.portConflicts, det.installed, detectedAt, caps,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 	)
 	if err != nil {
@@ -123,6 +124,35 @@ func decodeDetection(c detectionCols, detectedAt sql.NullString) (*models.ProxyD
 	return d, at
 }
 
+// encodeCapabilities flattens a ProxyCapabilities into the JSON stored in the
+// detected_capabilities column. A nil matrix encodes to a NULL (untyped nil), so
+// an agent that never reported capabilities round-trips back to a nil matrix
+// (distinguishable from "reported nothing supported").
+func encodeCapabilities(c *models.ProxyCapabilities) any {
+	if c == nil {
+		return nil
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+
+// decodeCapabilities rebuilds a ProxyCapabilities from the stored JSON. A NULL or
+// empty column decodes to nil ("never reported"), letting callers distinguish it
+// from a reported all-false matrix.
+func decodeCapabilities(s sql.NullString) *models.ProxyCapabilities {
+	if !s.Valid || s.String == "" {
+		return nil
+	}
+	var c models.ProxyCapabilities
+	if err := json.Unmarshal([]byte(s.String), &c); err != nil {
+		return nil
+	}
+	return &c
+}
+
 // scanAgent reads a single agent row from a *sql.Row or *sql.Rows scanner.
 func scanAgent(sc interface {
 	Scan(dest ...any) error
@@ -133,6 +163,7 @@ func scanAgent(sc interface {
 	var caddyRunning int
 	var det detectionCols
 	var detectedAt sql.NullString
+	var capabilities sql.NullString
 
 	err := sc.Scan(
 		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
@@ -141,6 +172,7 @@ func scanAgent(sc interface {
 		&a.DNSError,
 		&det.kind, &det.version, &det.binaryPath, &det.configDir,
 		&det.logPaths, &det.portConflicts, &det.installed, &detectedAt,
+		&capabilities,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -148,6 +180,7 @@ func scanAgent(sc interface {
 	}
 	a.CaddyRunning = caddyRunning != 0
 	a.ProxyDetection, a.ProxyDetectedAt = decodeDetection(det, detectedAt)
+	a.ProxyCapabilities = decodeCapabilities(capabilities)
 
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -164,7 +197,8 @@ const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
 	caddy_running, last_error, dns_error,
 	detected_proxy_kind, detected_proxy_version, detected_binary_path,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
-	detected_installed, detected_at, created_at, updated_at`
+	detected_installed, detected_at, detected_capabilities,
+	created_at, updated_at`
 
 // boolToInt maps a bool to SQLite's integer boolean representation.
 func boolToInt(b bool) int {
@@ -240,6 +274,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		s := a.ProxyDetectedAt.UTC().Format(time.RFC3339)
 		detectedAt = &s
 	}
+	caps := encodeCapabilities(a.ProxyCapabilities)
 
 	res, err := d.sql.Exec(`
 		UPDATE agents
@@ -250,14 +285,15 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 			detected_proxy_kind = ?, detected_proxy_version = ?,
 			detected_binary_path = ?, detected_config_dir = ?,
 			detected_log_paths = ?, detected_port_conflicts = ?,
-			detected_installed = ?, detected_at = ?, updated_at = ?
+			detected_installed = ?, detected_at = ?, detected_capabilities = ?,
+			updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version, boolToInt(a.CaddyRunning),
 		a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
-		det.logPaths, det.portConflicts, det.installed, detectedAt,
+		det.logPaths, det.portConflicts, det.installed, detectedAt, caps,
 		a.UpdatedAt.Format(time.RFC3339),
 		a.ID,
 	)
@@ -393,6 +429,28 @@ func (d *DB) UpdateAgentDetection(id string, det *models.ProxyDetection) error {
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent detection: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+// UpdateAgentCapabilities records the agent's reported capability matrix (§8) for
+// its selected backend, including module-probed options (e.g. caddy-ratelimit).
+// It is a narrow update (touches only detected_capabilities + updated_at) so it
+// never clobbers operator-owned fields or the agent's liveness/health self-report
+// written by the same heartbeat. A nil matrix clears the stored value.
+func (d *DB) UpdateAgentCapabilities(id string, caps *models.ProxyCapabilities) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET detected_capabilities = ?, updated_at = ? WHERE id = ?`,
+		encodeCapabilities(caps), now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent capabilities: %w", err)
 	}
 
 	n, _ := res.RowsAffected()

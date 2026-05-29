@@ -27,6 +27,7 @@ type Manager struct {
 	apiPort         int
 	version         string
 	detection       *models.ProxyDetection
+	capabilities    *models.ProxyCapabilities
 	client          *http.Client
 }
 
@@ -42,6 +43,10 @@ type registerRequest struct {
 	// installed proxy + version + paths + bind-conflict holder. The agent dials
 	// out and carries it here so the orchestrator can store it on the agent row.
 	ProxyDetection *models.ProxyDetection `json:"proxy_detection,omitempty"`
+	// ProxyCapabilities is the agent's capability matrix (§8) for its selected
+	// backend, including module-probed options. Carried on the outbound register
+	// payload so the orchestrator stores it from first contact.
+	ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities,omitempty"`
 }
 
 // statusResponse is the JSON body from GET /api/v1/agents/{id}/status.
@@ -92,6 +97,13 @@ func (m *Manager) SetDetection(d *models.ProxyDetection) {
 	m.detection = d
 }
 
+// SetCapabilities records the backend capability matrix (§8) carried in the
+// registration request, so the orchestrator can store it on the agent row from
+// first contact (it is also refreshed on every heartbeat).
+func (m *Manager) SetCapabilities(c *models.ProxyCapabilities) {
+	m.capabilities = c
+}
+
 // Token returns the agent token.
 func (m *Manager) Token() string {
 	return m.token
@@ -112,13 +124,14 @@ func (m *Manager) Register(ctx context.Context) error {
 	}
 
 	body := registerRequest{
-		ID:             m.agentID,
-		FQDN:           m.fqdn,
-		Token:          m.token,
-		APIURL:         apiURL,
-		PublicIP:       publicIP,
-		Version:        m.version,
-		ProxyDetection: m.detection,
+		ID:                m.agentID,
+		FQDN:              m.fqdn,
+		Token:             m.token,
+		APIURL:            apiURL,
+		PublicIP:          publicIP,
+		Version:           m.version,
+		ProxyDetection:    m.detection,
+		ProxyCapabilities: m.capabilities,
 	}
 
 	data, err := json.Marshal(body)

@@ -48,13 +48,14 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 // No auth required (agent doesn't have a token yet — it's registering one).
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID             string                 `json:"id"`
-		FQDN           string                 `json:"fqdn"`
-		Token          string                 `json:"token"`
-		APIURL         string                 `json:"api_url"`
-		PublicIP       string                 `json:"public_ip"`
-		Version        string                 `json:"version"`
-		ProxyDetection *models.ProxyDetection `json:"proxy_detection"`
+		ID                string                    `json:"id"`
+		FQDN              string                    `json:"fqdn"`
+		Token             string                    `json:"token"`
+		APIURL            string                    `json:"api_url"`
+		PublicIP          string                    `json:"public_ip"`
+		Version           string                    `json:"version"`
+		ProxyDetection    *models.ProxyDetection    `json:"proxy_detection"`
+		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -90,6 +91,9 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		// Phase-0 read-only detection (§13.0/§2.1/§9), carried on the agent's
 		// outbound register payload. Stored as-is; refreshed by heartbeats.
 		ProxyDetection: req.ProxyDetection,
+		// Capability matrix (§8) for the agent's selected backend, including
+		// module-probed options. Stored as-is; refreshed by heartbeats.
+		ProxyCapabilities: req.ProxyCapabilities,
 	}
 	if req.ProxyDetection != nil {
 		now := time.Now().UTC()
@@ -277,15 +281,16 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":                agent.ID,
-		"status":            agent.Status,
-		"last_seen":         agent.LastSeen,
-		"public_ip":         agent.PublicIP,
-		"version":           agent.Version,
-		"caddy_running":     agent.CaddyRunning,
-		"last_error":        agent.LastError,
-		"proxy_detection":   agent.ProxyDetection,
-		"proxy_detected_at": agent.ProxyDetectedAt,
+		"id":                 agent.ID,
+		"status":             agent.Status,
+		"last_seen":          agent.LastSeen,
+		"public_ip":          agent.PublicIP,
+		"version":            agent.Version,
+		"caddy_running":      agent.CaddyRunning,
+		"last_error":         agent.LastError,
+		"proxy_detection":    agent.ProxyDetection,
+		"proxy_detected_at":  agent.ProxyDetectedAt,
+		"proxy_capabilities": agent.ProxyCapabilities,
 	})
 }
 
@@ -368,6 +373,10 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// ProxyDetection is the agent's read-only Phase-0 detection, re-reported on
 		// each beat (§13.0/§2.1/§9). Stored on the agent row; nil leaves it as-is.
 		ProxyDetection *models.ProxyDetection `json:"proxy_detection"`
+		// ProxyCapabilities is the agent's capability matrix (§8) for its selected
+		// backend, re-reported each beat. Stored on the agent row; nil leaves it
+		// as-is (so a transient probe failure doesn't erase a known-good matrix).
+		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -397,6 +406,15 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if req.ProxyDetection != nil {
 		if uerr := s.db.UpdateAgentDetection(id, req.ProxyDetection); uerr != nil {
 			log.Printf("failed to update agent %s detection: %v", id, uerr)
+		}
+	}
+
+	// Persist the agent's reported capability matrix (§8). Like detection, it's a
+	// narrow update that doesn't clobber the health self-report; only update when
+	// the agent actually reported capabilities (nil leaves the stored copy as-is).
+	if req.ProxyCapabilities != nil {
+		if uerr := s.db.UpdateAgentCapabilities(id, req.ProxyCapabilities); uerr != nil {
+			log.Printf("failed to update agent %s capabilities: %v", id, uerr)
 		}
 	}
 
