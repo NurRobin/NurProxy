@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -34,8 +35,9 @@ import (
 // Backend names the supported move targets. They mirror the proxy registry keys
 // and proxymodel.RawConfig.Backend tags.
 const (
-	BackendCaddy = "caddy"
-	BackendNginx = "nginx"
+	BackendCaddy  = "caddy"
+	BackendNginx  = "nginx"
+	BackendApache = "apache"
 )
 
 // Source records whether the artifact being moved was model-backed (generated)
@@ -181,6 +183,25 @@ func renderIntent(backend string, route proxymodel.Route) (content string, warni
 		}
 		return sb.String(), warnings, nil
 
+	case BackendApache:
+		res, rErr := apachegen.Render(apachegen.Input{Route: route})
+		if rErr != nil {
+			return "", nil, rErr
+		}
+		var sb strings.Builder
+		if res.Preamble != "" {
+			sb.WriteString(res.Preamble)
+			if !strings.HasSuffix(res.Preamble, "\n") {
+				sb.WriteString("\n")
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(res.VHost)
+		for _, w := range res.Warnings {
+			warnings = append(warnings, w.String())
+		}
+		return sb.String(), warnings, nil
+
 	case BackendCaddy:
 		raw, rErr := caddygen.GenerateRoute(route)
 		if rErr != nil {
@@ -205,7 +226,7 @@ func renderIntent(backend string, route proxymodel.Route) (content string, warni
 // advisory in the UI instead).
 func annotateBaseTemplate(backend, content string) string {
 	switch backend {
-	case BackendNginx:
+	case BackendNginx, BackendApache:
 		header := "# NurProxy base template — generated from the known options after a\n" +
 			"# cross-proxy move. Re-apply any custom directives from your previous\n" +
 			"# config, then accept. NurProxy will not overwrite this without an Accept.\n\n"

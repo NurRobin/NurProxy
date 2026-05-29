@@ -18,6 +18,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/apache" // register the apache backend in the proxy registry
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // register the nginx backend in the proxy registry
