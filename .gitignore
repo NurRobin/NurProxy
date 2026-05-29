@@ -1,6 +1,7 @@
 # Binaries
 /nurproxy
 /nurproxy-agent
+/nurproxy-headless
 *.exe
 *.dll
 *.so
