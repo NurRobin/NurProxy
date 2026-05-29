@@ -103,6 +103,56 @@ type ApplyAck struct {
 	Reports []ArtifactReport `json:"reports"`
 }
 
+// LogTailRequest starts an on-demand log tail on the agent (§15). The
+// orchestrator pushes it down the agent-initiated stream when an operator opens
+// the log view in the dashboard; the agent tails the requested file and POSTs
+// LogChunks back up the same control plane (the orchestrator never reads the
+// agent inbound — invariant #2). The tail stops on a matching LogTailStop or when
+// the agent's stream drops. This is deliberately on-demand: there is never a
+// continuous log firehose.
+type LogTailRequest struct {
+	// SessionID is the orchestrator-assigned tail identity. The agent echoes it on
+	// every LogChunk and matches it against a LogTailStop. One open dashboard view
+	// owns one session.
+	SessionID string `json:"session_id"`
+	// Path is the log file to tail. The agent validates it against the proxy's
+	// configured log paths (proxy_log_paths, §9): a path outside that allowlist is
+	// refused with an error chunk, so a compromised orchestrator cannot read
+	// arbitrary files off the agent.
+	Path string `json:"path"`
+	// Lines is how many trailing lines to send as the initial backlog before
+	// following new writes. Zero means a backend default.
+	Lines int `json:"lines,omitempty"`
+}
+
+// LogTailStop ends an on-demand tail session started by a LogTailRequest (§15).
+// The orchestrator pushes it when the operator closes the log view; the agent
+// stops the matching tailer and frees the open file. Stopping an unknown session
+// is a no-op.
+type LogTailStop struct {
+	// SessionID identifies the tail to stop (matches a prior LogTailRequest).
+	SessionID string `json:"session_id"`
+}
+
+// LogChunk is one batch of tailed log lines the agent POSTs back to the
+// orchestrator over the agent-initiated control plane (§15). The orchestrator
+// buffers chunks per session and serves them to the open dashboard view. A chunk
+// carries either log lines, a terminal Error (e.g. path not allowed, file gone),
+// or EOF when the tail has stopped.
+type LogChunk struct {
+	// SessionID ties the chunk to its tail session (echoes LogTailRequest).
+	SessionID string `json:"session_id"`
+	// Path is the file the lines came from, echoed for the UI.
+	Path string `json:"path"`
+	// Lines are the freshly read log lines (newline already stripped per line).
+	Lines []string `json:"lines,omitempty"`
+	// Error is a terminal tail error (path refused, open failed). When set the
+	// session is finished and the agent has stopped the tailer.
+	Error string `json:"error,omitempty"`
+	// EOF reports that the tail session has ended (stop requested or stream gone).
+	EOF bool `json:"eof,omitempty"`
+}
+
 // ArtifactChecksum is the agent's per-heartbeat report of one managed artifact's
 // on-disk (or live admin-API) state (§11). The agent computes the checksum of
 // the artifact it currently has applied; the orchestrator compares it against

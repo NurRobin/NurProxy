@@ -31,6 +31,13 @@ const (
 	EventRoutes = "routes"
 	// EventPing is a keepalive used to detect dead connections promptly.
 	EventPing = "ping"
+	// EventLogTail asks the agent to start an on-demand log tail (§15). The payload
+	// is a proxymodel.LogTailRequest. The agent tails the file and POSTs LogChunks
+	// back up the control plane; it never opens an inbound connection (invariant #2).
+	EventLogTail = "log_tail"
+	// EventLogTailStop asks the agent to stop a tail session (§15). The payload is a
+	// proxymodel.LogTailStop. Pushed when the operator closes the dashboard log view.
+	EventLogTailStop = "log_tail_stop"
 )
 
 // subscriber is one live connection for an agent.

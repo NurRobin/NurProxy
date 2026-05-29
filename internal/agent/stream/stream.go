@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/logtail"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -75,6 +76,17 @@ type Client struct {
 	// drift signal.
 	managedMu sync.RWMutex
 	managed   map[string]string
+
+	// logPaths is the operator-configured proxy_log_paths allowlist (§9). An
+	// on-demand tail (§15) is refused unless its path is within this set, so a
+	// compromised orchestrator can never use the tail to read arbitrary host files.
+	// Empty means no tail is permitted (fail closed).
+	logPaths []string
+	// tailsMu guards tails, the live on-demand tail sessions keyed by session ID.
+	// Each session has a cancel func that the matching stop event (or Run's
+	// shutdown) calls to end the tailer.
+	tailsMu sync.Mutex
+	tails   map[string]context.CancelFunc
 }
 
 // New creates a stream Client. backend is the bundled-Caddy proxy backend the
@@ -87,10 +99,19 @@ func New(orchestratorURL, agentID, token string, backend caddyBackend, hs *healt
 		caddy:           backend,
 		health:          hs,
 		managed:         make(map[string]string),
+		tails:           make(map[string]context.CancelFunc),
 		// No client timeout: this connection is meant to stay open. Reconnects
 		// are driven by the context and by read errors.
 		http: &http.Client{},
 	}
+}
+
+// WithLogPaths sets the proxy_log_paths allowlist that bounds on-demand log
+// tailing (§15). A tail request for a path outside this set is refused. Returns
+// the receiver for chaining.
+func (c *Client) WithLogPaths(paths []string) *Client {
+	c.logPaths = paths
+	return c
 }
 
 // ManagedChecksums returns the agent's current per-artifact checksum snapshot for
@@ -199,9 +220,111 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 		c.applyIntents(ctx, set)
 	case "ping":
 		// Liveness only — nothing to do.
+	case "log_tail":
+		var req proxymodel.LogTailRequest
+		if err := json.Unmarshal([]byte(data), &req); err != nil {
+			log.Printf("Stream: bad log_tail payload: %v", err)
+			return
+		}
+		c.startLogTail(ctx, req)
+	case "log_tail_stop":
+		var stop proxymodel.LogTailStop
+		if err := json.Unmarshal([]byte(data), &stop); err != nil {
+			log.Printf("Stream: bad log_tail_stop payload: %v", err)
+			return
+		}
+		c.stopLogTail(stop.SessionID)
 	default:
 		log.Printf("Stream: ignoring unknown event %q", eventType)
 	}
+}
+
+// startLogTail begins an on-demand tail for the requested session (§15). The path
+// is checked against the configured proxy_log_paths allowlist (fail closed); a
+// refused path is reported back as a terminal error chunk rather than silently
+// dropped, so the dashboard shows why. The tailer runs in its own goroutine under
+// a child context whose cancel is stored so a stop event (or stream shutdown) can
+// end it. Re-starting an already-running session is a no-op. Chunks are POSTed
+// back up the agent-initiated control plane — the orchestrator never reads the
+// agent inbound (invariant #2).
+func (c *Client) startLogTail(ctx context.Context, req proxymodel.LogTailRequest) {
+	if req.SessionID == "" {
+		return
+	}
+	c.tailsMu.Lock()
+	if _, running := c.tails[req.SessionID]; running {
+		c.tailsMu.Unlock()
+		return
+	}
+	tailer, err := logtail.NewTailer(req.Path, req.Lines, c.logPaths, func(ch logtail.Chunk) {
+		c.sendLogChunk(ctx, req.SessionID, req.Path, ch)
+	})
+	if err != nil {
+		c.tailsMu.Unlock()
+		log.Printf("Stream: refusing log tail for %q: %v", req.Path, err)
+		c.sendLogChunk(ctx, req.SessionID, req.Path, logtail.Chunk{Err: err, EOF: true})
+		return
+	}
+	tailCtx, cancel := context.WithCancel(ctx)
+	c.tails[req.SessionID] = cancel
+	c.tailsMu.Unlock()
+
+	log.Printf("Stream: starting log tail session %s for %q", req.SessionID, req.Path)
+	go func() {
+		tailer.Run(tailCtx)
+		// Tailer ended (stop or shutdown): drop the session so a later start can reuse
+		// the ID and a stop becomes a no-op.
+		c.tailsMu.Lock()
+		delete(c.tails, req.SessionID)
+		c.tailsMu.Unlock()
+	}()
+}
+
+// stopLogTail cancels the tailer for a session (§15). Stopping an unknown or
+// already-stopped session is a no-op. The tailer's own goroutine emits the
+// terminal EOF chunk and removes the session entry.
+func (c *Client) stopLogTail(sessionID string) {
+	c.tailsMu.Lock()
+	cancel := c.tails[sessionID]
+	c.tailsMu.Unlock()
+	if cancel != nil {
+		log.Printf("Stream: stopping log tail session %s", sessionID)
+		cancel()
+	}
+}
+
+// sendLogChunk POSTs one tailed chunk back to the orchestrator over the
+// agent-initiated control plane (§15). A send failure is logged but never fatal:
+// the dashboard simply sees a gap and the operator can reopen the view.
+func (c *Client) sendLogChunk(ctx context.Context, sessionID, path string, ch logtail.Chunk) {
+	chunk := proxymodel.LogChunk{
+		SessionID: sessionID,
+		Path:      path,
+		Lines:     ch.Lines,
+		EOF:       ch.EOF,
+	}
+	if ch.Err != nil {
+		chunk.Error = ch.Err.Error()
+	}
+	body, err := json.Marshal(chunk)
+	if err != nil {
+		return
+	}
+	url := fmt.Sprintf("%s/api/v1/agents/%s/logs/chunk", c.orchestratorURL, c.agentID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Stream: failed to send log chunk for session %s: %v", sessionID, err)
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 // applyIntents renders the pushed intent snapshot natively, replaces the agent's
