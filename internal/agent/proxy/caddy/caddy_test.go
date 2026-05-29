@@ -3,6 +3,7 @@ package caddy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -410,5 +411,153 @@ func TestBackend_InstallCerts_empty_isNoop(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Error("no certs should have been written for an empty push")
+	}
+}
+
+// readTLSMock pulls the mock client's recorded tls strategy back out via the
+// admin-API config dump so the backend's EnsureServerTLS can be asserted without
+// a real Caddy. The mock client stashes the load_files and automatic_https blobs
+// under fixed keys.
+func readTLSMock(t *testing.T, b *Backend) (loadFiles []caddygen.LoadFile, auto caddygen.AutomaticHTTPS) {
+	t.Helper()
+	cfg, err := b.GetConfig(context.Background())
+	if err != nil {
+		t.Fatalf("GetConfig: %v", err)
+	}
+	var parsed struct {
+		LoadFiles      json.RawMessage `json:"tls_load_files"`
+		AutomaticHTTPS json.RawMessage `json:"automatic_https"`
+	}
+	if err := json.Unmarshal(cfg, &parsed); err != nil {
+		t.Fatalf("unmarshal mock config: %v", err)
+	}
+	if len(parsed.LoadFiles) > 0 {
+		if err := json.Unmarshal(parsed.LoadFiles, &loadFiles); err != nil {
+			t.Fatalf("unmarshal load_files: %v", err)
+		}
+	}
+	if len(parsed.AutomaticHTTPS) > 0 {
+		if err := json.Unmarshal(parsed.AutomaticHTTPS, &auto); err != nil {
+			t.Fatalf("unmarshal automatic_https: %v", err)
+		}
+	}
+	return loadFiles, auto
+}
+
+// TestBackend_EnsureServerTLS_providedCert verifies the central path: an
+// installed cert is loaded into the tls app and automatic_https is disabled
+// wholesale (§7, built-in Caddy on provided certs).
+func TestBackend_EnsureServerTLS_providedCert(t *testing.T) {
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, key))
+
+	if err := b.InstallCerts(context.Background(), []proxy.CertBundle{{
+		Host:    "app.example.com",
+		CertPEM: []byte("CERTDATA"),
+		KeyPEM:  []byte("-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n"),
+	}}); err != nil {
+		t.Fatalf("InstallCerts: %v", err)
+	}
+
+	if err := b.EnsureServerTLS(context.Background(), []proxy.TLSIntent{
+		{Host: "app.example.com", Policy: proxymodel.TLSPolicyCentral},
+	}); err != nil {
+		t.Fatalf("EnsureServerTLS: %v", err)
+	}
+
+	loadFiles, auto := readTLSMock(t, b)
+	if len(loadFiles) != 1 {
+		t.Fatalf("expected 1 loaded cert, got %d", len(loadFiles))
+	}
+	if loadFiles[0].Certificate == "" || loadFiles[0].Key == "" {
+		t.Errorf("load file paths must be set, got %+v", loadFiles[0])
+	}
+	// The materialized key path must exist and be readable plaintext.
+	if _, err := os.Stat(loadFiles[0].Key); err != nil {
+		t.Errorf("materialized key path not readable: %v", err)
+	}
+	if !auto.Disable {
+		t.Errorf("automatic_https should be disabled for an all-provided fleet, got %+v", auto)
+	}
+}
+
+// TestBackend_EnsureServerTLS_selfACMEFallback verifies the fallback path: a
+// self-acme host loads no cert and keeps automatic_https enabled (§7).
+func TestBackend_EnsureServerTLS_selfACMEFallback(t *testing.T) {
+	b := New(agentcaddy.NewMockClient())
+
+	if err := b.EnsureServerTLS(context.Background(), []proxy.TLSIntent{
+		{Host: "fallback.example.com", Policy: proxymodel.TLSPolicySelfACME},
+	}); err != nil {
+		t.Fatalf("EnsureServerTLS: %v", err)
+	}
+
+	loadFiles, auto := readTLSMock(t, b)
+	if len(loadFiles) != 0 {
+		t.Errorf("self-acme host must load no provided cert, got %d", len(loadFiles))
+	}
+	if auto.Disable {
+		t.Error("automatic_https must stay enabled for a self-acme host")
+	}
+	if len(auto.Skip) != 0 {
+		t.Errorf("self-acme host must not be skipped, got skip=%v", auto.Skip)
+	}
+}
+
+// TestBackend_EnsureServerTLS_mixed verifies coexistence: a provided host is
+// loaded + skipped from ACME while a self-acme host keeps managed certs (§7).
+func TestBackend_EnsureServerTLS_mixed(t *testing.T) {
+	dir := t.TempDir()
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, nil))
+
+	if err := b.InstallCerts(context.Background(), []proxy.CertBundle{{
+		Host: "provided.example.com", CertPEM: []byte("C"), KeyPEM: []byte("K"),
+	}}); err != nil {
+		t.Fatalf("InstallCerts: %v", err)
+	}
+
+	if err := b.EnsureServerTLS(context.Background(), []proxy.TLSIntent{
+		{Host: "provided.example.com", Policy: proxymodel.TLSPolicyCentral},
+		{Host: "acme.example.com", Policy: proxymodel.TLSPolicySelfACME},
+	}); err != nil {
+		t.Fatalf("EnsureServerTLS: %v", err)
+	}
+
+	loadFiles, auto := readTLSMock(t, b)
+	if len(loadFiles) != 1 {
+		t.Fatalf("expected provided host loaded, got %d", len(loadFiles))
+	}
+	if auto.Disable {
+		t.Error("automatic_https must stay enabled while a self-acme host exists")
+	}
+	if len(auto.Skip) != 1 || auto.Skip[0] != "provided.example.com" {
+		t.Errorf("provided host must be skipped from ACME, got skip=%v", auto.Skip)
+	}
+}
+
+// TestBackend_EnsureServerTLS_certMissing verifies a central host whose cert is
+// not yet installed is dropped from load_files but still skipped from ACME, and
+// the apply does not fail (invariant #4).
+func TestBackend_EnsureServerTLS_certMissing(t *testing.T) {
+	dir := t.TempDir()
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, nil))
+
+	if err := b.EnsureServerTLS(context.Background(), []proxy.TLSIntent{
+		{Host: "nocert.example.com", Policy: proxymodel.TLSPolicyCentral},
+	}); err != nil {
+		t.Fatalf("EnsureServerTLS should not fail on a missing cert, got %v", err)
+	}
+
+	loadFiles, auto := readTLSMock(t, b)
+	if len(loadFiles) != 0 {
+		t.Errorf("missing cert must not be loaded, got %d", len(loadFiles))
+	}
+	// Sole host, all paths empty → treated as provided → ACME disabled.
+	if !auto.Disable {
+		t.Errorf("a lone central host must still disable ACME, got %+v", auto)
 	}
 }

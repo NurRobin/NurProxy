@@ -162,6 +162,19 @@ type Artifact struct {
 	Enabled bool `json:"enabled"`
 }
 
+// TLSIntent is one host's public-listener TLS policy, used by the bundled Caddy
+// backend to render its server TLS strategy (§7): central provided certs (load
+// the installed bundle, disable Caddy ACME) vs self-ACME (let Caddy manage the
+// cert) vs off. The backend resolves the on-disk cert paths from its cert store
+// for the central path, so the caller only supplies the host and its policy.
+type TLSIntent struct {
+	// Host is the public FQDN this policy governs.
+	Host string
+	// Policy selects central provided certs (default), Caddy self-ACME (fallback),
+	// or off (plaintext).
+	Policy proxymodel.TLSPolicy
+}
+
 // CertBundle is a leaf certificate plus its private key (and chain) destined for
 // a backend's cert store (§7). It is written by InstallCerts before the
 // referencing config is applied (preflight ordering). Keys are sensitive: they

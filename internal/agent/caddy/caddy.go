@@ -252,6 +252,79 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 	return nil
 }
 
+// ApplyTLS configures the bundled Caddy's TLS strategy (§7): it loads the
+// provided certificate files into Caddy's tls app and sets srv0's automatic_https
+// policy, so the built-in Caddy serves centrally-provisioned certs instead of
+// running its own ACME. loadFiles is the tls app's certificates/load_files (one
+// per provided-cert host); automaticHTTPS is the http server's automatic_https
+// block (Disable when every host is on provided certs, otherwise Skip the
+// provided hosts so self-ACME hosts still get managed). Caller renders both with
+// caddygen.GenerateServerTLS, keeping the strategy a pure, tested decision.
+//
+// It PUTs the tls app's load_files (creating the tls app if absent) and PUTs
+// srv0's automatic_https, building from the deepest existing ancestor down so it
+// never clobbers sibling config — the same conservative approach EnsureServer
+// uses. A nil/empty load_files set still writes automatic_https (e.g. disable for
+// a pure-provided fleet or a managed self-ACME server with no loaded files).
+func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automaticHTTPS json.RawMessage) error {
+	c.mu.Lock()
+	if c.mock {
+		c.mockConfig["tls_load_files"] = loadFiles
+		c.mockConfig["automatic_https"] = automaticHTTPS
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	// Set the http server's automatic_https policy. srv0 must already exist
+	// (EnsureServer runs first); PUT replaces just the automatic_https sub-object.
+	if len(automaticHTTPS) > 0 {
+		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http/servers/srv0/automatic_https", automaticHTTPS); err != nil {
+			return fmt.Errorf("setting automatic_https: %w", err)
+		}
+	}
+
+	// Load the provided certificate files into the tls app. Build from the deepest
+	// existing ancestor down so we never clobber sibling tls config (e.g. an
+	// operator's automation policies), mirroring EnsureServer.
+	certificates := map[string]interface{}{"load_files": loadFiles}
+
+	if _, err := c.doRequest(ctx, http.MethodGet, "/config/apps/tls", nil); err == nil {
+		// tls app exists — set just its certificates object.
+		data, err := json.Marshal(certificates)
+		if err != nil {
+			return fmt.Errorf("marshaling tls certificates: %w", err)
+		}
+		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/tls/certificates", data); err != nil {
+			return fmt.Errorf("loading tls certificates: %w", err)
+		}
+		return nil
+	}
+
+	tlsApp := map[string]interface{}{"certificates": certificates}
+	if _, err := c.doRequest(ctx, http.MethodGet, "/config/apps", nil); err == nil {
+		// apps exists but tls doesn't — create just the tls app.
+		data, err := json.Marshal(tlsApp)
+		if err != nil {
+			return fmt.Errorf("marshaling tls app: %w", err)
+		}
+		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/tls", data); err != nil {
+			return fmt.Errorf("creating tls app: %w", err)
+		}
+		return nil
+	}
+
+	// No apps object at all — create it with the tls app inside.
+	data, err := json.Marshal(map[string]interface{}{"tls": tlsApp})
+	if err != nil {
+		return fmt.Errorf("marshaling apps: %w", err)
+	}
+	if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps", data); err != nil {
+		return fmt.Errorf("creating apps with tls: %w", err)
+	}
+	return nil
+}
+
 // AddRoute adds a route to the Caddy configuration.
 func (c *Client) AddRoute(ctx context.Context, route json.RawMessage) error {
 	c.mu.Lock()
