@@ -22,8 +22,10 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/mcp"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
+	orchtls "github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/web"
 )
 
@@ -98,6 +100,14 @@ func main() {
 	rec.Start(rootCtx)
 	defer rec.Stop()
 
+	// Central TLS renewal: a background loop re-issues certificates entering the
+	// 30-day window, re-encrypts them at rest, and re-pushes the bundle to the
+	// serving agent over its stream (the agent reloads). The agent is never probed
+	// inbound; certs ride the agent-initiated stream (§7). Started only when an
+	// ACME account can be constructed; failures here are non-fatal (the built-in
+	// Caddy self-ACME fallback keeps hosts served).
+	startRenewer(rootCtx, database, rec, *dataDir)
+
 	// Create API server, wiring in the hub + reconciler so the stream endpoint
 	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
@@ -167,6 +177,62 @@ func main() {
 	log.Printf("NurProxy %s listening on :%d", version, *port)
 	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("HTTP server error: %v", err)
+	}
+}
+
+// startRenewer constructs the central TLS Renewer and launches its loop in a
+// background goroutine. It loads (or generates) the persistent ACME account key
+// from the data dir and reads the operator-set acme_email / acme_directory
+// settings. Any setup failure is logged and renewal is simply skipped — it must
+// never block orchestrator startup, and hosts still serve via stored certs or
+// the Caddy self-ACME fallback.
+func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, dataDir string) {
+	accountKey, err := orchtls.LoadOrGenerateAccountKey(filepath.Join(dataDir, "acme-account.key"))
+	if err != nil {
+		log.Printf("tls: renewal disabled: %v", err)
+		return
+	}
+
+	email, _ := database.GetSetting("acme_email")
+	caDir, _ := database.GetSetting("acme_directory")
+
+	acmeClient, err := orchtls.NewLegoClient(orchtls.LegoConfig{
+		Email:      email,
+		CADirURL:   caDir,
+		AccountKey: accountKey,
+	})
+	if err != nil {
+		log.Printf("tls: renewal disabled: %v", err)
+		return
+	}
+
+	issuer := orchtls.NewIssuer(acmeClient, nil)
+	store := reconciler.NewCertRenewalStore(database)
+	renewer := orchtls.NewRenewer(store, issuer, orchtls.RenewerConfig{
+		Reloader: rec,
+		Audit:    &dbAuditSink{db: database},
+	})
+
+	go renewer.Start(ctx)
+	log.Printf("tls: central renewal loop started (window %s)", orchtls.DefaultRenewWindow)
+}
+
+// dbAuditSink writes renewal audit events to the orchestrator audit log with
+// the system source, satisfying tls.AuditSink (invariant #5: every config change
+// — including cert renewal — is audited with source + actor).
+type dbAuditSink struct{ db *db.DB }
+
+func (s *dbAuditSink) Audit(entityType, entityID, action, details string) {
+	entry := &models.AuditLogEntry{
+		EntityType: entityType,
+		EntityID:   entityID,
+		Action:     action,
+		Actor:      "renewer",
+		Source:     models.AuditSourceSystem,
+		Details:    details,
+	}
+	if err := s.db.InsertAuditLog(entry); err != nil {
+		log.Printf("tls: failed to insert renewal audit log: %v", err)
 	}
 }
 
