@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
@@ -23,10 +22,22 @@ func SetVersion(v string) {
 	version = v
 }
 
+// caddyBackend is the subset of the bundled-Caddy proxy backend the agent API
+// drives. It is satisfied by *proxy/caddy.Backend (the admin-API Proxy
+// implementation), so the local API reconciles routes through the proxy backend
+// rather than the raw admin client.
+type caddyBackend interface {
+	EnsureServer(ctx context.Context) error
+	ClearRoutes(ctx context.Context) error
+	AddRoute(ctx context.Context, route json.RawMessage) error
+	RemoveRoute(ctx context.Context, routeID string) error
+	GetConfig(ctx context.Context) (json.RawMessage, error)
+}
+
 // Server is the agent HTTP API server.
 type Server struct {
 	port        int
-	caddyClient *caddy.Client
+	caddyClient caddyBackend
 	token       string
 	health      *health.State
 	routes      map[string]json.RawMessage // domain -> route config
@@ -40,11 +51,12 @@ func (s *Server) SetHealth(h *health.State) {
 	s.health = h
 }
 
-// New creates a new agent API server.
-func New(port int, caddyClient *caddy.Client, token string) *Server {
+// New creates a new agent API server. backend is the bundled-Caddy proxy
+// backend the agent reconciles routes through.
+func New(port int, backend caddyBackend, token string) *Server {
 	return &Server{
 		port:        port,
-		caddyClient: caddyClient,
+		caddyClient: backend,
 		token:       token,
 		routes:      make(map[string]json.RawMessage),
 	}
