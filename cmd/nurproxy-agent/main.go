@@ -16,7 +16,9 @@ import (
 	agentconfig "github.com/NurRobin/NurProxy/internal/agent/config"
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
 var version = "dev"
@@ -83,6 +85,21 @@ func main() {
 	}
 
 	mgr.SetVersion(version)
+
+	// Phase 0 (§13.0, §2.1, §9): read-only proxy detection. This manages nothing,
+	// writes no files, and does not touch the running Caddy path; it only reports
+	// which proxy is installed (+ version/paths) and which process holds :80/:443.
+	// The result rides the agent-initiated adoption + heartbeat payloads (the
+	// agent always dials out; the orchestrator never probes it inbound).
+	detection := detectProxy(ctx)
+	if detection != nil {
+		log.Printf("Proxy detection: installed=%t kind=%q version=%q config_dir=%q",
+			detection.Installed, detection.Kind, detection.Version, detection.ConfigDir)
+		for _, c := range detection.PortConflicts {
+			log.Printf("Proxy detection: :%d held by %q (pid %d)", c.Port, c.Process, c.PID)
+		}
+	}
+	mgr.SetDetection(detection)
 
 	log.Printf("Agent ID: %s", mgr.AgentID())
 	log.Printf("Agent Token: %s...%s", mgr.Token()[:10], mgr.Token()[len(mgr.Token())-4:])
@@ -151,6 +168,9 @@ func main() {
 	// Step 4: Start heartbeat loop. It carries the health snapshot so the
 	// dashboard always sees the agent and any problems it's reporting.
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
+	// Re-report detection on every beat so the orchestrator's stored copy tracks
+	// host changes (e.g. a previously-conflicting proxy releasing :443).
+	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx) })
 	hb.Start(ctx)
 
 	// Step 5: Open the push stream. The agent dials out and holds it open; the
@@ -181,4 +201,16 @@ func main() {
 	}
 
 	log.Printf("Agent stopped.")
+}
+
+// detectProxy runs read-only proxy detection and converts it to the shared wire
+// model. It never mutates host state; a detection error is logged and reported
+// as nil (the orchestrator keeps any prior value), never fatal.
+func detectProxy(ctx context.Context) *models.ProxyDetection {
+	det, err := proxy.NewDetector().Detect(ctx)
+	if err != nil {
+		log.Printf("Proxy detection failed: %v", err)
+		return nil
+	}
+	return det.ToModel()
 }

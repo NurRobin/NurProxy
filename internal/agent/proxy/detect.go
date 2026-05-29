@@ -15,6 +15,8 @@ import (
 	"context"
 	"os/exec"
 	"strings"
+
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
 // Kind identifies a supported reverse-proxy implementation.
@@ -53,6 +55,28 @@ type PortConflict struct {
 	Port    int    `json:"port"`
 	Process string `json:"process,omitempty"` // e.g. "nginx"
 	PID     int    `json:"pid,omitempty"`
+}
+
+// ToModel converts the agent-side Detection into the shared wire/storage model
+// carried in the adoption + heartbeat payloads. The agent dials out only; this
+// is the shape the orchestrator persists on the agent row and exposes read-only.
+func (d Detection) ToModel() *models.ProxyDetection {
+	m := &models.ProxyDetection{
+		Installed:  d.Installed,
+		Kind:       string(d.Kind),
+		Version:    d.Version,
+		BinaryPath: d.BinaryPath,
+		ConfigDir:  d.ConfigDir,
+		LogPaths:   d.LogPaths,
+	}
+	for _, c := range d.PortConflicts {
+		m.PortConflicts = append(m.PortConflicts, models.ProxyPortConflict{
+			Port:    c.Port,
+			Process: c.Process,
+			PID:     c.PID,
+		})
+	}
+	return m
 }
 
 // runner runs an external command and returns its combined output. It is a

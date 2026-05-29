@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
 // Heartbeat periodically sends heartbeats with the agent's public IP to the
@@ -21,6 +23,7 @@ type Heartbeat struct {
 	version         string
 	interval        time.Duration
 	healthFn        func() (caddyRunning bool, lastError string)
+	detectionFn     func() *models.ProxyDetection
 	client          *http.Client
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -33,6 +36,10 @@ type heartbeatPayload struct {
 	Version      string `json:"version"`
 	CaddyRunning bool   `json:"caddy_running"`
 	LastError    string `json:"last_error"`
+	// ProxyDetection re-reports the read-only Phase-0 detection on every beat
+	// (§13.0/§2.1/§9) so the orchestrator's stored copy stays fresh as the host
+	// changes (e.g. an Existing proxy stops releasing :443). Omitted when unknown.
+	ProxyDetection *models.ProxyDetection `json:"proxy_detection,omitempty"`
 }
 
 // New creates a new Heartbeat sender. healthFn supplies the agent's current
@@ -50,6 +57,13 @@ func New(orchestratorURL, agentID, token, version string, interval time.Duration
 			Timeout: 15 * time.Second,
 		},
 	}
+}
+
+// SetDetectionFn supplies the read-only proxy detection re-reported on each beat.
+// It may be nil (no detection sent). The function is called per beat so the
+// agent can refresh detection over time without restarting the heartbeat.
+func (h *Heartbeat) SetDetectionFn(fn func() *models.ProxyDetection) {
+	h.detectionFn = fn
 }
 
 // Start begins the heartbeat loop. It blocks until the context is canceled.
@@ -100,12 +114,18 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		ip = ""
 	}
 
+	var detection *models.ProxyDetection
+	if h.detectionFn != nil {
+		detection = h.detectionFn()
+	}
+
 	payload := heartbeatPayload{
-		AgentID:      h.agentID,
-		PublicIP:     ip,
-		Version:      h.version,
-		CaddyRunning: caddyRunning,
-		LastError:    lastError,
+		AgentID:        h.agentID,
+		PublicIP:       ip,
+		Version:        h.version,
+		CaddyRunning:   caddyRunning,
+		LastError:      lastError,
+		ProxyDetection: detection,
 	}
 
 	data, err := json.Marshal(payload)
