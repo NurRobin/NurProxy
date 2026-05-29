@@ -129,12 +129,14 @@ type mockHub struct {
 	mu        sync.Mutex
 	connected map[string]bool
 	published map[string][][]proxymodel.RouteIntent
+	sets      map[string][]proxymodel.IntentSet
 }
 
 func newMockHub() *mockHub {
 	return &mockHub{
 		connected: make(map[string]bool),
 		published: make(map[string][][]proxymodel.RouteIntent),
+		sets:      make(map[string][]proxymodel.IntentSet),
 	}
 }
 
@@ -145,10 +147,25 @@ func (m *mockHub) Connected(agentID string) bool {
 }
 
 func (m *mockHub) PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool {
+	return m.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents})
+}
+
+func (m *mockHub) PublishIntentSet(agentID string, set proxymodel.IntentSet) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.published[agentID] = append(m.published[agentID], intents)
+	m.published[agentID] = append(m.published[agentID], set.Intents)
+	m.sets[agentID] = append(m.sets[agentID], set)
 	return m.connected[agentID]
+}
+
+func (m *mockHub) lastSet(agentID string) (proxymodel.IntentSet, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sets := m.sets[agentID]
+	if len(sets) == 0 {
+		return proxymodel.IntentSet{}, false
+	}
+	return sets[len(sets)-1], true
 }
 
 func (m *mockHub) setConnected(agentID string, ok bool) {
@@ -508,6 +525,78 @@ func TestPushAgentRoutes(t *testing.T) {
 	}
 	if hub.lastPublished(agent.ID) != nil {
 		t.Error("expected no publish to a disconnected agent")
+	}
+}
+
+// TestPushAgentRoutes_includesCertsForPreflight verifies the push carries the
+// agent's cert bundles alongside the intents (§5/§7), so the agent installs them
+// before applying the referencing config (preflight ordering). The decrypted key
+// must ride the bundle (re-encrypted at rest on the agent).
+func TestPushAgentRoutes_includesCertsForPreflight(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, _ := setupScenario(t, d)
+
+	if err := d.UpsertCertificate(&models.Certificate{
+		ID:      "cert-1",
+		Host:    "app.example.com",
+		Names:   []string{"app.example.com"},
+		CertPEM: "LEAFCHAIN",
+		KeyPEM:  "PRIVATEKEY",
+	}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.SetHub(hub)
+
+	if err := r.PushAgentRoutes(agent.ID); err != nil {
+		t.Fatalf("PushAgentRoutes: %v", err)
+	}
+
+	set, ok := hub.lastSet(agent.ID)
+	if !ok {
+		t.Fatal("expected an intent set to be published")
+	}
+	if len(set.Intents) != 1 {
+		t.Fatalf("expected 1 intent, got %d", len(set.Intents))
+	}
+	if len(set.Certs) != 1 {
+		t.Fatalf("expected 1 cert bundle in the push, got %d", len(set.Certs))
+	}
+	cb := set.Certs[0]
+	if cb.Host != "app.example.com" {
+		t.Errorf("cert host = %q, want app.example.com", cb.Host)
+	}
+	if cb.CertPEM != "LEAFCHAIN" || cb.KeyPEM != "PRIVATEKEY" {
+		t.Errorf("cert bundle = %+v, want decrypted leaf+key", cb)
+	}
+}
+
+// TestPushAgentRoutes_noCert_omitsBundles verifies that without a stored cert the
+// push carries no cert material (the host falls back to self-ACME, §7) and never
+// fails the push.
+func TestPushAgentRoutes_noCert_omitsBundles(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, _ := setupScenario(t, d)
+
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.SetHub(hub)
+
+	if err := r.PushAgentRoutes(agent.ID); err != nil {
+		t.Fatalf("PushAgentRoutes: %v", err)
+	}
+	set, ok := hub.lastSet(agent.ID)
+	if !ok {
+		t.Fatal("expected an intent set to be published")
+	}
+	if len(set.Certs) != 0 {
+		t.Errorf("expected no cert bundles, got %d", len(set.Certs))
 	}
 }
 

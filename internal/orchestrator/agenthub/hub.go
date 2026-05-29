@@ -114,10 +114,21 @@ func (h *Hub) Publish(agentID string, ev Event) bool {
 }
 
 // PublishIntents is a convenience wrapper that pushes a full intent-set snapshot
-// (the agent's complete desired state). The agent renders each intent natively
-// and reconciles its managed set against the snapshot (§3/B1).
+// (the agent's complete desired state) with no cert material. The agent renders
+// each intent natively and reconciles its managed set against the snapshot
+// (§3/B1).
 func (h *Hub) PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool {
-	data, err := json.Marshal(proxymodel.IntentSet{Intents: intents})
+	return h.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents})
+}
+
+// PublishIntentSet pushes a full intent-set snapshot that may carry cert bundles
+// alongside the intents (§5/§7). The orchestrator gathers/issues the certs first,
+// then pushes them with the config in one "everything is ready, go live" message;
+// the agent installs the certs (InstallCerts) before applying any referencing
+// config (preflight ordering). Certs ride this agent-initiated stream — there is
+// no inbound probe of the agent (invariant #2).
+func (h *Hub) PublishIntentSet(agentID string, set proxymodel.IntentSet) bool {
+	data, err := json.Marshal(set)
 	if err != nil {
 		return false
 	}

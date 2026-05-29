@@ -47,6 +47,10 @@ type caddyBackend interface {
 	ClearRoutes(ctx context.Context) error
 	AddRoute(ctx context.Context, route json.RawMessage) error
 	Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error)
+	// InstallCerts writes the pushed cert bundles to disk before any referencing
+	// config is applied (preflight ordering, §5). It is called first in
+	// applyIntents so a generated config never validates against a missing file.
+	InstallCerts(ctx context.Context, certs []proxy.CertBundle) error
 }
 
 // Client manages the agent's stream connection and applies pushed routes.
@@ -187,7 +191,7 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			log.Printf("Stream: bad intent payload: %v", err)
 			return
 		}
-		c.applyIntents(ctx, set.Intents)
+		c.applyIntents(ctx, set)
 	case "ping":
 		// Liveness only — nothing to do.
 	default:
@@ -202,7 +206,18 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 // (here, Caddy route JSON) and round-trips the rendered content + checksum so the
 // store becomes the authoritative versioned artifact without the orchestrator
 // modeling the host.
-func (c *Client) applyIntents(ctx context.Context, intents []proxymodel.RouteIntent) {
+//
+// Preflight ordering (§5): the push is "everything is ready, go live" — it carries
+// both the cert bundles and the intent set. The agent installs the certs FIRST
+// (InstallCerts), then applies the config that references them, so a generated
+// config never validates against a missing cert file. A cert-install failure is
+// surfaced via health and the apply still proceeds for the built-in Caddy path
+// (which can self-ACME as a fallback, §7); file backends that hard-require the
+// cert will fail their own validate, attributed per-artifact.
+func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
+	c.installCerts(ctx, set.Certs)
+
+	intents := set.Intents
 	reports := make([]proxymodel.ArtifactReport, 0, len(intents))
 	// managed is the fresh snapshot of artifacts this apply leaves live (artifactID
 	// -> checksum). It replaces the prior snapshot wholesale, so artifacts dropped
@@ -275,6 +290,35 @@ func (c *Client) applyIntents(ctx context.Context, intents []proxymodel.RouteInt
 
 	log.Printf("Stream: applied %d/%d intents", applied, len(intents))
 	c.sendAck(ctx, reports)
+}
+
+// installCerts runs the preflight cert install for a push (§5/§7): it converts the
+// wire cert bundles into the agent-side proxy.CertBundle form and hands them to the
+// backend, which writes them to disk (encrypting keys at rest) BEFORE applyIntents
+// applies any referencing config. An install error is logged and surfaced via
+// health but never aborts the apply: the built-in Caddy can self-ACME as a fallback
+// (§7), and per-artifact validation still attributes a genuinely missing cert. A
+// nil/empty slice is a no-op (no TLS material in this push).
+func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle) {
+	if len(certs) == 0 {
+		return
+	}
+	bundles := make([]proxy.CertBundle, 0, len(certs))
+	for _, cb := range certs {
+		bundles = append(bundles, proxy.CertBundle{
+			Host:    cb.Host,
+			CertPEM: []byte(cb.CertPEM),
+			KeyPEM:  []byte(cb.KeyPEM),
+		})
+	}
+	if err := c.caddy.InstallCerts(ctx, bundles); err != nil {
+		log.Printf("Stream: failed to install %d cert bundle(s): %v", len(bundles), err)
+		if c.health != nil {
+			c.health.SetError(fmt.Sprintf("failed to install TLS certificates: %v", err))
+		}
+		return
+	}
+	log.Printf("Stream: installed %d cert bundle(s) before apply", len(bundles))
 }
 
 // checksum returns the hex-encoded SHA-256 of the rendered content. It matches
