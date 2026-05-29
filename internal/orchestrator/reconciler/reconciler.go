@@ -16,6 +16,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
+	"github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -826,19 +827,13 @@ func extractHostFromRoute(raw json.RawMessage) string {
 	return ""
 }
 
-// routesMatch compares two route JSON blobs for semantic equality.
-// It normalizes by unmarshaling into maps and re-marshaling.
+// routesMatch compares two Caddy route JSON blobs for semantic equality. It
+// delegates to the shared caddyeq comparator (the single source of truth for
+// Caddy semantic equality, also used to gate version writes in §4/§11), so the
+// reconciler's reload-suppression and the store's phantom-version suppression
+// stay in lock-step.
 func routesMatch(a, b json.RawMessage) bool {
-	var ma, mb interface{}
-	if err := json.Unmarshal(a, &ma); err != nil {
-		return false
-	}
-	if err := json.Unmarshal(b, &mb); err != nil {
-		return false
-	}
-	ja, _ := json.Marshal(ma)
-	jb, _ := json.Marshal(mb)
-	return string(ja) == string(jb)
+	return caddyeq.Equal(string(a), string(b))
 }
 
 // audit is a convenience wrapper that logs to both the audit table and stderr.
