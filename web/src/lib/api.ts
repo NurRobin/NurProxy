@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion } from './types';
 
 const BASE = '/api/v1';
 
@@ -101,6 +101,24 @@ export const api = {
     request<{ message: string }>(`/domains/${id}/config`, { method: 'PUT', body: JSON.stringify({ config }) }),
   resetDomainConfig: (id: number) =>
     request<{ message: string }>(`/domains/${id}/config/reset`, { method: 'POST' }),
+
+  // Config artifacts + drift review (§11, Phase 3)
+  listArtifacts: (params?: Record<string, string>) => {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<ConfigArtifact[]>(`/artifacts${qs}`);
+  },
+  getArtifact: (id: string) => request<ConfigArtifact>(`/artifacts/${id}`),
+  listArtifactVersions: (id: string) => request<ConfigArtifactVersion[]>(`/artifacts/${id}/versions`),
+  acceptArtifact: (id: string, content?: string) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/accept`, { method: 'POST', body: JSON.stringify(content !== undefined ? { content } : {}) }),
+  rejectArtifact: (id: string) => request<ConfigArtifact>(`/artifacts/${id}/reject`, { method: 'POST' }),
+  rollbackArtifact: (id: string, version: number) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/rollback`, { method: 'POST', body: JSON.stringify({ version }) }),
+  bulkArtifacts: (action: 'accept' | 'reject', agentId?: string) =>
+    request<{ action: string; resolved: number; total: number }>('/artifacts/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ action, agent_id: agentId ?? '' }),
+    }),
 
   // System
   health: () => request<HealthResponse>('/health'),

@@ -106,3 +106,43 @@ export interface Setting {
   value: string;
   updated_at: string;
 }
+
+export type ArtifactSource = 'generated' | 'manual';
+export type ArtifactApplyState = 'live' | 'drifted' | 'apply_failed';
+export type TargetKind = 'file' | 'caddy-route';
+
+export interface ArtifactTarget {
+  kind: TargetKind;
+  path: string;
+}
+
+/** A unit of the central managed-config store (§4). */
+export interface ConfigArtifact {
+  id: string;
+  agent_id: string;
+  backend: string;
+  target: ArtifactTarget;
+  source: ArtifactSource;
+  domain_id?: number;
+  content: string;
+  checksum: string;
+  live_version: number;
+  enabled: boolean;
+  drifted: boolean;
+  apply_state: ArtifactApplyState;
+  last_error?: string;
+  updated_at: string;
+}
+
+/** One entry in an artifact's append-only version history (§4, §11). */
+export interface ConfigArtifactVersion {
+  id: number;
+  artifact_id: string;
+  version: number;
+  content: string;
+  checksum: string;
+  source: ArtifactSource;
+  actor?: string;
+  note?: string;
+  created_at: string;
+}
