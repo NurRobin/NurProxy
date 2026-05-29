@@ -30,6 +30,23 @@ export interface ProxyDetection {
   port_conflicts?: ProxyPortConflict[];
 }
 
+/**
+ * The agent's last-reported capability matrix (§8) for its selected backend. A
+ * false field means the backend cannot honor that option, so the dashboard
+ * greys it out and the agent drops it during Render with an audited warning.
+ */
+export interface ProxyCapabilities {
+  reverse_proxy: boolean;
+  websocket: boolean;
+  force_https: boolean;
+  custom_headers: boolean;
+  path_rewrite: boolean;
+  basic_auth: boolean;
+  ip_filter: boolean;
+  rate_limit: boolean;
+  central_tls: boolean;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -47,6 +64,7 @@ export interface Agent {
   dns_error?: string;
   proxy_detection?: ProxyDetection;
   proxy_detected_at?: string;
+  proxy_capabilities?: ProxyCapabilities;
   created_at: string;
   updated_at: string;
   servers?: Server[];
