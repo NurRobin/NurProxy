@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -47,12 +48,13 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 // No auth required (agent doesn't have a token yet — it's registering one).
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID       string `json:"id"`
-		FQDN     string `json:"fqdn"`
-		Token    string `json:"token"`
-		APIURL   string `json:"api_url"`
-		PublicIP string `json:"public_ip"`
-		Version  string `json:"version"`
+		ID             string                 `json:"id"`
+		FQDN           string                 `json:"fqdn"`
+		Token          string                 `json:"token"`
+		APIURL         string                 `json:"api_url"`
+		PublicIP       string                 `json:"public_ip"`
+		Version        string                 `json:"version"`
+		ProxyDetection *models.ProxyDetection `json:"proxy_detection"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -85,6 +87,13 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		// Assume healthy until the agent reports otherwise via heartbeat, so a
 		// freshly registered agent doesn't surface a spurious "Caddy down" error.
 		CaddyRunning: true,
+		// Phase-0 read-only detection (§13.0/§2.1/§9), carried on the agent's
+		// outbound register payload. Stored as-is; refreshed by heartbeats.
+		ProxyDetection: req.ProxyDetection,
+	}
+	if req.ProxyDetection != nil {
+		now := time.Now().UTC()
+		agent.ProxyDetectedAt = &now
 	}
 
 	if err := s.db.CreateAgent(agent); err != nil {
@@ -268,13 +277,15 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":            agent.ID,
-		"status":        agent.Status,
-		"last_seen":     agent.LastSeen,
-		"public_ip":     agent.PublicIP,
-		"version":       agent.Version,
-		"caddy_running": agent.CaddyRunning,
-		"last_error":    agent.LastError,
+		"id":                agent.ID,
+		"status":            agent.Status,
+		"last_seen":         agent.LastSeen,
+		"public_ip":         agent.PublicIP,
+		"version":           agent.Version,
+		"caddy_running":     agent.CaddyRunning,
+		"last_error":        agent.LastError,
+		"proxy_detection":   agent.ProxyDetection,
+		"proxy_detected_at": agent.ProxyDetectedAt,
 	})
 }
 
@@ -354,6 +365,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// a pointer so an older agent that omits it doesn't get read as "down".
 		CaddyRunning *bool  `json:"caddy_running"`
 		LastError    string `json:"last_error"`
+		// ProxyDetection is the agent's read-only Phase-0 detection, re-reported on
+		// each beat (§13.0/§2.1/§9). Stored on the agent row; nil leaves it as-is.
+		ProxyDetection *models.ProxyDetection `json:"proxy_detection"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -375,6 +389,15 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning); err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
+	}
+
+	// Persist the agent's read-only proxy detection (§13.0). It's a narrow update
+	// so it doesn't clobber operator-owned fields or the health self-report just
+	// written above. Only update when the agent actually reported detection.
+	if req.ProxyDetection != nil {
+		if uerr := s.db.UpdateAgentDetection(id, req.ProxyDetection); uerr != nil {
+			log.Printf("failed to update agent %s detection: %v", id, uerr)
+		}
 	}
 
 	// A heartbeat is proof of life: an agent the orchestrator had marked offline
