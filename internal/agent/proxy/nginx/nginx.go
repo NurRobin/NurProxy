@@ -231,10 +231,15 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 	}, nil
 }
 
-// ReadManaged reads the managed vhost files this backend owns from
-// sites-available, for adoption upload and drift checks (§4, §11). Only files
-// matching the nurproxy- prefix are returned; the operator's own vhosts are left
-// untouched. Enabled reports whether the sites-enabled symlink is present.
+// ReadManaged reads the vhost files in sites-available for adoption upload and
+// drift checks (§4, §11). It reads ALL files (no whitelist): Existing-mode
+// adoption tracks the operator's hand-written vhosts too — there is nothing to
+// guard against by scoping, because NurProxy never auto-overwrites a file
+// without an explicit Accept. Files NurProxy generated (the nurproxy- prefix)
+// are returned with Adopted=false for drift comparison; every other file is an
+// operator-authored config, returned with Adopted=true so the orchestrator
+// stores it as Source: manual, version 1. Enabled reports whether the
+// sites-enabled symlink is present.
 func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 	entries, err := os.ReadDir(b.layout.Available)
 	if err != nil {
@@ -245,19 +250,26 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 	}
 	var arts []proxy.Artifact
 	for _, e := range entries {
-		if e.IsDir() || !IsManagedFile(e.Name()) {
+		if e.IsDir() {
 			continue
 		}
-		path := filepath.Join(b.layout.Available, e.Name())
+		name := e.Name()
+		// Skip our own in-flight temp files so a concurrent apply never surfaces a
+		// half-written vhost as an adopted artifact.
+		if strings.HasSuffix(name, tempSuffix) {
+			continue
+		}
+		path := filepath.Join(b.layout.Available, name)
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("reading managed nginx file %q: %w", path, err)
+			return nil, fmt.Errorf("reading nginx config %q: %w", path, err)
 		}
-		enabled := symlinkPresent(filepath.Join(b.layout.Enabled, e.Name()))
+		enabled := symlinkPresent(filepath.Join(b.layout.Enabled, name))
 		arts = append(arts, proxy.Artifact{
 			Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: path},
 			Content: string(data),
 			Enabled: enabled,
+			Adopted: !IsManagedFile(name),
 		})
 	}
 	return arts, nil

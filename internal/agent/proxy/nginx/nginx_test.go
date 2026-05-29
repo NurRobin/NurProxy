@@ -203,17 +203,23 @@ func TestRender_structuredRoute_producesFileArtifact(t *testing.T) {
 	}
 }
 
-func TestReadManaged_returnsOnlyManagedFiles(t *testing.T) {
+func TestReadManaged_adoptsAllFiles_taggingManagedVsOperator(t *testing.T) {
 	b, _ := newBackend(t, &fakeRunner{})
 	if err := os.MkdirAll(b.layout.Available, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// One managed file, one operator file.
+	// One NurProxy-managed file, one operator file: adoption reads BOTH (§4, no
+	// whitelist), tagging only the operator file Adopted.
 	managed := b.layout.AvailablePath("app.example.com")
 	if err := os.WriteFile(managed, []byte("server {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(b.layout.Available, "operator-site.conf"), []byte("server {}\n"), 0o644); err != nil {
+	operator := filepath.Join(b.layout.Available, "operator-site.conf")
+	if err := os.WriteFile(operator, []byte("server { listen 8080; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A temp file from an in-flight apply must be skipped.
+	if err := os.WriteFile(managed+tempSuffix, []byte("half\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -221,11 +227,29 @@ func TestReadManaged_returnsOnlyManagedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadManaged error: %v", err)
 	}
-	if len(arts) != 1 {
-		t.Fatalf("ReadManaged returned %d artifacts, want 1 (managed only)", len(arts))
+	if len(arts) != 2 {
+		t.Fatalf("ReadManaged returned %d artifacts, want 2 (all files, temp skipped)", len(arts))
 	}
-	if filepath.Base(arts[0].Target.Path) != "nurproxy-app.example.com.conf" {
-		t.Errorf("got %q, want the managed file", arts[0].Target.Path)
+	byBase := map[string]proxy.Artifact{}
+	for _, a := range arts {
+		byBase[filepath.Base(a.Target.Path)] = a
+	}
+	m, ok := byBase["nurproxy-app.example.com.conf"]
+	if !ok {
+		t.Fatal("managed file missing from adoption read")
+	}
+	if m.Adopted {
+		t.Error("NurProxy-managed file should have Adopted=false")
+	}
+	o, ok := byBase["operator-site.conf"]
+	if !ok {
+		t.Fatal("operator file missing from adoption read")
+	}
+	if !o.Adopted {
+		t.Error("operator-authored file should have Adopted=true (Source: manual)")
+	}
+	if o.Content != "server { listen 8080; }\n" {
+		t.Errorf("operator content = %q, want verbatim", o.Content)
 	}
 }
 
