@@ -45,8 +45,13 @@ type Proxy interface {
 	// (target + content). It is a thin wrapper over the backend's pure renderer.
 	Render(ctx context.Context, route proxymodel.Route) (Artifact, error)
 
-	// ReadManaged reads the artifacts this backend currently manages on disk,
-	// used for adoption upload and drift checks (§4, §11).
+	// ReadManaged reads the config artifacts in the backend's configured dirs,
+	// used for both adoption upload and drift checks (§4, §11). For Existing-mode
+	// adoption it reads ALL files (no whitelist — we never auto-overwrite, so
+	// there is nothing to scope), tagging operator-authored files Adopted so the
+	// orchestrator stores them as Source: manual, version 1. NurProxy-generated
+	// files are returned with Adopted=false for drift comparison against their
+	// accepted state.
 	ReadManaged(ctx context.Context) ([]Artifact, error)
 
 	// Apply writes, validates, and activates the given artifacts atomically
@@ -160,6 +165,12 @@ type Artifact struct {
 	// Enabled reports whether the artifact is active (e.g. nginx sites-enabled
 	// symlink present); meaningless for caddy-route, where presence == enabled.
 	Enabled bool `json:"enabled"`
+	// Adopted reports that this artifact is an operator-authored config the
+	// backend discovered on disk (NOT one NurProxy generated) during adoption
+	// (§4). The orchestrator stores adopted artifacts as Source: manual, version
+	// 1; we never auto-overwrite them. False means a NurProxy-managed (generated)
+	// file, tracked for drift against its accepted state.
+	Adopted bool `json:"adopted"`
 }
 
 // TLSIntent is one host's public-listener TLS policy, used by the bundled Caddy
