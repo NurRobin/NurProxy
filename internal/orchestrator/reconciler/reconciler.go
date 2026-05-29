@@ -95,6 +95,53 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	return nil
 }
 
+// RepushCertForHost re-pushes the config + cert bundle for the agent serving
+// host (an FQDN), so a centrally-renewed certificate reaches that agent and is
+// reloaded. It is the post-renewal hook the TLS Renewer calls (§7): it resolves
+// host -> domain -> server -> agent, then re-runs the agent's instant push,
+// which gathers the now-renewed cert from the store and rides it down the
+// agent-initiated stream ahead of the intents (preflight ordering). It satisfies
+// tls.Reloader. Best-effort by contract: if the agent is offline PushAgentRoutes
+// is a no-op and the agent re-syncs (with the fresh cert) on reconnect.
+func (r *Reconciler) RepushCertForHost(_ context.Context, host string) error {
+	agentID, err := r.agentServingHost(host)
+	if err != nil {
+		return err
+	}
+	if agentID == "" {
+		// No domain matches this host (e.g. it was deleted). Nothing to push; the
+		// stored cert simply has no current consumer.
+		return nil
+	}
+	return r.PushAgentRoutes(agentID)
+}
+
+// agentServingHost resolves an FQDN to the id of the agent currently serving it,
+// by matching the host against each domain's computed FQDN and following
+// domain -> server -> agent. Returns "" (no error) when no domain matches.
+func (r *Reconciler) agentServingHost(host string) (string, error) {
+	domains, err := r.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return "", fmt.Errorf("listing domains to resolve host %q: %w", host, err)
+	}
+	for i := range domains {
+		dom := &domains[i]
+		zone, zErr := r.db.GetZone(dom.ZoneID)
+		if zErr != nil {
+			continue
+		}
+		if dom.FQDN(zone.Name) != host {
+			continue
+		}
+		srv, sErr := r.db.GetServer(dom.ServerID)
+		if sErr != nil {
+			return "", fmt.Errorf("resolving server for host %q: %w", host, sErr)
+		}
+		return srv.AgentID, nil
+	}
+	return "", nil
+}
+
 // gatherCerts collects the cert bundles for the FQDNs in the desired route set, so
 // they can ride the push and be installed before Apply (preflight ordering,
 // §5/§7). A host with no stored certificate is simply skipped (built-in Caddy
