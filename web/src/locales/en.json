@@ -238,6 +238,15 @@
     "permsNote": "The agent must be able to write the config dir and run the reload/test commands — grant a group-owned dir plus a narrowly-scoped sudoers entry for exactly those commands, not blanket sudo.",
     "copyConfig": "Copy config"
   },
+  "logtail": {
+    "title": "Log tail",
+    "tailAction": "Tail",
+    "starting": "Starting tail…",
+    "live": "Live — tailing while this view is open. Close to stop.",
+    "ended": "Tail ended.",
+    "empty": "No log output yet.",
+    "error": "Could not tail this log"
+  },
   "servers": {
     "title": "Servers",
     "subtitle": "Backend addresses your agents proxy to. Each belongs to one agent.",

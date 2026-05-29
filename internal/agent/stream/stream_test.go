@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -88,6 +89,100 @@ func TestStreamRendersIntentAppliesAndAcks(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for apply ack")
+	}
+}
+
+func TestLogTail_followsAllowedFile_postsChunks_stopsOnStop(t *testing.T) {
+	chunkCh := make(chan proxymodel.LogChunk, 32)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agents/{id}/logs/chunk", func(w http.ResponseWriter, r *http.Request) {
+		var ch proxymodel.LogChunk
+		_ = json.NewDecoder(r.Body).Decode(&ch)
+		chunkCh <- ch
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	dir := t.TempDir()
+	logPath := dir + "/access.log"
+	if err := os.WriteFile(logPath, []byte("backlog1\nbacklog2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := caddybackend.New(caddy.NewMockClient())
+	c := New(ts.URL, "agent-1", "tok", backend, health.New()).WithLogPaths([]string{dir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.startLogTail(ctx, proxymodel.LogTailRequest{SessionID: "s1", Path: logPath, Lines: 10})
+
+	var got []string
+	deadline := time.After(3 * time.Second)
+	for len(got) < 2 {
+		select {
+		case ch := <-chunkCh:
+			if ch.Error != "" {
+				t.Fatalf("unexpected chunk error: %s", ch.Error)
+			}
+			got = append(got, ch.Lines...)
+		case <-deadline:
+			t.Fatalf("timed out waiting for backlog; got %v", got)
+		}
+	}
+	if got[0] != "backlog1" || got[1] != "backlog2" {
+		t.Fatalf("backlog = %v, want [backlog1 backlog2]", got)
+	}
+
+	// Stopping the session must cancel the tailer and emit a terminal EOF chunk.
+	c.stopLogTail("s1")
+	select {
+	case ch := <-chunkCh:
+		if !ch.EOF {
+			// A late follow chunk may arrive first; drain until EOF.
+			for {
+				select {
+				case ch2 := <-chunkCh:
+					if ch2.EOF {
+						return
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("no EOF chunk after stop")
+				}
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no chunk after stop")
+	}
+}
+
+func TestLogTail_refusesPathOutsideAllowlist_postsErrorChunk(t *testing.T) {
+	chunkCh := make(chan proxymodel.LogChunk, 4)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agents/{id}/logs/chunk", func(w http.ResponseWriter, r *http.Request) {
+		var ch proxymodel.LogChunk
+		_ = json.NewDecoder(r.Body).Decode(&ch)
+		chunkCh <- ch
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	backend := caddybackend.New(caddy.NewMockClient())
+	c := New(ts.URL, "agent-1", "tok", backend, health.New()).WithLogPaths([]string{"/var/log/nginx"})
+
+	c.startLogTail(context.Background(), proxymodel.LogTailRequest{SessionID: "bad", Path: "/etc/passwd"})
+
+	select {
+	case ch := <-chunkCh:
+		if ch.Error == "" {
+			t.Fatal("expected a terminal error chunk for a disallowed path")
+		}
+		if !ch.EOF {
+			t.Error("refusal chunk should be terminal (EOF)")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no error chunk for disallowed path")
 	}
 }
 

@@ -30,6 +30,21 @@ export interface ProxyDetection {
   port_conflicts?: ProxyPortConflict[];
 }
 
+// On-demand log tail (§15). The dashboard opens a session, polls for lines past a
+// cursor, and stops the session when the view closes. The agent dials out for
+// every hop — the orchestrator never reads the agent inbound.
+export interface LogTailLine {
+  seq: number;
+  text: string;
+}
+
+export interface LogTailPoll {
+  lines: LogTailLine[];
+  cursor: number;
+  done: boolean;
+  error?: string;
+}
+
 /**
  * The agent's last-reported capability matrix (§8) for its selected backend. A
  * false field means the backend cannot honor that option, so the dashboard

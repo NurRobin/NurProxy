@@ -6,6 +6,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
@@ -25,6 +26,7 @@ type Server struct {
 	sessions *auth.SessionManager
 	hub      *agenthub.Hub
 	pusher   RoutePusher
+	logs     *logbroker.Broker
 }
 
 // SetAgentHub wires the live agent connection hub and the route pusher into the
@@ -43,6 +45,7 @@ func NewServer(database *db.DB, version string) *Server {
 		version:  version,
 		mux:      http.NewServeMux(),
 		sessions: auth.NewSessionManager([]byte("nurproxy-session-key-" + version)),
+		logs:     logbroker.New(),
 	}
 
 	s.registerRoutes()
@@ -96,6 +99,13 @@ func (s *Server) registerRoutes() {
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", s.requireAgentAuth(s.handleAgentRoutesAck))
+	// On-demand log tail (§15): the agent POSTs tailed chunks up the control plane
+	// (agent auth); the dashboard starts/polls/stops a tail (user auth). The tail
+	// request rides the agent's existing stream — never an inbound probe.
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/chunk", s.requireAgentAuth(s.handleAgentLogChunk))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/tail", s.requireAuth(s.handleStartLogTail))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handlePollLogTail))
+	s.mux.HandleFunc("DELETE /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handleStopLogTail))
 
 	// Servers (auth required)
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/servers", s.requireAuth(s.handleListServers))

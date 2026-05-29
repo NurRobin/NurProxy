@@ -17,6 +17,7 @@ import MultiSelect from '../components/MultiSelect';
 import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
 import ExistingSetup from './ExistingSetup';
+import LogTailViewer from '../components/LogTailViewer';
 
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.never'));
 
@@ -456,6 +457,8 @@ function DetectedProxy({ agent }: { agent: Agent }) {
   const { t } = useTranslation();
   const d = agent.proxy_detection;
   const [setupOpen, setSetupOpen] = useState(false);
+  // Path of the log currently being tailed on-demand (§15); null = no viewer open.
+  const [tailPath, setTailPath] = useState<string | null>(null);
 
   // Compose a one-line summary like "nginx 1.24 at /etc/nginx".
   const summary = () => {
@@ -496,7 +499,16 @@ function DetectedProxy({ agent }: { agent: Agent }) {
                 value={
                   <span className="font-mono text-xs">
                     {d.log_paths.map((p) => (
-                      <span key={p} className="block">{p}</span>
+                      <span key={p} className="flex items-center justify-end gap-2">
+                        <span className="truncate">{p}</span>
+                        <button
+                          type="button"
+                          onClick={() => setTailPath(p)}
+                          className="shrink-0 font-sans font-medium text-accent underline underline-offset-2 hover:text-accent-hover"
+                        >
+                          {t('logtail.tailAction')}
+                        </button>
+                      </span>
                     ))}
                   </span>
                 }
@@ -554,6 +566,9 @@ function DetectedProxy({ agent }: { agent: Agent }) {
       )}
 
       <ExistingSetup agent={agent} open={setupOpen} onClose={() => setSetupOpen(false)} />
+      {tailPath && (
+        <LogTailViewer agentId={agent.id} path={tailPath} open={!!tailPath} onClose={() => setTailPath(null)} />
+      )}
     </div>
   );
 }

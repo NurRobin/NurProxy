@@ -106,6 +106,9 @@ func main() {
 	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
 	srv.SetAgentHub(hub, rec)
+	// Sweep abandoned on-demand log tails (§15): a dashboard view that vanished
+	// without a clean close is reaped and its agent told to stop tailing.
+	srv.StartLogReaper(rootCtx)
 
 	// Serve embedded dashboard + API
 	mux := http.NewServeMux()

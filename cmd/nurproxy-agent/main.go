@@ -231,7 +231,8 @@ func main() {
 	// changes — no inbound reachability required. The client also tracks the
 	// artifacts it has applied so the heartbeat can report their checksums for
 	// drift detection (§11).
-	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyBackend, hs)
+	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyBackend, hs).
+		WithLogPaths(cfg.ProxyLogPaths)
 
 	// Step 5: Start heartbeat loop. It carries the health snapshot so the
 	// dashboard always sees the agent and any problems it's reporting.

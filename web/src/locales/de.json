@@ -238,6 +238,15 @@
     "permsNote": "Der Agent muss das Konfigurationsverzeichnis beschreiben und die Reload-/Test-Befehle ausführen können — gewähre ein gruppen-eigenes Verzeichnis sowie einen eng begrenzten sudoers-Eintrag für genau diese Befehle, kein pauschales sudo.",
     "copyConfig": "Konfiguration kopieren"
   },
+  "logtail": {
+    "title": "Log-Verfolgung",
+    "tailAction": "Verfolgen",
+    "starting": "Verfolgung wird gestartet…",
+    "live": "Live — wird verfolgt, solange diese Ansicht offen ist. Schließen zum Beenden.",
+    "ended": "Verfolgung beendet.",
+    "empty": "Noch keine Log-Ausgabe.",
+    "error": "Dieses Log konnte nicht verfolgt werden"
+  },
   "servers": {
     "title": "Server",
     "subtitle": "Backend-Adressen, an die deine Agents weiterleiten. Jeder gehört zu einem Agent.",

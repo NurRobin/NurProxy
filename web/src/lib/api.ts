@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll } from './types';
 
 const BASE = '/api/v1';
 
@@ -135,6 +135,18 @@ export const api = {
   getSettings: () => request<Setting[]>('/settings'),
   updateSetting: (key: string, value: string) =>
     request<{ key: string; value: string }>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+
+  // On-demand log tailing (§15): open → poll → close. The agent tails the file
+  // and posts chunks back up its stream; the dashboard never reaches the agent.
+  startLogTail: (agentId: string, path: string, lines?: number) =>
+    request<{ session_id: string }>(`/agents/${agentId}/logs/tail`, {
+      method: 'POST',
+      body: JSON.stringify({ path, lines: lines ?? 0 }),
+    }),
+  pollLogTail: (agentId: string, sessionId: string, cursor: number) =>
+    request<LogTailPoll>(`/agents/${agentId}/logs/tail/${sessionId}?cursor=${cursor}`),
+  stopLogTail: (agentId: string, sessionId: string) =>
+    request<{ status: string }>(`/agents/${agentId}/logs/tail/${sessionId}`, { method: 'DELETE' }),
 
   // Admin API key
   getAPIKey: () => request<{ exists: boolean; masked?: string }>('/api-key'),
