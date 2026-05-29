@@ -11,30 +11,48 @@ import (
 // checks tell our files apart from the operator's hand-rolled ones (§4, §11).
 const managedPrefix = "nurproxy-"
 
-// confSuffix is the file extension for a managed vhost file.
+// confSuffix is the file extension for a managed vhost file. Both Debian
+// (sites-available) and RHEL (conf.d) use a .conf extension; on RHEL conf.d only
+// *.conf files are auto-included, so the suffix is load-bearing there.
 const confSuffix = ".conf"
 
-// Layout resolves the Debian/Ubuntu nginx directory pair the backend writes to
-// (§9): sites-available holds the real files, sites-enabled holds symlinks nginx
-// includes. Both are derived from the config dir the agent detected. For the
-// canonical Debian layout ConfigDir is /etc/nginx/sites-available, so Enabled is
-// its sibling sites-enabled; when ConfigDir is the nginx root we append the
-// standard subdirectories.
+// Layout resolves the nginx directory layout the backend writes to (§9). nginx
+// has two on-disk conventions, mirroring Apache:
+//
+//   - Debian/Ubuntu: real files in /etc/nginx/sites-available, activated by a
+//     symlink in /etc/nginx/sites-enabled (what the distro's include glob picks
+//     up). Enabled is non-empty for this layout.
+//   - RHEL/Fedora: a flat /etc/nginx/conf.d where every *.conf is auto-included
+//     by the stock `include /etc/nginx/conf.d/*.conf;`; there is no
+//     enable/disable symlink step. Enabled is empty for this layout.
+//
+// The agent's nginx backend keys its symlink behavior off whether Enabled is
+// set: with a sites-enabled dir it symlinks (Debian), without one the file's
+// presence in conf.d is the activation (RHEL).
 type Layout struct {
 	// Available is the directory holding the real managed vhost files
-	// (sites-available).
+	// (sites-available on Debian, conf.d on RHEL).
 	Available string
-	// Enabled is the directory holding the activation symlinks (sites-enabled).
+	// Enabled is the directory holding the activation symlinks (sites-enabled on
+	// Debian). Empty for the RHEL conf.d layout, where presence == enabled.
 	Enabled string
 }
 
-// ResolveLayout derives the sites-available / sites-enabled pair from a detected
-// config dir. It is pure (string manipulation only) so the path logic is
-// unit-testable without a host. Three cases:
+// IsConfD reports whether this is the flat RHEL/Fedora conf.d layout (no separate
+// enable step). True when there is no sites-enabled directory.
+func (l Layout) IsConfD() bool { return l.Enabled == "" }
+
+// ResolveLayout derives the nginx directory layout from a detected config dir.
+// It is pure (string manipulation only) so the path logic is unit-testable
+// without a host. Cases:
 //
-//   - configDir ends in "sites-available" → Enabled is its sibling sites-enabled.
-//   - configDir ends in "sites-enabled" → Available is its sibling sites-available.
-//   - otherwise (e.g. /etc/nginx) → append sites-available / sites-enabled.
+//   - configDir ends in "sites-available" → Debian; Enabled is sibling
+//     sites-enabled.
+//   - configDir ends in "sites-enabled" → Debian; Available is sibling
+//     sites-available.
+//   - configDir ends in "conf.d" → RHEL/Fedora flat layout; Enabled empty.
+//   - otherwise (e.g. the /etc/nginx root) → default to the Debian
+//     sites-available / sites-enabled pair.
 func ResolveLayout(configDir string) Layout {
 	clean := filepath.Clean(configDir)
 	base := filepath.Base(clean)
@@ -45,6 +63,9 @@ func ResolveLayout(configDir string) Layout {
 		return Layout{Available: clean, Enabled: filepath.Join(parent, "sites-enabled")}
 	case "sites-enabled":
 		return Layout{Available: filepath.Join(parent, "sites-available"), Enabled: clean}
+	case "conf.d":
+		// RHEL/Fedora: managed files live in conf.d, no enable step.
+		return Layout{Available: clean, Enabled: ""}
 	default:
 		return Layout{
 			Available: filepath.Join(clean, "sites-available"),
@@ -68,8 +89,11 @@ func (l Layout) AvailablePath(host string) string {
 }
 
 // EnabledPath is the absolute path of the activation symlink for host in the
-// sites-enabled directory.
+// sites-enabled directory. Meaningless (empty Enabled) on the RHEL conf.d layout.
 func (l Layout) EnabledPath(host string) string {
+	if l.Enabled == "" {
+		return ""
+	}
 	return filepath.Join(l.Enabled, ManagedFileName(host))
 }
 

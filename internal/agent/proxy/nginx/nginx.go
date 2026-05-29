@@ -264,7 +264,12 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading nginx config %q: %w", path, err)
 		}
-		enabled := symlinkPresent(filepath.Join(b.layout.Enabled, name))
+		// Debian: activation is the sites-enabled symlink. RHEL conf.d: presence in
+		// the dir is the activation, so a read file is enabled by definition.
+		enabled := true
+		if !b.layout.IsConfD() {
+			enabled = symlinkPresent(filepath.Join(b.layout.Enabled, name))
+		}
 		arts = append(arts, proxy.Artifact{
 			Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: path},
 			Content: string(data),
@@ -293,8 +298,10 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 	if err := os.MkdirAll(b.layout.Available, 0o755); err != nil {
 		return fmt.Errorf("ensuring sites-available %q: %w", b.layout.Available, err)
 	}
-	if err := os.MkdirAll(b.layout.Enabled, 0o755); err != nil {
-		return fmt.Errorf("ensuring sites-enabled %q: %w", b.layout.Enabled, err)
+	if !b.layout.IsConfD() {
+		if err := os.MkdirAll(b.layout.Enabled, 0o755); err != nil {
+			return fmt.Errorf("ensuring sites-enabled %q: %w", b.layout.Enabled, err)
+		}
 	}
 
 	staged := make([]stagedFile, 0, len(arts))
@@ -332,7 +339,9 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 			rollback()
 			return fmt.Errorf("staging config %q: %w", dest, err)
 		}
-		if art.Enabled {
+		// Debian: ensure the sites-enabled symlink. RHEL conf.d: the file's presence
+		// in the dir is the activation, so there is no symlink step.
+		if art.Enabled && !b.layout.IsConfD() {
 			link := b.enabledLinkFor(dest)
 			s.enabledLink = link
 			s.linkPreexisted = symlinkPresent(link)
@@ -364,7 +373,8 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 	}
 	slog.InfoContext(ctx, "nginx: applied config",
 		slog.Int("artifacts", len(arts)),
-		slog.String("sites_available", b.layout.Available))
+		slog.String("sites_available", b.layout.Available),
+		slog.Bool("confd_layout", b.layout.IsConfD()))
 	return nil
 }
 
@@ -376,9 +386,13 @@ func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {
 	if target.Path == "" {
 		return errors.New("nginx remove: empty target path")
 	}
-	link := b.enabledLinkFor(target.Path)
-	if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("removing symlink %q: %w", link, err)
+	// Debian: drop the sites-enabled symlink first. RHEL conf.d: no symlink, the
+	// file's removal below is the deactivation.
+	if !b.layout.IsConfD() {
+		link := b.enabledLinkFor(target.Path)
+		if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("removing symlink %q: %w", link, err)
+		}
 	}
 	if err := os.Remove(target.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("removing config %q: %w", target.Path, err)
