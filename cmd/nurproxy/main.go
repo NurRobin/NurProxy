@@ -30,14 +30,24 @@ import (
 var version = "dev"
 
 func main() {
+	// Subcommands are dispatched before flag parsing so they can own their flags.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "install":
+			cmdInstall(os.Args[2:])
+			return
+		case "uninstall":
+			cmdUninstall(os.Args[2:])
+			return
+		case "version":
+			fmt.Printf("nurproxy %s\n", version)
+			return
+		}
+	}
+
 	port := flag.Int("port", 8080, "HTTP port")
 	dataDir := flag.String("data-dir", "./data", "Data directory")
 	flag.Parse()
-
-	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Printf("nurproxy %s\n", version)
-		return
-	}
 
 	// Check env vars
 	if envPort := os.Getenv("NP_PORT"); envPort != "" {
