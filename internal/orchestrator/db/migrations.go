@@ -225,6 +225,21 @@ var migrations = []string{
 	DROP TABLE providers;
 	ALTER TABLE providers_new RENAME TO providers;
 	`,
+
+	// Migration 004: agent self-reported health (caddy state + last error), an
+	// orchestrator-side DNS/config error channel, and a heartbeat-staleness
+	// timeout that drives offline detection.
+	//
+	// last_error and dns_error are kept separate so the two writers never clobber
+	// each other: the agent owns last_error (via heartbeat), the orchestrator
+	// owns dns_error (via the reconciler).
+	`
+	ALTER TABLE agents ADD COLUMN caddy_running INTEGER NOT NULL DEFAULT 1;
+	ALTER TABLE agents ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN dns_error TEXT NOT NULL DEFAULT '';
+
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('agent_offline_timeout', '90');
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

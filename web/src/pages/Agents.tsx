@@ -31,11 +31,27 @@ export default function Agents() {
 
   const [adoptAgent, setAdoptAgent] = useState<Agent | null>(null);
   const [adoptName, setAdoptName] = useState('');
+  const [adoptFqdn, setAdoptFqdn] = useState('');
   const [adoptZoneIds, setAdoptZoneIds] = useState<Set<string>>(new Set());
   const [adoptDnsMode, setAdoptDnsMode] = useState<'static' | 'ddns'>('static');
   const [adoptDdnsInterval, setAdoptDdnsInterval] = useState(60);
   const [adoptLoading, setAdoptLoading] = useState(false);
   const [adoptError, setAdoptError] = useState('');
+
+  const [editAgent, setEditAgent] = useState<Agent | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editFqdn, setEditFqdn] = useState('');
+  const [editZoneIds, setEditZoneIds] = useState<Set<string>>(new Set());
+  const [editDnsMode, setEditDnsMode] = useState<'static' | 'ddns'>('static');
+  const [editDdnsInterval, setEditDdnsInterval] = useState(60);
+  const [editLoading, setEditLoading] = useState(false);
+  const [editError, setEditError] = useState('');
+
+  // Client-side check: does the hostname fall inside any of the selected zones?
+  const fqdnInZones = useCallback((fqdn: string, ids: Set<string>) => {
+    const names = zones.filter((z) => ids.has(z.id)).map((z) => z.name);
+    return names.some((n) => fqdn === n || fqdn.endsWith('.' + n));
+  }, [zones]);
 
   const [deleteAgent, setDeleteAgent] = useState<Agent | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -68,7 +84,7 @@ export default function Agents() {
   }
 
   function startAdopt(agent: Agent) {
-    setAdoptAgent(agent); setAdoptName(agent.fqdn); setAdoptZoneIds(new Set());
+    setAdoptAgent(agent); setAdoptName(agent.fqdn); setAdoptFqdn(agent.fqdn); setAdoptZoneIds(new Set());
     setAdoptDnsMode('static'); setAdoptDdnsInterval(60); setAdoptError('');
   }
 
@@ -78,6 +94,7 @@ export default function Agents() {
     try {
       await api.adoptAgent(adoptAgent.id, {
         name: adoptName || undefined,
+        fqdn: adoptFqdn || undefined,
         zone_ids: adoptZoneIds.size > 0 ? [...adoptZoneIds] : undefined,
         dns_mode: adoptDnsMode,
         ddns_interval: adoptDnsMode === 'ddns' ? adoptDdnsInterval : undefined,
@@ -89,6 +106,33 @@ export default function Agents() {
       setAdoptError(errMessage(err, t('setup.adoptFailed')));
     } finally {
       setAdoptLoading(false);
+    }
+  }
+
+  function startEdit(agent: Agent) {
+    setEditAgent(agent); setEditName(agent.name); setEditFqdn(agent.fqdn);
+    setEditZoneIds(new Set((agent.zones ?? []).map((z) => z.id)));
+    setEditDnsMode(agent.dns_mode || 'static'); setEditDdnsInterval(agent.ddns_interval || 60); setEditError('');
+  }
+
+  async function handleEdit() {
+    if (!editAgent) return;
+    setEditLoading(true); setEditError('');
+    try {
+      await api.updateAgent(editAgent.id, {
+        name: editName || undefined,
+        fqdn: editFqdn || undefined,
+        zone_ids: [...editZoneIds],
+        dns_mode: editDnsMode,
+        ddns_interval: editDdnsInterval,
+      });
+      toast.success(t('agents.updated', { name: editName || editAgent.name }));
+      setEditAgent(null);
+      fetchData();
+    } catch (err) {
+      setEditError(errMessage(err, t('agents.updateFailed')));
+    } finally {
+      setEditLoading(false);
     }
   }
 
@@ -188,9 +232,21 @@ export default function Agents() {
                       <Button variant="secondary" size="sm" onClick={() => handleReject(selected.id)}>{t('agents.reject')}</Button>
                     </div>
                   ) : (
-                    <Button variant="danger-ghost" size="sm" onClick={() => setDeleteAgent(selected)}>{t('agents.deleteAgent')}</Button>
+                    <div className="flex gap-2">
+                      <Button variant="secondary" size="sm" onClick={() => startEdit(selected)}>{t('agents.edit')}</Button>
+                      <Button variant="danger-ghost" size="sm" onClick={() => setDeleteAgent(selected)}>{t('agents.deleteAgent')}</Button>
+                    </div>
                   )}
                 </div>
+
+                {/* Surface anything wrong the agent (or the orchestrator's DNS
+                    management) is reporting, so problems are visible and fixable. */}
+                {selected.status !== 'pending' && selected.last_error && (
+                  <Callout tone="danger" title={t('agents.agentError')}>{selected.last_error}</Callout>
+                )}
+                {selected.status !== 'pending' && selected.dns_error && (
+                  <Callout tone="warning" title={t('agents.dnsProblem')}>{selected.dns_error}</Callout>
+                )}
 
                 {selected.status === 'pending' ? (
                   <Callout tone="warning" title={t('agents.awaitingApproval')}>
@@ -206,6 +262,14 @@ export default function Agents() {
                         {selected.zones && selected.zones.length > 0 && <Row label={t('agents.zones')} value={selected.zones.map((z) => z.name).join(', ')} />}
                         {selected.public_ip && <Row label={t('agents.ip')} value={selected.public_ip} />}
                         {selected.version && <Row label={t('agents.version')} value={selected.version} />}
+                        <Row
+                          label={t('agents.caddyStatus')}
+                          value={
+                            <span className={selected.caddy_running === false ? 'text-danger-fg' : 'text-success-fg'}>
+                              {selected.caddy_running === false ? t('agents.notRunning') : t('agents.running')}
+                            </span>
+                          }
+                        />
                         <Row label={t('agents.lastSeen')} value={seen(selected.last_seen)} />
                         <Row label={t('agents.id')} value={<span className="font-mono text-xs">{selected.id}</span>} />
                       </dl>
@@ -273,6 +337,12 @@ export default function Agents() {
                 emptyHint={t('setup.noZonesYet')}
               />
             </Field>
+            <Field label={t('agents.anchorFqdn')} hint={t('agents.anchorFqdnHelp')}>
+              <Input value={adoptFqdn} onChange={(e) => setAdoptFqdn(e.target.value)} placeholder="edge1.example.com" />
+            </Field>
+            {adoptFqdn && adoptZoneIds.size > 0 && !fqdnInZones(adoptFqdn, adoptZoneIds) && (
+              <Callout tone="warning">{t('agents.anchorFqdnWarn')}</Callout>
+            )}
             <Field label={t('setup.dnsMode')} help="dns-mode">
               <div className="flex gap-4">
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
@@ -292,6 +362,53 @@ export default function Agents() {
             <div className="flex justify-end gap-3 pt-1">
               <Button variant="secondary" onClick={() => setAdoptAgent(null)}>{t('common.cancel')}</Button>
               <Button onClick={handleAdopt} loading={adoptLoading}>{t('setup.approveAgent')}</Button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Edit modal — per-agent settings, incl. correcting the anchor FQDN. */}
+      <Modal open={editAgent !== null} onClose={() => setEditAgent(null)} title={t('agents.editAgent')} description={editAgent?.fqdn}>
+        {editAgent && (
+          <div className="space-y-4">
+            {editError && <Callout tone="danger">{editError}</Callout>}
+            <Field label={t('setup.displayName')}>
+              <Input value={editName} onChange={(e) => setEditName(e.target.value)} placeholder={t('setup.displayNamePh')} />
+            </Field>
+            <Field label={t('setup.dnsZones')} help="zone">
+              <MultiSelect
+                items={zones.map((z) => ({ id: z.id, label: z.name }))}
+                selected={editZoneIds}
+                onChange={setEditZoneIds}
+                maxHeightClass="max-h-40"
+                emptyHint={t('setup.noZonesYet')}
+              />
+            </Field>
+            <Field label={t('agents.anchorFqdn')} hint={t('agents.anchorFqdnHelp')}>
+              <Input value={editFqdn} onChange={(e) => setEditFqdn(e.target.value)} placeholder="edge1.example.com" />
+            </Field>
+            {editFqdn && editZoneIds.size > 0 && !fqdnInZones(editFqdn, editZoneIds) && (
+              <Callout tone="warning">{t('agents.anchorFqdnWarn')}</Callout>
+            )}
+            <Field label={t('setup.dnsMode')} help="dns-mode">
+              <div className="flex gap-4">
+                <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
+                  <input type="radio" name="edit-dns-mode" checked={editDnsMode === 'static'} onChange={() => setEditDnsMode('static')} className="accent-[var(--accent)]" /> {t('setup.static')}
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
+                  <input type="radio" name="edit-dns-mode" checked={editDnsMode === 'ddns'} onChange={() => setEditDnsMode('ddns')} className="accent-[var(--accent)]" /> {t('setup.ddns')}
+                </label>
+              </div>
+            </Field>
+            {editDnsMode === 'ddns' && (
+              <Field label={t('agents.ddnsIntervalLabel', { seconds: editDdnsInterval })}>
+                <input type="range" min={30} max={600} step={10} value={editDdnsInterval} onChange={(e) => setEditDdnsInterval(Number(e.target.value))} className="w-full accent-[var(--accent)]" />
+                <div className="flex justify-between text-xs text-fg-faint"><span>30s</span><span>600s</span></div>
+              </Field>
+            )}
+            <div className="flex justify-end gap-3 pt-1">
+              <Button variant="secondary" onClick={() => setEditAgent(null)}>{t('common.cancel')}</Button>
+              <Button onClick={handleEdit} loading={editLoading}>{t('agents.save')}</Button>
             </div>
           </div>
         )}

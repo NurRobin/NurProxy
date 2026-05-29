@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -81,6 +82,9 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		PublicIP:  req.PublicIP,
 		Status:    models.AgentStatusPending,
 		Version:   req.Version,
+		// Assume healthy until the agent reports otherwise via heartbeat, so a
+		// freshly registered agent doesn't surface a spurious "Caddy down" error.
+		CaddyRunning: true,
 	}
 
 	if err := s.db.CreateAgent(agent); err != nil {
@@ -117,6 +121,7 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Name         string         `json:"name"`
+		FQDN         string         `json:"fqdn"`
 		ZoneIDs      []string       `json:"zone_ids"`
 		DNSMode      models.DNSMode `json:"dns_mode"`
 		DDNSInterval int            `json:"ddns_interval"`
@@ -128,6 +133,10 @@ func (s *Server) handleAdoptAgent(w http.ResponseWriter, r *http.Request) {
 
 	if req.Name != "" {
 		agent.Name = req.Name
+	}
+	if err := s.applyFQDNChange(agent, req.FQDN); err != nil {
+		writeError(w, err.code, err.msg)
+		return
 	}
 	if req.DNSMode != "" {
 		agent.DNSMode = req.DNSMode
@@ -191,6 +200,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Name         *string         `json:"name"`
+		FQDN         *string         `json:"fqdn"`
 		ZoneIDs      *[]string       `json:"zone_ids"`
 		DNSMode      *models.DNSMode `json:"dns_mode"`
 		DDNSInterval *int            `json:"ddns_interval"`
@@ -202,6 +212,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 
 	if req.Name != nil {
 		agent.Name = *req.Name
+	}
+	if req.FQDN != nil {
+		if err := s.applyFQDNChange(agent, *req.FQDN); err != nil {
+			writeError(w, err.code, err.msg)
+			return
+		}
 	}
 	if req.DNSMode != nil {
 		agent.DNSMode = *req.DNSMode
@@ -252,12 +268,72 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":        agent.ID,
-		"status":    agent.Status,
-		"last_seen": agent.LastSeen,
-		"public_ip": agent.PublicIP,
-		"version":   agent.Version,
+		"id":            agent.ID,
+		"status":        agent.Status,
+		"last_seen":     agent.LastSeen,
+		"public_ip":     agent.PublicIP,
+		"version":       agent.Version,
+		"caddy_running": agent.CaddyRunning,
+		"last_error":    agent.LastError,
 	})
+}
+
+// fqdnError carries an HTTP status + message out of applyFQDNChange.
+type fqdnError struct {
+	code int
+	msg  string
+}
+
+func (e *fqdnError) Error() string { return e.msg }
+
+// applyFQDNChange validates and applies an FQDN (anchor hostname) override onto
+// the agent in place. A blank fqdn or one equal to the current value is a no-op.
+// When the anchor actually moves, it clears the stored A-record id (so the
+// reconciler recreates the record at the new name) and any stale last_error.
+func (s *Server) applyFQDNChange(agent *models.Agent, fqdn string) *fqdnError {
+	fqdn = strings.TrimSpace(strings.ToLower(fqdn))
+	if fqdn == "" || fqdn == agent.FQDN {
+		return nil
+	}
+	if !validFQDN(fqdn) {
+		return &fqdnError{http.StatusBadRequest, "invalid FQDN: must be a hostname like edge1.example.com"}
+	}
+	if existing, err := s.db.GetAgentByFQDN(fqdn); err == nil && existing != nil && existing.ID != agent.ID {
+		return &fqdnError{http.StatusConflict, "another agent already uses this FQDN"}
+	}
+	agent.FQDN = fqdn
+	agent.DNSRecordID = "" // anchor moved — recreate the A record at the new name
+	agent.DNSError = ""    // clear any stale "FQDN outside zone" error
+	return nil
+}
+
+// validFQDN reports whether s is a syntactically valid multi-label DNS hostname
+// (e.g. edge1.example.com). It is deliberately permissive but rejects schemes,
+// ports, whitespace, single-label names, and malformed labels.
+func validFQDN(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	labels := strings.Split(s, ".")
+	if len(labels) < 2 {
+		return false // require at least one dot, so it lives inside a zone
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			isLetter := c >= 'a' && c <= 'z'
+			isDigit := c >= '0' && c <= '9'
+			if !isLetter && !isDigit && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // POST /api/v1/agents/{id}/heartbeat — called BY the agent.
@@ -274,33 +350,66 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PublicIP string `json:"public_ip"`
 		Version  string `json:"version"`
+		// CaddyRunning and LastError are the agent's self-report. CaddyRunning is
+		// a pointer so an older agent that omits it doesn't get read as "down".
+		CaddyRunning *bool  `json:"caddy_running"`
+		LastError    string `json:"last_error"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if err := s.db.UpdateAgentHeartbeat(id, req.PublicIP); err != nil {
+	// Snapshot the prior state so we can detect and audit transitions.
+	prev, err := s.db.GetAgent(id)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
 	}
 
-	// Update version if provided
-	if req.Version != "" {
-		agent, err := s.db.GetAgent(id)
-		if err == nil && agent.Version != req.Version {
-			agent.Version = req.Version
-			if uerr := s.db.UpdateAgent(agent); uerr != nil {
-				log.Printf("failed to update agent version: %v", uerr)
-			}
+	caddyRunning := prev.CaddyRunning
+	if req.CaddyRunning != nil {
+		caddyRunning = *req.CaddyRunning
+	}
+
+	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning); err != nil {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+
+	// A heartbeat is proof of life: an agent the orchestrator had marked offline
+	// is back. Adoption state itself is owned by the operator, so we only flip
+	// the offline<->adopted axis here, never pending->adopted.
+	if prev.Status == models.AgentStatusOffline {
+		if uerr := s.db.UpdateAgentStatus(id, models.AgentStatusAdopted); uerr != nil {
+			log.Printf("failed to mark agent %s back online: %v", id, uerr)
+		} else {
+			s.audit(r, "agent", id, "status_change", "agent came back online (heartbeat)")
 		}
 	}
 
-	// Return current agent status
+	// Audit health-state changes so operators can see, e.g., Caddy going down.
+	if req.CaddyRunning != nil && prev.CaddyRunning != caddyRunning {
+		s.audit(r, "agent", id, "caddy_state", fmt.Sprintf("caddy_running=%t", caddyRunning))
+	}
+	if prev.LastError != req.LastError && req.LastError != "" {
+		s.audit(r, "agent", id, "agent_error", req.LastError)
+	}
+
+	// Re-read the fresh row (UpdateAgentHealth + the offline->adopted flip both
+	// wrote to it) before any further mutation, so we don't clobber them.
 	agent, err := s.db.GetAgent(id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to get agent status")
 		return
+	}
+
+	// Update version if it changed.
+	if req.Version != "" && agent.Version != req.Version {
+		agent.Version = req.Version
+		if uerr := s.db.UpdateAgent(agent); uerr != nil {
+			log.Printf("failed to update agent version: %v", uerr)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{

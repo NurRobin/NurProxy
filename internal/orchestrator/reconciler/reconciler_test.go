@@ -121,6 +121,52 @@ func (m *mockAgentClient) getPushCalls() int {
 }
 
 // ---------------------------------------------------------------------------
+// Mock Route Hub
+// ---------------------------------------------------------------------------
+
+type mockHub struct {
+	mu        sync.Mutex
+	connected map[string]bool
+	published map[string][][]json.RawMessage
+}
+
+func newMockHub() *mockHub {
+	return &mockHub{
+		connected: make(map[string]bool),
+		published: make(map[string][][]json.RawMessage),
+	}
+}
+
+func (m *mockHub) Connected(agentID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.connected[agentID]
+}
+
+func (m *mockHub) PublishRoutes(agentID string, routes []json.RawMessage) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.published[agentID] = append(m.published[agentID], routes)
+	return m.connected[agentID]
+}
+
+func (m *mockHub) setConnected(agentID string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.connected[agentID] = ok
+}
+
+func (m *mockHub) lastPublished(agentID string) []json.RawMessage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	batches := m.published[agentID]
+	if len(batches) == 0 {
+		return nil
+	}
+	return batches[len(batches)-1]
+}
+
+// ---------------------------------------------------------------------------
 // Mock DNS Provider
 // ---------------------------------------------------------------------------
 
@@ -244,6 +290,9 @@ func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, zone *models.
 		t.Fatalf("CreateZone: %v", err)
 	}
 
+	// A freshly-heartbeating, live agent: last_seen is recent so staleness-based
+	// liveness keeps it adopted.
+	seen := time.Now().UTC()
 	agent = &models.Agent{
 		ID:        "agent-1",
 		Name:      "Agent One",
@@ -252,6 +301,7 @@ func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, zone *models.
 		TokenHash: "token-hash-1",
 		DNSMode:   models.DNSModeStatic,
 		Status:    models.AgentStatusAdopted,
+		LastSeen:  &seen,
 	}
 	if err := d.CreateAgent(agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
@@ -347,6 +397,63 @@ func TestReconcileRoutes_PushMissing(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected audit entry with action route_pushed")
+	}
+}
+
+func TestReconcileRoutes_HubPushSkipsInbound(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, _ := setupScenario(t, d)
+
+	mc := newMockAgentClient()
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+
+	r := New(d, mc, time.Minute)
+	r.SetHub(hub)
+
+	if err := r.reconcileRoutes(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileRoutes: %v", err)
+	}
+
+	// Routes should be delivered over the stream, NOT via the inbound client.
+	pushed := hub.lastPublished(agent.ID)
+	if len(pushed) != 1 {
+		t.Fatalf("expected 1 route published to hub, got %d", len(pushed))
+	}
+	if host := extractHostFromRoute(pushed[0]); host != "app.example.com" {
+		t.Errorf("published route host = %q, want app.example.com", host)
+	}
+	if mc.getPushCalls() != 0 {
+		t.Errorf("inbound push should not be used for a connected agent, got %d calls", mc.getPushCalls())
+	}
+}
+
+func TestPushAgentRoutes(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, _ := setupScenario(t, d)
+
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.SetHub(hub)
+
+	if err := r.PushAgentRoutes(agent.ID); err != nil {
+		t.Fatalf("PushAgentRoutes: %v", err)
+	}
+	pushed := hub.lastPublished(agent.ID)
+	if len(pushed) != 1 {
+		t.Fatalf("expected 1 route pushed, got %d", len(pushed))
+	}
+
+	// Disconnected agent: no-op, no error.
+	hub.setConnected(agent.ID, false)
+	hub.published[agent.ID] = nil
+	if err := r.PushAgentRoutes(agent.ID); err != nil {
+		t.Fatalf("PushAgentRoutes (disconnected): %v", err)
+	}
+	if hub.lastPublished(agent.ID) != nil {
+		t.Error("expected no publish to a disconnected agent")
 	}
 }
 
@@ -750,10 +857,14 @@ func TestReconcileAgents_MarkOffline(t *testing.T) {
 	d := testDB(t)
 	_, _, agent, _, _ := setupScenario(t, d)
 
-	mc := newMockAgentClient()
-	// Agent is NOT healthy.
-	mc.setHealthy(agent.APIURL, false)
+	// Agent's last heartbeat is long ago — well past the offline timeout.
+	stale := time.Now().UTC().Add(-10 * time.Minute)
+	agent.LastSeen = &stale
+	if err := d.UpdateAgent(agent); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
 
+	mc := newMockAgentClient()
 	r := New(d, mc, time.Minute)
 
 	if err := r.reconcileAgents(context.Background()); err != nil {
@@ -787,14 +898,13 @@ func TestReconcileAgents_ComeBackOnline(t *testing.T) {
 	d := testDB(t)
 	_, _, agent, _, _ := setupScenario(t, d)
 
-	// Mark agent as offline first.
+	// Mark agent as offline, but its last heartbeat is fresh (setupScenario set
+	// it just now) — so a reconcile cycle should bring it back online.
 	if err := d.UpdateAgentStatus(agent.ID, models.AgentStatusOffline); err != nil {
 		t.Fatalf("UpdateAgentStatus: %v", err)
 	}
 
 	mc := newMockAgentClient()
-	mc.setHealthy(agent.APIURL, true)
-
 	r := New(d, mc, time.Minute)
 
 	if err := r.reconcileAgents(context.Background()); err != nil {

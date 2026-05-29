@@ -26,6 +26,9 @@ export interface Agent {
   status: 'pending' | 'adopted' | 'offline' | 'error';
   last_seen?: string;
   version?: string;
+  caddy_running?: boolean;
+  last_error?: string;
+  dns_error?: string;
   created_at: string;
   updated_at: string;
   servers?: Server[];

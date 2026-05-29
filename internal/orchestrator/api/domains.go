@@ -102,6 +102,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "create", dom.Subdomain)
+	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusCreated, dom)
 }
@@ -194,6 +195,7 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "update", dom.Subdomain)
+	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, dom)
 }
@@ -206,6 +208,10 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the owning server before we flip status, so we can push the new
+	// (route-removed) set to the agent immediately.
+	dom, _ := s.db.GetDomain(id)
+
 	// Set status to "deleting" — reconciler handles actual cleanup
 	if err := s.db.UpdateDomainStatus(id, models.DomainStatusDeleting, ""); err != nil {
 		writeError(w, http.StatusNotFound, "domain not found")
@@ -213,6 +219,11 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "delete", "")
+	// A full-sync push now excludes the deleting domain, so a connected agent
+	// drops the route at once; DNS record + row cleanup follow in the reconciler.
+	if dom != nil {
+		s.triggerAgentPush(dom.ServerID)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "domain marked for deletion"})
 }
@@ -307,6 +318,7 @@ func (s *Server) handleUpdateDomainConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "update_config", "manual config set")
+	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "manual config set"})
 }
@@ -335,6 +347,7 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "reset_config", "manual config cleared")
+	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "config reset to auto-generated"})
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os/exec"
 	"sync"
@@ -43,7 +44,11 @@ func (p *Process) Start(ctx context.Context) error {
 		return nil
 	}
 
-	// Build minimal initial config with the admin listener.
+	// Build a minimal initial config with just the admin listener. Keeping the
+	// HTTP server out of the bootstrap means Caddy reliably starts (binding only
+	// localhost admin), so its admin API stays up even when ports 80/443 are
+	// taken — letting the agent introspect and report accurately. EnsureServer
+	// creates the HTTP server afterwards.
 	initialConfig := map[string]interface{}{
 		"admin": map[string]interface{}{
 			"listen": fmt.Sprintf("localhost:%d", p.adminPort),
@@ -74,7 +79,27 @@ func (p *Process) Start(ctx context.Context) error {
 		p.mu.Unlock()
 	}()
 
+	// Wait for the admin API to accept connections before returning, so the very
+	// first EnsureServer/route push doesn't race the listener and fail with
+	// "connection refused".
+	waitAdminReady(p.adminPort, 5*time.Second)
+
 	return nil
+}
+
+// waitAdminReady blocks until Caddy's admin port accepts a TCP connection or the
+// timeout elapses. It's best-effort: callers proceed regardless.
+func waitAdminReady(adminPort int, timeout time.Duration) {
+	addr := fmt.Sprintf("localhost:%d", adminPort)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // Stop stops the Caddy process.
@@ -165,26 +190,65 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
-	// Check if server exists.
-	_, err := c.doRequest(ctx, http.MethodGet, "/config/apps/http/servers/srv0", nil)
-	if err == nil {
+	// Already present? Nothing to do.
+	if _, err := c.doRequest(ctx, http.MethodGet, "/config/apps/http/servers/srv0", nil); err == nil {
 		return nil
 	}
 
-	// Create initial http app structure.
-	serverCfg := map[string]interface{}{
+	// The fresh srv0 (no routes yet — routes are added afterwards). We only get
+	// here when srv0 is absent, so there are no existing routes to preserve.
+	server := map[string]interface{}{
 		"listen": []string{":443", ":80"},
-	}
-	data, err := json.Marshal(serverCfg)
-	if err != nil {
-		return fmt.Errorf("marshaling server config: %w", err)
+		"routes": []json.RawMessage{},
 	}
 
-	_, err = c.doRequest(ctx, http.MethodPost, "/config/apps/http/servers/srv0", data)
-	if err != nil {
-		return fmt.Errorf("creating server: %w", err)
+	// The Caddy admin API does not create intermediate config paths, so we build
+	// from the deepest existing ancestor downward to avoid "invalid traversal
+	// path" errors, while never clobbering sibling config (other apps/servers).
+	if body, err := c.doRequest(ctx, http.MethodGet, "/config/apps/http", nil); err == nil {
+		// http app exists — merge srv0 into its servers and PUT the app back so a
+		// missing "servers" object is created without disturbing other servers.
+		var httpApp struct {
+			Servers map[string]json.RawMessage `json:"servers"`
+		}
+		_ = json.Unmarshal(body, &httpApp)
+		if httpApp.Servers == nil {
+			httpApp.Servers = map[string]json.RawMessage{}
+		}
+		srvData, _ := json.Marshal(server)
+		httpApp.Servers["srv0"] = srvData
+		appData, err := json.Marshal(map[string]interface{}{"servers": httpApp.Servers})
+		if err != nil {
+			return fmt.Errorf("marshaling http app: %w", err)
+		}
+		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http", appData); err != nil {
+			return fmt.Errorf("creating server: %w", err)
+		}
+		return nil
 	}
 
+	httpApp := map[string]interface{}{"servers": map[string]interface{}{"srv0": server}}
+
+	if _, err := c.doRequest(ctx, http.MethodGet, "/config/apps", nil); err == nil {
+		// apps exists but http doesn't — create just the http app.
+		data, err := json.Marshal(httpApp)
+		if err != nil {
+			return fmt.Errorf("marshaling http app: %w", err)
+		}
+		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http", data); err != nil {
+			return fmt.Errorf("creating http app: %w", err)
+		}
+		return nil
+	}
+
+	// No apps object at all — create it with the http app inside.
+	data, err := json.Marshal(map[string]interface{}{"http": httpApp})
+	if err != nil {
+		return fmt.Errorf("marshaling apps: %w", err)
+	}
+	if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps", data); err != nil {
+		return fmt.Errorf("creating apps: %w", err)
+	}
 	return nil
 }
 

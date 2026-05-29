@@ -15,9 +15,16 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
 	agentconfig "github.com/NurRobin/NurProxy/internal/agent/config"
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
+	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/stream"
 )
 
 var version = "dev"
+
+// heartbeatInterval is how often the agent dials home. It is kept comfortably
+// below the orchestrator's agent_offline_timeout (default 90s) so a single
+// missed beat never flaps the agent offline.
+const heartbeatInterval = 30 * time.Second
 
 var (
 	orchestratorURL = flag.String("orchestrator", "", "Orchestrator URL (required)")
@@ -81,35 +88,64 @@ func main() {
 		log.Fatalf("Adoption failed: %v", err)
 	}
 
-	// Step 2: Start Caddy subprocess.
+	// Shared health state: the agent reports problems to the dashboard instead of
+	// dying on them. A failure to run the local proxy (e.g. ports 80/443 already
+	// taken by nginx) must NOT stop the agent from connecting and explaining why.
+	hs := health.New()
+
+	// Step 2: Start Caddy subprocess. Failures here are reported, not fatal.
 	caddyProc := caddy.NewProcess(cfg.CaddyAdminPort)
 	if err := caddyProc.Start(ctx); err != nil {
-		log.Fatalf("Failed to start Caddy: %v", err)
+		log.Printf("WARNING: failed to start Caddy: %v (continuing — agent stays connected)", err)
+		hs.SetCaddyRunning(false)
+		hs.SetError(fmt.Sprintf("failed to start Caddy: %v", err))
 	}
 
-	// Create Caddy client (mock if no real Caddy).
+	// Create Caddy client. Fall back to the in-memory mock whenever there is no
+	// live Caddy process to talk to (binary missing, or Start failed above).
 	var caddyClient *caddy.Client
-	if caddyProc.IsMock() {
+	if caddyProc.IsMock() || !caddyProc.Running() {
 		caddyClient = caddy.NewMockClient()
+		if caddyProc.IsMock() {
+			hs.SetCaddyRunning(false)
+			hs.SetError("Caddy binary not found — no local reverse proxy (install caddy on this host)")
+		}
 	} else {
 		caddyClient = caddy.NewClient(cfg.CaddyAdminPort)
 	}
 
-	// Ensure the HTTP server exists in Caddy.
+	// Ensure the HTTP server exists in Caddy. A bind failure here is the classic
+	// "ports 80/443 already in use" case — report it clearly and keep running.
 	if err := caddyClient.EnsureServer(ctx); err != nil {
-		log.Printf("Warning: failed to ensure Caddy server: %v", err)
+		log.Printf("WARNING: Caddy could not start its HTTP server: %v", err)
+		hs.SetCaddyRunning(false)
+		hs.SetError(fmt.Sprintf("Caddy could not bind :80/:443 — are the ports already in use (nginx/apache)? %v", err))
+	} else if !caddyProc.IsMock() && caddyProc.Running() {
+		// Real Caddy is serving — healthy.
+		hs.SetCaddyRunning(true)
+		hs.SetError("")
 	}
 
-	// Step 3: Start Agent API server.
+	// Step 3: Start Agent API server (non-fatal: a bind failure is reported via
+	// health and the agent keeps heartbeating).
 	api.SetVersion(version)
 	apiServer := api.New(cfg.APIPort, caddyClient, mgr.Token())
+	apiServer.SetHealth(hs)
 	if err := apiServer.Start(ctx); err != nil {
-		log.Fatalf("Failed to start API server: %v", err)
+		log.Printf("WARNING: failed to start agent API server: %v", err)
+		hs.SetError(fmt.Sprintf("failed to start agent API server: %v", err))
 	}
 
-	// Step 4: Start heartbeat loop.
-	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, 60*time.Second)
+	// Step 4: Start heartbeat loop. It carries the health snapshot so the
+	// dashboard always sees the agent and any problems it's reporting.
+	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	hb.Start(ctx)
+
+	// Step 5: Open the push stream. The agent dials out and holds it open; the
+	// orchestrator pushes the desired route set down it the instant it changes —
+	// no inbound reachability required. Runs until shutdown, reconnecting as needed.
+	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyClient, hs)
+	go streamClient.Run(ctx)
 
 	log.Printf("Agent is running. Press Ctrl+C to stop.")
 

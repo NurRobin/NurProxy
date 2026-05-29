@@ -22,11 +22,13 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 
 	_, err := d.sql.Exec(`
 		INSERT INTO agents (id, name, fqdn, api_url, token_hash, dns_mode,
-			ddns_interval, public_ip, dns_record_id, status, last_seen, version, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ddns_interval, public_ip, dns_record_id, status, last_seen, version,
+			caddy_running, last_error, dns_error, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version,
+		boolToInt(a.CaddyRunning), a.LastError, a.DNSError,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 	)
 	if err != nil {
@@ -42,15 +44,18 @@ func scanAgent(sc interface {
 	var a models.Agent
 	var lastSeen sql.NullString
 	var createdAt, updatedAt string
+	var caddyRunning int
 
 	err := sc.Scan(
 		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
 		&a.DNSMode, &a.DDNSInterval, &a.PublicIP, &a.DNSRecordID,
-		&a.Status, &lastSeen, &a.Version, &createdAt, &updatedAt,
+		&a.Status, &lastSeen, &a.Version, &caddyRunning, &a.LastError,
+		&a.DNSError, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
+	a.CaddyRunning = caddyRunning != 0
 
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -64,7 +69,15 @@ func scanAgent(sc interface {
 
 const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
 	ddns_interval, public_ip, dns_record_id, status, last_seen, version,
-	created_at, updated_at`
+	caddy_running, last_error, dns_error, created_at, updated_at`
+
+// boolToInt maps a bool to SQLite's integer boolean representation.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 // GetAgent retrieves an agent by ID.
 func (d *DB) GetAgent(id string) (*models.Agent, error) {
@@ -130,11 +143,13 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		UPDATE agents
 		SET name = ?, fqdn = ?, api_url = ?, token_hash = ?,
 			dns_mode = ?, ddns_interval = ?, public_ip = ?, dns_record_id = ?,
-			status = ?, last_seen = ?, version = ?, updated_at = ?
+			status = ?, last_seen = ?, version = ?, caddy_running = ?,
+			last_error = ?, dns_error = ?, updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
-		string(a.Status), lastSeen, a.Version, a.UpdatedAt.Format(time.RFC3339),
+		string(a.Status), lastSeen, a.Version, boolToInt(a.CaddyRunning),
+		a.LastError, a.DNSError, a.UpdatedAt.Format(time.RFC3339),
 		a.ID,
 	)
 	if err != nil {
@@ -200,15 +215,65 @@ func (d *DB) UpdateAgentDNSRecord(id string, recordID string) error {
 	return nil
 }
 
-// UpdateAgentHeartbeat updates the last_seen timestamp and public IP.
+// UpdateAgentHeartbeat updates the last_seen timestamp and public IP. A blank
+// IP leaves the stored value untouched (so a transient detection failure on the
+// agent doesn't erase a known-good address).
 func (d *DB) UpdateAgentHeartbeat(id string, ip string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
-		UPDATE agents SET last_seen = ?, public_ip = ?, updated_at = ? WHERE id = ?`,
-		now, ip, now, id,
+		UPDATE agents
+		SET last_seen = ?, public_ip = CASE WHEN ? != '' THEN ? ELSE public_ip END,
+			updated_at = ?
+		WHERE id = ?`,
+		now, ip, ip, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent heartbeat: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+// UpdateAgentHealth records a full heartbeat from the agent: it refreshes
+// last_seen, the public IP, and the agent's self-reported Caddy state and last
+// error. It is a narrow update so it doesn't clobber fields (name, fqdn, zones,
+// dns_record_id) owned by the orchestrator. A blank IP is ignored.
+func (d *DB) UpdateAgentHealth(id, ip, lastError string, caddyRunning bool) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents
+		SET last_seen = ?, public_ip = CASE WHEN ? != '' THEN ? ELSE public_ip END,
+			caddy_running = ?, last_error = ?, updated_at = ?
+		WHERE id = ?`,
+		now, ip, ip, boolToInt(caddyRunning), lastError, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent health: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+// SetAgentDNSError records an orchestrator-side DNS/config error about an agent
+// (e.g. its FQDN is outside every assigned zone). Passing an empty string
+// clears it. It touches only dns_error (not last_seen or last_error), so it
+// won't affect liveness or stomp the agent's own self-report.
+func (d *DB) SetAgentDNSError(id, dnsError string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET dns_error = ?, updated_at = ? WHERE id = ?`,
+		dnsError, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent dns error: %w", err)
 	}
 
 	n, _ := res.RowsAffected()

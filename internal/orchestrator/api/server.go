@@ -4,10 +4,18 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// RoutePusher computes an agent's desired routes and delivers them over its live
+// stream. The reconciler implements it; API handlers call it to push config the
+// instant a domain changes.
+type RoutePusher interface {
+	PushAgentRoutes(agentID string) error
+}
 
 // Server holds the API server state.
 type Server struct {
@@ -15,6 +23,17 @@ type Server struct {
 	version  string
 	mux      *http.ServeMux
 	sessions *auth.SessionManager
+	hub      *agenthub.Hub
+	pusher   RoutePusher
+}
+
+// SetAgentHub wires the live agent connection hub and the route pusher into the
+// server, enabling the SSE stream endpoint and instant route delivery. When
+// unset (e.g. in tests), the stream endpoint reports streaming unavailable and
+// route changes fall back to the reconciler's periodic cycle.
+func (s *Server) SetAgentHub(hub *agenthub.Hub, pusher RoutePusher) {
+	s.hub = hub
+	s.pusher = pusher
 }
 
 // NewServer creates a new API server and registers all routes.
@@ -72,6 +91,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/reject", s.requireAuth(s.handleRejectAgent))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAuth(s.handleAgentStatus))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", s.requireAgentAuth(s.handleAgentHeartbeat))
+	// Live push channel: the agent dials out and holds this open; the
+	// orchestrator pushes config down it (works behind NAT). Agent auth.
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", s.requireAgentAuth(s.handleAgentRoutesAck))
 
 	// Servers (auth required)
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/servers", s.requireAuth(s.handleListServers))
