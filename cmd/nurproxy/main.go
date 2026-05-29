@@ -20,6 +20,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/mcp"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
@@ -99,6 +100,12 @@ func main() {
 	// Serve embedded dashboard + API
 	mux := http.NewServeMux()
 	mux.Handle("/api/", srv.Handler())
+
+	// Opt-in MCP endpoint (off by default; 404s unless mcp_enabled=true). Mounted
+	// at the root so it lives outside the dashboard's /api/ surface.
+	mcpHandler := mcp.New(database, version)
+	mux.Handle("/mcp", mcpHandler)
+	mux.Handle("/mcp/", mcpHandler)
 
 	distFS, err := fs.Sub(web.Assets, "dist")
 	if err != nil {
