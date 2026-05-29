@@ -339,6 +339,29 @@ var migrations = []string{
 	`
 	ALTER TABLE agents ADD COLUMN auto_reconcile_config INTEGER NOT NULL DEFAULT 0;
 	`,
+
+	// Migration 010: central TLS cert store (§7). The orchestrator issues certs
+	// centrally via DNS-01 and stores cert+key here. The private key is encrypted
+	// at rest with the existing AES-256-GCM key (cert_pem is public, stored plain;
+	// key_pem_enc is the base64 AES-256-GCM ciphertext). Per-host certs by default;
+	// is_wildcard flags the opt-in shared-key case. names is a JSON array of all
+	// SANs covered. expires_at drives ≥30-day-early renewal.
+	`
+	CREATE TABLE IF NOT EXISTS certificates (
+		id          TEXT PRIMARY KEY,
+		host        TEXT NOT NULL,
+		names       TEXT NOT NULL DEFAULT '[]',
+		is_wildcard INTEGER NOT NULL DEFAULT 0,
+		cert_pem    TEXT NOT NULL,
+		key_pem_enc TEXT NOT NULL,
+		issued_at   TEXT NOT NULL DEFAULT (datetime('now')),
+		expires_at  TEXT NOT NULL DEFAULT '',
+		updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(host)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_certificates_expires ON certificates(expires_at);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

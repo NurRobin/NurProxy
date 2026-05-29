@@ -389,3 +389,22 @@ type Notifier struct {
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// Certificate is a TLS certificate issued centrally by the orchestrator via
+// DNS-01 (§7) and distributed to agents over the agent-initiated stream. The
+// private key is sensitive: it is stored encrypted at rest (AES-256-GCM) and is
+// never serialized into API responses (json:"-").
+type Certificate struct {
+	ID         string   `json:"id"`
+	Host       string   `json:"host"`
+	Names      []string `json:"names"`
+	IsWildcard bool     `json:"is_wildcard"`
+	// CertPEM is the leaf certificate plus chain (public, safe to serve).
+	CertPEM string `json:"cert_pem"`
+	// KeyPEM is the private key (sensitive). Stored encrypted at rest, never in
+	// API responses.
+	KeyPEM    string    `json:"-"`
+	IssuedAt  time.Time `json:"issued_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
