@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // Heartbeat periodically sends heartbeats with the agent's public IP to the
@@ -25,6 +26,7 @@ type Heartbeat struct {
 	healthFn        func() (caddyRunning bool, lastError string)
 	detectionFn     func() *models.ProxyDetection
 	capabilitiesFn  func() *models.ProxyCapabilities
+	checksumsFn     func() []proxymodel.ArtifactChecksum
 	client          *http.Client
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -45,6 +47,10 @@ type heartbeatPayload struct {
 	// so the orchestrator's stored copy tracks module changes (e.g. caddy-ratelimit
 	// installed/removed). Omitted when unknown.
 	ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities,omitempty"`
+	// ArtifactChecksums reports each managed artifact's current on-disk/live
+	// checksum (§11) so the orchestrator can detect drift against the accepted
+	// state. Omitted when the agent manages nothing.
+	ArtifactChecksums []proxymodel.ArtifactChecksum `json:"artifact_checksums,omitempty"`
 }
 
 // New creates a new Heartbeat sender. healthFn supplies the agent's current
@@ -77,6 +83,14 @@ func (h *Heartbeat) SetDetectionFn(fn func() *models.ProxyDetection) {
 // installed) without restarting the heartbeat.
 func (h *Heartbeat) SetCapabilitiesFn(fn func() *models.ProxyCapabilities) {
 	h.capabilitiesFn = fn
+}
+
+// SetArtifactChecksumsFn supplies the managed-artifact checksum snapshot (§11)
+// reported on each beat for drift detection. It may be nil (no checksums sent).
+// The function is called per beat so the agent reports its current live set
+// without restarting the heartbeat.
+func (h *Heartbeat) SetArtifactChecksumsFn(fn func() []proxymodel.ArtifactChecksum) {
+	h.checksumsFn = fn
 }
 
 // Start begins the heartbeat loop. It blocks until the context is canceled.
@@ -137,6 +151,11 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		capabilities = h.capabilitiesFn()
 	}
 
+	var checksums []proxymodel.ArtifactChecksum
+	if h.checksumsFn != nil {
+		checksums = h.checksumsFn()
+	}
+
 	payload := heartbeatPayload{
 		AgentID:           h.agentID,
 		PublicIP:          ip,
@@ -145,6 +164,7 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		LastError:         lastError,
 		ProxyDetection:    detection,
 		ProxyCapabilities: capabilities,
+		ArtifactChecksums: checksums,
 	}
 
 	data, err := json.Marshal(payload)

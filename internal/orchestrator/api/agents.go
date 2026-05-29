@@ -9,6 +9,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // GET /api/v1/agents
@@ -377,6 +378,11 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// backend, re-reported each beat. Stored on the agent row; nil leaves it
 		// as-is (so a transient probe failure doesn't erase a known-good matrix).
 		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
+		// ArtifactChecksums is the agent's per-beat report of each managed
+		// artifact's on-disk/live checksum (§11). The orchestrator compares each
+		// against the accepted state and flags drift (on-disk != accepted), never
+		// overwriting while unresolved. Empty/omitted leaves drift state untouched.
+		ArtifactChecksums []proxymodel.ArtifactChecksum `json:"artifact_checksums"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -453,8 +459,46 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Drift detection (§11): compare each reported on-disk checksum against the
+	// accepted state. A divergence flags the artifact for review (never
+	// overwriting the stored/accepted content); a match clears any prior drift.
+	s.reconcileArtifactChecksums(r, id, req.ArtifactChecksums)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":    agent.Status,
 		"last_seen": agent.LastSeen,
 	})
+}
+
+// reconcileArtifactChecksums compares the agent's heartbeat-reported on-disk
+// checksums against the accepted state in the central store and flags/clears
+// drift accordingly (§11, invariant #3). It never overwrites stored content; the
+// accepted state is preserved for the operator's review (accept/reject). Only a
+// genuine drift transition is audited (source + actor), not every heartbeat
+// (invariant #5). Best-effort and resilient: an unknown artifact ID (e.g. a
+// manual/adopted artifact the orchestrator hasn't created yet) is skipped, not
+// fatal to the heartbeat.
+func (s *Server) reconcileArtifactChecksums(r *http.Request, agentID string, checksums []proxymodel.ArtifactChecksum) {
+	for _, c := range checksums {
+		if c.ArtifactID == "" {
+			continue
+		}
+		drifted, changed, err := s.db.ReconcileArtifactChecksum(c.ArtifactID, c.Checksum)
+		if err != nil {
+			// Unknown/absent artifact is expected before its first apply-ACK lands;
+			// log at low volume and move on.
+			log.Printf("heartbeat: drift check for artifact %s on agent %s: %v", c.ArtifactID, agentID, err)
+			continue
+		}
+		if !changed {
+			continue
+		}
+		if drifted {
+			s.auditAs(r, models.AuditSourceAgent, "config_artifact", c.ArtifactID, "drifted",
+				fmt.Sprintf("on-disk content diverged from accepted state (agent %s)", agentID))
+		} else {
+			s.auditAs(r, models.AuditSourceAgent, "config_artifact", c.ArtifactID, "drift_resolved",
+				fmt.Sprintf("on-disk content back in agreement (agent %s)", agentID))
+		}
+	}
 }

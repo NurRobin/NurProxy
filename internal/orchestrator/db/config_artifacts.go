@@ -357,6 +357,115 @@ func (d *DB) MarkConfigArtifactDrifted(id string) error {
 	return nil
 }
 
+// ReconcileArtifactChecksum compares an agent's heartbeat-reported on-disk
+// checksum against the accepted (stored) checksum and updates the drift state
+// (§11). It is the heartbeat half of drift detection: the agent reports each
+// managed artifact's checksum, the orchestrator decides whether the host
+// diverged from the last accepted state.
+//
+// Behavior (idempotent, never overwrites stored content — the accepted state is
+// preserved for the review flow):
+//   - checksum matches accepted: if the artifact was drifted, clear it back to
+//     live (the host is back in agreement); otherwise no-op. Returns drifted=false.
+//   - checksum differs: flag drifted + apply_state=drifted (if not already).
+//     Returns drifted=true.
+//
+// changed reports whether this call actually transitioned the drift state (so the
+// caller can audit only genuine transitions, not every heartbeat). An artifact in
+// apply_failed state is left untouched (the failure, not drift, is the story).
+func (d *DB) ReconcileArtifactChecksum(id, onDiskChecksum string) (drifted, changed bool, err error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return false, false, fmt.Errorf("beginning checksum reconcile: %w", err)
+	}
+	defer tx.Rollback()
+
+	var accepted, applyState string
+	var wasDrifted int
+	row := tx.QueryRow(
+		"SELECT checksum, drifted, apply_state FROM config_artifacts WHERE id = ?", id,
+	)
+	if scanErr := row.Scan(&accepted, &wasDrifted, &applyState); scanErr == sql.ErrNoRows {
+		return false, false, fmt.Errorf("config artifact not found: %s", id)
+	} else if scanErr != nil {
+		return false, false, fmt.Errorf("reading artifact checksum: %w", scanErr)
+	}
+
+	// A failed apply owns the state until it is resolved by a fresh apply-ACK; a
+	// heartbeat checksum doesn't override that story.
+	if applyState == models.ArtifactStateApplyFailed {
+		return wasDrifted != 0, false, tx.Commit()
+	}
+
+	matches := onDiskChecksum == accepted
+	switch {
+	case matches && wasDrifted != 0:
+		// Host came back into agreement — clear drift.
+		if _, err := tx.Exec(`
+			UPDATE config_artifacts
+			SET drifted = 0, apply_state = ?, last_error = '', updated_at = ?
+			WHERE id = ?`,
+			models.ArtifactStateLive, now, id,
+		); err != nil {
+			return false, false, fmt.Errorf("clearing drift: %w", err)
+		}
+		return false, true, tx.Commit()
+	case !matches && wasDrifted == 0:
+		// Newly diverged — flag for review. Stored content is left intact.
+		if _, err := tx.Exec(`
+			UPDATE config_artifacts
+			SET drifted = 1, apply_state = ?, updated_at = ?
+			WHERE id = ?`,
+			models.ArtifactStateDrifted, now, id,
+		); err != nil {
+			return false, false, fmt.Errorf("flagging drift: %w", err)
+		}
+		return true, true, tx.Commit()
+	default:
+		// No transition (matches && live, or differs && already drifted).
+		return wasDrifted != 0, false, tx.Commit()
+	}
+}
+
+// RejectConfigArtifactDrift resolves a drift by reverting to the accepted state:
+// it clears the drift flag without writing a new version (the stored content IS
+// the accepted state to re-apply to disk). The caller is responsible for pushing
+// the stored content back to the agent (re-apply). Returns the artifact so the
+// caller can re-render/re-push it.
+func (d *DB) RejectConfigArtifactDrift(id string) (*models.ConfigArtifact, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE config_artifacts
+		SET drifted = 0, apply_state = ?, last_error = '', updated_at = ?
+		WHERE id = ?`,
+		models.ArtifactStateLive, now, id,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("rejecting artifact drift: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, fmt.Errorf("config artifact not found: %s", id)
+	}
+	return d.GetConfigArtifact(id)
+}
+
+// RollbackConfigArtifact promotes a prior version's content to a new live version
+// (§11). It re-uses the version-append path so a rollback is itself recorded as a
+// new version with actor/note for audit — history is append-only, never rewound.
+// The semantic-equality gate still applies: rolling back to content semantically
+// equal to the current live state writes no phantom version (and clears drift).
+// The caller re-applies the resulting live content to the agent.
+func (d *DB) RollbackConfigArtifact(id string, toVersion int, actor, note string) (*models.ConfigArtifactVersion, error) {
+	target, err := d.GetConfigArtifactVersion(id, toVersion)
+	if err != nil {
+		return nil, err
+	}
+	return d.AppendConfigArtifactVersion(id, target.Content, target.Source, actor, note)
+}
+
 // SetConfigArtifactApplyState updates the lifecycle status and last error of an
 // artifact (e.g. apply_failed after a failed write/validate/reload). It also
 // keeps the drifted flag consistent with the drifted state.

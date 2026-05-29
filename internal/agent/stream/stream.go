@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/agent/health"
@@ -56,6 +57,15 @@ type Client struct {
 	caddy           caddyBackend
 	health          *health.State
 	http            *http.Client
+
+	// managedMu guards managed, the agent's snapshot of the artifacts it currently
+	// has applied (artifactID -> checksum of the rendered content). It is refreshed
+	// on every successful apply and read by the heartbeat so the orchestrator can
+	// detect drift (on-disk != accepted, §11). For the built-in Caddy admin-API
+	// path the rendered route content IS the live state, so its checksum is the
+	// drift signal.
+	managedMu sync.RWMutex
+	managed   map[string]string
 }
 
 // New creates a stream Client. backend is the bundled-Caddy proxy backend the
@@ -67,10 +77,33 @@ func New(orchestratorURL, agentID, token string, backend caddyBackend, hs *healt
 		token:           token,
 		caddy:           backend,
 		health:          hs,
+		managed:         make(map[string]string),
 		// No client timeout: this connection is meant to stay open. Reconnects
 		// are driven by the context and by read errors.
 		http: &http.Client{},
 	}
+}
+
+// ManagedChecksums returns the agent's current per-artifact checksum snapshot for
+// the heartbeat (§11). The orchestrator compares each against the accepted state
+// to detect drift. The returned slice is a copy, safe to use after the call.
+func (c *Client) ManagedChecksums() []proxymodel.ArtifactChecksum {
+	c.managedMu.RLock()
+	defer c.managedMu.RUnlock()
+	out := make([]proxymodel.ArtifactChecksum, 0, len(c.managed))
+	for id, sum := range c.managed {
+		out = append(out, proxymodel.ArtifactChecksum{ArtifactID: id, Checksum: sum})
+	}
+	return out
+}
+
+// setManaged replaces the managed-artifact checksum snapshot atomically after an
+// apply, so the heartbeat always reports the agent's true current set (added and
+// removed artifacts both reflected).
+func (c *Client) setManaged(m map[string]string) {
+	c.managedMu.Lock()
+	c.managed = m
+	c.managedMu.Unlock()
 }
 
 // Run connects to the orchestrator and keeps the stream open, reconnecting with
@@ -171,6 +204,10 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 // modeling the host.
 func (c *Client) applyIntents(ctx context.Context, intents []proxymodel.RouteIntent) {
 	reports := make([]proxymodel.ArtifactReport, 0, len(intents))
+	// managed is the fresh snapshot of artifacts this apply leaves live (artifactID
+	// -> checksum). It replaces the prior snapshot wholesale, so artifacts dropped
+	// from the intent set stop being reported (no stale drift on removed configs).
+	managed := make(map[string]string, len(intents))
 	applied := 0
 
 	// Ensure the server exists first (creates the config path), then clear, then
@@ -226,7 +263,15 @@ func (c *Client) applyIntents(ctx context.Context, intents []proxymodel.RouteInt
 		}
 		applied++
 		reports = append(reports, report)
+		// Track the successfully-applied artifact for the heartbeat drift check.
+		if in.ArtifactID != "" {
+			managed[in.ArtifactID] = report.Checksum
+		}
 	}
+
+	// Replace the managed snapshot so the heartbeat reports exactly what is live
+	// now (additions and removals both reflected).
+	c.setManaged(managed)
 
 	log.Printf("Stream: applied %d/%d intents", applied, len(intents))
 	c.sendAck(ctx, reports)
