@@ -8,74 +8,55 @@ import (
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
-// DomainConfig holds all settings needed to generate a Caddy route for a domain.
-type DomainConfig struct {
-	FQDN                  string
-	UpstreamAddr          string // server address
-	UpstreamPort          int
-	WebSocket             bool
-	ForceHTTPS            bool
-	MaxBodySize           string
-	CustomRequestHeaders  map[string]string
-	CustomResponseHeaders map[string]string
-	UpstreamScheme        string // "http" or "https", default "http"
-
-	// Path manipulation.
-	PathStrip   string // strip this prefix from the request path
-	PathRewrite string // rewrite the request URI to this value
-
-	// Upstream timeouts, in seconds (0 = unset).
-	TimeoutRead  int
-	TimeoutWrite int
-	TimeoutIdle  int
-
-	// Access control.
-	BasicAuthUser string // if set with hash, enables HTTP basic auth
-	BasicAuthHash string // bcrypt hash of the password
-	IPAllowlist   []string
-	IPBlocklist   []string
-
-	// Rate limiting (requests/second per client). Requires the caddy-ratelimit
-	// module on the agent's Caddy build. 0 = disabled.
-	RateLimit float64
-
-	RawCaddy string // if set, use this instead of generating
-}
+// backendCaddy is the backend tag the Caddy renderer recognizes on a raw
+// escape-hatch payload (proxymodel.RawConfig.Backend).
+const backendCaddy = "caddy"
 
 var slugRe = regexp.MustCompile(`[^a-zA-Z0-9-]`)
 
-// ConfigFromDomain builds a DomainConfig from a stored domain, its resolved
-// FQDN, and the upstream server address. It is the single source of truth for
-// translating a domain's proxy settings into a Caddy route, shared by the
-// reconciler and the API's config preview so they never diverge.
-func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) DomainConfig {
-	cfg := DomainConfig{
-		FQDN:                  fqdn,
-		UpstreamAddr:          upstreamAddr,
-		UpstreamPort:          d.Port,
-		WebSocket:             d.WebSocket || d.ProxyConfig.WebSocket,
-		ForceHTTPS:            d.ForceHTTPS || d.ProxyConfig.ForceHTTPS,
-		MaxBodySize:           d.ProxyConfig.MaxBodySize,
-		CustomRequestHeaders:  d.ProxyConfig.CustomRequestHeaders,
-		CustomResponseHeaders: d.ProxyConfig.CustomResponseHeaders,
-		UpstreamScheme:        d.ProxyConfig.UpstreamScheme,
-		PathStrip:             d.ProxyConfig.PathStrip,
-		PathRewrite:           d.ProxyConfig.PathRewrite,
-		TimeoutRead:           d.ProxyConfig.TimeoutRead,
-		TimeoutWrite:          d.ProxyConfig.TimeoutWrite,
-		TimeoutIdle:           d.ProxyConfig.TimeoutIdle,
-		IPAllowlist:           d.ProxyConfig.IPAllowlist,
-		IPBlocklist:           d.ProxyConfig.IPBlocklist,
-		RateLimit:             d.ProxyConfig.RateLimit,
-		RawCaddy:              d.ProxyConfig.RawCaddy,
+// ConfigFromDomain builds a backend-neutral proxymodel.Route from a stored
+// domain, its resolved FQDN, and the upstream server address. It is the single
+// source of truth for translating a domain's proxy settings into proxy intent,
+// shared by the reconciler and the API's config preview so they never diverge.
+func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Route {
+	route := proxymodel.Route{
+		Host: fqdn,
+		Upstream: proxymodel.Upstream{
+			Addr:   upstreamAddr,
+			Port:   d.Port,
+			Scheme: proxymodel.Scheme(d.ProxyConfig.UpstreamScheme),
+		},
+		WebSocket:       d.WebSocket || d.ProxyConfig.WebSocket,
+		ForceHTTPS:      d.ForceHTTPS || d.ProxyConfig.ForceHTTPS,
+		MaxBodySize:     d.ProxyConfig.MaxBodySize,
+		RequestHeaders:  d.ProxyConfig.CustomRequestHeaders,
+		ResponseHeaders: d.ProxyConfig.CustomResponseHeaders,
+		Path: proxymodel.PathRules{
+			StripPrefix: d.ProxyConfig.PathStrip,
+			Rewrite:     d.ProxyConfig.PathRewrite,
+		},
+		Timeouts: proxymodel.Timeouts{
+			Read:  d.ProxyConfig.TimeoutRead,
+			Write: d.ProxyConfig.TimeoutWrite,
+			Idle:  d.ProxyConfig.TimeoutIdle,
+		},
+		IPAllowlist: d.ProxyConfig.IPAllowlist,
+		IPBlocklist: d.ProxyConfig.IPBlocklist,
+		RateLimit:   proxymodel.RateLimit{RequestsPerSecond: d.ProxyConfig.RateLimit},
 	}
 	if d.ProxyConfig.BasicAuth != nil {
-		cfg.BasicAuthUser = d.ProxyConfig.BasicAuth.Username
-		cfg.BasicAuthHash = d.ProxyConfig.BasicAuth.Password
+		route.BasicAuth = &proxymodel.BasicAuth{
+			Username:     d.ProxyConfig.BasicAuth.Username,
+			PasswordHash: d.ProxyConfig.BasicAuth.Password,
+		}
 	}
-	return cfg
+	if d.ProxyConfig.RawCaddy != "" {
+		route.Raw = proxymodel.RawConfig{Backend: backendCaddy, Content: d.ProxyConfig.RawCaddy}
+	}
+	return route
 }
 
 // forbiddenResponse returns a static_response handler that replies 403.
@@ -100,27 +81,33 @@ func slugify(fqdn string) string {
 	return s
 }
 
-// GenerateRoute produces a Caddy JSON route configuration from a DomainConfig.
-// The returned json.RawMessage is ready to be sent to the Caddy admin API.
-func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
-	// Manual override: return raw JSON directly.
-	if cfg.RawCaddy != "" {
+// GenerateRoute produces a Caddy JSON route configuration from a backend-neutral
+// proxymodel.Route. The returned json.RawMessage is ready to be sent to the
+// Caddy admin API.
+func GenerateRoute(route proxymodel.Route) (json.RawMessage, error) {
+	// Manual override: return the raw Caddy JSON directly. The escape hatch is
+	// honored only when tagged for the caddy backend (a payload tagged for
+	// nginx/apache is not ours to emit).
+	if route.IsRaw() {
+		if route.Raw.Backend != backendCaddy {
+			return nil, fmt.Errorf("raw config targets backend %q, not %q", route.Raw.Backend, backendCaddy)
+		}
 		// Validate that it is well-formed JSON.
 		var raw json.RawMessage
-		if err := json.Unmarshal([]byte(cfg.RawCaddy), &raw); err != nil {
-			return nil, fmt.Errorf("invalid RawCaddy JSON: %w", err)
+		if err := json.Unmarshal([]byte(route.Raw.Content), &raw); err != nil {
+			return nil, fmt.Errorf("invalid raw Caddy JSON: %w", err)
 		}
 		return raw, nil
 	}
 
-	if cfg.FQDN == "" {
-		return nil, fmt.Errorf("FQDN is required")
+	if route.Host == "" {
+		return nil, fmt.Errorf("host is required")
 	}
-	if cfg.UpstreamAddr == "" {
-		return nil, fmt.Errorf("UpstreamAddr is required")
+	if route.Upstream.Addr == "" {
+		return nil, fmt.Errorf("upstream address is required")
 	}
-	if cfg.UpstreamPort == 0 {
-		return nil, fmt.Errorf("UpstreamPort is required")
+	if route.Upstream.Port == 0 {
+		return nil, fmt.Errorf("upstream port is required")
 	}
 
 	// Build the inner handlers for the main route (the request pipeline that
@@ -129,21 +116,21 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 
 	// Path manipulation (rewrite handler) runs first so downstream handlers and
 	// the upstream see the modified path.
-	if cfg.PathStrip != "" {
+	if route.Path.StripPrefix != "" {
 		innerHandlers = append(innerHandlers, map[string]interface{}{
 			"handler":           "rewrite",
-			"strip_path_prefix": cfg.PathStrip,
+			"strip_path_prefix": route.Path.StripPrefix,
 		})
 	}
-	if cfg.PathRewrite != "" {
+	if route.Path.Rewrite != "" {
 		innerHandlers = append(innerHandlers, map[string]interface{}{
 			"handler": "rewrite",
-			"uri":     cfg.PathRewrite,
+			"uri":     route.Path.Rewrite,
 		})
 	}
 
 	// HTTP basic authentication.
-	if cfg.BasicAuthUser != "" && cfg.BasicAuthHash != "" {
+	if route.BasicAuth != nil && route.BasicAuth.Username != "" && route.BasicAuth.PasswordHash != "" {
 		innerHandlers = append(innerHandlers, map[string]interface{}{
 			"handler": "authentication",
 			"providers": map[string]interface{}{
@@ -151,9 +138,9 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 					"hash": map[string]interface{}{"algorithm": "bcrypt"},
 					"accounts": []map[string]interface{}{
 						{
-							"username": cfg.BasicAuthUser,
+							"username": route.BasicAuth.Username,
 							// Caddy expects the hashed password base64-encoded.
-							"password": base64.StdEncoding.EncodeToString([]byte(cfg.BasicAuthHash)),
+							"password": base64.StdEncoding.EncodeToString([]byte(route.BasicAuth.PasswordHash)),
 						},
 					},
 				},
@@ -162,24 +149,24 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 	}
 
 	// Rate limiting (requires the caddy-ratelimit module).
-	if cfg.RateLimit > 0 {
+	if route.RateLimit.RequestsPerSecond > 0 {
 		innerHandlers = append(innerHandlers, map[string]interface{}{
 			"handler": "rate_limit",
 			"rate_limits": map[string]interface{}{
 				"default": map[string]interface{}{
 					"key":        "{http.request.remote.host}",
 					"window":     "1s",
-					"max_events": int(cfg.RateLimit),
+					"max_events": int(route.RateLimit.RequestsPerSecond),
 				},
 			},
 		})
 	}
 
 	// Body size limit handler (before reverse_proxy).
-	if cfg.MaxBodySize != "" && cfg.MaxBodySize != "unlimited" {
+	if route.MaxBodySize != "" && route.MaxBodySize != "unlimited" {
 		innerHandlers = append(innerHandlers, Handler{
 			Handler: "request_body",
-			MaxSize: cfg.MaxBodySize,
+			MaxSize: route.MaxBodySize,
 		})
 	}
 
@@ -187,7 +174,7 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 	rp := ReverseProxy{
 		Handler: "reverse_proxy",
 		Upstreams: []Upstream{
-			{Dial: fmt.Sprintf("%s:%d", cfg.UpstreamAddr, cfg.UpstreamPort)},
+			{Dial: fmt.Sprintf("%s:%d", route.Upstream.Addr, route.Upstream.Port)},
 		},
 	}
 
@@ -198,7 +185,7 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 	}
 
 	// Merge custom request headers.
-	for k, v := range cfg.CustomRequestHeaders {
+	for k, v := range route.RequestHeaders {
 		requestHeaders[k] = []string{v}
 	}
 
@@ -207,36 +194,37 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 	}
 
 	// Custom response headers.
-	if len(cfg.CustomResponseHeaders) > 0 {
-		respHeaders := make(map[string][]string, len(cfg.CustomResponseHeaders))
-		for k, v := range cfg.CustomResponseHeaders {
+	if len(route.ResponseHeaders) > 0 {
+		respHeaders := make(map[string][]string, len(route.ResponseHeaders))
+		for k, v := range route.ResponseHeaders {
 			respHeaders[k] = []string{v}
 		}
 		rp.Headers.Response = &HeaderMod{Set: respHeaders}
 	}
 
 	// WebSocket support.
-	if cfg.WebSocket {
+	if route.WebSocket {
 		rp.FlushInterval = -1
 	}
 
 	// Upstream transport: needed when talking HTTPS to the backend or when any
 	// upstream timeout is configured.
-	if cfg.UpstreamScheme == "https" || cfg.TimeoutRead > 0 || cfg.TimeoutWrite > 0 || cfg.TimeoutIdle > 0 {
+	httpsUpstream := route.EffectiveScheme() == proxymodel.SchemeHTTPS
+	if httpsUpstream || route.Timeouts.Read > 0 || route.Timeouts.Write > 0 || route.Timeouts.Idle > 0 {
 		t := &Transport{Protocol: "http"}
-		if cfg.UpstreamScheme == "https" {
+		if httpsUpstream {
 			t.TLS = &TLS{}
 		}
 		// Map our read/write/idle timeouts onto the closest valid Caddy http
 		// transport fields.
-		if cfg.TimeoutWrite > 0 {
-			t.DialTimeout = fmt.Sprintf("%ds", cfg.TimeoutWrite)
+		if route.Timeouts.Write > 0 {
+			t.DialTimeout = fmt.Sprintf("%ds", route.Timeouts.Write)
 		}
-		if cfg.TimeoutRead > 0 {
-			t.ResponseHeaderTimeout = fmt.Sprintf("%ds", cfg.TimeoutRead)
+		if route.Timeouts.Read > 0 {
+			t.ResponseHeaderTimeout = fmt.Sprintf("%ds", route.Timeouts.Read)
 		}
-		if cfg.TimeoutIdle > 0 {
-			t.KeepAlive = &KeepAlive{IdleTimeout: fmt.Sprintf("%ds", cfg.TimeoutIdle)}
+		if route.Timeouts.Idle > 0 {
+			t.KeepAlive = &KeepAlive{IdleTimeout: fmt.Sprintf("%ds", route.Timeouts.Idle)}
 		}
 		rp.Transport = t
 	}
@@ -246,19 +234,19 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 	// Build the subroute's inner routes. IP allow/block guards run first as
 	// terminal routes so blocked clients never reach the proxy.
 	var innerRoutes []Route
-	if len(cfg.IPBlocklist) > 0 {
+	if len(route.IPBlocklist) > 0 {
 		innerRoutes = append(innerRoutes, Route{
-			Match:    []map[string]interface{}{{"remote_ip": map[string]interface{}{"ranges": cfg.IPBlocklist}}},
+			Match:    []map[string]interface{}{{"remote_ip": map[string]interface{}{"ranges": route.IPBlocklist}}},
 			Handle:   []interface{}{forbiddenResponse()},
 			Terminal: true,
 		})
 	}
-	if len(cfg.IPAllowlist) > 0 {
+	if len(route.IPAllowlist) > 0 {
 		// Deny everything that is NOT in the allowlist.
 		innerRoutes = append(innerRoutes, Route{
 			Match: []map[string]interface{}{{
 				"not": []map[string]interface{}{
-					{"remote_ip": map[string]interface{}{"ranges": cfg.IPAllowlist}},
+					{"remote_ip": map[string]interface{}{"ranges": route.IPAllowlist}},
 				},
 			}},
 			Handle:   []interface{}{forbiddenResponse()},
@@ -280,7 +268,7 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 	// is matched on the "http" protocol and marked terminal so it ONLY fires on
 	// non-TLS requests — otherwise an HTTPS request would also match and create
 	// an infinite redirect loop.
-	if cfg.ForceHTTPS {
+	if route.ForceHTTPS {
 		topHandlers = append(topHandlers, Handler{
 			Handler: "subroute",
 			Routes: []Route{
@@ -303,14 +291,14 @@ func GenerateRoute(cfg DomainConfig) (json.RawMessage, error) {
 
 	topHandlers = append(topHandlers, subroute)
 
-	route := CaddyRoute{
-		ID:       "domain-" + slugify(cfg.FQDN),
-		Match:    []Match{{Host: []string{cfg.FQDN}}},
+	caddyRoute := CaddyRoute{
+		ID:       "domain-" + slugify(route.Host),
+		Match:    []Match{{Host: []string{route.Host}}},
 		Handle:   topHandlers,
 		Terminal: true,
 	}
 
-	data, err := json.Marshal(route)
+	data, err := json.Marshal(caddyRoute)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling route: %w", err)
 	}

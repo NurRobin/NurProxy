@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 func TestSlugify(t *testing.T) {
@@ -34,10 +35,9 @@ func TestSlugify(t *testing.T) {
 }
 
 func TestGenerateRoute_Basic(t *testing.T) {
-	cfg := DomainConfig{
-		FQDN:         "app.example.com",
-		UpstreamAddr: "10.0.0.1",
-		UpstreamPort: 8080,
+	cfg := proxymodel.Route{
+		Host:     "app.example.com",
+		Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 8080},
 	}
 
 	raw, err := GenerateRoute(cfg)
@@ -111,11 +111,10 @@ func TestGenerateRoute_Basic(t *testing.T) {
 }
 
 func TestGenerateRoute_WebSocket(t *testing.T) {
-	cfg := DomainConfig{
-		FQDN:         "ws.example.com",
-		UpstreamAddr: "10.0.0.2",
-		UpstreamPort: 9090,
-		WebSocket:    true,
+	cfg := proxymodel.Route{
+		Host:      "ws.example.com",
+		Upstream:  proxymodel.Upstream{Addr: "10.0.0.2", Port: 9090},
+		WebSocket: true,
 	}
 
 	raw, err := GenerateRoute(cfg)
@@ -140,14 +139,13 @@ func TestGenerateRoute_WebSocket(t *testing.T) {
 }
 
 func TestGenerateRoute_CustomHeaders(t *testing.T) {
-	cfg := DomainConfig{
-		FQDN:         "headers.example.com",
-		UpstreamAddr: "10.0.0.3",
-		UpstreamPort: 3000,
-		CustomRequestHeaders: map[string]string{
+	cfg := proxymodel.Route{
+		Host:     "headers.example.com",
+		Upstream: proxymodel.Upstream{Addr: "10.0.0.3", Port: 3000},
+		RequestHeaders: map[string]string{
 			"X-Custom-Req": "req-value",
 		},
-		CustomResponseHeaders: map[string]string{
+		ResponseHeaders: map[string]string{
 			"X-Custom-Resp": "resp-value",
 		},
 	}
@@ -190,11 +188,10 @@ func TestGenerateRoute_CustomHeaders(t *testing.T) {
 }
 
 func TestGenerateRoute_MaxBodySize(t *testing.T) {
-	cfg := DomainConfig{
-		FQDN:         "upload.example.com",
-		UpstreamAddr: "10.0.0.4",
-		UpstreamPort: 4000,
-		MaxBodySize:  "100m",
+	cfg := proxymodel.Route{
+		Host:        "upload.example.com",
+		Upstream:    proxymodel.Upstream{Addr: "10.0.0.4", Port: 4000},
+		MaxBodySize: "100m",
 	}
 
 	raw, err := GenerateRoute(cfg)
@@ -228,11 +225,10 @@ func TestGenerateRoute_MaxBodySize(t *testing.T) {
 }
 
 func TestGenerateRoute_MaxBodySize_Unlimited(t *testing.T) {
-	cfg := DomainConfig{
-		FQDN:         "upload.example.com",
-		UpstreamAddr: "10.0.0.4",
-		UpstreamPort: 4000,
-		MaxBodySize:  "unlimited",
+	cfg := proxymodel.Route{
+		Host:        "upload.example.com",
+		Upstream:    proxymodel.Upstream{Addr: "10.0.0.4", Port: 4000},
+		MaxBodySize: "unlimited",
 	}
 
 	raw, err := GenerateRoute(cfg)
@@ -253,11 +249,9 @@ func TestGenerateRoute_MaxBodySize_Unlimited(t *testing.T) {
 }
 
 func TestGenerateRoute_HTTPSUpstream(t *testing.T) {
-	cfg := DomainConfig{
-		FQDN:           "secure.example.com",
-		UpstreamAddr:   "10.0.0.5",
-		UpstreamPort:   8443,
-		UpstreamScheme: "https",
+	cfg := proxymodel.Route{
+		Host:     "secure.example.com",
+		Upstream: proxymodel.Upstream{Addr: "10.0.0.5", Port: 8443, Scheme: proxymodel.SchemeHTTPS},
 	}
 
 	raw, err := GenerateRoute(cfg)
@@ -290,9 +284,9 @@ func TestGenerateRoute_HTTPSUpstream(t *testing.T) {
 func TestGenerateRoute_ManualOverride(t *testing.T) {
 	customJSON := `{"@id":"custom-route","match":[{"host":["custom.example.com"]}],"terminal":true}`
 
-	cfg := DomainConfig{
-		FQDN:     "custom.example.com",
-		RawCaddy: customJSON,
+	cfg := proxymodel.Route{
+		Host: "custom.example.com",
+		Raw:  proxymodel.RawConfig{Backend: "caddy", Content: customJSON},
 	}
 
 	raw, err := GenerateRoute(cfg)
@@ -312,22 +306,32 @@ func TestGenerateRoute_ManualOverride(t *testing.T) {
 }
 
 func TestGenerateRoute_ManualOverride_InvalidJSON(t *testing.T) {
-	cfg := DomainConfig{
-		RawCaddy: "not valid json{",
+	cfg := proxymodel.Route{
+		Raw: proxymodel.RawConfig{Backend: "caddy", Content: "not valid json{"},
 	}
 
 	_, err := GenerateRoute(cfg)
 	if err == nil {
-		t.Fatal("expected error for invalid RawCaddy JSON")
+		t.Fatal("expected error for invalid raw Caddy JSON")
+	}
+}
+
+func TestGenerateRoute_ManualOverride_WrongBackend(t *testing.T) {
+	cfg := proxymodel.Route{
+		Raw: proxymodel.RawConfig{Backend: "nginx", Content: "server {}"},
+	}
+
+	_, err := GenerateRoute(cfg)
+	if err == nil {
+		t.Fatal("expected error for raw config tagged for a non-caddy backend")
 	}
 }
 
 func TestGenerateRoute_ForceHTTPS(t *testing.T) {
-	cfg := DomainConfig{
-		FQDN:         "redirect.example.com",
-		UpstreamAddr: "10.0.0.6",
-		UpstreamPort: 5000,
-		ForceHTTPS:   true,
+	cfg := proxymodel.Route{
+		Host:       "redirect.example.com",
+		Upstream:   proxymodel.Upstream{Addr: "10.0.0.6", Port: 5000},
+		ForceHTTPS: true,
 	}
 
 	raw, err := GenerateRoute(cfg)
@@ -382,11 +386,11 @@ func TestGenerateRoute_ForceHTTPS(t *testing.T) {
 func TestGenerateRoute_MissingRequired(t *testing.T) {
 	tests := []struct {
 		name string
-		cfg  DomainConfig
+		cfg  proxymodel.Route
 	}{
-		{"missing FQDN", DomainConfig{UpstreamAddr: "10.0.0.1", UpstreamPort: 80}},
-		{"missing UpstreamAddr", DomainConfig{FQDN: "test.com", UpstreamPort: 80}},
-		{"missing UpstreamPort", DomainConfig{FQDN: "test.com", UpstreamAddr: "10.0.0.1"}},
+		{"missing Host", proxymodel.Route{Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}}},
+		{"missing UpstreamAddr", proxymodel.Route{Host: "test.com", Upstream: proxymodel.Upstream{Port: 80}}},
+		{"missing UpstreamPort", proxymodel.Route{Host: "test.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -398,7 +402,7 @@ func TestGenerateRoute_MissingRequired(t *testing.T) {
 	}
 }
 
-// innerHandlerStrings marshals every inner handler of the main route back to
+// mainRouteHandlers marshals every inner handler of the main route back to
 // JSON so tests can assert on the presence of specific handlers/keys.
 func mainRouteHandlers(t *testing.T, raw json.RawMessage) []string {
 	t.Helper()
@@ -418,9 +422,10 @@ func mainRouteHandlers(t *testing.T, raw json.RawMessage) []string {
 }
 
 func TestGenerateRoute_PathStripAndRewrite(t *testing.T) {
-	raw, err := GenerateRoute(DomainConfig{
-		FQDN: "p.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
-		PathStrip: "/api", PathRewrite: "/v2{http.request.uri.path}",
+	raw, err := GenerateRoute(proxymodel.Route{
+		Host:     "p.example.com",
+		Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80},
+		Path:     proxymodel.PathRules{StripPrefix: "/api", Rewrite: "/v2{http.request.uri.path}"},
 	})
 	if err != nil {
 		t.Fatalf("GenerateRoute: %v", err)
@@ -442,9 +447,10 @@ func TestGenerateRoute_PathStripAndRewrite(t *testing.T) {
 }
 
 func TestGenerateRoute_Timeouts(t *testing.T) {
-	raw, err := GenerateRoute(DomainConfig{
-		FQDN: "t.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
-		TimeoutRead: 30, TimeoutWrite: 10, TimeoutIdle: 120,
+	raw, err := GenerateRoute(proxymodel.Route{
+		Host:     "t.example.com",
+		Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80},
+		Timeouts: proxymodel.Timeouts{Read: 30, Write: 10, Idle: 120},
 	})
 	if err != nil {
 		t.Fatalf("GenerateRoute: %v", err)
@@ -475,9 +481,10 @@ func TestGenerateRoute_Timeouts(t *testing.T) {
 }
 
 func TestGenerateRoute_BasicAuth(t *testing.T) {
-	raw, err := GenerateRoute(DomainConfig{
-		FQDN: "auth.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
-		BasicAuthUser: "alice", BasicAuthHash: "$2a$14$abcdefghijklmnopqrstuv",
+	raw, err := GenerateRoute(proxymodel.Route{
+		Host:      "auth.example.com",
+		Upstream:  proxymodel.Upstream{Addr: "10.0.0.1", Port: 80},
+		BasicAuth: &proxymodel.BasicAuth{Username: "alice", PasswordHash: "$2a$14$abcdefghijklmnopqrstuv"},
 	})
 	if err != nil {
 		t.Fatalf("GenerateRoute: %v", err)
@@ -496,8 +503,9 @@ func TestGenerateRoute_BasicAuth(t *testing.T) {
 }
 
 func TestGenerateRoute_IPLists(t *testing.T) {
-	raw, err := GenerateRoute(DomainConfig{
-		FQDN: "ip.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
+	raw, err := GenerateRoute(proxymodel.Route{
+		Host:        "ip.example.com",
+		Upstream:    proxymodel.Upstream{Addr: "10.0.0.1", Port: 80},
 		IPBlocklist: []string{"1.2.3.0/24"},
 		IPAllowlist: []string{"10.0.0.0/8"},
 	})
@@ -526,9 +534,10 @@ func TestGenerateRoute_IPLists(t *testing.T) {
 }
 
 func TestGenerateRoute_RateLimit(t *testing.T) {
-	raw, err := GenerateRoute(DomainConfig{
-		FQDN: "rl.example.com", UpstreamAddr: "10.0.0.1", UpstreamPort: 80,
-		RateLimit: 25,
+	raw, err := GenerateRoute(proxymodel.Route{
+		Host:      "rl.example.com",
+		Upstream:  proxymodel.Upstream{Addr: "10.0.0.1", Port: 80},
+		RateLimit: proxymodel.RateLimit{RequestsPerSecond: 25},
 	})
 	if err != nil {
 		t.Fatalf("GenerateRoute: %v", err)
@@ -557,46 +566,66 @@ func TestConfigFromDomain(t *testing.T) {
 			BasicAuth:   &models.BasicAuthConfig{Username: "u", Password: "h"},
 		},
 	}
-	cfg := ConfigFromDomain(d, "x.example.com", "10.0.0.9")
-	if cfg.UpstreamAddr != "10.0.0.9" || cfg.UpstreamPort != 3000 {
-		t.Errorf("upstream wrong: %+v", cfg)
+	route := ConfigFromDomain(d, "x.example.com", "10.0.0.9")
+	if route.Upstream.Addr != "10.0.0.9" || route.Upstream.Port != 3000 {
+		t.Errorf("upstream wrong: %+v", route)
 	}
-	if !cfg.WebSocket || !cfg.ForceHTTPS {
-		t.Errorf("ws/forcehttps OR-ing wrong: %+v", cfg)
+	if !route.WebSocket || !route.ForceHTTPS {
+		t.Errorf("ws/forcehttps OR-ing wrong: %+v", route)
 	}
-	if cfg.PathStrip != "/x" || cfg.TimeoutRead != 5 || cfg.RateLimit != 3 {
-		t.Errorf("proxy fields not mapped: %+v", cfg)
+	if route.Path.StripPrefix != "/x" || route.Timeouts.Read != 5 || route.RateLimit.RequestsPerSecond != 3 {
+		t.Errorf("proxy fields not mapped: %+v", route)
 	}
-	if cfg.BasicAuthUser != "u" || cfg.BasicAuthHash != "h" {
-		t.Errorf("basic auth not mapped: %+v", cfg)
+	if route.BasicAuth == nil || route.BasicAuth.Username != "u" || route.BasicAuth.PasswordHash != "h" {
+		t.Errorf("basic auth not mapped: %+v", route)
 	}
-	if len(cfg.IPAllowlist) != 1 || cfg.IPAllowlist[0] != "1.1.1.1/32" {
-		t.Errorf("ip allowlist not mapped: %+v", cfg)
+	if len(route.IPAllowlist) != 1 || route.IPAllowlist[0] != "1.1.1.1/32" {
+		t.Errorf("ip allowlist not mapped: %+v", route)
 	}
 
 	// And the generated route must be valid JSON.
-	if _, err := GenerateRoute(cfg); err != nil {
+	if _, err := GenerateRoute(route); err != nil {
 		t.Fatalf("GenerateRoute from ConfigFromDomain: %v", err)
+	}
+}
+
+func TestConfigFromDomain_RawCaddy(t *testing.T) {
+	d := models.Domain{
+		Port: 80,
+		ProxyConfig: models.ProxyConfig{
+			RawCaddy: `{"@id":"r"}`,
+		},
+	}
+	route := ConfigFromDomain(d, "raw.example.com", "10.0.0.1")
+	if !route.IsRaw() {
+		t.Fatalf("expected raw route, got %+v", route.Raw)
+	}
+	if route.Raw.Backend != "caddy" {
+		t.Errorf("raw backend = %q, want caddy", route.Raw.Backend)
+	}
+	if route.Raw.Content != `{"@id":"r"}` {
+		t.Errorf("raw content = %q", route.Raw.Content)
 	}
 }
 
 func TestGenerateRoute_ValidJSON(t *testing.T) {
 	// Ensure all generated routes are valid JSON by round-tripping through
 	// json.Unmarshal into a generic map.
-	configs := []DomainConfig{
-		{FQDN: "a.com", UpstreamAddr: "1.2.3.4", UpstreamPort: 80},
-		{FQDN: "b.com", UpstreamAddr: "1.2.3.4", UpstreamPort: 80, WebSocket: true},
-		{FQDN: "c.com", UpstreamAddr: "1.2.3.4", UpstreamPort: 80, MaxBodySize: "50m"},
-		{FQDN: "d.com", UpstreamAddr: "1.2.3.4", UpstreamPort: 443, UpstreamScheme: "https"},
-		{FQDN: "e.com", UpstreamAddr: "1.2.3.4", UpstreamPort: 80, ForceHTTPS: true},
+	configs := []proxymodel.Route{
+		{Host: "a.com", Upstream: proxymodel.Upstream{Addr: "1.2.3.4", Port: 80}},
+		{Host: "b.com", Upstream: proxymodel.Upstream{Addr: "1.2.3.4", Port: 80}, WebSocket: true},
+		{Host: "c.com", Upstream: proxymodel.Upstream{Addr: "1.2.3.4", Port: 80}, MaxBodySize: "50m"},
+		{Host: "d.com", Upstream: proxymodel.Upstream{Addr: "1.2.3.4", Port: 443, Scheme: proxymodel.SchemeHTTPS}},
+		{Host: "e.com", Upstream: proxymodel.Upstream{Addr: "1.2.3.4", Port: 80}, ForceHTTPS: true},
 		{
-			FQDN: "f.com", UpstreamAddr: "1.2.3.4", UpstreamPort: 80,
-			CustomRequestHeaders:  map[string]string{"X-A": "1"},
-			CustomResponseHeaders: map[string]string{"X-B": "2"},
+			Host:            "f.com",
+			Upstream:        proxymodel.Upstream{Addr: "1.2.3.4", Port: 80},
+			RequestHeaders:  map[string]string{"X-A": "1"},
+			ResponseHeaders: map[string]string{"X-B": "2"},
 		},
 	}
 	for _, cfg := range configs {
-		t.Run(cfg.FQDN, func(t *testing.T) {
+		t.Run(cfg.Host, func(t *testing.T) {
 			raw, err := GenerateRoute(cfg)
 			if err != nil {
 				t.Fatalf("GenerateRoute error: %v", err)
