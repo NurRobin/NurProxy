@@ -12,6 +12,8 @@ package agenthub
 import (
 	"encoding/json"
 	"sync"
+
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // Event is a single message pushed to an agent over its stream.
@@ -22,7 +24,10 @@ type Event struct {
 
 // Event type constants.
 const (
-	// EventRoutes carries the agent's full desired route set (a sync snapshot).
+	// EventRoutes carries the agent's full desired intent set (a sync snapshot).
+	// As of Phase 3 the payload is a proxymodel.IntentSet, not pre-rendered Caddy
+	// JSON: the agent renders the intent natively and reports the rendered
+	// artifact back in its apply-ACK (§3/B1).
 	EventRoutes = "routes"
 	// EventPing is a keepalive used to detect dead connections promptly.
 	EventPing = "ping"
@@ -108,9 +113,11 @@ func (h *Hub) Publish(agentID string, ev Event) bool {
 	return true
 }
 
-// PublishRoutes is a convenience wrapper that pushes a full route-set snapshot.
-func (h *Hub) PublishRoutes(agentID string, routes []json.RawMessage) bool {
-	data, err := json.Marshal(routes)
+// PublishIntents is a convenience wrapper that pushes a full intent-set snapshot
+// (the agent's complete desired state). The agent renders each intent natively
+// and reconciles its managed set against the snapshot (§3/B1).
+func (h *Hub) PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool {
+	data, err := json.Marshal(proxymodel.IntentSet{Intents: intents})
 	if err != nil {
 		return false
 	}

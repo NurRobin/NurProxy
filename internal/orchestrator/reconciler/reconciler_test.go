@@ -12,6 +12,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // ---------------------------------------------------------------------------
@@ -127,13 +128,13 @@ func (m *mockAgentClient) getPushCalls() int {
 type mockHub struct {
 	mu        sync.Mutex
 	connected map[string]bool
-	published map[string][][]json.RawMessage
+	published map[string][][]proxymodel.RouteIntent
 }
 
 func newMockHub() *mockHub {
 	return &mockHub{
 		connected: make(map[string]bool),
-		published: make(map[string][][]json.RawMessage),
+		published: make(map[string][][]proxymodel.RouteIntent),
 	}
 }
 
@@ -143,10 +144,10 @@ func (m *mockHub) Connected(agentID string) bool {
 	return m.connected[agentID]
 }
 
-func (m *mockHub) PublishRoutes(agentID string, routes []json.RawMessage) bool {
+func (m *mockHub) PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.published[agentID] = append(m.published[agentID], routes)
+	m.published[agentID] = append(m.published[agentID], intents)
 	return m.connected[agentID]
 }
 
@@ -156,7 +157,7 @@ func (m *mockHub) setConnected(agentID string, ok bool) {
 	m.connected[agentID] = ok
 }
 
-func (m *mockHub) lastPublished(agentID string) []json.RawMessage {
+func (m *mockHub) lastPublished(agentID string) []proxymodel.RouteIntent {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	batches := m.published[agentID]
@@ -418,10 +419,13 @@ func TestReconcileRoutes_HubPushSkipsInbound(t *testing.T) {
 	// Routes should be delivered over the stream, NOT via the inbound client.
 	pushed := hub.lastPublished(agent.ID)
 	if len(pushed) != 1 {
-		t.Fatalf("expected 1 route published to hub, got %d", len(pushed))
+		t.Fatalf("expected 1 intent published to hub, got %d", len(pushed))
 	}
-	if host := extractHostFromRoute(pushed[0]); host != "app.example.com" {
-		t.Errorf("published route host = %q, want app.example.com", host)
+	if host := pushed[0].Route.Host; host != "app.example.com" {
+		t.Errorf("published intent host = %q, want app.example.com", host)
+	}
+	if pushed[0].ArtifactID == "" {
+		t.Error("published intent should carry a stable artifact id")
 	}
 	if mc.getPushCalls() != 0 {
 		t.Errorf("inbound push should not be used for a connected agent, got %d calls", mc.getPushCalls())

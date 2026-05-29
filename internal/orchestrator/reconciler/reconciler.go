@@ -18,6 +18,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // AgentClient defines the operations the reconciler needs from an agent.
@@ -33,7 +34,7 @@ type AgentClient interface {
 // push routes to agents over their live (outbound-initiated) stream.
 type RouteHub interface {
 	Connected(agentID string) bool
-	PublishRoutes(agentID string, routes []json.RawMessage) bool
+	PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool
 }
 
 // Reconciler periodically syncs desired state (database) with actual state
@@ -80,12 +81,22 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	if err != nil {
 		return err
 	}
-	routes := make([]json.RawMessage, 0, len(desired))
-	for _, d := range desired {
-		routes = append(routes, d.route)
-	}
-	r.hub.PublishRoutes(agentID, routes)
+	r.hub.PublishIntents(agentID, intentsFromDesired(desired))
 	return nil
+}
+
+// intentsFromDesired flattens the desired route map into the intent snapshot
+// pushed over the stream (the canonical wire format, §3/B1).
+func intentsFromDesired(desired map[string]desiredRoute) []proxymodel.RouteIntent {
+	intents := make([]proxymodel.RouteIntent, 0, len(desired))
+	for _, d := range desired {
+		intents = append(intents, proxymodel.RouteIntent{
+			ArtifactID: d.artifactID,
+			Backend:    "caddy",
+			Route:      d.intent,
+		})
+	}
+	return intents
 }
 
 // Start launches the periodic reconciliation loop in a background goroutine.
@@ -318,7 +329,8 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
-		route, gErr := caddygen.GenerateRoute(caddygen.ConfigFromDomain(*dom, fqdn, srv.Address))
+		intent := caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+		route, gErr := caddygen.GenerateRoute(intent)
 		if gErr != nil {
 			log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
 			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
@@ -328,9 +340,11 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 		}
 
 		desiredByFQDN[fqdn] = desiredRoute{
-			domain: dom,
-			fqdn:   fqdn,
-			route:  route,
+			domain:     dom,
+			fqdn:       fqdn,
+			route:      route,
+			intent:     intent,
+			artifactID: artifactIDForDomain(dom.ID),
 		}
 	}
 
@@ -350,11 +364,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 	// diff below is the fallback for same-host / port-forwarded setups where the
 	// orchestrator can reach the agent directly.
 	if r.hub != nil && r.hub.Connected(agent.ID) {
-		routes := make([]json.RawMessage, 0, len(desiredByFQDN))
-		for _, d := range desiredByFQDN {
-			routes = append(routes, d.route)
-		}
-		r.hub.PublishRoutes(agent.ID, routes)
+		r.hub.PublishIntents(agent.ID, intentsFromDesired(desiredByFQDN))
 		return nil
 	}
 
@@ -796,7 +806,26 @@ func (r *Reconciler) resolveDNS(zoneID string) (*models.Zone, *models.Provider, 
 type desiredRoute struct {
 	domain *models.Domain
 	fqdn   string
-	route  json.RawMessage
+	// route is the rendered Caddy route JSON, kept for the inbound-HTTP fallback
+	// path (the agent's local REST API still speaks Caddy JSON for same-host /
+	// port-forwarded setups).
+	route json.RawMessage
+	// intent is the backend-neutral Route pushed over the live stream (the
+	// canonical wire format, §3/B1): the agent renders it natively and reports
+	// back the rendered artifact.
+	intent proxymodel.Route
+	// artifactID is the stable, orchestrator-assigned identity of this domain's
+	// config artifact, echoed back by the agent in its apply-ACK so the rendered
+	// content round-trips into the correct store row.
+	artifactID string
+}
+
+// artifactIDForDomain derives the stable artifact identity for a generated
+// (model-backed) domain config. It is deterministic per domain so the agent can
+// echo it back across reconnects without the orchestrator persisting a mapping
+// before the first apply-ACK.
+func artifactIDForDomain(domainID int64) string {
+	return fmt.Sprintf("dom-%d", domainID)
 }
 
 // mergeZoneIDIntoConfig injects the zone's external ID into the provider config
