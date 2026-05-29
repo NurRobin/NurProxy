@@ -19,6 +19,14 @@ import (
 	"github.com/NurRobin/NurProxy/internal/provider"
 )
 
+// WildcardSharedKeyWarning is the operator-facing warning surfaced whenever a
+// wildcard certificate is requested. Per-host certs are the default (§7); a
+// wildcard is opt-in precisely because it places the SAME private key on every
+// agent that serves any host under the wildcard — a wider blast radius if any
+// one of those agents is compromised. The UI shows this on the opt-in toggle and
+// the issuer logs + audits it on every wildcard issuance/renewal.
+const WildcardSharedKeyWarning = "wildcard certificate: the same private key is installed on every agent serving any host under this wildcard — a compromise of one agent exposes the key for all of them; prefer per-host certificates unless you specifically need a wildcard"
+
 // IssueRequest describes a single certificate to obtain.
 type IssueRequest struct {
 	// Host is the primary FQDN the certificate must cover, e.g. "app.example.com".
@@ -111,6 +119,16 @@ func (i *Issuer) Issue(ctx context.Context, req IssueRequest, p provider.Provide
 			slog.String("host", req.Host),
 		)
 		return nil, fmt.Errorf("provider %q: %w", info.ID, ErrNoTXTSupport)
+	}
+
+	// Per-host is the default; a wildcard is opt-in and carries an explicit
+	// shared-private-key warning (§7). Surface it on every wildcard issuance so it
+	// is never silent — logged here and audited by the caller.
+	if req.Wildcard {
+		i.logger.WarnContext(ctx, "issuing wildcard certificate (opt-in)",
+			slog.String("host", req.Host),
+			slog.String("warning", WildcardSharedKeyWarning),
+		)
 	}
 
 	names := req.Names()
