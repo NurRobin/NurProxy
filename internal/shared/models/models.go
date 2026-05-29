@@ -144,6 +144,25 @@ type BasicAuthConfig struct {
 	Password string `json:"password"` // bcrypt hash
 }
 
+// RawConfig is the per-backend escape hatch for a domain's proxy config (§6).
+// When set, the operator's raw native config is used verbatim instead of being
+// rendered from the structured ProxyConfig fields. It replaces the old
+// single-backend ProxyConfig.RawCaddy with a backend-tagged payload so the same
+// escape hatch works for caddy, nginx, and apache.
+type RawConfig struct {
+	// Backend names the proxy this content targets ("caddy" | "nginx" |
+	// "apache").
+	Backend string `json:"backend,omitempty"`
+	// Content is the raw native config text. For built-in Caddy this is route
+	// JSON; for nginx/apache it is the native config block.
+	Content string `json:"content,omitempty"`
+}
+
+// IsZero reports whether the raw escape hatch is unset (no override).
+func (r RawConfig) IsZero() bool {
+	return r.Backend == "" && r.Content == ""
+}
+
 // ProxyConfig holds per-domain reverse proxy settings.
 type ProxyConfig struct {
 	WebSocket             bool              `json:"websocket,omitempty"`
@@ -161,7 +180,7 @@ type ProxyConfig struct {
 	IPAllowlist           []string          `json:"ip_allowlist,omitempty"`
 	IPBlocklist           []string          `json:"ip_blocklist,omitempty"`
 	RateLimit             float64           `json:"rate_limit,omitempty"` // requests/second
-	RawCaddy              string            `json:"_raw_caddy,omitempty"` // manual override
+	RawConfig             RawConfig         `json:"raw_config,omitempty"` // per-backend manual override (§6)
 }
 
 // Domain represents a proxied subdomain.

@@ -243,9 +243,9 @@ func (s *Server) handleGetDomainConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// If manual config, return the raw caddy config
-	if dom.ManualConfig && dom.ProxyConfig.RawCaddy != "" {
+	if dom.ManualConfig && !dom.ProxyConfig.RawConfig.IsZero() {
 		var raw json.RawMessage
-		if err := json.Unmarshal([]byte(dom.ProxyConfig.RawCaddy), &raw); err == nil {
+		if err := json.Unmarshal([]byte(dom.ProxyConfig.RawConfig.Content), &raw); err == nil {
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"manual": true,
 				"config": raw,
@@ -309,7 +309,7 @@ func (s *Server) handleUpdateDomainConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	dom.ManualConfig = true
-	dom.ProxyConfig.RawCaddy = string(req.Config)
+	dom.ProxyConfig.RawConfig = models.RawConfig{Backend: "caddy", Content: string(req.Config)}
 	dom.Status = models.DomainStatusPending
 
 	if err := s.db.UpdateDomain(dom); err != nil {
@@ -338,7 +338,7 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 	}
 
 	dom.ManualConfig = false
-	dom.ProxyConfig.RawCaddy = ""
+	dom.ProxyConfig.RawConfig = models.RawConfig{}
 	dom.Status = models.DomainStatusPending
 
 	if err := s.db.UpdateDomain(dom); err != nil {
