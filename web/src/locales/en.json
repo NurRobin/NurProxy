@@ -193,7 +193,21 @@
     "edit": "Edit",
     "save": "Save",
     "updated": "{{name}} updated.",
-    "updateFailed": "Failed to update agent."
+    "updateFailed": "Failed to update agent.",
+    "detectedProxy": "Detected proxy",
+    "detectedAt": "detected {{when}}",
+    "detectPending": "No detection reported yet.",
+    "noProxyDetected": "No supported reverse proxy detected on this host.",
+    "proxyAt": "{{name}} at {{dir}}",
+    "proxyKind": "Proxy",
+    "proxyVersion": "Version",
+    "proxyBinary": "Binary",
+    "proxyConfigDir": "Config dir",
+    "proxyLogPaths": "Log paths",
+    "bindConflict": "Port conflict",
+    "bindConflictBody": "Another process is holding the ports the built-in proxy needs. Switch this agent to an existing-proxy setup, or free the port.",
+    "bindConflictItem": ":{{port}} held by {{process}}{{pid}}",
+    "unknownProcess": "an unknown process"
   },
   "servers": {
     "title": "Servers",

@@ -14,6 +14,22 @@ export interface Zone {
   created_at: string;
 }
 
+export interface ProxyPortConflict {
+  port: number;
+  process?: string;
+  pid?: number;
+}
+
+export interface ProxyDetection {
+  installed: boolean;
+  kind?: string;
+  version?: string;
+  binary_path?: string;
+  config_dir?: string;
+  log_paths?: string[];
+  port_conflicts?: ProxyPortConflict[];
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -29,6 +45,8 @@ export interface Agent {
   caddy_running?: boolean;
   last_error?: string;
   dns_error?: string;
+  proxy_detection?: ProxyDetection;
+  proxy_detected_at?: string;
   created_at: string;
   updated_at: string;
   servers?: Server[];
