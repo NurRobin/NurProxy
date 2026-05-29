@@ -46,6 +46,7 @@ func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Rou
 		IPAllowlist: d.ProxyConfig.IPAllowlist,
 		IPBlocklist: d.ProxyConfig.IPBlocklist,
 		RateLimit:   proxymodel.RateLimit{RequestsPerSecond: d.ProxyConfig.RateLimit},
+		TLS:         proxymodel.TLSConfig{Policy: tlsPolicyFromDomain(d)},
 	}
 	if d.ProxyConfig.BasicAuth != nil {
 		route.BasicAuth = &proxymodel.BasicAuth{
@@ -61,6 +62,29 @@ func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Rou
 		route.Raw = proxymodel.RawConfig{Backend: backend, Content: d.ProxyConfig.RawConfig.Content}
 	}
 	return route
+}
+
+// tlsPolicyFromDomain resolves a domain's public-listener TLS provisioning
+// policy (§7) into the backend-neutral proxymodel.TLSPolicy. The explicit
+// per-domain ProxyConfig.TLSPolicy wins; an empty policy defaults to central
+// provisioning (DNS-01, built-in Caddy on provided certs) EXCEPT when the
+// domain's SSLMode is "off", which disables TLS. "self-acme" selects the Caddy
+// self-ACME fallback (zones not in a configured DNS provider, orchestrator-down
+// resilience). An unrecognized value falls back to central rather than failing.
+func tlsPolicyFromDomain(d models.Domain) proxymodel.TLSPolicy {
+	switch proxymodel.TLSPolicy(d.ProxyConfig.TLSPolicy) {
+	case proxymodel.TLSPolicySelfACME:
+		return proxymodel.TLSPolicySelfACME
+	case proxymodel.TLSPolicyOff:
+		return proxymodel.TLSPolicyOff
+	case proxymodel.TLSPolicyCentral:
+		return proxymodel.TLSPolicyCentral
+	}
+	// No explicit policy: honor SSLMode off, otherwise central by default.
+	if d.SSLMode == models.SSLModeOff {
+		return proxymodel.TLSPolicyOff
+	}
+	return proxymodel.TLSPolicyCentral
 }
 
 // forbiddenResponse returns a static_response handler that replies 403.

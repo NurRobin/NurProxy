@@ -212,6 +212,14 @@ type ProxyConfig struct {
 	IPBlocklist           []string          `json:"ip_blocklist,omitempty"`
 	RateLimit             float64           `json:"rate_limit,omitempty"` // requests/second
 	RawConfig             RawConfig         `json:"raw_config,omitempty"` // per-backend manual override (§6)
+	// TLSPolicy selects how the public-listener certificate is provisioned (§7):
+	// "central" (default) issues the cert centrally via DNS-01 and feeds the
+	// bundle to the agent (built-in Caddy runs on provided certs with
+	// automatic_https disabled); "self-acme" lets the backend (Caddy) obtain its
+	// own cert as the explicit fallback for zones not in a configured DNS provider
+	// or for orchestrator-down resilience; "off" disables TLS. Empty is treated as
+	// "central" by the renderer.
+	TLSPolicy string `json:"tls_policy,omitempty"`
 }
 
 // Domain represents a proxied subdomain.
