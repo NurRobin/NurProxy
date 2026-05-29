@@ -24,6 +24,7 @@ type Heartbeat struct {
 	interval        time.Duration
 	healthFn        func() (caddyRunning bool, lastError string)
 	detectionFn     func() *models.ProxyDetection
+	capabilitiesFn  func() *models.ProxyCapabilities
 	client          *http.Client
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -40,6 +41,10 @@ type heartbeatPayload struct {
 	// (§13.0/§2.1/§9) so the orchestrator's stored copy stays fresh as the host
 	// changes (e.g. an Existing proxy stops releasing :443). Omitted when unknown.
 	ProxyDetection *models.ProxyDetection `json:"proxy_detection,omitempty"`
+	// ProxyCapabilities re-reports the backend capability matrix (§8) on every beat
+	// so the orchestrator's stored copy tracks module changes (e.g. caddy-ratelimit
+	// installed/removed). Omitted when unknown.
+	ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities,omitempty"`
 }
 
 // New creates a new Heartbeat sender. healthFn supplies the agent's current
@@ -64,6 +69,14 @@ func New(orchestratorURL, agentID, token, version string, interval time.Duration
 // agent can refresh detection over time without restarting the heartbeat.
 func (h *Heartbeat) SetDetectionFn(fn func() *models.ProxyDetection) {
 	h.detectionFn = fn
+}
+
+// SetCapabilitiesFn supplies the backend capability matrix (§8) re-reported on
+// each beat. It may be nil (no capabilities sent). The function is called per
+// beat so the agent can refresh capabilities over time (e.g. after a module is
+// installed) without restarting the heartbeat.
+func (h *Heartbeat) SetCapabilitiesFn(fn func() *models.ProxyCapabilities) {
+	h.capabilitiesFn = fn
 }
 
 // Start begins the heartbeat loop. It blocks until the context is canceled.
@@ -119,13 +132,19 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		detection = h.detectionFn()
 	}
 
+	var capabilities *models.ProxyCapabilities
+	if h.capabilitiesFn != nil {
+		capabilities = h.capabilitiesFn()
+	}
+
 	payload := heartbeatPayload{
-		AgentID:        h.agentID,
-		PublicIP:       ip,
-		Version:        h.version,
-		CaddyRunning:   caddyRunning,
-		LastError:      lastError,
-		ProxyDetection: detection,
+		AgentID:           h.agentID,
+		PublicIP:          ip,
+		Version:           h.version,
+		CaddyRunning:      caddyRunning,
+		LastError:         lastError,
+		ProxyDetection:    detection,
+		ProxyCapabilities: capabilities,
 	}
 
 	data, err := json.Marshal(payload)

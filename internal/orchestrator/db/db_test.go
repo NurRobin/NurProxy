@@ -618,6 +618,68 @@ func TestAgent_UpdateDetection_roundTrips(t *testing.T) {
 	}
 }
 
+func TestAgent_Capabilities_freshAgentIsNil(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	got, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if got.ProxyCapabilities != nil {
+		t.Errorf("ProxyCapabilities: got %+v, want nil for an agent that never reported", got.ProxyCapabilities)
+	}
+}
+
+func TestAgent_UpdateCapabilities_roundTrips(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	tests := []struct {
+		name string
+		caps *models.ProxyCapabilities
+	}{
+		{
+			name: "ratelimit present",
+			caps: &models.ProxyCapabilities{
+				ReverseProxy: true, WebSocket: true, ForceHTTPS: true,
+				CustomHeaders: true, PathRewrite: true, BasicAuth: true,
+				IPFilter: true, RateLimit: true, CentralTLS: true,
+			},
+		},
+		{
+			name: "ratelimit absent",
+			caps: &models.ProxyCapabilities{
+				ReverseProxy: true, WebSocket: true, ForceHTTPS: true,
+				CustomHeaders: true, PathRewrite: true, BasicAuth: true,
+				IPFilter: true, RateLimit: false, CentralTLS: true,
+			},
+		},
+		{
+			name: "all false",
+			caps: &models.ProxyCapabilities{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := d.UpdateAgentCapabilities(a.ID, tt.caps); err != nil {
+				t.Fatalf("UpdateAgentCapabilities: %v", err)
+			}
+			got, err := d.GetAgent(a.ID)
+			if err != nil {
+				t.Fatalf("GetAgent: %v", err)
+			}
+			if got.ProxyCapabilities == nil {
+				t.Fatalf("ProxyCapabilities: got nil after update, want non-nil")
+			}
+			if *got.ProxyCapabilities != *tt.caps {
+				t.Errorf("ProxyCapabilities: got %+v, want %+v", *got.ProxyCapabilities, *tt.caps)
+			}
+		})
+	}
+}
+
 func TestAgent_Heartbeat(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)

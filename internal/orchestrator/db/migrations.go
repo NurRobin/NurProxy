@@ -267,6 +267,17 @@ var migrations = []string{
 	ALTER TABLE agents ADD COLUMN detected_installed      INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE agents ADD COLUMN detected_at             TEXT;
 	`,
+
+	// Migration 007: store the agent's reported capability matrix (§8) on the
+	// agent row. The agent reports which proxy options its selected backend
+	// supports — including module-probed ones (e.g. is caddy-ratelimit compiled
+	// in?) — at adoption and on every heartbeat. The orchestrator persists it here
+	// (a single JSON blob, since it is read as a unit by the dashboard) and exposes
+	// it read-only so unsupported options are greyed out per the selected backend.
+	// NULL until the first capability report arrives.
+	`
+	ALTER TABLE agents ADD COLUMN detected_capabilities TEXT;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
