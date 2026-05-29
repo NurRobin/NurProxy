@@ -92,6 +92,12 @@ type ArtifactReport struct {
 	Enabled bool `json:"enabled"`
 	// Error is the per-artifact apply error, empty on success.
 	Error string `json:"error,omitempty"`
+	// Warnings lists proxy options the backend dropped because it cannot express
+	// them (invariant #4). Each is "<option>: <reason>". The orchestrator audits
+	// each entry so the operator sees, in the central audit log, exactly what was
+	// silently dropped — the "audited" half of invariant #4 (the agent already
+	// logged them locally).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // ApplyAck is the body the agent POSTs after applying a pushed IntentSet. It

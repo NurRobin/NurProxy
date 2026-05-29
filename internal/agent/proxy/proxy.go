@@ -171,6 +171,13 @@ type Artifact struct {
 	// 1; we never auto-overwrite them. False means a NurProxy-managed (generated)
 	// file, tracked for drift against its accepted state.
 	Adopted bool `json:"adopted"`
+	// Warnings lists the proxy options this backend dropped because it cannot
+	// express them (invariant #4: unsupported options are dropped, never failing
+	// the render). Each entry is a human-readable "<option>: <reason>". The agent
+	// logs them locally and carries them back in the apply-ACK so the orchestrator
+	// audits each drop (invariant #4's "logged + audited" half lives centrally,
+	// since the audit log is on the orchestrator).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // TLSIntent is one host's public-listener TLS policy, used by the bundled Caddy

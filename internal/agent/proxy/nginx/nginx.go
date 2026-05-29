@@ -187,7 +187,8 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 // Render turns a backend-neutral route into a file Artifact: the content is the
 // nginx http-preamble plus server block produced by the pure nginxgen renderer,
 // and the target is the sites-available path nurproxy-<host>.conf. Dropped
-// options (invariant #4) are logged + audited here; they never fail the render.
+// options (invariant #4) are logged here and carried back in the apply-ACK so
+// the orchestrator audits each one; they never fail the render.
 func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
 	in := nginxgen.Input{Route: route}
 	// Resolve provided-cert paths for a TLS route so the renderer can emit the
@@ -204,11 +205,13 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 	if err != nil {
 		return proxy.Artifact{}, fmt.Errorf("rendering nginx config for %q: %w", route.Host, err)
 	}
+	warnings := make([]string, 0, len(res.Warnings))
 	for _, w := range res.Warnings {
 		slog.WarnContext(ctx, "nginx: dropped unsupported proxy option",
 			slog.String("host", route.Host),
 			slog.String("option", w.Option),
 			slog.String("reason", w.Reason))
+		warnings = append(warnings, w.String())
 	}
 
 	var content strings.Builder
@@ -226,8 +229,9 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 			Kind: proxy.TargetKindFile,
 			Path: b.layout.AvailablePath(route.Host),
 		},
-		Content: content.String(),
-		Enabled: true,
+		Content:  content.String(),
+		Enabled:  true,
+		Warnings: warnings,
 	}, nil
 }
 
