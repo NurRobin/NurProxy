@@ -34,6 +34,7 @@ func TestMigration_TablesExist(t *testing.T) {
 		"providers", "agents", "servers", "domains",
 		"notifiers", "audit_log", "settings", "schema_version",
 		"zones", "agent_zones",
+		"config_artifacts", "config_artifact_versions",
 	}
 	for _, tbl := range tables {
 		var name string
