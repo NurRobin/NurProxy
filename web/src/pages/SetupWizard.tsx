@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation, Trans } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
+import { copyText } from '../lib/clipboard';
 import type { Agent, Zone } from '../lib/types';
 import type { TestProviderZone } from '../lib/api';
 import { Check } from 'lucide-react';
@@ -163,11 +164,12 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     `  --fqdn ${agentFqdn || 'edge1.example.com'}`;
 
   async function copyToClipboard(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
+    // copyText falls back to execCommand on insecure origins (plain http on a
+    // LAN IP / behind a proxy), where navigator.clipboard is undefined.
+    if (await copyText(text)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch { /* ignore */ }
+    }
   }
 
   const pendingAgents = agents.filter((a) => a.status === 'pending');

@@ -5,6 +5,7 @@ import Modal from '../components/Modal';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import { Field, Input, Select } from '../components/Field';
+import { copyText } from '../lib/clipboard';
 import type { Agent, ProxyDetection } from '../lib/types';
 
 type ProxyKind = 'nginx' | 'apache' | 'caddy';
@@ -125,12 +126,11 @@ export default function ExistingSetup({ agent, open, onClose }: Props) {
   const fromDetection = (val: string | undefined) => detKindMatches && !!val;
 
   async function copy() {
-    try {
-      await navigator.clipboard.writeText(yaml);
+    // copyText works over plain http too (hidden-textarea fallback); the snippet
+    // also stays visible in the <pre> below for manual selection if it fails.
+    if (await copyText(yaml)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* clipboard unavailable — the snippet is still visible to copy by hand */
     }
   }
 
