@@ -80,7 +80,7 @@ func (p *CloudflareProvider) Info() provider.ProviderInfo {
 		Name:        "Cloudflare",
 		Description: "Cloudflare DNS management via API v4",
 		Website:     "https://www.cloudflare.com",
-		RecordTypes: []string{"A", "AAAA", "CNAME"},
+		RecordTypes: []string{"A", "AAAA", "CNAME", "TXT"},
 	}
 }
 

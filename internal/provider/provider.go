@@ -24,6 +24,18 @@ type ProviderInfo struct {
 	RecordTypes []string `json:"record_types"`
 }
 
+// SupportsTXT reports whether the provider can create TXT records, which is the
+// prerequisite for DNS-01 ACME challenges (§7). A provider that cannot must fall
+// back to HTTP-01 (Caddy) rather than failing silently.
+func (i ProviderInfo) SupportsTXT() bool {
+	for _, t := range i.RecordTypes {
+		if t == "TXT" {
+			return true
+		}
+	}
+	return false
+}
+
 type Zone struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
