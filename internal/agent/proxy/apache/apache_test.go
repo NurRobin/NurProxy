@@ -376,3 +376,33 @@ func TestRegistered_includesApache(t *testing.T) {
 		t.Errorf("apache backend should be registered in init(); registered = %v", proxy.Registered())
 	}
 }
+
+func TestProbeDirs_debianLayout_includesEnabledDir(t *testing.T) {
+	b := New(proxy.Config{Type: "apache", ConfigDir: "/etc/apache2/sites-available"})
+	dirs := b.ProbeDirs()
+	if len(dirs) != 2 {
+		t.Fatalf("Debian layout should probe sites-available + sites-enabled, got %v", dirs)
+	}
+	if dirs[0] != "/etc/apache2/sites-available" || dirs[1] != "/etc/apache2/sites-enabled" {
+		t.Fatalf("unexpected probe dirs: %v", dirs)
+	}
+}
+
+func TestProbeDirs_confDLayout_onlyAvailableDir(t *testing.T) {
+	b := New(proxy.Config{Type: "apache", ConfigDir: "/etc/httpd/conf.d"})
+	dirs := b.ProbeDirs()
+	if len(dirs) != 1 || dirs[0] != "/etc/httpd/conf.d" {
+		t.Fatalf("conf.d layout should probe only the one dir, got %v", dirs)
+	}
+}
+
+func TestReloadHint_default_andOverride(t *testing.T) {
+	b := New(proxy.Config{Type: "apache", ConfigDir: "/etc/apache2/sites-available", Binary: "/usr/sbin/apachectl"})
+	if got := b.ReloadHint(); got != "/usr/sbin/apachectl graceful" {
+		t.Fatalf("default ReloadHint = %q", got)
+	}
+	o := New(proxy.Config{Type: "apache", ConfigDir: "/etc/apache2/sites-available", ReloadCmd: "sudo systemctl reload apache2"})
+	if got := o.ReloadHint(); got != "sudo systemctl reload apache2" {
+		t.Fatalf("override ReloadHint = %q", got)
+	}
+}

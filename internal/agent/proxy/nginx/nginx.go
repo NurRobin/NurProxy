@@ -452,6 +452,38 @@ func (b *Backend) enabledLinkFor(availablePath string) string {
 	return filepath.Join(b.layout.Enabled, filepath.Base(availablePath))
 }
 
+// ProbeDirs reports the directories the agent must be able to write to manage
+// nginx (§12): sites-available always, plus sites-enabled on the Debian layout
+// (the symlink-activation dir). The RHEL conf.d layout has no separate enable
+// dir, so only the one directory is returned. The startup permission probe
+// (permcheck) writes a throwaway file in each to confirm the group/ownership
+// grant before any real apply.
+func (b *Backend) ProbeDirs() []string {
+	if b.layout.IsConfD() {
+		return []string{b.layout.Available}
+	}
+	return []string{b.layout.Available, b.layout.Enabled}
+}
+
+// Runner exposes the backend's config-validate/reload runner so the startup
+// permission probe can confirm the scoped-sudoers reload grant (§12) without
+// the backend depending on the probe package. It satisfies permcheck.TestRunner.
+func (b *Backend) Runner() Runner { return b.runner }
+
+// ReloadHint returns the reload command the operator must allow via a scoped
+// sudoers entry (§12), woven into the probe's actionable health message. It is
+// the per-agent override when set, else the default nginx reload invocation.
+func (b *Backend) ReloadHint() string {
+	if r, ok := b.runner.(*execRunner); ok && r.reloadCmd != "" {
+		return r.reloadCmd
+	}
+	bin := b.binary
+	if bin == "" {
+		bin = "nginx"
+	}
+	return bin + " -s reload"
+}
+
 // primaryTarget returns the first artifact's target path, used as "our file" for
 // error attribution. A single-domain apply has exactly one; for a multi-file
 // apply the first is a reasonable anchor (the attribution still compares the
