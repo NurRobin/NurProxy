@@ -36,6 +36,18 @@ var (
 	apiPort         = flag.Int("api-port", 8780, "Agent API port")
 	caddyAdminPort  = flag.Int("caddy-admin-port", 2019, "Caddy admin API port (localhost)")
 	showVersion     = flag.Bool("version", false, "Print version and exit")
+
+	// Proxy backend config (§9). Empty = autodetect / OS default; proxy-mode
+	// defaults to built-in (bundled Caddy). These are also settable via env
+	// (NP_PROXY_*) and the agent.yaml config file.
+	proxyMode      = flag.String("proxy-mode", "", "Proxy mode: built-in (default) | existing")
+	proxyType      = flag.String("proxy-type", "", "Existing proxy type: caddy | nginx | apache")
+	proxyBinary    = flag.String("proxy-binary", "", "Override detected proxy binary path")
+	proxyConfigDir = flag.String("proxy-config-dir", "", "Override detected proxy config directory")
+	proxyReloadCmd = flag.String("proxy-reload-cmd", "", "Override proxy reload command")
+	proxyTestCmd   = flag.String("proxy-test-cmd", "", "Override proxy config-test command")
+	proxyLogPaths  = flag.String("proxy-log-paths", "", "Comma-separated proxy log paths to surface")
+	proxyService   = flag.String("proxy-service", "", "Service unit (systemd/openrc/launchd) for reloads")
 )
 
 func main() {
@@ -59,7 +71,21 @@ func main() {
 	}
 
 	// Load config with priority: flags > env > config file > defaults.
-	cfg, err := agentconfig.Load(*orchestratorURL, *fqdn, *dataDir, *apiPort, *caddyAdminPort)
+	cfg, err := agentconfig.Load(agentconfig.Flags{
+		Orchestrator:   *orchestratorURL,
+		FQDN:           *fqdn,
+		DataDir:        *dataDir,
+		APIPort:        *apiPort,
+		CaddyPort:      *caddyAdminPort,
+		ProxyMode:      *proxyMode,
+		ProxyType:      *proxyType,
+		ProxyBinary:    *proxyBinary,
+		ProxyConfigDir: *proxyConfigDir,
+		ProxyReloadCmd: *proxyReloadCmd,
+		ProxyTestCmd:   *proxyTestCmd,
+		ProxyLogPaths:  *proxyLogPaths,
+		ProxyService:   *proxyService,
+	})
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
 	}
@@ -70,6 +96,7 @@ func main() {
 	log.Printf("  Data dir:     %s", cfg.DataDir)
 	log.Printf("  API port:     %d", cfg.APIPort)
 	log.Printf("  Caddy admin:  %d", cfg.CaddyAdminPort)
+	log.Printf("  Proxy mode:   %s", cfg.ProxyMode)
 
 	// Set up context with graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -101,6 +128,17 @@ func main() {
 		}
 	}
 	mgr.SetDetection(detection)
+
+	// Report the backend capability matrix (§8) at registration. For the built-in
+	// Caddy this includes module probing (is caddy-ratelimit compiled in?); the
+	// probe reads the caddy binary's module list, so it works before the Caddy
+	// subprocess is started. Capabilities are refreshed on every heartbeat too.
+	capabilities := detectCapabilities()
+	if capabilities != nil {
+		log.Printf("Proxy capabilities: rate_limit=%t central_tls=%t",
+			capabilities.RateLimit, capabilities.CentralTLS)
+	}
+	mgr.SetCapabilities(capabilities)
 
 	log.Printf("Agent ID: %s", mgr.AgentID())
 	log.Printf("Agent Token: %s...%s", mgr.Token()[:10], mgr.Token()[len(mgr.Token())-4:])
@@ -178,6 +216,10 @@ func main() {
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
 	// host changes (e.g. a previously-conflicting proxy releasing :443).
 	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx) })
+	// Re-report the capability matrix on each beat so module changes (e.g.
+	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
+	// backend the agent reconciles through, so the report matches what Render emits.
+	hb.SetCapabilitiesFn(func() *models.ProxyCapabilities { return caddyBackend.Capabilities().ToModel() })
 	hb.Start(ctx)
 
 	// Step 5: Open the push stream. The agent dials out and holds it open; the
@@ -220,4 +262,14 @@ func detectProxy(ctx context.Context) *models.ProxyDetection {
 		return nil
 	}
 	return det.ToModel()
+}
+
+// detectCapabilities probes the bundled Caddy backend's capability matrix (§8),
+// including module probing (e.g. caddy-ratelimit). It builds a probe-only caddy
+// backend over a mock client — Capabilities never touches the admin API, only the
+// binary's module list — so it works before the Caddy subprocess starts. The
+// result rides the agent-initiated register/heartbeat payloads.
+func detectCapabilities() *models.ProxyCapabilities {
+	b := caddybackend.New(caddy.NewMockClient())
+	return b.Capabilities().ToModel()
 }
