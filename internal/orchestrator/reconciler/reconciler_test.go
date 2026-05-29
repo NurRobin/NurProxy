@@ -432,6 +432,56 @@ func TestReconcileRoutes_HubPushSkipsInbound(t *testing.T) {
 	}
 }
 
+// TestBuildDesiredRoutes_SkipsDriftedArtifact verifies drift = review, not
+// bulldoze (§11, invariant #3): a domain whose artifact is in an unresolved
+// drifted state is NOT pushed, so the reconciler never overwrites the operator's
+// on-disk change while it awaits review. Enabling the opt-in per-agent
+// auto-reconcile policy restores the push (hands-off auto-correction).
+func TestBuildDesiredRoutes_SkipsDriftedArtifact(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	// Create the domain's artifact and flag it drifted.
+	artifactID := artifactIDForDomain(dom.ID)
+	art := &models.ConfigArtifact{
+		ID:      artifactID,
+		AgentID: agent.ID,
+		Backend: "caddy",
+		Target:  models.Target{Kind: models.TargetKindCaddyRoute, Path: "caddy:route:" + artifactID},
+		Source:  models.ArtifactSourceGenerated,
+		Content: `{"handle":[]}`,
+	}
+	if err := d.CreateConfigArtifact(art, "tester", "seed"); err != nil {
+		t.Fatalf("CreateConfigArtifact: %v", err)
+	}
+	if err := d.MarkConfigArtifactDrifted(artifactID); err != nil {
+		t.Fatalf("MarkConfigArtifactDrifted: %v", err)
+	}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	desired, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes: %v", err)
+	}
+	if len(desired) != 0 {
+		t.Errorf("drifted artifact should be skipped, got %d desired routes", len(desired))
+	}
+
+	// With auto-reconcile enabled, the domain is pushed again.
+	if err := d.SetAgentAutoReconcileConfig(agent.ID, true); err != nil {
+		t.Fatalf("SetAgentAutoReconcileConfig: %v", err)
+	}
+	agent.AutoReconcileConfig = true
+	desired, err = r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes (auto): %v", err)
+	}
+	if len(desired) != 1 {
+		t.Errorf("auto-reconcile should push the artifact, got %d desired routes", len(desired))
+	}
+}
+
 func TestPushAgentRoutes(t *testing.T) {
 	d := testDB(t)
 	_, _, agent, _, _ := setupScenario(t, d)

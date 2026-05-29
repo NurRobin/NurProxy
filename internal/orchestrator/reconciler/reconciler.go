@@ -329,6 +329,22 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
+		artifactID := artifactIDForDomain(dom.ID)
+
+		// Drift = review, not bulldoze (§11, invariant #3): if this domain's
+		// artifact is in an unresolved drifted state, do NOT push it — leave the
+		// operator's on-disk change in place until they Accept or Reject it. The
+		// opt-in per-agent auto-reconcile policy overrides this, restoring the old
+		// hands-off auto-correction (the artifact is pushed normally so the agent
+		// re-applies the generated content over the drift). DNS reconciliation is
+		// untouched by this gate — it stays automatic.
+		if !agent.AutoReconcileConfig {
+			if art, aErr := r.db.GetConfigArtifact(artifactID); aErr == nil && art.Drifted {
+				log.Printf("reconciler: skipping push for %s (artifact %s drifted, awaiting review)", fqdn, artifactID)
+				continue
+			}
+		}
+
 		intent := caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
 		route, gErr := caddygen.GenerateRoute(intent)
 		if gErr != nil {
@@ -344,7 +360,7 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			fqdn:       fqdn,
 			route:      route,
 			intent:     intent,
-			artifactID: artifactIDForDomain(dom.ID),
+			artifactID: artifactID,
 		}
 	}
 
@@ -764,6 +780,18 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 						log.Printf("reconciler: failed to delete route %s on agent %s: %v", fqdn, agent.ID, rErr)
 					}
 				}
+			}
+		}
+
+		// Remove the domain's config artifact from the central store so no ghost
+		// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
+		// applied) is fine.
+		artifactID := artifactIDForDomain(dom.ID)
+		if _, aErr := r.db.GetConfigArtifact(artifactID); aErr == nil {
+			if dErr := r.db.DeleteConfigArtifact(artifactID); dErr != nil {
+				log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)
+			} else {
+				r.audit("config_artifact", artifactID, "remove", "domain deleted")
 			}
 		}
 

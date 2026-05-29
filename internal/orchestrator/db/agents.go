@@ -36,14 +36,16 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 			detected_proxy_kind, detected_proxy_version, detected_binary_path,
 			detected_config_dir, detected_log_paths, detected_port_conflicts,
 			detected_installed, detected_at, detected_capabilities,
+			auto_reconcile_config,
 			created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
 		string(a.Status), lastSeen, a.Version,
 		boolToInt(a.CaddyRunning), a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
 		det.logPaths, det.portConflicts, det.installed, detectedAt, caps,
+		boolToInt(a.AutoReconcileConfig),
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 	)
 	if err != nil {
@@ -164,6 +166,7 @@ func scanAgent(sc interface {
 	var det detectionCols
 	var detectedAt sql.NullString
 	var capabilities sql.NullString
+	var autoReconcile int
 
 	err := sc.Scan(
 		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
@@ -173,12 +176,14 @@ func scanAgent(sc interface {
 		&det.kind, &det.version, &det.binaryPath, &det.configDir,
 		&det.logPaths, &det.portConflicts, &det.installed, &detectedAt,
 		&capabilities,
+		&autoReconcile,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	a.CaddyRunning = caddyRunning != 0
+	a.AutoReconcileConfig = autoReconcile != 0
 	a.ProxyDetection, a.ProxyDetectedAt = decodeDetection(det, detectedAt)
 	a.ProxyCapabilities = decodeCapabilities(capabilities)
 
@@ -198,6 +203,7 @@ const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
 	detected_proxy_kind, detected_proxy_version, detected_binary_path,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
 	detected_installed, detected_at, detected_capabilities,
+	auto_reconcile_config,
 	created_at, updated_at`
 
 // boolToInt maps a bool to SQLite's integer boolean representation.
@@ -286,6 +292,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 			detected_binary_path = ?, detected_config_dir = ?,
 			detected_log_paths = ?, detected_port_conflicts = ?,
 			detected_installed = ?, detected_at = ?, detected_capabilities = ?,
+			auto_reconcile_config = ?,
 			updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.FQDN, a.APIURL, a.TokenHash,
@@ -294,6 +301,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
 		det.logPaths, det.portConflicts, det.installed, detectedAt, caps,
+		boolToInt(a.AutoReconcileConfig),
 		a.UpdatedAt.Format(time.RFC3339),
 		a.ID,
 	)
@@ -451,6 +459,28 @@ func (d *DB) UpdateAgentCapabilities(id string, caps *models.ProxyCapabilities) 
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent capabilities: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+// SetAgentAutoReconcileConfig toggles the opt-in per-agent "auto-reconcile
+// config" policy (§11). When enabled the reconciler re-applies generated
+// artifacts over on-disk drift instead of flagging it for review (hands-off
+// mode). It is a narrow update so it never clobbers the agent's liveness/health
+// self-report. DNS reconciliation is unaffected (always automatic).
+func (d *DB) SetAgentAutoReconcileConfig(id string, enabled bool) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET auto_reconcile_config = ?, updated_at = ? WHERE id = ?`,
+		boolToInt(enabled), now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent auto-reconcile policy: %w", err)
 	}
 
 	n, _ := res.RowsAffected()
