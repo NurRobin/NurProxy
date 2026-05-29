@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -163,6 +164,9 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 		dom.ZoneID = *req.ZoneID
 	}
+	// Capture the prior server so a move can clean up the artifact on the old
+	// agent (no ghost vhosts, §3).
+	oldServerID := dom.ServerID
 	if req.ServerID != nil {
 		if _, err := s.db.GetServer(*req.ServerID); err != nil {
 			writeError(w, http.StatusBadRequest, "server not found")
@@ -195,9 +199,66 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "update", dom.Subdomain)
+
+	// Domain lifecycle: a server move (to a server on a different agent) must
+	// remove the artifact on the OLD agent and (re-)render the intent on the new
+	// one — no ghost vhosts (§3). The artifact row is keyed by agent_id, so we drop
+	// the stale row; the old agent's next full-sync push (below) no longer lists
+	// this domain, so it clears the route, and the new agent renders + reports a
+	// fresh artifact in its apply-ACK.
+	if req.ServerID != nil && oldServerID != dom.ServerID {
+		s.handleArtifactServerMove(r, dom.ID, oldServerID, dom.ServerID)
+	}
+
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, dom)
+}
+
+// handleArtifactServerMove cleans up a domain's config artifact after it moves
+// from one server to another (§3). When the move crosses agents, it deletes the
+// stale artifact row (keyed to the old agent) so no orphaned/ghost artifact
+// lingers, and pushes the old agent's now-shrunk intent set so it drops the
+// route on disk. The new agent re-renders the intent and round-trips a fresh
+// artifact on its next apply-ACK. A move within the same agent is a no-op here
+// (the artifact stays valid; the agent just re-applies it).
+func (s *Server) handleArtifactServerMove(r *http.Request, domainID int64, oldServerID, newServerID string) {
+	oldAgentID := s.agentIDForServer(oldServerID)
+	newAgentID := s.agentIDForServer(newServerID)
+	if oldAgentID == "" || oldAgentID == newAgentID {
+		return // same agent (or unresolvable old server) — nothing to clean up.
+	}
+
+	artifactID := artifactIDForDomainID(domainID)
+	if _, err := s.db.GetConfigArtifact(artifactID); err == nil {
+		if dErr := s.db.DeleteConfigArtifact(artifactID); dErr != nil {
+			log.Printf("move: failed to delete stale artifact %s: %v", artifactID, dErr)
+		} else {
+			s.audit(r, "config_artifact", artifactID, "remove", "domain moved to another agent")
+		}
+	}
+
+	// Push the old agent so it drops the now-unmanaged route (no ghost vhost).
+	s.pushAgent(oldAgentID)
+}
+
+// agentIDForServer resolves a server ID to its owning agent ID, or "" on error.
+func (s *Server) agentIDForServer(serverID string) string {
+	if serverID == "" {
+		return ""
+	}
+	srv, err := s.db.GetServer(serverID)
+	if err != nil {
+		return ""
+	}
+	return srv.AgentID
+}
+
+// artifactIDForDomainID derives the stable artifact identity for a generated
+// (model-backed) domain config, mirroring the reconciler's artifactIDForDomain
+// and the agents_stream domainIDFromArtifactID round-trip ("dom-<id>").
+func artifactIDForDomainID(domainID int64) string {
+	return "dom-" + strconv.FormatInt(domainID, 10)
 }
 
 // DELETE /api/v1/domains/{id}
