@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,7 +19,9 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
+	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -188,6 +191,16 @@ func main() {
 	// same client (real or mock) and issues the same admin-API calls.
 	caddyBackend := caddybackend.New(caddyClient)
 
+	// Central TLS (§7): attach a cert store so InstallCerts can write
+	// orchestrator-issued bundles to disk, encrypting private keys at rest with an
+	// agent-local AES-256 key. Certs ride the agent-initiated stream (no inbound,
+	// invariant #2) and are installed BEFORE the referencing config is applied
+	// (preflight ordering). A failure to provision the at-rest key is non-fatal: the
+	// agent stays connected and the built-in Caddy can self-ACME as the fallback.
+	if store := newCertStore(cfg.DataDir); store != nil {
+		caddyBackend.WithCertStore(store)
+	}
+
 	// Ensure the HTTP server exists in Caddy. A bind failure here is the classic
 	// "ports 80/443 already in use" case — report it clearly and keep running.
 	if err := caddyBackend.EnsureServer(ctx); err != nil {
@@ -269,6 +282,26 @@ func detectProxy(ctx context.Context) *models.ProxyDetection {
 		return nil
 	}
 	return det.ToModel()
+}
+
+// newCertStore builds the agent's cert store under <dataDir>/certs, loading or
+// generating an agent-local AES-256 key (<dataDir>/cert.key) to encrypt cert
+// private keys at rest (§7). A failure to provision the at-rest key is non-fatal:
+// it logs and returns a store with no key (plaintext PEM) so central TLS still
+// works while the operator fixes permissions, rather than crashing the agent
+// (mirrors the never-die-on-host-problems posture). Returns nil only if dataDir is
+// empty.
+func newCertStore(dataDir string) *certstore.Store {
+	if dataDir == "" {
+		return nil
+	}
+	certDir := filepath.Join(dataDir, "certs")
+	key, err := crypto.LoadOrGenerateKey(filepath.Join(dataDir, "cert.key"))
+	if err != nil {
+		log.Printf("WARNING: could not provision at-rest cert key: %v (cert keys will be stored unencrypted)", err)
+		return certstore.New(certDir, nil)
+	}
+	return certstore.New(certDir, key)
 }
 
 // detectCapabilities probes the bundled Caddy backend's capability matrix (§8),

@@ -33,9 +33,38 @@ type RouteIntent struct {
 // IntentSet is the full desired set of route intents pushed to an agent in one
 // "routes" event — a sync snapshot (the agent reconciles its whole managed set
 // against it, exactly like the prior route snapshot).
+//
+// Certs ride the same push so the agent has everything it needs to go live in one
+// message ("everything is ready, go live", §5 preflight). The orchestrator gathers
+// or issues the certificates first, then pushes them alongside the intent set; the
+// agent installs the certs (InstallCerts) BEFORE applying any referencing config
+// (Apply), so a generated config that points at cert files never fails validation
+// for a missing file. Certs ride the existing agent-initiated stream — there is no
+// inbound probe of the agent (invariant #2).
 type IntentSet struct {
 	// Intents is the complete desired set; an empty slice means "manage nothing".
 	Intents []RouteIntent `json:"intents"`
+	// Certs are the certificate bundles the agent must install before Apply
+	// (preflight ordering, §5/§7). Empty when the orchestrator has no cert material
+	// for this agent (e.g. self-ACME fallback or no TLS).
+	Certs []CertBundle `json:"certs,omitempty"`
+}
+
+// CertBundle is one leaf certificate plus its private key destined for an agent's
+// cert store (§7). It is the wire form of the agent-side proxy.CertBundle: the
+// orchestrator issues/gathers it centrally (DNS-01 via lego) and pushes it down
+// the agent-initiated stream, where the agent writes it to disk (encrypting the
+// key at rest) before applying the config that references it. The key is sensitive
+// and only ever travels over the stream's TLS transport.
+type CertBundle struct {
+	// Host is the FQDN the certificate covers, e.g. "app.example.com". The agent
+	// derives the on-disk file names from it.
+	Host string `json:"host"`
+	// CertPEM is the leaf certificate plus issuer chain in PEM form (public).
+	CertPEM string `json:"cert_pem"`
+	// KeyPEM is the private key in PEM form (sensitive; encrypted at rest by the
+	// agent after install).
+	KeyPEM string `json:"key_pem"`
 }
 
 // ArtifactReport is the agent's atomic apply-ACK for one artifact: the rendered

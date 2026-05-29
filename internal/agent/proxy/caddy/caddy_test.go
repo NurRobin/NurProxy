@@ -1,13 +1,18 @@
 package caddy
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	agentcaddy "github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
+	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -346,5 +351,64 @@ func TestFactory_registered(t *testing.T) {
 	}
 	if p.Info().Kind != proxy.Kind("caddy") {
 		t.Fatalf("registered backend Info().Kind = %q, want caddy", p.Info().Kind)
+	}
+}
+
+// TestBackend_InstallCerts_writesBundleEncrypted verifies InstallCerts writes the
+// pushed bundle into the configured cert store, encrypting the key at rest (§7).
+func TestBackend_InstallCerts_writesBundleEncrypted(t *testing.T) {
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, key))
+
+	keyPEM := []byte("-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n")
+	err = b.InstallCerts(context.Background(), []proxy.CertBundle{{
+		Host:    "app.example.com",
+		CertPEM: []byte("CERTDATA"),
+		KeyPEM:  keyPEM,
+	}})
+	if err != nil {
+		t.Fatalf("InstallCerts: %v", err)
+	}
+
+	// Key on disk must be ciphertext, but ReadKey round-trips to plaintext.
+	store := certstore.New(dir, key)
+	got, err := store.ReadKey("app.example.com")
+	if err != nil {
+		t.Fatalf("ReadKey: %v", err)
+	}
+	if string(got) != string(keyPEM) {
+		t.Errorf("installed key = %q, want original", got)
+	}
+	onDisk, _ := os.ReadFile(filepath.Join(dir, "app.example.com.key.enc"))
+	if bytes.Contains(onDisk, []byte("secret")) {
+		t.Error("private key must not be stored in plaintext")
+	}
+}
+
+// TestBackend_InstallCerts_noStore_isNoop verifies that without a cert store
+// InstallCerts is a logged no-op (self-ACME fallback applies), never an error
+// (invariant #4).
+func TestBackend_InstallCerts_noStore_isNoop(t *testing.T) {
+	b := New(agentcaddy.NewMockClient())
+	if err := b.InstallCerts(context.Background(), []proxy.CertBundle{{
+		Host: "app.example.com", CertPEM: []byte("c"), KeyPEM: []byte("k"),
+	}}); err != nil {
+		t.Fatalf("InstallCerts with no store should be a no-op, got %v", err)
+	}
+}
+
+// TestBackend_InstallCerts_empty_isNoop verifies an empty bundle list is a no-op.
+func TestBackend_InstallCerts_empty_isNoop(t *testing.T) {
+	dir := t.TempDir()
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, nil))
+	if err := b.InstallCerts(context.Background(), nil); err != nil {
+		t.Fatalf("InstallCerts(nil) should be a no-op, got %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Error("no certs should have been written for an empty push")
 	}
 }
