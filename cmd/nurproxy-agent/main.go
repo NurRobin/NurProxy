@@ -17,6 +17,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
@@ -143,9 +144,15 @@ func main() {
 		caddyClient = caddy.NewClient(cfg.CaddyAdminPort)
 	}
 
+	// Drive the bundled Caddy through the proxy.Proxy interface: the agent
+	// reconciles routes via the admin-API caddy backend (§5) instead of the raw
+	// admin client. Behavior is byte-for-byte unchanged — the backend wraps the
+	// same client (real or mock) and issues the same admin-API calls.
+	caddyBackend := caddybackend.New(caddyClient)
+
 	// Ensure the HTTP server exists in Caddy. A bind failure here is the classic
 	// "ports 80/443 already in use" case — report it clearly and keep running.
-	if err := caddyClient.EnsureServer(ctx); err != nil {
+	if err := caddyBackend.EnsureServer(ctx); err != nil {
 		log.Printf("WARNING: Caddy could not start its HTTP server: %v", err)
 		hs.SetCaddyRunning(false)
 		hs.SetError(fmt.Sprintf("Caddy could not bind :80/:443 — are the ports already in use (nginx/apache)? %v", err))
@@ -158,7 +165,7 @@ func main() {
 	// Step 3: Start Agent API server (non-fatal: a bind failure is reported via
 	// health and the agent keeps heartbeating).
 	api.SetVersion(version)
-	apiServer := api.New(cfg.APIPort, caddyClient, mgr.Token())
+	apiServer := api.New(cfg.APIPort, caddyBackend, mgr.Token())
 	apiServer.SetHealth(hs)
 	if err := apiServer.Start(ctx); err != nil {
 		log.Printf("WARNING: failed to start agent API server: %v", err)
@@ -176,7 +183,7 @@ func main() {
 	// Step 5: Open the push stream. The agent dials out and holds it open; the
 	// orchestrator pushes the desired route set down it the instant it changes —
 	// no inbound reachability required. Runs until shutdown, reconnecting as needed.
-	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyClient, hs)
+	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyBackend, hs)
 	go streamClient.Run(ctx)
 
 	log.Printf("Agent is running. Press Ctrl+C to stop.")

@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 )
 
@@ -27,23 +26,36 @@ const (
 	maxLine = 4 << 20 // 4 MiB
 )
 
+// caddyBackend is the subset of the bundled-Caddy proxy backend the stream
+// drives. It is satisfied by *proxy/caddy.Backend (the admin-API Proxy
+// implementation), so the agent reconciles routes through the proxy backend
+// rather than the raw admin client. The primitives are kept separate (rather
+// than a single Apply) so per-host apply success/failure is reported exactly as
+// before and the EnsureServer bind-failure case stays distinctly attributed.
+type caddyBackend interface {
+	EnsureServer(ctx context.Context) error
+	ClearRoutes(ctx context.Context) error
+	AddRoute(ctx context.Context, route json.RawMessage) error
+}
+
 // Client manages the agent's stream connection and applies pushed routes.
 type Client struct {
 	orchestratorURL string
 	agentID         string
 	token           string
-	caddy           *caddy.Client
+	caddy           caddyBackend
 	health          *health.State
 	http            *http.Client
 }
 
-// New creates a stream Client.
-func New(orchestratorURL, agentID, token string, caddyClient *caddy.Client, hs *health.State) *Client {
+// New creates a stream Client. backend is the bundled-Caddy proxy backend the
+// agent reconciles routes through.
+func New(orchestratorURL, agentID, token string, backend caddyBackend, hs *health.State) *Client {
 	return &Client{
 		orchestratorURL: strings.TrimRight(orchestratorURL, "/"),
 		agentID:         agentID,
 		token:           token,
-		caddy:           caddyClient,
+		caddy:           backend,
 		health:          hs,
 		// No client timeout: this connection is meant to stay open. Reconnects
 		// are driven by the context and by read errors.
