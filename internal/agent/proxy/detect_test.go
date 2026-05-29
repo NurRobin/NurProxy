@@ -154,3 +154,36 @@ func TestDetectPortConflicts_onlyReportsHTTPPorts(t *testing.T) {
 		t.Fatalf("detectPortConflicts() = %+v, want %+v", got, want)
 	}
 }
+
+func TestDetection_ToModel_mapsAllFields(t *testing.T) {
+	d := Detection{
+		Installed:  true,
+		Kind:       KindNginx,
+		Version:    "1.24.0",
+		BinaryPath: "/usr/sbin/nginx",
+		ConfigDir:  "/etc/nginx/sites-available",
+		LogPaths:   []string{"/var/log/nginx/error.log"},
+		PortConflicts: []PortConflict{
+			{Port: 443, Process: "nginx", PID: 1234},
+		},
+	}
+	m := d.ToModel()
+	if m == nil {
+		t.Fatal("ToModel() returned nil")
+	}
+	if !m.Installed || m.Kind != "nginx" || m.Version != "1.24.0" {
+		t.Errorf("scalars: got installed=%t kind=%q version=%q", m.Installed, m.Kind, m.Version)
+	}
+	if m.BinaryPath != "/usr/sbin/nginx" || m.ConfigDir != "/etc/nginx/sites-available" {
+		t.Errorf("paths: got binary=%q config=%q", m.BinaryPath, m.ConfigDir)
+	}
+	if len(m.LogPaths) != 1 || m.LogPaths[0] != "/var/log/nginx/error.log" {
+		t.Errorf("log_paths: got %v", m.LogPaths)
+	}
+	if len(m.PortConflicts) != 1 {
+		t.Fatalf("port_conflicts: got %d, want 1", len(m.PortConflicts))
+	}
+	if c := m.PortConflicts[0]; c.Port != 443 || c.Process != "nginx" || c.PID != 1234 {
+		t.Errorf("port_conflict: got %+v", c)
+	}
+}
