@@ -608,6 +608,35 @@ func TestConfigFromDomain_RawConfig(t *testing.T) {
 	}
 }
 
+// TestConfigFromDomain_TLSPolicy verifies the per-domain TLS provisioning policy
+// (§7) is mapped onto the route's TLS config: central by default, self-acme as
+// the explicit fallback, off honored from either the policy or SSLMode.
+func TestConfigFromDomain_TLSPolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     models.ProxyConfig
+		sslMode models.SSLMode
+		want    proxymodel.TLSPolicy
+	}{
+		{name: "empty defaults to central", want: proxymodel.TLSPolicyCentral},
+		{name: "explicit central", cfg: models.ProxyConfig{TLSPolicy: "central"}, want: proxymodel.TLSPolicyCentral},
+		{name: "self-acme fallback", cfg: models.ProxyConfig{TLSPolicy: "self-acme"}, want: proxymodel.TLSPolicySelfACME},
+		{name: "explicit off", cfg: models.ProxyConfig{TLSPolicy: "off"}, want: proxymodel.TLSPolicyOff},
+		{name: "ssl mode off falls back to off", sslMode: models.SSLModeOff, want: proxymodel.TLSPolicyOff},
+		{name: "unknown policy defaults to central", cfg: models.ProxyConfig{TLSPolicy: "bogus"}, want: proxymodel.TLSPolicyCentral},
+		{name: "explicit policy wins over ssl mode off", cfg: models.ProxyConfig{TLSPolicy: "self-acme"}, sslMode: models.SSLModeOff, want: proxymodel.TLSPolicySelfACME},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := models.Domain{Port: 80, ProxyConfig: tt.cfg, SSLMode: tt.sslMode}
+			route := ConfigFromDomain(d, "h.example.com", "10.0.0.1")
+			if route.TLS.Policy != tt.want {
+				t.Errorf("TLS.Policy = %q, want %q", route.TLS.Policy, tt.want)
+			}
+		})
+	}
+}
+
 func TestGenerateRoute_ValidJSON(t *testing.T) {
 	// Ensure all generated routes are valid JSON by round-tripping through
 	// json.Unmarshal into a generic map.
