@@ -405,6 +405,9 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 			Content:    art.Content,
 			Checksum:   checksum(art.Content),
 			Enabled:    art.Enabled,
+			// Carry the dropped-option warnings back so the orchestrator audits
+			// each one (invariant #4: dropped, logged, and audited).
+			Warnings: art.Warnings,
 		}
 
 		if err := c.caddy.AddRoute(ctx, json.RawMessage(art.Content)); err != nil {

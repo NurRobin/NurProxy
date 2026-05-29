@@ -205,6 +205,15 @@ func (s *Server) storeArtifactReport(r *http.Request, agentID string, rep *proxy
 		return
 	}
 
+	// Invariant #4: the backend dropped one or more unsupported options rather
+	// than failing the render. The agent logged each locally; record them in the
+	// central audit log too (source agent + actor agent) so the operator can see
+	// exactly what was silently dropped. This runs regardless of apply success.
+	for _, w := range rep.Warnings {
+		s.auditAs(r, models.AuditSourceAgent, "config_artifact", rep.ArtifactID, "option_dropped",
+			fmt.Sprintf("%s (%s)", w, rep.Host))
+	}
+
 	existing, err := s.db.GetConfigArtifact(rep.ArtifactID)
 	notFound := err != nil
 
