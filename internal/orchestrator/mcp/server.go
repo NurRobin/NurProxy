@@ -360,6 +360,7 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if err := d.CreateDomain(dom); err != nil {
 		return nil, err
 	}
+	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "create", dom.Subdomain)
 	return dom, nil
 }
 
@@ -407,6 +408,7 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if err := d.UpdateDomain(dom); err != nil {
 		return nil, err
 	}
+	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "update", dom.Subdomain)
 	return dom, nil
 }
 
@@ -423,7 +425,20 @@ func toolDeleteDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if err := d.UpdateDomainStatus(in.ID, models.DomainStatusDeleting, ""); err != nil {
 		return nil, fmt.Errorf("domain not found")
 	}
+	auditMCP(d, "domain", fmt.Sprintf("%d", in.ID), "delete", "")
 	return map[string]any{"id": in.ID, "status": "deleting"}, nil
+}
+
+// auditMCP records a mutation made through the MCP channel.
+func auditMCP(d *db.DB, entityType, entityID, action, details string) {
+	_ = d.InsertAuditLog(&models.AuditLogEntry{
+		EntityType: entityType,
+		EntityID:   entityID,
+		Action:     action,
+		Actor:      "mcp",
+		Source:     models.AuditSourceMCP,
+		Details:    details,
+	})
 }
 
 func nonNilServers(s []models.Server, err error) (any, error) {

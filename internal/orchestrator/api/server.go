@@ -121,8 +121,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/v1/api-key", s.requireAuth(s.handleRevokeAPIKey))
 }
 
-// audit is a helper to insert an audit log entry.
+// audit inserts an audit log entry, deriving the actor and source channel from
+// the request's auth context (set by the auth middleware).
 func (s *Server) audit(r *http.Request, entityType, entityID, action, details string) {
+	source, _ := r.Context().Value(ctxSource).(string)
+	s.auditAs(r, source, entityType, entityID, action, details)
+}
+
+// auditAs is like audit but records an explicit source. Used for endpoints that
+// run without the auth middleware (e.g. agent registration), where the source
+// can't be derived from context.
+func (s *Server) auditAs(r *http.Request, source, entityType, entityID, action, details string) {
 	actor := "unknown"
 	if a, ok := r.Context().Value(ctxActor).(string); ok {
 		actor = a
@@ -132,6 +141,7 @@ func (s *Server) audit(r *http.Request, entityType, entityID, action, details st
 		EntityID:   entityID,
 		Action:     action,
 		Actor:      actor,
+		Source:     source,
 		Details:    details,
 	}); err != nil {
 		log.Printf("failed to insert audit log: %v", err)

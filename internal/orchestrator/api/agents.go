@@ -96,7 +96,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.audit(r, "agent", agent.ID, "register", agent.FQDN)
+	s.auditAs(r, models.AuditSourceAgent, "agent", agent.ID, "register", agent.FQDN)
 
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"id":     agent.ID,
