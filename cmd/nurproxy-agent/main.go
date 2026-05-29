@@ -210,7 +210,14 @@ func main() {
 		hs.SetError(fmt.Sprintf("failed to start agent API server: %v", err))
 	}
 
-	// Step 4: Start heartbeat loop. It carries the health snapshot so the
+	// Step 4: Create the push stream client. The agent dials out and holds it
+	// open; the orchestrator pushes the desired route set down it the instant it
+	// changes — no inbound reachability required. The client also tracks the
+	// artifacts it has applied so the heartbeat can report their checksums for
+	// drift detection (§11).
+	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyBackend, hs)
+
+	// Step 5: Start heartbeat loop. It carries the health snapshot so the
 	// dashboard always sees the agent and any problems it's reporting.
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
@@ -220,12 +227,12 @@ func main() {
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
 	hb.SetCapabilitiesFn(func() *models.ProxyCapabilities { return caddyBackend.Capabilities().ToModel() })
+	// Report each managed artifact's checksum so the orchestrator detects drift
+	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
+	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
 	hb.Start(ctx)
 
-	// Step 5: Open the push stream. The agent dials out and holds it open; the
-	// orchestrator pushes the desired route set down it the instant it changes —
-	// no inbound reachability required. Runs until shutdown, reconnecting as needed.
-	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyBackend, hs)
+	// Open the stream. Runs until shutdown, reconnecting as needed.
 	go streamClient.Run(ctx)
 
 	log.Printf("Agent is running. Press Ctrl+C to stop.")

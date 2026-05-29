@@ -73,3 +73,18 @@ type ApplyAck struct {
 	// Reports is one entry per attempted artifact (success or per-item error).
 	Reports []ArtifactReport `json:"reports"`
 }
+
+// ArtifactChecksum is the agent's per-heartbeat report of one managed artifact's
+// on-disk (or live admin-API) state (§11). The agent computes the checksum of
+// the artifact it currently has applied; the orchestrator compares it against
+// the accepted checksum in the store and marks the artifact drifted when they
+// diverge. Bandwidth is a non-issue: only the artifact identity + checksum ride
+// the heartbeat, never the full content (that rides the apply-ACK on change).
+type ArtifactChecksum struct {
+	// ArtifactID is the stable identity the agent echoes from the RouteIntent it
+	// applied (e.g. "dom-7"), matching a row in the central store.
+	ArtifactID string `json:"artifact_id"`
+	// Checksum is the SHA-256 (hex) of the artifact's current on-disk/live content,
+	// computed by the agent the same way the orchestrator computes it.
+	Checksum string `json:"checksum"`
+}
