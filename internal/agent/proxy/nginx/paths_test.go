@@ -33,6 +33,24 @@ func TestResolveLayout_table(t *testing.T) {
 			wantAvailable: "/etc/nginx/sites-available",
 			wantEnabled:   "/etc/nginx/sites-enabled",
 		},
+		{
+			name:          "rhel conf.d is flat with no enable step",
+			configDir:     "/etc/nginx/conf.d",
+			wantAvailable: "/etc/nginx/conf.d",
+			wantEnabled:   "",
+		},
+		{
+			name:          "rhel conf.d trailing slash cleaned",
+			configDir:     "/etc/nginx/conf.d/",
+			wantAvailable: "/etc/nginx/conf.d",
+			wantEnabled:   "",
+		},
+		{
+			name:          "non-standard nginx root still defaults to debian pair",
+			configDir:     "/usr/local/etc/nginx",
+			wantAvailable: "/usr/local/etc/nginx/sites-available",
+			wantEnabled:   "/usr/local/etc/nginx/sites-enabled",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -44,6 +62,36 @@ func TestResolveLayout_table(t *testing.T) {
 				t.Errorf("Enabled = %q, want %q", got.Enabled, tt.wantEnabled)
 			}
 		})
+	}
+}
+
+func TestLayout_IsConfD_table(t *testing.T) {
+	tests := []struct {
+		name      string
+		configDir string
+		want      bool
+	}{
+		{name: "debian sites-available is not conf.d", configDir: "/etc/nginx/sites-available", want: false},
+		{name: "debian sites-enabled is not conf.d", configDir: "/etc/nginx/sites-enabled", want: false},
+		{name: "nginx root defaults to debian, not conf.d", configDir: "/etc/nginx", want: false},
+		{name: "rhel conf.d is conf.d", configDir: "/etc/nginx/conf.d", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ResolveLayout(tt.configDir).IsConfD(); got != tt.want {
+				t.Errorf("ResolveLayout(%q).IsConfD() = %v, want %v", tt.configDir, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnabledPath_confDLayoutHasNoSymlinkPath(t *testing.T) {
+	l := ResolveLayout("/etc/nginx/conf.d")
+	if got := l.EnabledPath("app.example.com"); got != "" {
+		t.Errorf("EnabledPath on conf.d layout = %q, want empty", got)
+	}
+	if got, want := l.AvailablePath("app.example.com"), "/etc/nginx/conf.d/nurproxy-app.example.com.conf"; got != want {
+		t.Errorf("AvailablePath = %q, want %q", got, want)
 	}
 }
 

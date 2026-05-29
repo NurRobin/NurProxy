@@ -80,6 +80,89 @@ func TestApply_success_writesFileSymlinkAndReloads(t *testing.T) {
 	}
 }
 
+// newConfDBackend builds a backend rooted at a temp RHEL/Fedora conf.d dir, so
+// the apply path exercises the flat (no-symlink) layout.
+func newConfDBackend(t *testing.T, r Runner) *Backend {
+	t.Helper()
+	dir := t.TempDir()
+	b := New(proxy.Config{Type: "nginx", ConfigDir: filepath.Join(dir, "conf.d")})
+	b.WithRunner(r)
+	return b
+}
+
+func TestApply_confDLayout_writesFileNoSymlinkAndReloads(t *testing.T) {
+	r := &fakeRunner{}
+	b := newConfDBackend(t, r)
+	if !b.layout.IsConfD() {
+		t.Fatalf("expected conf.d layout, got Enabled=%q", b.layout.Enabled)
+	}
+	art := sampleArtifact(b, "app.example.com", "server { listen 80; }\n")
+
+	if err := b.Apply(context.Background(), []proxy.Artifact{art}); err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	got, err := os.ReadFile(art.Target.Path)
+	if err != nil {
+		t.Fatalf("reading applied conf.d file: %v", err)
+	}
+	if string(got) != art.Content {
+		t.Errorf("file content = %q, want %q", got, art.Content)
+	}
+	if filepath.Base(art.Target.Path) != "nurproxy-app.example.com.conf" {
+		t.Errorf("conf.d file base = %q, want nurproxy-app.example.com.conf", filepath.Base(art.Target.Path))
+	}
+	// No sites-enabled directory is created on the flat conf.d layout.
+	enabledDir := filepath.Join(filepath.Dir(filepath.Dir(art.Target.Path)), "sites-enabled")
+	if _, statErr := os.Stat(enabledDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("conf.d layout must not create a sites-enabled dir, stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(art.Target.Path + tempSuffix); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("temp file should be removed, stat err = %v", statErr)
+	}
+	if r.tests != 1 || r.reloads != 1 {
+		t.Errorf("tests=%d reloads=%d, want 1 and 1", r.tests, r.reloads)
+	}
+}
+
+func TestRemove_confDLayout_deletesFileNoSymlinkStep(t *testing.T) {
+	r := &fakeRunner{}
+	b := newConfDBackend(t, r)
+	art := sampleArtifact(b, "app.example.com", "server { listen 80; }\n")
+	if err := b.Apply(context.Background(), []proxy.Artifact{art}); err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if err := b.Remove(context.Background(), art.Target); err != nil {
+		t.Fatalf("Remove error: %v", err)
+	}
+	if _, statErr := os.Stat(art.Target.Path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("conf.d file should be removed, stat err = %v", statErr)
+	}
+	if r.reloads != 2 { // Apply + Remove
+		t.Errorf("reloads=%d, want 2", r.reloads)
+	}
+}
+
+func TestReadManaged_confDLayout_filePresenceIsEnabled(t *testing.T) {
+	b := newConfDBackend(t, &fakeRunner{})
+	if err := os.MkdirAll(b.layout.Available, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	managed := b.layout.AvailablePath("app.example.com")
+	if err := os.WriteFile(managed, []byte("server {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	arts, err := b.ReadManaged(context.Background())
+	if err != nil {
+		t.Fatalf("ReadManaged error: %v", err)
+	}
+	if len(arts) != 1 {
+		t.Fatalf("ReadManaged returned %d artifacts, want 1", len(arts))
+	}
+	if !arts[0].Enabled {
+		t.Error("on the conf.d layout a present file is enabled by definition")
+	}
+}
+
 func TestApply_testFails_rollsBackNewFile_andAttributesOurError(t *testing.T) {
 	r := &fakeRunner{
 		testErr: errors.New("exit 1"),
