@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronLeft, FileCode, RotateCcw, History } from 'lucide-react';
+import { ChevronLeft, FileCode, RotateCcw, History, LayoutGrid, Code, Save, X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Agent, ConfigArtifact, ConfigArtifactVersion } from '../lib/types';
+import type { Agent, ConfigArtifact, ConfigArtifactVersion, ArtifactMask } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
 import { usePolling } from '../lib/usePolling';
 import ArtifactStatusBadge from '../components/ArtifactStatusBadge';
@@ -221,6 +221,15 @@ function ArtifactDetail({
   const [busy, setBusy] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
 
+  // §6 mask: toggle between the structured Form view and the Raw text. The mask
+  // is fetched lazily on first switch to Form; raw is always available and is the
+  // substrate / source of truth.
+  const [view, setView] = useState<'form' | 'raw'>('raw');
+  const [mask, setMask] = useState<ArtifactMask | null>(null);
+  const [maskLoading, setMaskLoading] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+
   const loadVersions = useCallback(async () => {
     setLoadingVersions(true);
     try {
@@ -233,6 +242,67 @@ function ArtifactDetail({
   }, [artifact.id, toast, t]);
 
   useEffect(() => { loadVersions(); }, [loadVersions]);
+
+  // Reset the view state whenever a different artifact is selected.
+  useEffect(() => {
+    setView('raw');
+    setMask(null);
+    setEditing(false);
+  }, [artifact.id]);
+
+  const loadMask = useCallback(async () => {
+    setMaskLoading(true);
+    try {
+      setMask(await api.artifactMask(artifact.id));
+    } catch (err) {
+      toast.error(errMessage(err, t('config.maskFailed')));
+    } finally {
+      setMaskLoading(false);
+    }
+  }, [artifact.id, toast, t]);
+
+  async function switchToForm() {
+    setView('form');
+    if (!mask) await loadMask();
+  }
+
+  function startEditing() {
+    setDraft(artifact.content);
+    setEditing(true);
+    setView('raw');
+  }
+
+  async function handleSaveRaw() {
+    setBusy(true);
+    try {
+      await api.editArtifactContent(artifact.id, draft);
+      toast.success(t('config.saved'));
+      setEditing(false);
+      onChanged();
+      loadVersions();
+      setMask(null);
+    } catch (err) {
+      toast.error(errMessage(err, t('config.saveFailed')));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleResetToModel() {
+    if (!window.confirm(t('config.resetToModelConfirm'))) return;
+    setBusy(true);
+    try {
+      await api.resetArtifactToModel(artifact.id);
+      toast.success(t('config.resetDone'));
+      onChanged();
+      loadVersions();
+      setMask(null);
+    } catch (err) {
+      toast.error(errMessage(err, t('config.resetFailed')));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function handleAccept() {
     setBusy(true);
@@ -340,10 +410,69 @@ function ArtifactDetail({
         </div>
       ) : (
         <div className="mt-5">
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-fg-faint">{t('config.content')}</h3>
-          <pre className="max-h-[28rem] overflow-auto rounded-lg border border-border bg-surface-2 p-3 font-mono text-xs leading-relaxed text-fg-muted">
-            {artifact.content || t('config.empty')}
-          </pre>
+          {/* §6 mask: Form ⇄ Raw toggle. Raw is the substrate; the form is a view. */}
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <div className="inline-flex rounded-lg border border-border bg-surface-2 p-0.5">
+              <button
+                onClick={() => { setEditing(false); switchToForm(); }}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium transition-colors ${view === 'form' ? 'bg-surface text-fg shadow-sm' : 'text-fg-muted hover:text-fg'}`}
+              >
+                <LayoutGrid className="h-3.5 w-3.5" />
+                {t('config.viewForm')}
+              </button>
+              <button
+                onClick={() => setView('raw')}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium transition-colors ${view === 'raw' ? 'bg-surface text-fg shadow-sm' : 'text-fg-muted hover:text-fg'}`}
+              >
+                <Code className="h-3.5 w-3.5" />
+                {t('config.viewRaw')}
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              {artifact.source === 'manual' && artifact.domain_id != null && (
+                <Button variant="secondary" size="sm" onClick={handleResetToModel} loading={busy}>
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  {t('config.resetToModel')}
+                </Button>
+              )}
+              {!editing && view === 'raw' && (
+                <Button variant="secondary" size="sm" onClick={startEditing}>
+                  <Code className="h-3.5 w-3.5" />
+                  {t('config.editRaw')}
+                </Button>
+              )}
+            </div>
+          </div>
+
+          {view === 'form' ? (
+            <MaskForm mask={mask} loading={maskLoading} />
+          ) : editing ? (
+            <div className="space-y-2">
+              {artifact.source === 'generated' && (
+                <Callout tone="warning">{t('config.editFlipsManual')}</Callout>
+              )}
+              <textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                spellCheck={false}
+                className="h-[28rem] w-full resize-y rounded-lg border border-border bg-surface-2 p-3 font-mono text-xs leading-relaxed text-fg focus:border-accent focus:outline-none"
+              />
+              <div className="flex justify-end gap-2">
+                <Button variant="secondary" size="sm" onClick={() => setEditing(false)}>
+                  <X className="h-3.5 w-3.5" />
+                  {t('common.cancel')}
+                </Button>
+                <Button size="sm" onClick={handleSaveRaw} loading={busy}>
+                  <Save className="h-3.5 w-3.5" />
+                  {t('config.saveRaw')}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <pre className="max-h-[28rem] overflow-auto rounded-lg border border-border bg-surface-2 p-3 font-mono text-xs leading-relaxed text-fg-muted">
+              {artifact.content || t('config.empty')}
+            </pre>
+          )}
         </div>
       )}
 
@@ -463,6 +592,80 @@ function Row({ label, value }: { label: React.ReactNode; value: React.ReactNode 
     <div className="flex justify-between gap-4">
       <dt className="text-fg-faint">{label}</dt>
       <dd className="min-w-0 truncate text-right text-fg">{value}</dd>
+    </div>
+  );
+}
+
+// MaskForm renders the structured "mask" view of an artifact (§6). It is a
+// read-only, best-effort projection of the config: when the parse is not clean
+// (mask.ok === false) it shows an advisory banner and preserves the unparsed
+// bytes verbatim, so nothing is hidden or lost. Editing happens in the raw view.
+function MaskForm({ mask, loading }: { mask: ArtifactMask | null; loading: boolean }) {
+  const { t } = useTranslation();
+  if (loading) return <p className="py-8 text-center text-sm text-fg-muted">{t('common.loading')}</p>;
+  if (!mask) return <p className="py-8 text-center text-sm text-fg-faint">{t('config.maskFailed')}</p>;
+
+  // No structured view for this backend yet (e.g. caddy): point to raw.
+  if (mask.backend !== 'nginx' && !mask.ok && (!mask.route || !mask.route.Host)) {
+    return <Callout tone="neutral">{t('config.maskBackendRawOnly')}</Callout>;
+  }
+
+  const r = mask.route ?? {};
+  const headerList = (h?: Record<string, string>) =>
+    h && Object.keys(h).length > 0
+      ? Object.entries(h).map(([k, v]) => `${k}: ${v}`).join(', ')
+      : t('config.form.none');
+
+  const rows: Array<[string, React.ReactNode]> = [
+    [t('config.form.host'), r.Host || t('config.form.none')],
+    [
+      t('config.form.upstream'),
+      r.Upstream?.Addr
+        ? `${r.Upstream.Scheme || 'http'}://${r.Upstream.Addr}:${r.Upstream.Port ?? ''}`
+        : t('config.form.none'),
+    ],
+    [t('config.form.tls'), r.TLS?.Policy || t('config.form.none')],
+    [t('config.form.websocket'), r.WebSocket ? t('config.form.enabled') : t('config.form.none')],
+    [t('config.form.forceHttps'), r.ForceHTTPS ? t('config.form.enabled') : t('config.form.none')],
+    [t('config.form.maxBodySize'), r.MaxBodySize || t('config.form.none')],
+    [t('config.form.stripPrefix'), r.Path?.StripPrefix || t('config.form.none')],
+    [t('config.form.rewrite'), r.Path?.Rewrite || t('config.form.none')],
+    [t('config.form.requestHeaders'), headerList(r.RequestHeaders)],
+    [t('config.form.responseHeaders'), headerList(r.ResponseHeaders)],
+    [t('config.form.ipAllow'), r.IPAllowlist?.length ? r.IPAllowlist.join(', ') : t('config.form.none')],
+    [t('config.form.ipBlock'), r.IPBlocklist?.length ? r.IPBlocklist.join(', ') : t('config.form.none')],
+    [t('config.form.basicAuth'), r.BasicAuth ? t('config.form.enabled') : t('config.form.none')],
+    [
+      t('config.form.rateLimit'),
+      r.RateLimit?.RequestsPerSecond ? `${r.RateLimit.RequestsPerSecond}/s` : t('config.form.none'),
+    ],
+    [
+      t('config.form.timeouts'),
+      r.Timeouts && (r.Timeouts.Read || r.Timeouts.Write)
+        ? `r=${r.Timeouts.Read ?? 0}s w=${r.Timeouts.Write ?? 0}s`
+        : t('config.form.none'),
+    ],
+  ];
+
+  return (
+    <div className="space-y-3">
+      {!mask.ok && <Callout tone="warning">{t('config.maskAdvisory')}</Callout>}
+      <dl className="divide-y divide-border rounded-lg border border-border">
+        {rows.map(([label, value]) => (
+          <div key={String(label)} className="flex justify-between gap-4 px-3 py-2 text-sm">
+            <dt className="text-fg-faint">{label}</dt>
+            <dd className="min-w-0 break-words text-right font-mono text-xs text-fg">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      {mask.unparsed && mask.unparsed.length > 0 && (
+        <div>
+          <h4 className="mb-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">{t('config.maskUnparsed')}</h4>
+          <pre className="max-h-48 overflow-auto rounded-lg border border-warning/40 bg-warning-soft/30 p-3 font-mono text-xs leading-relaxed text-fg-muted">
+            {mask.unparsed.join('\n\n')}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

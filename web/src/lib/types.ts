@@ -134,6 +134,38 @@ export interface ConfigArtifact {
   updated_at: string;
 }
 
+/** Backend-neutral proxy route — the structured "mask" recovered from a config (§6). */
+export interface ProxyRoute {
+  Host?: string;
+  Upstream?: { Addr?: string; Port?: number; Scheme?: string };
+  WebSocket?: boolean;
+  ForceHTTPS?: boolean;
+  MaxBodySize?: string;
+  RequestHeaders?: Record<string, string>;
+  ResponseHeaders?: Record<string, string>;
+  Path?: { StripPrefix?: string; Rewrite?: string };
+  Timeouts?: { Read?: number; Write?: number; Idle?: number };
+  BasicAuth?: { Username?: string } | null;
+  IPAllowlist?: string[];
+  IPBlocklist?: string[];
+  RateLimit?: { RequestsPerSecond?: number };
+  TLS?: { Policy?: string; Wildcard?: boolean };
+}
+
+/**
+ * The structured "mask" view of an artifact's config (§6). The mask is a
+ * toggleable, best-effort view: `ok` reports whether it losslessly represents
+ * the config; when false the raw text stays authoritative and `unparsed` holds
+ * the bytes the parser could not map (never destroyed).
+ */
+export interface ArtifactMask {
+  backend: string;
+  ok: boolean;
+  route: ProxyRoute;
+  unparsed?: string[];
+  notes?: string[];
+}
+
 /** One entry in an artifact's append-only version history (§4, §11). */
 export interface ConfigArtifactVersion {
   id: number;

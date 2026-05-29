@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask } from './types';
 
 const BASE = '/api/v1';
 
@@ -119,6 +119,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ action, agent_id: agentId ?? '' }),
     }),
+  // Config UX: structured "mask" + raw edit + reset-to-model (§6, Phase 6)
+  artifactMask: (id: string) => request<ArtifactMask>(`/artifacts/${id}/mask`),
+  editArtifactContent: (id: string, content: string) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/content`, { method: 'PUT', body: JSON.stringify({ content }) }),
+  resetArtifactToModel: (id: string) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/reset-to-model`, { method: 'POST' }),
 
   // System
   health: () => request<HealthResponse>('/health'),
