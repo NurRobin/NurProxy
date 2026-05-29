@@ -7,6 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/configeq"
+	// Register the Caddy semantic comparator so version-gating treats Caddy's
+	// re-serialized route JSON as unchanged (no phantom versions, §4/§11). File
+	// backends fall back to configeq.RawEqual automatically.
+	_ "github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -189,10 +194,14 @@ func (d *DB) ListConfigArtifacts(filter ConfigArtifactFilter) ([]models.ConfigAr
 // version number is LiveVersion+1; content/checksum/source become the live
 // values and the drift flag is cleared (apply_state -> live).
 //
-// Callers MUST only invoke this on a *semantic* change (§4, §11): the backend's
-// Equal(a, b) decides whether content differs meaningfully, so re-serialization
-// (Caddy) does not spawn phantom versions. actor/note are recorded for audit
-// (apply/accept/rollback).
+// Version writes are gated on *semantic* change (§4, §11): the per-backend
+// configeq.Equal decides whether content differs meaningfully against the
+// currently-live content. If it is semantically equal — the common case when
+// Caddy re-serializes its route JSON on reload — NO new version is written (no
+// phantom versions) and the existing live version is returned unchanged, with
+// the drift flag cleared (the on-disk state is back in agreement). actor/note
+// are recorded for audit (apply/accept/rollback) only when a version is
+// actually appended.
 func (d *DB) AppendConfigArtifactVersion(artifactID, content string, source models.ArtifactSource, actor, note string) (*models.ConfigArtifactVersion, error) {
 	now := time.Now().UTC()
 	checksum := ChecksumContent(content)
@@ -204,10 +213,10 @@ func (d *DB) AppendConfigArtifactVersion(artifactID, content string, source mode
 	defer tx.Rollback()
 
 	var liveVersion int
-	var curSource string
+	var curSource, curContent, backend string
 	err = tx.QueryRow(
-		"SELECT live_version, source FROM config_artifacts WHERE id = ?", artifactID,
-	).Scan(&liveVersion, &curSource)
+		"SELECT live_version, source, content, backend FROM config_artifacts WHERE id = ?", artifactID,
+	).Scan(&liveVersion, &curSource, &curContent, &backend)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("config artifact not found: %s", artifactID)
 	}
@@ -218,6 +227,25 @@ func (d *DB) AppendConfigArtifactVersion(artifactID, content string, source mode
 	if source == "" {
 		source = curSource
 	}
+
+	// Gate: no phantom versions. If the incoming content is semantically equal
+	// to the live content for this backend, do not append — just clear any drift
+	// (the host is back in agreement) and return the existing live version.
+	if configeq.Equal(backend, curContent, content) {
+		if _, err := tx.Exec(`
+			UPDATE config_artifacts
+			SET drifted = 0, apply_state = ?, last_error = '', updated_at = ?
+			WHERE id = ?`,
+			models.ArtifactStateLive, now.Format(time.RFC3339), artifactID,
+		); err != nil {
+			return nil, fmt.Errorf("clearing drift on unchanged artifact: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("committing unchanged artifact: %w", err)
+		}
+		return d.GetConfigArtifactVersion(artifactID, liveVersion)
+	}
+
 	next := liveVersion + 1
 
 	if _, err := tx.Exec(`

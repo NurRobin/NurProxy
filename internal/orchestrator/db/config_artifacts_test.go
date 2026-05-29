@@ -141,6 +141,129 @@ func TestConfigArtifact_AppendVersion_promotesLiveState(t *testing.T) {
 	}
 }
 
+// TestConfigArtifact_AppendVersion_noPhantomVersionOnReserialization is the
+// core "no phantom versions" property (§4/§11): when the agent re-reports Caddy's
+// re-serialized route JSON — same semantics, different byte layout (key order,
+// whitespace) — AppendConfigArtifactVersion must NOT write a new version. The
+// live version stays put and history does not grow.
+func TestConfigArtifact_AppendVersion_noPhantomVersionOnReserialization(t *testing.T) {
+	d := testDB(t)
+	createTestAgentRow(t, d, "agent-1")
+	// Seed with a richer route so re-serialization can reorder keys.
+	art := &models.ConfigArtifact{
+		ID:      "art-1",
+		AgentID: "agent-1",
+		Backend: "caddy",
+		Target:  models.Target{Kind: models.TargetKindCaddyRoute, Path: "caddy:route:art-1"},
+		Source:  models.ArtifactSourceGenerated,
+		Content: `{"match":[{"host":["a.example.com"]}],"handle":[{"handler":"reverse_proxy"}]}`,
+	}
+	if err := d.CreateConfigArtifact(art, "tester", "initial"); err != nil {
+		t.Fatalf("CreateConfigArtifact: %v", err)
+	}
+
+	// Same intent, Caddy-style re-serialization: keys reordered, whitespace added.
+	reserialized := "{\n  \"handle\": [ { \"handler\": \"reverse_proxy\" } ],\n  \"match\": [ { \"host\": [ \"a.example.com\" ] } ]\n}"
+	v, err := d.AppendConfigArtifactVersion("art-1", reserialized,
+		models.ArtifactSourceGenerated, "agent", "heartbeat re-report")
+	if err != nil {
+		t.Fatalf("AppendConfigArtifactVersion: %v", err)
+	}
+	if v.Version != 1 {
+		t.Errorf("phantom version written: got version %d, want 1 (unchanged)", v.Version)
+	}
+
+	got, err := d.GetConfigArtifact("art-1")
+	if err != nil {
+		t.Fatalf("GetConfigArtifact: %v", err)
+	}
+	if got.LiveVersion != 1 {
+		t.Errorf("LiveVersion = %d, want 1 (no phantom version)", got.LiveVersion)
+	}
+	// The stored content is the original — we did not rewrite it with the
+	// re-serialized bytes (they are semantically identical, so it doesn't matter,
+	// and not rewriting keeps the checksum stable).
+	if got.Content != art.Content {
+		t.Errorf("content was rewritten on no-op append: %q", got.Content)
+	}
+
+	versions, err := d.ListConfigArtifactVersions("art-1")
+	if err != nil {
+		t.Fatalf("ListConfigArtifactVersions: %v", err)
+	}
+	if len(versions) != 1 {
+		t.Fatalf("history grew to %d versions on re-serialization, want 1", len(versions))
+	}
+}
+
+// TestConfigArtifact_AppendVersion_noOpClearsDrift verifies that a no-op append
+// (semantically equal content) resolves a prior drift: the host is back in
+// agreement with the accepted state, so drifted clears without a new version.
+func TestConfigArtifact_AppendVersion_noOpClearsDrift(t *testing.T) {
+	d := testDB(t)
+	createTestAgentRow(t, d, "agent-1")
+	createTestArtifact(t, d, "art-1", "agent-1") // content {"handle":[]}
+
+	if err := d.MarkConfigArtifactDrifted("art-1"); err != nil {
+		t.Fatalf("MarkConfigArtifactDrifted: %v", err)
+	}
+
+	// Re-report the same content but with whitespace: semantically equal.
+	if _, err := d.AppendConfigArtifactVersion("art-1", `{"handle": []}`,
+		models.ArtifactSourceGenerated, "agent", "re-report"); err != nil {
+		t.Fatalf("AppendConfigArtifactVersion: %v", err)
+	}
+
+	got, _ := d.GetConfigArtifact("art-1")
+	if got.Drifted || got.ApplyState != models.ArtifactStateLive {
+		t.Errorf("no-op append did not clear drift: drifted=%v state=%q", got.Drifted, got.ApplyState)
+	}
+	if got.LiveVersion != 1 {
+		t.Errorf("LiveVersion = %d, want 1 (no version on no-op)", got.LiveVersion)
+	}
+	versions, _ := d.ListConfigArtifactVersions("art-1")
+	if len(versions) != 1 {
+		t.Errorf("history grew on no-op drift clear: %d versions", len(versions))
+	}
+}
+
+// TestConfigArtifact_AppendVersion_fileBackendByteChangeWritesVersion confirms
+// file backends use raw equality: a single byte difference is a real change and
+// DOES append a version (no false suppression).
+func TestConfigArtifact_AppendVersion_fileBackendByteChangeWritesVersion(t *testing.T) {
+	d := testDB(t)
+	createTestAgentRow(t, d, "agent-1")
+	art := &models.ConfigArtifact{
+		ID:      "art-nginx",
+		AgentID: "agent-1",
+		Backend: "nginx",
+		Target:  models.Target{Kind: models.TargetKindFile, Path: "/etc/nginx/sites-available/x.conf"},
+		Source:  models.ArtifactSourceManual,
+		Content: "server { listen 80; }",
+	}
+	if err := d.CreateConfigArtifact(art, "tester", "initial"); err != nil {
+		t.Fatalf("CreateConfigArtifact: %v", err)
+	}
+
+	// Identical bytes: no version.
+	v, err := d.AppendConfigArtifactVersion("art-nginx", "server { listen 80; }", "", "agent", "re-report")
+	if err != nil {
+		t.Fatalf("AppendConfigArtifactVersion (identical): %v", err)
+	}
+	if v.Version != 1 {
+		t.Errorf("identical file content wrote phantom version %d", v.Version)
+	}
+
+	// One byte differs: a real change, version 2.
+	v, err = d.AppendConfigArtifactVersion("art-nginx", "server { listen 81; }", "", "operator", "edit")
+	if err != nil {
+		t.Fatalf("AppendConfigArtifactVersion (changed): %v", err)
+	}
+	if v.Version != 2 {
+		t.Errorf("file byte change = version %d, want 2", v.Version)
+	}
+}
+
 func TestConfigArtifact_AppendVersionInheritsSource_whenEmpty(t *testing.T) {
 	d := testDB(t)
 	createTestAgentRow(t, d, "agent-1")
