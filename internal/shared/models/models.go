@@ -149,8 +149,14 @@ type Agent struct {
 	// stores and exposes it so the dashboard can grey out unsupported options. Nil
 	// when the agent has not yet reported capabilities.
 	ProxyCapabilities *ProxyCapabilities `json:"proxy_capabilities,omitempty"`
-	CreatedAt         time.Time          `json:"created_at"`
-	UpdatedAt         time.Time          `json:"updated_at"`
+	// AutoReconcileConfig is the opt-in per-agent policy that restores hands-off
+	// behavior for config artifacts (§11): when true the reconciler automatically
+	// re-applies generated artifacts over on-disk drift instead of flagging it for
+	// review. Off by default — drift is a review, not a bulldoze. DNS
+	// reconciliation stays automatic regardless of this flag.
+	AutoReconcileConfig bool      `json:"auto_reconcile_config"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.

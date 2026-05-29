@@ -329,6 +329,16 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_config_artifact_versions_artifact
 		ON config_artifact_versions(artifact_id);
 	`,
+
+	// Migration 009: opt-in per-agent "auto-reconcile config" policy (§11). By
+	// default drift is a review, not a bulldoze: NurProxy never overwrites an
+	// artifact the operator changed on-disk without an explicit Accept. An operator
+	// who wants the old hands-off behavior sets this flag on the agent, restoring
+	// automatic re-apply of generated artifacts over drift. DNS reconciliation is
+	// unaffected (it stays automatic regardless).
+	`
+	ALTER TABLE agents ADD COLUMN auto_reconcile_config INTEGER NOT NULL DEFAULT 0;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

@@ -89,6 +89,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/v1/agents/{id}", s.requireAuth(s.handleDeleteAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/adopt", s.requireAuth(s.handleAdoptAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/reject", s.requireAuth(s.handleRejectAgent))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/auto-reconcile", s.requireAuth(s.handleSetAutoReconcile))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAuth(s.handleAgentStatus))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", s.requireAgentAuth(s.handleAgentHeartbeat))
 	// Live push channel: the agent dials out and holds this open; the
@@ -111,6 +112,15 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/domains/{id}/config", s.requireAuth(s.handleGetDomainConfig))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/config", s.requireAuth(s.handleUpdateDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/config/reset", s.requireAuth(s.handleResetDomainConfig))
+
+	// Config artifacts + drift review (auth required, §11 Phase 3)
+	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAuth(s.handleListArtifacts))
+	s.mux.HandleFunc("POST /api/v1/artifacts/bulk", s.requireAuth(s.handleBulkArtifacts))
+	s.mux.HandleFunc("GET /api/v1/artifacts/{id}", s.requireAuth(s.handleGetArtifact))
+	s.mux.HandleFunc("GET /api/v1/artifacts/{id}/versions", s.requireAuth(s.handleListArtifactVersions))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/accept", s.requireAuth(s.handleAcceptArtifact))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/reject", s.requireAuth(s.handleRejectArtifact))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/rollback", s.requireAuth(s.handleRollbackArtifact))
 
 	// System (auth required)
 	s.mux.HandleFunc("GET /api/v1/audit-log", s.requireAuth(s.handleAuditLog))
