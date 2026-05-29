@@ -149,15 +149,28 @@ func (d Domain) FQDN(zoneName string) string {
 	return d.Subdomain + "." + zoneName
 }
 
+// AuditSource categorizes which channel an audited action came through.
+type AuditSource = string
+
+const (
+	AuditSourceUI     AuditSource = "ui"     // browser session (dashboard)
+	AuditSourceAPI    AuditSource = "api"    // admin API key (REST)
+	AuditSourceMCP    AuditSource = "mcp"    // MCP tool call
+	AuditSourceAgent  AuditSource = "agent"  // an agent (token auth)
+	AuditSourceSystem AuditSource = "system" // orchestrator itself (reconciler)
+)
+
 // AuditLogEntry records a single change event for audit purposes.
 type AuditLogEntry struct {
-	ID         int64     `json:"id"`
-	EntityType string    `json:"entity_type"`
-	EntityID   string    `json:"entity_id"`
-	Action     string    `json:"action"`
-	Actor      string    `json:"actor"`
-	Details    string    `json:"details,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID         int64  `json:"id"`
+	EntityType string `json:"entity_type"`
+	EntityID   string `json:"entity_id"`
+	Action     string `json:"action"`
+	Actor      string `json:"actor"`
+	// Source is the channel the action came through (ui/api/mcp/agent/system).
+	Source    string    `json:"source,omitempty"`
+	Details   string    `json:"details,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Setting is a key-value configuration pair.

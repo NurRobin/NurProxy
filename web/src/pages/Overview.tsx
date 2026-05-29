@@ -148,10 +148,13 @@ export default function Overview() {
             <ul className="divide-y divide-border">
               {auditLog.map((entry) => (
                 <li key={entry.id} className="flex items-center justify-between gap-4 px-4 py-3">
-                  <p className="min-w-0 truncate text-sm text-fg-muted">
-                    <span className="font-medium text-fg">{entry.action}</span>{' '}
-                    <span>{entry.entity_type}</span>
-                    {entry.details && <span className="text-fg-faint"> — {entry.details}</span>}
+                  <p className="flex min-w-0 items-center gap-2 truncate text-sm text-fg-muted">
+                    {entry.source && <SourceBadge source={entry.source} />}
+                    <span className="truncate">
+                      <span className="font-medium text-fg">{entry.action}</span>{' '}
+                      <span>{entry.entity_type}</span>
+                      {entry.details && <span className="text-fg-faint"> — {entry.details}</span>}
+                    </span>
                   </p>
                   <span className="flex-shrink-0 text-xs text-fg-faint">{seen(entry.created_at)}</span>
                 </li>
@@ -161,5 +164,23 @@ export default function Overview() {
         </section>
       )}
     </div>
+  );
+}
+
+// SourceBadge renders the audit entry's origin channel as a small colored chip.
+const SOURCE_STYLES: Record<string, string> = {
+  ui: 'bg-accent-soft text-accent',
+  api: 'bg-surface-2 text-fg-muted',
+  mcp: 'bg-warning-soft text-warning-fg',
+  agent: 'bg-success-soft text-success-fg',
+  system: 'bg-surface-2 text-fg-faint',
+};
+
+function SourceBadge({ source }: { source: string }) {
+  const cls = SOURCE_STYLES[source] ?? 'bg-surface-2 text-fg-faint';
+  return (
+    <span className={`flex-shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
+      {source}
+    </span>
   );
 }

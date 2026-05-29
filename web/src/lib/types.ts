@@ -77,6 +77,8 @@ export interface AuditLogEntry {
   entity_id: string;
   action: string;
   actor: string;
+  /** Channel the action came through: ui | api | mcp | agent | system. */
+  source?: string;
   details?: string;
   created_at: string;
 }

@@ -240,6 +240,13 @@ var migrations = []string{
 
 	INSERT OR IGNORE INTO settings (key, value) VALUES ('agent_offline_timeout', '90');
 	`,
+
+	// Migration 005: categorize audit-log entries by source channel
+	// (ui/api/mcp/agent/system) so the log distinguishes where each action
+	// originated.
+	`
+	ALTER TABLE audit_log ADD COLUMN source TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

@@ -191,6 +191,24 @@ func TestCreateListUpdateDeleteDomain(t *testing.T) {
 		t.Fatalf("unexpected created domain: %+v", created)
 	}
 
+	// The mutation must be recorded in the audit log as source "mcp".
+	entries, _, err := d.ListAuditLogFiltered(models.AuditSourceMCP, 10, 0)
+	if err != nil {
+		t.Fatalf("ListAuditLogFiltered: %v", err)
+	}
+	foundCreate := false
+	for _, e := range entries {
+		if e.Source != models.AuditSourceMCP {
+			t.Errorf("filtered audit entry source = %q, want mcp", e.Source)
+		}
+		if e.Action == "create" && e.EntityType == "domain" {
+			foundCreate = true
+		}
+	}
+	if !foundCreate {
+		t.Error("expected an mcp-sourced 'create domain' audit entry")
+	}
+
 	// duplicate should be a tool error
 	if isErr := callTool(t, h, "create_domain", map[string]any{
 		"subdomain": "app", "zone_id": zoneID, "server_id": serverID, "port": 8080,

@@ -31,7 +31,9 @@ func (s *Server) handleAuditLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	entries, total, err := s.db.ListAuditLog(limit, offset)
+	source := r.URL.Query().Get("source") // optional: ui|api|mcp|agent|system
+
+	entries, total, err := s.db.ListAuditLogFiltered(source, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list audit log")
 		return
@@ -42,6 +44,7 @@ func (s *Server) handleAuditLog(w http.ResponseWriter, r *http.Request) {
 		"total":   total,
 		"limit":   limit,
 		"offset":  offset,
+		"source":  source,
 	})
 }
 

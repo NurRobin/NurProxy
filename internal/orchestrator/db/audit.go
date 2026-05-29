@@ -13,9 +13,9 @@ func (d *DB) InsertAuditLog(entry *models.AuditLogEntry) error {
 	entry.CreatedAt = now
 
 	res, err := d.sql.Exec(`
-		INSERT INTO audit_log (entity_type, entity_id, action, actor, details, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		entry.EntityType, entry.EntityID, entry.Action, entry.Actor, entry.Details,
+		INSERT INTO audit_log (entity_type, entity_id, action, actor, source, details, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		entry.EntityType, entry.EntityID, entry.Action, entry.Actor, entry.Source, entry.Details,
 		now.Format(time.RFC3339),
 	)
 	if err != nil {
@@ -31,17 +31,33 @@ func (d *DB) InsertAuditLog(entry *models.AuditLogEntry) error {
 	return nil
 }
 
-// ListAuditLog returns a page of audit log entries (newest first) along with
-// the total count of all entries for pagination.
+// ListAuditLog returns a page of audit log entries (newest first) plus the total
+// count, across all sources.
 func (d *DB) ListAuditLog(limit, offset int) ([]models.AuditLogEntry, int, error) {
+	return d.ListAuditLogFiltered("", limit, offset)
+}
+
+// ListAuditLogFiltered is like ListAuditLog but, when source is non-empty, only
+// returns entries from that source (ui/api/mcp/agent/system). The total reflects
+// the same filter.
+func (d *DB) ListAuditLogFiltered(source string, limit, offset int) ([]models.AuditLogEntry, int, error) {
+	countQ := "SELECT COUNT(*) FROM audit_log"
+	listQ := `SELECT id, entity_type, entity_id, action, actor, source, details, created_at
+		FROM audit_log`
+	var args []any
+	if source != "" {
+		countQ += " WHERE source = ?"
+		listQ += " WHERE source = ?"
+		args = append(args, source)
+	}
+	listQ += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+
 	var total int
-	if err := d.sql.QueryRow("SELECT COUNT(*) FROM audit_log").Scan(&total); err != nil {
+	if err := d.sql.QueryRow(countQ, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("counting audit log: %w", err)
 	}
 
-	rows, err := d.sql.Query(`
-		SELECT id, entity_type, entity_id, action, actor, details, created_at
-		FROM audit_log ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := d.sql.Query(listQ, append(args, limit, offset)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("listing audit log: %w", err)
 	}
@@ -52,7 +68,7 @@ func (d *DB) ListAuditLog(limit, offset int) ([]models.AuditLogEntry, int, error
 		var e models.AuditLogEntry
 		var createdAt string
 
-		if err := rows.Scan(&e.ID, &e.EntityType, &e.EntityID, &e.Action, &e.Actor, &e.Details, &createdAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.EntityType, &e.EntityID, &e.Action, &e.Actor, &e.Source, &e.Details, &createdAt); err != nil {
 			return nil, 0, fmt.Errorf("scanning audit log entry: %w", err)
 		}
 

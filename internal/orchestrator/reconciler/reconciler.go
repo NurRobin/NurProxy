@@ -849,6 +849,7 @@ func (r *Reconciler) audit(entityType, entityID, action, details string) {
 		EntityID:   entityID,
 		Action:     action,
 		Actor:      "reconciler",
+		Source:     models.AuditSourceSystem,
 		Details:    details,
 	}
 	if err := r.db.InsertAuditLog(entry); err != nil {
