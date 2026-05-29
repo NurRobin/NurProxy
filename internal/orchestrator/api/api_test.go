@@ -703,6 +703,33 @@ func TestDomainCRUD(t *testing.T) {
 		t.Fatalf("set manual config: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
+	// Manual config is stored in the per-backend RawConfig escape hatch, tagged
+	// for the caddy backend (§6).
+	withManual, _ := database.GetDomain(domainID)
+	if !withManual.ManualConfig {
+		t.Error("expected manual_config to be true after PUT")
+	}
+	if withManual.ProxyConfig.RawConfig.Backend != "caddy" {
+		t.Errorf("expected RawConfig backend caddy, got %q", withManual.ProxyConfig.RawConfig.Backend)
+	}
+	if withManual.ProxyConfig.RawConfig.Content == "" {
+		t.Error("expected RawConfig content to be set after PUT")
+	}
+
+	// GET now returns the stored manual config verbatim.
+	w = doRequest(t, handler, "GET", "/api/v1/domains/"+strconv.FormatInt(domainID, 10)+"/config", nil, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get manual config: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var manualResp struct {
+		Manual bool            `json:"manual"`
+		Config json.RawMessage `json:"config"`
+	}
+	json.NewDecoder(w.Body).Decode(&manualResp)
+	if !manualResp.Manual {
+		t.Error("expected manual=true in config preview after manual set")
+	}
+
 	// Reset config
 	w = doRequest(t, handler, "POST", "/api/v1/domains/"+strconv.FormatInt(domainID, 10)+"/config/reset", nil, cookie)
 	if w.Code != http.StatusOK {
@@ -712,6 +739,9 @@ func TestDomainCRUD(t *testing.T) {
 	reset, _ := database.GetDomain(domainID)
 	if reset.ManualConfig {
 		t.Error("expected manual_config to be false after reset")
+	}
+	if !reset.ProxyConfig.RawConfig.IsZero() {
+		t.Errorf("expected RawConfig cleared after reset, got %+v", reset.ProxyConfig.RawConfig)
 	}
 
 	// Delete domain (soft delete)

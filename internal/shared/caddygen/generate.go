@@ -53,8 +53,12 @@ func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Rou
 			PasswordHash: d.ProxyConfig.BasicAuth.Password,
 		}
 	}
-	if d.ProxyConfig.RawCaddy != "" {
-		route.Raw = proxymodel.RawConfig{Backend: backendCaddy, Content: d.ProxyConfig.RawCaddy}
+	if !d.ProxyConfig.RawConfig.IsZero() {
+		backend := d.ProxyConfig.RawConfig.Backend
+		if backend == "" {
+			backend = backendCaddy
+		}
+		route.Raw = proxymodel.RawConfig{Backend: backend, Content: d.ProxyConfig.RawConfig.Content}
 	}
 	return route
 }

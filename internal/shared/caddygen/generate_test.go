@@ -589,11 +589,11 @@ func TestConfigFromDomain(t *testing.T) {
 	}
 }
 
-func TestConfigFromDomain_RawCaddy(t *testing.T) {
+func TestConfigFromDomain_RawConfig(t *testing.T) {
 	d := models.Domain{
 		Port: 80,
 		ProxyConfig: models.ProxyConfig{
-			RawCaddy: `{"@id":"r"}`,
+			RawConfig: models.RawConfig{Backend: "caddy", Content: `{"@id":"r"}`},
 		},
 	}
 	route := ConfigFromDomain(d, "raw.example.com", "10.0.0.1")
