@@ -19,11 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strings"
 
 	agentcaddy "github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -39,7 +41,11 @@ const rateLimitModule = "http.handlers.rate_limit"
 
 func init() {
 	proxy.Register(backendName, func(cfg proxy.Config) (proxy.Proxy, error) {
-		return New(agentcaddy.NewClient(cfg.AdminPort)), nil
+		b := New(agentcaddy.NewClient(cfg.AdminPort))
+		if cfg.CertDir != "" {
+			b.certs = certstore.New(cfg.CertDir, cfg.EncryptKey)
+		}
+		return b, nil
 	})
 }
 
@@ -49,6 +55,11 @@ func init() {
 // pre-interface agent.
 type Backend struct {
 	client *agentcaddy.Client
+	// certs writes centrally-issued cert bundles to disk for InstallCerts (§7),
+	// encrypting private keys at rest on the agent. Nil when no cert directory is
+	// configured, in which case InstallCerts is a logged no-op (built-in Caddy can
+	// still self-ACME as the fallback, §7).
+	certs *certstore.Store
 	// listModules returns the module IDs compiled into the live caddy binary,
 	// used by Capabilities to probe optional modules (e.g. caddy-ratelimit). It is
 	// a field so tests can inject captured `caddy list-modules` output without a
@@ -63,6 +74,15 @@ type Backend struct {
 func New(client *agentcaddy.Client) *Backend {
 	b := &Backend{client: client}
 	b.listModules = listInstalledModules
+	return b
+}
+
+// WithCertStore attaches a cert store so InstallCerts writes centrally-issued
+// bundles to disk (encrypting keys at rest). The agent's main wiring uses this so
+// the mock-fallback client construction stays in one place while still enabling
+// central TLS. Returns the receiver for chaining.
+func (b *Backend) WithCertStore(s *certstore.Store) *Backend {
+	b.certs = s
 	return b
 }
 
@@ -293,11 +313,41 @@ func (b *Backend) Validate(ctx context.Context) error {
 	return nil
 }
 
-// InstallCerts is a no-op in the current phase: central TLS distribution to
-// built-in Caddy (provided certs) lands in Phase 4 (§7). It is defined so the
-// backend satisfies the interface; certs ride the agent-initiated stream, never
-// an inbound probe.
+// InstallCerts writes the centrally-issued cert bundles to the backend's cert
+// directory (§7), encrypting each private key at rest on the agent. It is the
+// preflight step: the agent stream calls InstallCerts BEFORE Apply of any config
+// that references the cert files, so a generated config never validates against a
+// missing file (§5). Certs arrive over the agent-initiated stream — never an
+// inbound probe (invariant #2).
+//
+// When no cert store is configured (no CertDir), it is a logged no-op: the
+// built-in Caddy can self-ACME as the fallback (§7), so a missing store must not
+// fail the whole apply (invariant #4). A per-bundle write error aborts InstallCerts
+// (returning the error) so the stream withholds Apply rather than going live with
+// a missing cert; the caller surfaces it via health.
 func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) error {
+	if len(certs) == 0 {
+		return nil
+	}
+	if b.certs == nil {
+		slog.WarnContext(ctx, "caddy: no cert store configured; skipping central cert install (self-ACME fallback applies)",
+			slog.Int("bundles", len(certs)))
+		return nil
+	}
+	for _, c := range certs {
+		paths, err := b.certs.Install(certstore.Bundle{
+			Host:    c.Host,
+			CertPEM: c.CertPEM,
+			KeyPEM:  c.KeyPEM,
+		})
+		if err != nil {
+			return fmt.Errorf("installing cert for %q: %w", c.Host, err)
+		}
+		slog.InfoContext(ctx, "caddy: installed central cert bundle",
+			slog.String("host", c.Host),
+			slog.String("cert_path", paths.CertPath),
+			slog.Bool("key_encrypted_at_rest", paths.Encrypted))
+	}
 	return nil
 }
 

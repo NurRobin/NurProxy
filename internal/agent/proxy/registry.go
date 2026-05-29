@@ -28,6 +28,14 @@ type Config struct {
 	LogPaths []string
 	// AdminPort is the Caddy admin API port for the built-in admin-API backend.
 	AdminPort int
+	// CertDir is where InstallCerts writes the centrally-issued cert bundles (§7).
+	// Keys are encrypted at rest under EncryptKey before being written. Empty means
+	// the backend uses its own default location.
+	CertDir string
+	// EncryptKey is the agent-local AES-256 key used to encrypt cert private keys at
+	// rest on the agent (§7). Empty disables at-rest encryption (keys written in
+	// plaintext PEM) — backends log a warning in that case.
+	EncryptKey []byte
 }
 
 // Factory builds a Proxy for a backend from the given Config. It mirrors the DNS
