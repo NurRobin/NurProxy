@@ -1,4 +1,4 @@
-.PHONY: build build-agent build-all test test-integration test-e2e lint clean dev help
+.PHONY: build build-agent build-headless build-all test test-integration test-e2e lint clean dev help
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -9,6 +9,9 @@ build: web-build ## Build orchestrator binary (rebuilds dashboard assets first)
 
 build-agent: ## Build agent binary
 	go build $(LDFLAGS) -o nurproxy-agent ./cmd/nurproxy-agent
+
+build-headless: ## Build headless orchestrator (no embedded dashboard, API+CLI only)
+	go build -tags headless $(LDFLAGS) -o nurproxy-headless ./cmd/nurproxy
 
 build-all: build build-agent ## Build both binaries
 

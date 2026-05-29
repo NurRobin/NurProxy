@@ -97,30 +97,40 @@ func main() {
 	mux.Handle("/mcp", mcpHandler)
 	mux.Handle("/mcp/", mcpHandler)
 
-	distFS, err := fs.Sub(web.Assets, "dist")
-	if err != nil {
-		_ = database.Close()
-		log.Fatalf("failed to load embedded assets: %v", err)
-	}
-	fileServer := http.FileServer(http.FS(distFS))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Try to serve the file directly
-		if r.URL.Path != "/" && !strings.HasPrefix(r.URL.Path, "/api/") {
-			f, err := distFS.Open(strings.TrimPrefix(r.URL.Path, "/"))
-			if err == nil {
-				f.Close()
+	if web.HasUI {
+		// Serve the embedded SPA dashboard.
+		distFS, err := fs.Sub(web.Assets, "dist")
+		if err != nil {
+			_ = database.Close()
+			log.Fatalf("failed to load embedded assets: %v", err)
+		}
+		fileServer := http.FileServer(http.FS(distFS))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// Try to serve the file directly
+			if r.URL.Path != "/" && !strings.HasPrefix(r.URL.Path, "/api/") {
+				f, err := distFS.Open(strings.TrimPrefix(r.URL.Path, "/"))
+				if err == nil {
+					f.Close()
+					fileServer.ServeHTTP(w, r)
+					return
+				}
+			}
+			// SPA fallback: serve index.html for all non-file routes
+			if r.URL.Path == "/" || !strings.Contains(r.URL.Path, ".") {
+				r.URL.Path = "/"
 				fileServer.ServeHTTP(w, r)
 				return
 			}
-		}
-		// SPA fallback: serve index.html for all non-file routes
-		if r.URL.Path == "/" || !strings.Contains(r.URL.Path, ".") {
-			r.URL.Path = "/"
 			fileServer.ServeHTTP(w, r)
-			return
-		}
-		fileServer.ServeHTTP(w, r)
-	})
+		})
+	} else {
+		// Headless build: no embedded dashboard. The API (/api/v1) and MCP (/mcp)
+		// endpoints above are the entire surface.
+		log.Printf("headless build: dashboard disabled — API at /api/v1, MCP at /mcp")
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "NurProxy headless build: no dashboard. Use the API at /api/v1.", http.StatusNotFound)
+		})
+	}
 
 	// Start HTTP server
 	httpSrv := &http.Server{
