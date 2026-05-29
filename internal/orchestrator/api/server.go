@@ -121,6 +121,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/accept", s.requireAuth(s.handleAcceptArtifact))
 	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/reject", s.requireAuth(s.handleRejectArtifact))
 	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/rollback", s.requireAuth(s.handleRollbackArtifact))
+	// Config UX: the structured "mask" + raw edit + reset-to-model (§6, Phase 6)
+	s.mux.HandleFunc("GET /api/v1/artifacts/{id}/mask", s.requireAuth(s.handleArtifactMask))
+	s.mux.HandleFunc("PUT /api/v1/artifacts/{id}/content", s.requireAuth(s.handleEditArtifactContent))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/reset-to-model", s.requireAuth(s.handleResetArtifactToModel))
 
 	// System (auth required)
 	s.mux.HandleFunc("GET /api/v1/audit-log", s.requireAuth(s.handleAuditLog))
