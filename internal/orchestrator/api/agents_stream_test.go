@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,19 +12,21 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
-// stubPusher publishes a fixed route set whenever the handler asks to push,
+// stubPusher publishes a fixed intent set whenever the handler asks to push,
 // standing in for the reconciler in stream tests.
 type stubPusher struct {
-	hub    *agenthub.Hub
-	routes []json.RawMessage
+	hub     *agenthub.Hub
+	intents []proxymodel.RouteIntent
 }
 
 func (p *stubPusher) PushAgentRoutes(agentID string) error {
-	p.hub.PublishRoutes(agentID, p.routes)
+	p.hub.PublishIntents(agentID, p.intents)
 	return nil
 }
 
@@ -56,8 +59,15 @@ func TestAgentStream_DeliversRoutesAndMarksOnline(t *testing.T) {
 	token := makeAgent(t, database, "agent-1", "edge1.example.com", models.AgentStatusOffline, &stale)
 
 	hub := agenthub.New()
-	routes := []json.RawMessage{json.RawMessage(`{"@id":"r1","match":[{"host":["app.example.com"]}]}`)}
-	srv.SetAgentHub(hub, &stubPusher{hub: hub, routes: routes})
+	intents := []proxymodel.RouteIntent{{
+		ArtifactID: "dom-1",
+		Backend:    "caddy",
+		Route: proxymodel.Route{
+			Host:     "app.example.com",
+			Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 8080},
+		},
+	}}
+	srv.SetAgentHub(hub, &stubPusher{hub: hub, intents: intents})
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -99,12 +109,15 @@ func TestAgentStream_DeliversRoutesAndMarksOnline(t *testing.T) {
 
 	select {
 	case data := <-gotRoutes:
-		var got []json.RawMessage
+		var got proxymodel.IntentSet
 		if err := json.Unmarshal([]byte(data), &got); err != nil {
-			t.Fatalf("routes data not valid JSON: %v (%q)", err, data)
+			t.Fatalf("intent data not valid JSON: %v (%q)", err, data)
 		}
-		if len(got) != 1 {
-			t.Errorf("expected 1 route, got %d", len(got))
+		if len(got.Intents) != 1 {
+			t.Errorf("expected 1 intent, got %d", len(got.Intents))
+		}
+		if got.Intents[0].Route.Host != "app.example.com" {
+			t.Errorf("intent host = %q, want app.example.com", got.Intents[0].Route.Host)
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for routes event")
@@ -148,8 +161,19 @@ func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 		t.Fatalf("CreateDomain: %v", err)
 	}
 
-	w := doRequestWithAuth(t, srv.Handler(), "POST", "/api/v1/agents/agent-1/routes/ack",
-		map[string]interface{}{"applied": []string{"app.example.com"}}, token)
+	artifactID := fmt.Sprintf("dom-%d", dom.ID)
+	content := `{"@id":"r1","match":[{"host":["app.example.com"]}]}`
+	ack := proxymodel.ApplyAck{Reports: []proxymodel.ArtifactReport{{
+		ArtifactID: artifactID,
+		Host:       "app.example.com",
+		Backend:    "caddy",
+		TargetKind: "caddy-route",
+		TargetPath: "caddy:route:r1",
+		Content:    content,
+		Checksum:   db.ChecksumContent(content),
+		Enabled:    true,
+	}}}
+	w := doRequestWithAuth(t, srv.Handler(), "POST", "/api/v1/agents/agent-1/routes/ack", ack, token)
 	if w.Code != http.StatusOK {
 		t.Fatalf("ack status = %d: %s", w.Code, w.Body.String())
 	}
@@ -163,6 +187,38 @@ func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 	}
 	if got.LastSynced == nil {
 		t.Error("expected last_synced to be set after ack")
+	}
+
+	// The agent-rendered artifact should have been round-tripped into the store
+	// as version 1 (B1, §3).
+	art, err := database.GetConfigArtifact(artifactID)
+	if err != nil {
+		t.Fatalf("artifact not stored from ack: %v", err)
+	}
+	if art.Content != content {
+		t.Errorf("stored content = %q, want %q", art.Content, content)
+	}
+	if art.LiveVersion != 1 {
+		t.Errorf("live version = %d, want 1", art.LiveVersion)
+	}
+	if art.Target.Kind != "caddy-route" {
+		t.Errorf("target kind = %q, want caddy-route", art.Target.Kind)
+	}
+	if art.DomainID == nil || *art.DomainID != dom.ID {
+		t.Errorf("artifact domain id = %v, want %d", art.DomainID, dom.ID)
+	}
+
+	// A re-apply of byte-identical content must NOT spawn a phantom version.
+	w2 := doRequestWithAuth(t, srv.Handler(), "POST", "/api/v1/agents/agent-1/routes/ack", ack, token)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second ack status = %d", w2.Code)
+	}
+	art2, err := database.GetConfigArtifact(artifactID)
+	if err != nil {
+		t.Fatalf("GetConfigArtifact: %v", err)
+	}
+	if art2.LiveVersion != 1 {
+		t.Errorf("live version after identical re-apply = %d, want 1 (no phantom version)", art2.LiveVersion)
 	}
 }
 
@@ -179,8 +235,13 @@ func TestAgentRoutesAck_RecordsError(t *testing.T) {
 		t.Fatalf("CreateDomain: %v", err)
 	}
 
-	w := doRequestWithAuth(t, srv.Handler(), "POST", "/api/v1/agents/agent-1/routes/ack",
-		map[string]interface{}{"errors": map[string]string{"app.example.com": "caddy refused: port in use"}}, token)
+	ack := proxymodel.ApplyAck{Reports: []proxymodel.ArtifactReport{{
+		ArtifactID: fmt.Sprintf("dom-%d", dom.ID),
+		Host:       "app.example.com",
+		Backend:    "caddy",
+		Error:      "caddy refused: port in use",
+	}}}
+	w := doRequestWithAuth(t, srv.Handler(), "POST", "/api/v1/agents/agent-1/routes/ack", ack, token)
 	if w.Code != http.StatusOK {
 		t.Fatalf("ack status = %d", w.Code)
 	}

@@ -10,6 +10,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -18,6 +20,8 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 const (
@@ -29,13 +33,19 @@ const (
 // caddyBackend is the subset of the bundled-Caddy proxy backend the stream
 // drives. It is satisfied by *proxy/caddy.Backend (the admin-API Proxy
 // implementation), so the agent reconciles routes through the proxy backend
-// rather than the raw admin client. The primitives are kept separate (rather
-// than a single Apply) so per-host apply success/failure is reported exactly as
-// before and the EnsureServer bind-failure case stays distinctly attributed.
+// rather than the raw admin client.
+//
+// As of Phase 3 the orchestrator pushes *intent* (proxymodel.Route), so the
+// agent renders each intent natively here (Render) before applying it — only the
+// agent knows the host's proxy facts (§3/B1). The rendered artifact + checksum
+// is then reported back atomically in the apply-ACK. EnsureServer is kept
+// separate from a single Apply so the classic ports-80/443 bind-failure stays
+// distinctly attributed (and clears health on success), exactly as before.
 type caddyBackend interface {
 	EnsureServer(ctx context.Context) error
 	ClearRoutes(ctx context.Context) error
 	AddRoute(ctx context.Context, route json.RawMessage) error
+	Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error)
 }
 
 // Client manages the agent's stream connection and applies pushed routes.
@@ -139,12 +149,12 @@ func (c *Client) connect(ctx context.Context) error {
 func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 	switch eventType {
 	case "routes":
-		var routes []json.RawMessage
-		if err := json.Unmarshal([]byte(data), &routes); err != nil {
-			log.Printf("Stream: bad routes payload: %v", err)
+		var set proxymodel.IntentSet
+		if err := json.Unmarshal([]byte(data), &set); err != nil {
+			log.Printf("Stream: bad intent payload: %v", err)
 			return
 		}
-		c.applyRoutes(ctx, routes)
+		c.applyIntents(ctx, set.Intents)
 	case "ping":
 		// Liveness only — nothing to do.
 	default:
@@ -152,11 +162,16 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 	}
 }
 
-// applyRoutes replaces the agent's entire route set with the pushed snapshot,
-// then reports the result back to the orchestrator.
-func (c *Client) applyRoutes(ctx context.Context, routes []json.RawMessage) {
-	applied := make([]string, 0, len(routes))
-	errs := make(map[string]string)
+// applyIntents renders the pushed intent snapshot natively, replaces the agent's
+// entire route set with it, and reports each rendered artifact back to the
+// orchestrator in one atomic apply-ACK (§3/B1). The agent owns rendering: the
+// orchestrator pushes backend-neutral intent, the agent produces native config
+// (here, Caddy route JSON) and round-trips the rendered content + checksum so the
+// store becomes the authoritative versioned artifact without the orchestrator
+// modeling the host.
+func (c *Client) applyIntents(ctx context.Context, intents []proxymodel.RouteIntent) {
+	reports := make([]proxymodel.ArtifactReport, 0, len(intents))
+	applied := 0
 
 	// Ensure the server exists first (creates the config path), then clear, then
 	// add — so clearing doesn't hit a not-yet-created path on a fresh Caddy.
@@ -175,30 +190,60 @@ func (c *Client) applyRoutes(ctx context.Context, routes []json.RawMessage) {
 		log.Printf("Stream: failed to clear routes: %v", err)
 	}
 
-	for _, route := range routes {
-		host := hostFromRoute(route)
-		if err := c.caddy.AddRoute(ctx, route); err != nil {
-			log.Printf("Stream: failed to apply route for %s: %v", host, err)
-			if host != "" {
-				errs[host] = err.Error()
-			}
+	for _, in := range intents {
+		host := in.Route.Host
+
+		// Render the intent natively. A render failure is a per-artifact error;
+		// it never aborts the whole batch (invariant #4).
+		art, err := c.caddy.Render(ctx, in.Route)
+		if err != nil {
+			log.Printf("Stream: failed to render intent for %s: %v", host, err)
+			reports = append(reports, proxymodel.ArtifactReport{
+				ArtifactID: in.ArtifactID,
+				Host:       host,
+				Backend:    in.Backend,
+				Error:      err.Error(),
+			})
 			continue
 		}
-		if host != "" {
-			applied = append(applied, host)
+
+		report := proxymodel.ArtifactReport{
+			ArtifactID: in.ArtifactID,
+			Host:       host,
+			Backend:    in.Backend,
+			TargetKind: string(art.Target.Kind),
+			TargetPath: art.Target.Path,
+			Content:    art.Content,
+			Checksum:   checksum(art.Content),
+			Enabled:    art.Enabled,
 		}
+
+		if err := c.caddy.AddRoute(ctx, json.RawMessage(art.Content)); err != nil {
+			log.Printf("Stream: failed to apply route for %s: %v", host, err)
+			report.Error = err.Error()
+			reports = append(reports, report)
+			continue
+		}
+		applied++
+		reports = append(reports, report)
 	}
 
-	log.Printf("Stream: applied %d/%d routes", len(applied), len(routes))
-	c.sendAck(ctx, applied, errs)
+	log.Printf("Stream: applied %d/%d intents", applied, len(intents))
+	c.sendAck(ctx, reports)
 }
 
-// sendAck reports applied routes and per-route errors to the orchestrator.
-func (c *Client) sendAck(ctx context.Context, applied []string, errs map[string]string) {
-	body, err := json.Marshal(struct {
-		Applied []string          `json:"applied"`
-		Errors  map[string]string `json:"errors"`
-	}{Applied: applied, Errors: errs})
+// checksum returns the hex-encoded SHA-256 of the rendered content. It matches
+// db.ChecksumContent on the orchestrator so the round-tripped checksum agrees
+// across the wire.
+func checksum(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// sendAck reports the rendered artifacts (content + checksum) and per-artifact
+// errors to the orchestrator in one atomic apply-ACK (§3/B1).
+func (c *Client) sendAck(ctx context.Context, reports []proxymodel.ArtifactReport) {
+	body, err := json.Marshal(proxymodel.ApplyAck{Reports: reports})
 	if err != nil {
 		return
 	}
@@ -230,20 +275,4 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
-}
-
-// hostFromRoute extracts the first host out of a Caddy route's match block.
-func hostFromRoute(raw json.RawMessage) string {
-	var partial struct {
-		Match []struct {
-			Host []string `json:"host"`
-		} `json:"match"`
-	}
-	if err := json.Unmarshal(raw, &partial); err != nil {
-		return ""
-	}
-	if len(partial.Match) > 0 && len(partial.Match[0].Host) > 0 {
-		return partial.Match[0].Host[0]
-	}
-	return ""
 }

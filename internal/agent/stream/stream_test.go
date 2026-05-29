@@ -12,10 +12,12 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
-func TestStreamAppliesRoutesAndAcks(t *testing.T) {
-	ackCh := make(chan map[string]interface{}, 1)
+func TestStreamRendersIntentAppliesAndAcks(t *testing.T) {
+	ackCh := make(chan proxymodel.ApplyAck, 1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/agents/{id}/stream", func(w http.ResponseWriter, r *http.Request) {
@@ -23,8 +25,17 @@ func TestStreamAppliesRoutesAndAcks(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 
-		routes := `[{"@id":"r1","match":[{"host":["app.example.com"]}]}]`
-		fmt.Fprintf(w, "event: routes\ndata: %s\n\n", routes)
+		// The orchestrator now pushes intent, not pre-rendered Caddy JSON.
+		set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-7",
+			Backend:    "caddy",
+			Route: proxymodel.Route{
+				Host:     "app.example.com",
+				Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 8080},
+			},
+		}}}
+		data, _ := json.Marshal(set)
+		fmt.Fprintf(w, "event: routes\ndata: %s\n\n", data)
 		w.(http.Flusher).Flush()
 
 		// Hold the connection open until the client goes away, so it doesn't
@@ -33,7 +44,7 @@ func TestStreamAppliesRoutesAndAcks(t *testing.T) {
 	})
 	mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		var parsed map[string]interface{}
+		var parsed proxymodel.ApplyAck
 		_ = json.Unmarshal(body, &parsed)
 		ackCh <- parsed
 		w.WriteHeader(http.StatusOK)
@@ -42,7 +53,8 @@ func TestStreamAppliesRoutesAndAcks(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	c := New(ts.URL, "agent-1", "tok", caddy.NewMockClient(), health.New())
+	backend := caddybackend.New(caddy.NewMockClient())
+	c := New(ts.URL, "agent-1", "tok", backend, health.New())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -50,15 +62,31 @@ func TestStreamAppliesRoutesAndAcks(t *testing.T) {
 
 	select {
 	case ack := <-ackCh:
-		applied, ok := ack["applied"].([]interface{})
-		if !ok || len(applied) != 1 {
-			t.Fatalf("expected 1 applied route, got %#v", ack["applied"])
+		if len(ack.Reports) != 1 {
+			t.Fatalf("expected 1 artifact report, got %d", len(ack.Reports))
 		}
-		if got := applied[0].(string); got != "app.example.com" {
-			t.Errorf("applied host = %q, want app.example.com", got)
+		rep := ack.Reports[0]
+		if rep.ArtifactID != "dom-7" {
+			t.Errorf("report artifact id = %q, want dom-7", rep.ArtifactID)
+		}
+		if rep.Host != "app.example.com" {
+			t.Errorf("report host = %q, want app.example.com", rep.Host)
+		}
+		if rep.Error != "" {
+			t.Errorf("unexpected apply error: %q", rep.Error)
+		}
+		// The agent renders natively and round-trips content + checksum.
+		if rep.Content == "" {
+			t.Error("report should carry rendered content")
+		}
+		if rep.Checksum != checksum(rep.Content) {
+			t.Errorf("report checksum %q does not match content", rep.Checksum)
+		}
+		if rep.TargetKind != "caddy-route" {
+			t.Errorf("report target kind = %q, want caddy-route", rep.TargetKind)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for route ack")
+		t.Fatal("timed out waiting for apply ack")
 	}
 }
 
@@ -84,7 +112,7 @@ func TestStreamReconnectsOnError(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	c := New(ts.URL, "agent-1", "tok", caddy.NewMockClient(), health.New())
+	c := New(ts.URL, "agent-1", "tok", caddybackend.New(caddy.NewMockClient()), health.New())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go c.Run(ctx)
