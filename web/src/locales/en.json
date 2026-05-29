@@ -1,6 +1,9 @@
 {
   "common": {
     "cancel": "Cancel",
+    "close": "Close",
+    "copy": "Copy",
+    "copied": "Copied!",
     "save": "Save",
     "delete": "Delete",
     "remove": "Remove",
@@ -208,7 +211,32 @@
     "bindConflict": "Port conflict",
     "bindConflictBody": "Another process is holding the ports the built-in proxy needs. Switch this agent to an existing-proxy setup, or free the port.",
     "bindConflictItem": ":{{port}} held by {{process}}{{pid}}",
-    "unknownProcess": "an unknown process"
+    "unknownProcess": "an unknown process",
+    "bindConflictChoices": "You have two options:",
+    "bindConflictChoiceFree": "Stop the existing proxy and let the built-in proxy take the ports.",
+    "bindConflictChoiceSwitch": "Switch this agent to manage the existing proxy instead of running the built-in one —",
+    "bindConflictSwitchLink": "set up Existing mode"
+  },
+  "existing": {
+    "title": "Set up Existing proxy",
+    "intro": "Manage a proxy already installed on this host instead of the built-in one. Confirm the detected paths below — you won’t usually need to change them.",
+    "detectedTitle": "Detected on this host",
+    "detectedBody": "{{name}} was detected — the fields below are pre-filled from it. Confirm or adjust.",
+    "noDetection": "Nothing was detected for this proxy type. The fields are pre-filled with the OS defaults — confirm they match this host before applying.",
+    "manageThis": "Set up Existing ({{kind}})",
+    "proxyKind": "Proxy",
+    "proxyKindHint": "Which proxy this agent should manage. Pre-selected from detection.",
+    "configDir": "Config dir",
+    "service": "Service",
+    "testCmd": "Test command",
+    "reloadCmd": "Reload command",
+    "logPaths": "Log paths",
+    "logPathsHint": "One path per line. Surfaced in the dashboard for on-demand tailing.",
+    "confirmedFromDetection": "Confirmed from detection",
+    "applyTitle": "Apply on the agent",
+    "applyHint": "Proxy mode lives in the agent’s own config. Add these keys to the agent’s config file (or pass them as flags) on the host, then restart the agent.",
+    "permsNote": "The agent must be able to write the config dir and run the reload/test commands — grant a group-owned dir plus a narrowly-scoped sudoers entry for exactly those commands, not blanket sudo.",
+    "copyConfig": "Copy config"
   },
   "servers": {
     "title": "Servers",

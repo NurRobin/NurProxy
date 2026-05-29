@@ -16,6 +16,7 @@ import HelpTip from '../components/HelpTip';
 import MultiSelect from '../components/MultiSelect';
 import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
+import ExistingSetup from './ExistingSetup';
 
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.never'));
 
@@ -454,6 +455,7 @@ function ListRow({ agent, active, tone, onClick }: { agent: Agent; active: boole
 function DetectedProxy({ agent }: { agent: Agent }) {
   const { t } = useTranslation();
   const d = agent.proxy_detection;
+  const [setupOpen, setSetupOpen] = useState(false);
 
   // Compose a one-line summary like "nginx 1.24 at /etc/nginx".
   const summary = () => {
@@ -463,6 +465,7 @@ function DetectedProxy({ agent }: { agent: Agent }) {
   };
 
   const conflicts = d?.port_conflicts ?? [];
+  const detected = !!(d && d.installed && d.kind);
 
   return (
     <div className="mt-6 border-t border-border pt-5">
@@ -503,6 +506,16 @@ function DetectedProxy({ agent }: { agent: Agent }) {
         </div>
       )}
 
+      {/* A detected proxy can be managed directly — this is the guided "Existing"
+          setup entry point, pre-filled from detection (confirm-not-type, §2/§2.1). */}
+      {detected && (
+        <div className="mt-3">
+          <Button variant="secondary" size="sm" onClick={() => setSetupOpen(true)}>
+            {t('existing.manageThis', { kind: d?.kind })}
+          </Button>
+        </div>
+      )}
+
       {conflicts.length > 0 && (
         <div className="mt-3">
           <Callout tone="warning" title={t('agents.bindConflict')}>
@@ -518,9 +531,29 @@ function DetectedProxy({ agent }: { agent: Agent }) {
                 </li>
               ))}
             </ul>
+            {/* The two real choices (§2.1), offered inline: keep only the agent
+                (free the port) or switch this agent to manage the existing proxy. */}
+            <div className="mt-3 space-y-2">
+              <p className="font-medium">{t('agents.bindConflictChoices')}</p>
+              <ol className="ml-4 list-decimal space-y-1">
+                <li>{t('agents.bindConflictChoiceFree')}</li>
+                <li>
+                  {t('agents.bindConflictChoiceSwitch')}{' '}
+                  <button
+                    type="button"
+                    onClick={() => setSetupOpen(true)}
+                    className="font-medium text-accent underline underline-offset-2 hover:text-accent-hover"
+                  >
+                    {t('agents.bindConflictSwitchLink')}
+                  </button>
+                </li>
+              </ol>
+            </div>
           </Callout>
         </div>
       )}
+
+      <ExistingSetup agent={agent} open={setupOpen} onClose={() => setSetupOpen(false)} />
     </div>
   );
 }

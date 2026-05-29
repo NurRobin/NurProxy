@@ -1,6 +1,9 @@
 {
   "common": {
     "cancel": "Abbrechen",
+    "close": "Schließen",
+    "copy": "Kopieren",
+    "copied": "Kopiert!",
     "save": "Speichern",
     "delete": "Löschen",
     "remove": "Entfernen",
@@ -208,7 +211,32 @@
     "bindConflict": "Port-Konflikt",
     "bindConflictBody": "Ein anderer Prozess belegt die Ports, die der integrierte Proxy benötigt. Stelle diesen Agent auf ein bestehendes Proxy-Setup um oder gib den Port frei.",
     "bindConflictItem": ":{{port}} belegt von {{process}}{{pid}}",
-    "unknownProcess": "einem unbekannten Prozess"
+    "unknownProcess": "einem unbekannten Prozess",
+    "bindConflictChoices": "Du hast zwei Möglichkeiten:",
+    "bindConflictChoiceFree": "Beende den bestehenden Proxy, damit der integrierte Proxy die Ports übernimmt.",
+    "bindConflictChoiceSwitch": "Stelle diesen Agent so um, dass er den bestehenden Proxy verwaltet, statt den integrierten zu betreiben —",
+    "bindConflictSwitchLink": "Bestehend-Modus einrichten"
+  },
+  "existing": {
+    "title": "Bestehenden Proxy einrichten",
+    "intro": "Verwalte einen bereits auf diesem Host installierten Proxy statt des integrierten. Bestätige die erkannten Pfade unten — du musst sie normalerweise nicht ändern.",
+    "detectedTitle": "Auf diesem Host erkannt",
+    "detectedBody": "{{name}} wurde erkannt — die Felder unten sind daraus vorausgefüllt. Bestätige oder passe sie an.",
+    "noDetection": "Für diesen Proxy-Typ wurde nichts erkannt. Die Felder sind mit den OS-Standardwerten vorausgefüllt — prüfe vor dem Anwenden, dass sie zu diesem Host passen.",
+    "manageThis": "Bestehend einrichten ({{kind}})",
+    "proxyKind": "Proxy",
+    "proxyKindHint": "Welchen Proxy dieser Agent verwalten soll. Aus der Erkennung vorausgewählt.",
+    "configDir": "Konfigurationsverzeichnis",
+    "service": "Dienst",
+    "testCmd": "Test-Befehl",
+    "reloadCmd": "Reload-Befehl",
+    "logPaths": "Log-Pfade",
+    "logPathsHint": "Ein Pfad pro Zeile. Im Dashboard für bedarfsweises Tailing sichtbar.",
+    "confirmedFromDetection": "Aus Erkennung bestätigt",
+    "applyTitle": "Auf dem Agent anwenden",
+    "applyHint": "Der Proxy-Modus liegt in der eigenen Konfiguration des Agents. Füge diese Schlüssel der Konfigurationsdatei des Agents hinzu (oder übergib sie als Flags) auf dem Host und starte den Agent neu.",
+    "permsNote": "Der Agent muss das Konfigurationsverzeichnis beschreiben und die Reload-/Test-Befehle ausführen können — gewähre ein gruppen-eigenes Verzeichnis sowie einen eng begrenzten sudoers-Eintrag für genau diese Befehle, kein pauschales sudo.",
+    "copyConfig": "Konfiguration kopieren"
   },
   "servers": {
     "title": "Server",
