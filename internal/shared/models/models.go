@@ -131,6 +131,12 @@ type Agent struct {
 	// traffic. It can be false (e.g. ports 80/443 are taken by another service)
 	// while the agent itself is perfectly healthy and connected.
 	CaddyRunning bool `json:"caddy_running"`
+	// ProxyMode is the agent's CURRENT live reverse-proxy mode: "built-in" (the
+	// bundled Caddy) or "existing" (a host-installed nginx/apache/caddy after a
+	// §19 hot-switch). Owned by the agent via heartbeat so the dashboard reflects
+	// reality after a hot-switch (or a restart honoring a persisted existing mode)
+	// instead of assuming built-in. Defaults to "built-in".
+	ProxyMode string `json:"proxy_mode"`
 	// LastError is the most recent operational error the agent reported about
 	// itself (e.g. a Caddy bind failure). Owned by the agent via heartbeat.
 	LastError string `json:"last_error,omitempty"`

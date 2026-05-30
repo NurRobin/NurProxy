@@ -24,6 +24,7 @@ type Heartbeat struct {
 	version         string
 	interval        time.Duration
 	healthFn        func() (caddyRunning bool, lastError string)
+	modeFn          func() string
 	detectionFn     func() *models.ProxyDetection
 	capabilitiesFn  func() *models.ProxyCapabilities
 	checksumsFn     func() []proxymodel.ArtifactChecksum
@@ -39,6 +40,10 @@ type heartbeatPayload struct {
 	Version      string `json:"version"`
 	CaddyRunning bool   `json:"caddy_running"`
 	LastError    string `json:"last_error"`
+	// ProxyMode re-reports the agent's CURRENT live reverse-proxy mode ("built-in"
+	// | "existing") on every beat (§19) so the orchestrator/dashboard reflect a
+	// hot-switch. Omitted when unknown (the orchestrator keeps the stored value).
+	ProxyMode string `json:"proxy_mode,omitempty"`
 	// ProxyDetection re-reports the read-only Phase-0 detection on every beat
 	// (§13.0/§2.1/§9) so the orchestrator's stored copy stays fresh as the host
 	// changes (e.g. an Existing proxy stops releasing :443). Omitted when unknown.
@@ -68,6 +73,14 @@ func New(orchestratorURL, agentID, token, version string, interval time.Duration
 			Timeout: 15 * time.Second,
 		},
 	}
+}
+
+// SetModeFn supplies the agent's current live reverse-proxy mode ("built-in" |
+// "existing") reported on each beat (§19). It may be nil (no mode sent). The
+// function is called per beat so a §19 hot-switch is reflected on the next beat
+// without restarting the heartbeat.
+func (h *Heartbeat) SetModeFn(fn func() string) {
+	h.modeFn = fn
 }
 
 // SetDetectionFn supplies the read-only proxy detection re-reported on each beat.
@@ -141,6 +154,11 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		ip = ""
 	}
 
+	var mode string
+	if h.modeFn != nil {
+		mode = h.modeFn()
+	}
+
 	var detection *models.ProxyDetection
 	if h.detectionFn != nil {
 		detection = h.detectionFn()
@@ -162,6 +180,7 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		Version:           h.version,
 		CaddyRunning:      caddyRunning,
 		LastError:         lastError,
+		ProxyMode:         mode,
 		ProxyDetection:    detection,
 		ProxyCapabilities: capabilities,
 		ArtifactChecksums: checksums,

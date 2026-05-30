@@ -72,7 +72,7 @@ func nginxLayoutTempDir(t *testing.T) string {
 
 func TestReconfigureBuiltInToExisting_WritableDir(t *testing.T) {
 	root := nginxLayoutTempDir(t)
-	h := proxy.NewHolder(seedBackend{})
+	h := proxy.NewHolder(seedBackend{}, "built-in")
 	hs := &fakeHealth{}
 
 	var stopped bool
@@ -112,7 +112,7 @@ func TestReconfigureBuiltInToExisting_WritableDir(t *testing.T) {
 }
 
 func TestReconfigureBuiltInToExisting_BogusDirFailsButSwaps(t *testing.T) {
-	h := proxy.NewHolder(seedBackend{})
+	h := proxy.NewHolder(seedBackend{}, "built-in")
 	hs := &fakeHealth{}
 
 	var stopped bool
@@ -158,7 +158,7 @@ func TestReconfigureBuiltInToExisting_BogusDirFailsButSwaps(t *testing.T) {
 }
 
 func TestReconfigureUnknownTypeIsNonFatal(t *testing.T) {
-	h := proxy.NewHolder(seedBackend{})
+	h := proxy.NewHolder(seedBackend{}, "built-in")
 	hs := &fakeHealth{}
 
 	res := h.Reconfigure(context.Background(), proxy.ReconfigureRequest{
@@ -179,7 +179,7 @@ func TestReconfigureUnknownTypeIsNonFatal(t *testing.T) {
 }
 
 func TestReconfigureBackToBuiltIn(t *testing.T) {
-	h := proxy.NewHolder(seedBackend{})
+	h := proxy.NewHolder(seedBackend{}, "built-in")
 	hs := &fakeHealth{}
 
 	var built bool
@@ -196,5 +196,49 @@ func TestReconfigureBackToBuiltIn(t *testing.T) {
 	}
 	if !res.OK {
 		t.Errorf("switch back to built-in should report OK (best-effort), got %+v", res)
+	}
+}
+
+// TestHolderModeTracksReconfigure asserts the Holder's reported mode (§19, the
+// value the heartbeat sends so the dashboard reflects reality) follows the live
+// backend across hot-switches: it seeds from NewHolder, becomes "existing" after
+// a successful switch to a file backend, and "built-in" again on the way back.
+func TestHolderModeTracksReconfigure(t *testing.T) {
+	if got := proxy.NewHolder(seedBackend{}, "").Mode(); got != "built-in" {
+		t.Errorf("empty seed mode should normalize to built-in, got %q", got)
+	}
+
+	root := nginxLayoutTempDir(t)
+	h := proxy.NewHolder(seedBackend{}, "built-in")
+	if got := h.Mode(); got != "built-in" {
+		t.Fatalf("seeded mode = %q, want built-in", got)
+	}
+
+	deps := proxy.ReconfigureDeps{
+		Health:       &fakeHealth{},
+		StopCaddy:    func() error { return nil },
+		CaddyFactory: func() proxy.Proxy { return seedBackend{} },
+	}
+
+	h.Reconfigure(context.Background(), proxy.ReconfigureRequest{
+		Mode: "existing", Type: "nginx", ConfigDir: root, TestCmd: "/bin/true",
+	}, deps)
+	if got := h.Mode(); got != "existing" {
+		t.Errorf("mode after switch to existing = %q, want existing", got)
+	}
+
+	// Even an applied-with-warnings switch (failing probe) is still "existing": the
+	// live backend was swapped, which is what the mode reports.
+	h2 := proxy.NewHolder(seedBackend{}, "built-in")
+	h2.Reconfigure(context.Background(), proxy.ReconfigureRequest{
+		Mode: "existing", Type: "nginx", ConfigDir: "/nonexistent/bogus", TestCmd: "/bin/true",
+	}, deps)
+	if got := h2.Mode(); got != "existing" {
+		t.Errorf("mode after applied-with-warnings switch = %q, want existing", got)
+	}
+
+	h.Reconfigure(context.Background(), proxy.ReconfigureRequest{Mode: "built-in"}, deps)
+	if got := h.Mode(); got != "built-in" {
+		t.Errorf("mode after switch back = %q, want built-in", got)
 	}
 }

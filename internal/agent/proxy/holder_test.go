@@ -87,7 +87,7 @@ var (
 
 func TestHolderForwardsEveryMethod(t *testing.T) {
 	be := newRecordingBackend()
-	h := NewHolder(be)
+	h := NewHolder(be, "built-in")
 	ctx := context.Background()
 
 	// Each call must hit the current backend exactly once.
@@ -123,7 +123,7 @@ func TestHolderForwardsReturnValues(t *testing.T) {
 	be := newRecordingBackend()
 	be.err = errors.New("boom")
 	be.getCfg = json.RawMessage(`{"k":"v"}`)
-	h := NewHolder(be)
+	h := NewHolder(be, "built-in")
 	ctx := context.Background()
 
 	if err := h.EnsureServer(ctx); err == nil {
@@ -138,7 +138,7 @@ func TestHolderForwardsReturnValues(t *testing.T) {
 func TestHolderCurrentReflectsSwap(t *testing.T) {
 	a := newRecordingBackend()
 	b := newRecordingBackend()
-	h := NewHolder(a)
+	h := NewHolder(a, "built-in")
 
 	if h.Current() != Proxy(a) {
 		t.Fatal("Current should return the seeded backend")
@@ -153,7 +153,7 @@ func TestHolderCurrentReflectsSwap(t *testing.T) {
 
 func TestHolderNoOpsWhenBackendIsNotAdminAPI(t *testing.T) {
 	// A bare Proxy (no admin-API methods) — use a struct that only implements Proxy.
-	h := NewHolder(proxyOnly{})
+	h := NewHolder(proxyOnly{}, "built-in")
 	ctx := context.Background()
 
 	if err := h.EnsureServer(ctx); err != nil {
