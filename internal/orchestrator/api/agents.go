@@ -293,6 +293,7 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 		"proxy_detection":    agent.ProxyDetection,
 		"proxy_detected_at":  agent.ProxyDetectedAt,
 		"proxy_capabilities": agent.ProxyCapabilities,
+		"proxy_permissions":  agent.ProxyPermissions,
 	})
 }
 
@@ -383,6 +384,10 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// backend, re-reported each beat. Stored on the agent row; nil leaves it
 		// as-is (so a transient probe failure doesn't erase a known-good matrix).
 		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
+		// ProxyPermissions is the agent's §12 permission self-test (config writable?
+		// service reloadable? + remediation), re-probed each beat in existing mode.
+		// Stored on the agent row; built-in mode reports nil and we clear the column.
+		ProxyPermissions *models.ProxyPermissions `json:"proxy_permissions"`
 		// ArtifactChecksums is the agent's per-beat report of each managed
 		// artifact's on-disk/live checksum (§11). The orchestrator compares each
 		// against the accepted state and flags drift (on-disk != accepted), never
@@ -427,6 +432,15 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		if uerr := s.db.UpdateAgentCapabilities(id, req.ProxyCapabilities); uerr != nil {
 			log.Printf("failed to update agent %s capabilities: %v", id, uerr)
 		}
+	}
+
+	// Persist the §12 permission self-test reported this beat. Unlike detection, we
+	// store it unconditionally (including nil → SQL NULL): an existing-mode agent
+	// always reports a result, and built-in mode reporting nil is the correct
+	// "no permission state" — so the stored value always tracks the agent's truth,
+	// and a granted permission clears the dashboard warning on the next beat.
+	if uerr := s.db.UpdateAgentPermissions(id, req.ProxyPermissions); uerr != nil {
+		log.Printf("failed to update agent %s permissions: %v", id, uerr)
 	}
 
 	// A heartbeat is proof of life: an agent the orchestrator had marked offline

@@ -113,6 +113,53 @@ type ProxyDetection struct {
 	PortConflicts []ProxyPortConflict `json:"port_conflicts,omitempty"`
 }
 
+// ProxyPermissions is the agent's structured §12 permission self-test for an
+// Existing-mode backend: can it WRITE the proxy's config dir (group/ownership
+// grant) and RELOAD the service (scoped-sudoers grant). The agent re-runs the
+// probe on every heartbeat and carries the result here, so the dashboard can
+// show exactly which grant is missing — and the targeted fix — instead of a
+// single opaque error blob, and so a granted permission clears on its own once
+// the next beat re-probes. Nil/Checked=false means built-in mode (no file/reload
+// privilege to probe).
+type ProxyPermissions struct {
+	// Checked reports whether a probe actually ran (true only in Existing mode).
+	Checked bool `json:"checked"`
+	// OK is true when both grants are present (CanWrite && CanReload).
+	OK bool `json:"ok"`
+	// CanWrite reports whether the agent can create/remove files in the config dir.
+	CanWrite bool `json:"can_write"`
+	// CanReload reports whether the validate/reload command ran without a denial.
+	CanReload bool `json:"can_reload"`
+	// WriteError is the actionable message when CanWrite is false, empty otherwise.
+	WriteError string `json:"write_error,omitempty"`
+	// ReloadError is the actionable message when CanReload is false, empty otherwise.
+	ReloadError string `json:"reload_error,omitempty"`
+	// Dirs are the config directories the write probe checked.
+	Dirs []string `json:"dirs,omitempty"`
+	// Remediation carries the least-privilege fix commands when a grant is missing;
+	// nil when everything is in order.
+	Remediation *Remediation `json:"remediation,omitempty"`
+}
+
+// Remediation is the least-privilege fix for missing Existing-mode grants (§12/
+// §19): ordered copy-paste steps plus the exact /etc/sudoers.d line. It mirrors
+// the agent-side permcheck.Remediation, carried to the dashboard so the operator
+// runs exactly what's needed — never blanket sudo.
+type Remediation struct {
+	// Steps are the ordered fix steps (group/ownership, then scoped sudoers).
+	Steps []RemediationStep `json:"steps,omitempty"`
+	// SudoersLine is the exact /etc/sudoers.d/nurproxy-agent content, or empty.
+	SudoersLine string `json:"sudoers_line,omitempty"`
+}
+
+// RemediationStep is one ordered fix step: a human title plus copy-paste commands.
+type RemediationStep struct {
+	// Title describes what this step grants.
+	Title string `json:"title"`
+	// Commands are the copy-paste shell lines, in run order.
+	Commands []string `json:"commands"`
+}
+
 // Agent represents a registered proxy agent.
 type Agent struct {
 	ID           string      `json:"id"`
@@ -158,6 +205,13 @@ type Agent struct {
 	// stores and exposes it so the dashboard can grey out unsupported options. Nil
 	// when the agent has not yet reported capabilities.
 	ProxyCapabilities *ProxyCapabilities `json:"proxy_capabilities,omitempty"`
+	// ProxyPermissions is the agent's last-reported §12 permission self-test for an
+	// Existing-mode backend (config-dir writable? service reloadable?) plus the
+	// targeted remediation when a grant is missing. Re-probed each heartbeat, so it
+	// clears on its own once the operator grants the right. Owned by the agent; the
+	// orchestrator stores and exposes it. Nil in built-in mode or before the first
+	// existing-mode beat.
+	ProxyPermissions *ProxyPermissions `json:"proxy_permissions,omitempty"`
 	// AutoReconcileConfig is the opt-in per-agent policy that restores hands-off
 	// behavior for config artifacts (§11): when true the reconciler automatically
 	// re-applies generated artifacts over on-disk drift instead of flagging it for

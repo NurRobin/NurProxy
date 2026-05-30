@@ -199,6 +199,57 @@ func TestReconfigureBackToBuiltIn(t *testing.T) {
 	}
 }
 
+// TestProbePermissions asserts the per-beat §12 self-test the heartbeat reports:
+// a built-in/admin-API backend needs no probe (checked=false), while an
+// existing file backend returns a real result + the probed dirs, and surfaces a
+// remediation only when a grant is missing.
+func TestProbePermissions(t *testing.T) {
+	// Built-in seed backend: not a file backend → checked=false, no remediation.
+	h := proxy.NewHolder(seedBackend{}, "built-in")
+	res, rem, dirs, checked := h.ProbePermissions(context.Background(), "agentuser")
+	if checked {
+		t.Error("built-in backend should not be permission-checked")
+	}
+	if rem != nil || len(dirs) != 0 {
+		t.Errorf("built-in probe should yield no remediation/dirs, got rem=%v dirs=%v", rem, dirs)
+	}
+	if !res.OK() {
+		t.Error("built-in probe should report OK (nothing to deny)")
+	}
+
+	// Switch to existing nginx with a writable layout + passing reload → checked,
+	// OK, dirs reported, no remediation.
+	root := nginxLayoutTempDir(t)
+	deps := proxy.ReconfigureDeps{Health: &fakeHealth{}, StopCaddy: func() error { return nil }}
+	h.Reconfigure(context.Background(), proxy.ReconfigureRequest{
+		Mode: "existing", Type: "nginx", ConfigDir: root, TestCmd: "/bin/true",
+	}, deps)
+
+	res, rem, dirs, checked = h.ProbePermissions(context.Background(), "agentuser")
+	if !checked {
+		t.Fatal("existing nginx backend should be permission-checked")
+	}
+	if len(dirs) == 0 {
+		t.Error("existing probe should report the probed config dirs")
+	}
+	if !res.OK() || rem != nil {
+		t.Errorf("writable+reloadable probe should be OK with no remediation, got OK=%v rem=%v", res.OK(), rem)
+	}
+
+	// A bogus config dir fails the write probe → checked, !OK, remediation present.
+	h2 := proxy.NewHolder(seedBackend{}, "built-in")
+	h2.Reconfigure(context.Background(), proxy.ReconfigureRequest{
+		Mode: "existing", Type: "nginx", ConfigDir: "/nonexistent/nurproxy/bogus", TestCmd: "/bin/true",
+	}, deps)
+	res, rem, _, checked = h2.ProbePermissions(context.Background(), "agentuser")
+	if !checked || res.OK() {
+		t.Errorf("bogus-dir probe should be checked and not OK, got checked=%v OK=%v", checked, res.OK())
+	}
+	if rem == nil || len(rem.Steps) == 0 {
+		t.Error("a failing probe should carry remediation steps for the missing grant")
+	}
+}
+
 // TestHolderModeTracksReconfigure asserts the Holder's reported mode (§19, the
 // value the heartbeat sends so the dashboard reflects reality) follows the live
 // backend across hot-switches: it seeds from NewHolder, becomes "existing" after

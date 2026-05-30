@@ -155,6 +155,30 @@ func decodeCapabilities(s sql.NullString) *models.ProxyCapabilities {
 	return &c
 }
 
+// encodePermissions flattens the agent's §12 permission self-test to a JSON
+// string column value, or nil (SQL NULL) when there is nothing to store (built-in
+// mode). decodePermissions is its inverse.
+func encodePermissions(p *models.ProxyPermissions) any {
+	if p == nil {
+		return nil
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+func decodePermissions(s sql.NullString) *models.ProxyPermissions {
+	if !s.Valid || s.String == "" {
+		return nil
+	}
+	var p models.ProxyPermissions
+	if err := json.Unmarshal([]byte(s.String), &p); err != nil {
+		return nil
+	}
+	return &p
+}
+
 // scanAgent reads a single agent row from a *sql.Row or *sql.Rows scanner.
 func scanAgent(sc interface {
 	Scan(dest ...any) error
@@ -167,6 +191,7 @@ func scanAgent(sc interface {
 	var detectedAt sql.NullString
 	var capabilities sql.NullString
 	var autoReconcile int
+	var permissions sql.NullString
 
 	err := sc.Scan(
 		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
@@ -177,7 +202,7 @@ func scanAgent(sc interface {
 		&det.logPaths, &det.portConflicts, &det.installed, &detectedAt,
 		&capabilities,
 		&autoReconcile,
-		&a.ProxyMode,
+		&a.ProxyMode, &permissions,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -187,6 +212,7 @@ func scanAgent(sc interface {
 	a.AutoReconcileConfig = autoReconcile != 0
 	a.ProxyDetection, a.ProxyDetectedAt = decodeDetection(det, detectedAt)
 	a.ProxyCapabilities = decodeCapabilities(capabilities)
+	a.ProxyPermissions = decodePermissions(permissions)
 
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -205,7 +231,7 @@ const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
 	detected_installed, detected_at, detected_capabilities,
 	auto_reconcile_config,
-	proxy_mode,
+	proxy_mode, proxy_permissions,
 	created_at, updated_at`
 
 // boolToInt maps a bool to SQLite's integer boolean representation.
@@ -465,6 +491,29 @@ func (d *DB) UpdateAgentCapabilities(id string, caps *models.ProxyCapabilities) 
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent capabilities: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+// UpdateAgentPermissions records the agent's §12 permission self-test (config-dir
+// writable? service reloadable? + remediation) reported each heartbeat in
+// existing mode. It is a narrow update (touches only proxy_permissions +
+// updated_at) so it never clobbers operator-owned fields or the liveness/health
+// self-report written by the same beat. A nil report stores SQL NULL, which is
+// the correct "no permission state" for built-in mode.
+func (d *DB) UpdateAgentPermissions(id string, perms *models.ProxyPermissions) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET proxy_permissions = ?, updated_at = ? WHERE id = ?`,
+		encodePermissions(perms), now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent permissions: %w", err)
 	}
 
 	n, _ := res.RowsAffected()

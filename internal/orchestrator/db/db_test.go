@@ -483,6 +483,50 @@ func TestAgent_HealthPersistsProxyMode(t *testing.T) {
 	}
 }
 
+func TestAgent_PersistsProxyPermissions(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	// A fresh agent has no permission report (NULL column → nil).
+	got, _ := d.GetAgent(a.ID)
+	if got.ProxyPermissions != nil {
+		t.Errorf("fresh agent should have no permissions report, got %+v", got.ProxyPermissions)
+	}
+
+	// A heartbeat carrying a failing self-test persists structured + round-trips.
+	perms := &models.ProxyPermissions{
+		Checked: true, OK: false, CanWrite: true, CanReload: false,
+		ReloadError: "nginx cannot be reloaded",
+		Dirs:        []string{"/etc/nginx/sites-available"},
+		Remediation: &models.Remediation{
+			SudoersLine: "nurproxy ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /usr/sbin/nginx -s reload",
+			Steps:       []models.RemediationStep{{Title: "scoped sudoers", Commands: []string{"echo ... | sudo tee ..."}}},
+		},
+	}
+	if err := d.UpdateAgentPermissions(a.ID, perms); err != nil {
+		t.Fatalf("UpdateAgentPermissions: %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyPermissions == nil {
+		t.Fatal("expected a persisted permissions report")
+	}
+	if got.ProxyPermissions.OK || got.ProxyPermissions.CanReload {
+		t.Errorf("round-trip lost the failing reload state: %+v", got.ProxyPermissions)
+	}
+	if got.ProxyPermissions.Remediation == nil || got.ProxyPermissions.Remediation.SudoersLine == "" {
+		t.Errorf("round-trip lost the remediation: %+v", got.ProxyPermissions)
+	}
+
+	// Reporting nil (built-in mode) clears the column back to NULL.
+	if err := d.UpdateAgentPermissions(a.ID, nil); err != nil {
+		t.Fatalf("UpdateAgentPermissions(nil): %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyPermissions != nil {
+		t.Errorf("nil report should clear the column, got %+v", got.ProxyPermissions)
+	}
+}
+
 func TestAgent_GetByFQDN(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
