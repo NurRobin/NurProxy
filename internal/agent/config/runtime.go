@@ -15,6 +15,7 @@ import (
 // on every startup and is purely a convenience cache — never authoritative.
 type RuntimeInfo struct {
 	OrchestratorURL string `json:"orchestrator_url"`
+	FQDN            string `json:"fqdn"`
 	APIPort         int    `json:"api_port"`
 	AgentID         string `json:"agent_id"`
 }

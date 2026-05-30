@@ -160,6 +160,7 @@ func main() {
 	// means the operator passes the flags explicitly.
 	if err := agentconfig.SaveRuntimeInfo(cfg.DataDir, agentconfig.RuntimeInfo{
 		OrchestratorURL: cfg.OrchestratorURL,
+		FQDN:            cfg.FQDN,
 		APIPort:         cfg.APIPort,
 		AgentID:         mgr.AgentID(),
 	}); err != nil {
