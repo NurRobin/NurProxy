@@ -406,3 +406,38 @@ func TestReloadHint_default_andOverride(t *testing.T) {
 		t.Fatalf("override ReloadHint = %q", got)
 	}
 }
+
+func TestResolvedCommands_default_andOverride(t *testing.T) {
+	b := New(proxy.Config{Type: "apache", ConfigDir: "/etc/apache2/sites-available", Binary: "/usr/sbin/apachectl"})
+	test, reload := b.ResolvedCommands()
+	if test != "/usr/sbin/apachectl configtest" {
+		t.Fatalf("default test cmd = %q", test)
+	}
+	if reload != "/usr/sbin/apachectl graceful" {
+		t.Fatalf("default reload cmd = %q", reload)
+	}
+
+	o := New(proxy.Config{
+		Type:      "apache",
+		ConfigDir: "/etc/apache2/sites-available",
+		Binary:    "/usr/sbin/apachectl",
+		TestCmd:   "sudo /usr/sbin/apachectl configtest",
+		ReloadCmd: "sudo systemctl reload apache2",
+	})
+	test, reload = o.ResolvedCommands()
+	if test != "sudo /usr/sbin/apachectl configtest" {
+		t.Fatalf("override test cmd = %q", test)
+	}
+	if reload != "sudo systemctl reload apache2" {
+		t.Fatalf("override reload cmd = %q", reload)
+	}
+
+	// No detected binary falls back to the bare "apachectl" defaults.
+	nb := New(proxy.Config{Type: "apache", ConfigDir: "/etc/apache2/sites-available", Binary: "nope-not-a-real-binary"})
+	nb.binary = ""
+	nb.runner = &execRunner{}
+	test, reload = nb.ResolvedCommands()
+	if test != "apachectl configtest" || reload != "apachectl graceful" {
+		t.Fatalf("empty-binary fallback = %q / %q", test, reload)
+	}
+}

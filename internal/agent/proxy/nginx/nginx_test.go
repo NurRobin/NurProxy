@@ -426,3 +426,39 @@ func TestReloadHint_default_andOverride(t *testing.T) {
 		t.Fatalf("override ReloadHint = %q", got)
 	}
 }
+
+func TestResolvedCommands_default_andOverride(t *testing.T) {
+	b := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available", Binary: "/usr/sbin/nginx"})
+	test, reload := b.ResolvedCommands()
+	if test != "/usr/sbin/nginx -t" {
+		t.Fatalf("default test cmd = %q", test)
+	}
+	if reload != "/usr/sbin/nginx -s reload" {
+		t.Fatalf("default reload cmd = %q", reload)
+	}
+
+	o := New(proxy.Config{
+		Type:      "nginx",
+		ConfigDir: "/etc/nginx/sites-available",
+		Binary:    "/usr/sbin/nginx",
+		TestCmd:   "sudo /usr/sbin/nginx -t",
+		ReloadCmd: "sudo systemctl reload nginx",
+	})
+	test, reload = o.ResolvedCommands()
+	if test != "sudo /usr/sbin/nginx -t" {
+		t.Fatalf("override test cmd = %q", test)
+	}
+	if reload != "sudo systemctl reload nginx" {
+		t.Fatalf("override reload cmd = %q", reload)
+	}
+
+	// No detected binary falls back to the bare "nginx" defaults rather than
+	// emitting " -t" with an empty binary.
+	nb := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available", Binary: "nope-not-a-real-binary"})
+	nb.binary = ""
+	nb.runner = &execRunner{}
+	test, reload = nb.ResolvedCommands()
+	if test != "nginx -t" || reload != "nginx -s reload" {
+		t.Fatalf("empty-binary fallback = %q / %q", test, reload)
+	}
+}
