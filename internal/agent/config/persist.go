@@ -78,6 +78,22 @@ func ApplyProxyConfig(dataDir string, p ProxyConfigUpdate) (*Config, error) {
 	}
 	cfg.DataDir = dataDir
 
+	// Backfill identity from runtime.json when the on-disk agent.yaml didn't carry
+	// it (e.g. a flag/env-started agent that never had a config file). This keeps
+	// the written agent.yaml self-sufficient — loadable standalone on the next
+	// start — instead of persisting empty required fields.
+	if ri, rerr := LoadRuntimeInfo(dataDir); rerr == nil {
+		if cfg.OrchestratorURL == "" {
+			cfg.OrchestratorURL = ri.OrchestratorURL
+		}
+		if cfg.FQDN == "" {
+			cfg.FQDN = ri.FQDN
+		}
+		if cfg.APIPort == 0 && ri.APIPort != 0 {
+			cfg.APIPort = ri.APIPort
+		}
+	}
+
 	cfg.ProxyMode = ProxyMode(p.Mode)
 	cfg.ProxyType = p.Type
 	cfg.ProxyConfigDir = p.ConfigDir

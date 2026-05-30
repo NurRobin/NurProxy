@@ -75,14 +75,25 @@ func cmdApply(args []string) {
 		fmt.Fprintln(os.Stderr, "Usage: nurproxy-agent apply <CODE> [--data-dir DIR] [--orchestrator URL] [--api-port N]")
 		fs.PrintDefaults()
 	}
-	_ = fs.Parse(args)
-
-	rest := fs.Args()
-	if len(rest) < 1 {
+	// Separate the positional <CODE> from the flags. Go's flag package stops
+	// parsing at the first non-flag token, so `apply <CODE> --orchestrator X`
+	// would otherwise drop every flag. Pull a leading positional, then parse the
+	// rest; if the code came after the flags instead, recover it from fs.Arg(0).
+	var code string
+	rest := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		code = args[0]
+		rest = args[1:]
+	}
+	_ = fs.Parse(rest)
+	if code == "" && fs.NArg() > 0 {
+		code = fs.Arg(0)
+	}
+	if code == "" {
 		fmt.Fprintln(os.Stderr, "error: apply requires a confirmation code, e.g. `nurproxy-agent apply XXXX-XXXX`")
 		os.Exit(2)
 	}
-	code := normalizeCode(rest[0])
+	code = normalizeCode(code)
 
 	if err := runApply(*dataDir, *orchestrator, *apiPort, code); err != nil {
 		if errors.Is(err, errCodeNotFound) {
