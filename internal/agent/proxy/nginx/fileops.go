@@ -83,12 +83,24 @@ func ensureSymlink(target, link string) error {
 	return os.Symlink(target, link)
 }
 
-// symlinkPresent reports whether link exists as a symlink (the sites-enabled
-// activation marker). A non-symlink or a missing entry both report false.
+// symlinkPresent reports whether link exists as a symlink (the canonical
+// sites-enabled activation marker NurProxy itself creates). A missing entry
+// reports false. Kept for the apply path, which only ever creates symlinks.
 func symlinkPresent(link string) bool {
 	fi, err := os.Lstat(link)
 	if err != nil {
 		return false
 	}
 	return fi.Mode()&os.ModeSymlink != 0
+}
+
+// activationPresent reports whether an entry exists in sites-enabled for this
+// vhost — by symlink (Debian's canonical activation, what NurProxy creates) OR by
+// a regular file. Some operators activate by copying the file into sites-enabled
+// instead of symlinking; treating only symlinks as "enabled" would mislabel those
+// live vhosts as inactive. Any present entry counts as enabled; a missing entry
+// is disabled.
+func activationPresent(link string) bool {
+	_, err := os.Lstat(link)
+	return err == nil
 }

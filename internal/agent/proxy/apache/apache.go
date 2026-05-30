@@ -253,9 +253,9 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 // an explicit Accept. Files NurProxy generated (the nurproxy- prefix) are
 // returned with Adopted=false for drift comparison; every other file is an
 // operator-authored config, returned with Adopted=true so the orchestrator
-// stores it as Source: manual, version 1. Enabled reports whether the
-// sites-enabled symlink is present (Debian) or — on the RHEL conf.d layout —
-// whether the file is present at all (presence == enabled).
+// stores it as Source: manual, version 1. Enabled reports whether an entry is
+// present in sites-enabled (Debian) — by symlink or copied file — or, on the RHEL
+// conf.d layout, whether the file is present at all (presence == enabled).
 func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 	entries, err := os.ReadDir(b.layout.Available)
 	if err != nil {
@@ -282,7 +282,7 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 		}
 		enabled := true
 		if !b.layout.IsConfD() {
-			enabled = symlinkPresent(filepath.Join(b.layout.Enabled, name))
+			enabled = activationPresent(filepath.Join(b.layout.Enabled, name))
 		}
 		arts = append(arts, proxy.Artifact{
 			Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: path},
