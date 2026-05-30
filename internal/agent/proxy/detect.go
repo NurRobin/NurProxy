@@ -93,6 +93,12 @@ type Detector struct {
 	run runner
 	// listListeners returns the current listening sockets; defaults to ss.
 	listListeners func(ctx context.Context) ([]listener, error)
+	// resolveHolder is the fallback used to name the process holding a port when
+	// `ss -ltnp` did not reveal it (an unprivileged agent can't see the process
+	// column for another user's socket). It walks /proc to attribute the listening
+	// socket to a pid + command, best-effort. Defaults to resolveHolderViaProc; a
+	// nil resolver disables the fallback. Returns ok=false when it cannot attribute.
+	resolveHolder func(port int) (process string, pid int, ok bool)
 }
 
 // NewDetector returns a Detector wired to the real host.
@@ -102,6 +108,7 @@ func NewDetector() *Detector {
 		run:      runCombined,
 	}
 	d.listListeners = d.listListenersSS
+	d.resolveHolder = resolveHolderViaProc
 	return d
 }
 
@@ -192,7 +199,17 @@ func (d *Detector) detectPortConflicts(ctx context.Context) []PortConflict {
 				continue
 			}
 			seen[want] = true
-			conflicts = append(conflicts, PortConflict{Port: want, Process: l.process, PID: l.pid})
+			pc := PortConflict{Port: want, Process: l.process, PID: l.pid}
+			// `ss -ltnp` omits the process column for sockets the agent doesn't own
+			// (a non-root agent can't see a root proxy's process). Fall back to
+			// walking /proc to name the holder when we have permission to (§2.1).
+			if pc.Process == "" && d.resolveHolder != nil {
+				if proc, pid, ok := d.resolveHolder(want); ok {
+					pc.Process = proc
+					pc.PID = pid
+				}
+			}
+			conflicts = append(conflicts, pc)
 		}
 	}
 	return conflicts
