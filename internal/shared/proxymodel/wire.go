@@ -173,3 +173,67 @@ type ArtifactChecksum struct {
 	// computed by the agent the same way the orchestrator computes it.
 	Checksum string `json:"checksum"`
 }
+
+// AdoptedArtifact is one config file the agent read off the host (via the
+// backend's ReadManaged) and reports into the central store on existing-mode
+// startup (§17 "adoption reads all files"). It is independent of the apply path:
+// the agent reports what it can READ even when it cannot reload the service, so a
+// limited-permission agent still surfaces the operator's config under Config.
+//
+// The agent assigns a stable ArtifactID derived from backend + path
+// (AdoptedArtifactID) so re-reporting the same file upserts the same row instead
+// of spawning duplicates. Generated (NurProxy-authored) files report Adopted=false
+// so the orchestrator tracks them for drift; operator-authored files report
+// Adopted=true and are stored as Source: manual, never auto-overwritten.
+type AdoptedArtifact struct {
+	// ArtifactID is the stable identity derived from backend+path (AdoptedArtifactID).
+	ArtifactID string `json:"artifact_id"`
+	// Backend names the proxy this config belongs to ("nginx" | "apache" | "caddy").
+	Backend string `json:"backend"`
+	// TargetKind locates the artifact ("file" | "caddy-route").
+	TargetKind string `json:"target_kind"`
+	// TargetPath is the file path on the host.
+	TargetPath string `json:"target_path"`
+	// Content is the native config text read off disk.
+	Content string `json:"content"`
+	// Checksum is the SHA-256 (hex) of Content, computed by the agent.
+	Checksum string `json:"checksum"`
+	// Enabled reports whether the artifact is active on the host (nginx
+	// sites-enabled symlink present, or conf.d presence).
+	Enabled bool `json:"enabled"`
+	// Adopted is true for operator-authored config (stored Source: manual), false
+	// for a NurProxy-generated file (tracked for drift).
+	Adopted bool `json:"adopted"`
+}
+
+// AdoptedArtifactReport is the agent's batch of read-off-host config artifacts,
+// POSTed to the orchestrator on existing-mode startup. The orchestrator upserts
+// each into the central versioned store keyed by ArtifactID.
+type AdoptedArtifactReport struct {
+	// Host is the agent's FQDN, for audit attribution.
+	Host string `json:"host"`
+	// Artifacts is the full set the agent read this cycle.
+	Artifacts []AdoptedArtifact `json:"artifacts"`
+}
+
+// AdoptedArtifactID derives a stable, filesystem-safe artifact identity from a
+// backend and an on-host path, so re-reporting the same file upserts the same
+// central row. The "adopt-" prefix keeps it clearly distinct from generated
+// per-domain IDs ("dom-<id>"), and slashes/dots in the path are replaced so the
+// ID is a single token. It is deterministic: same (backend, path) → same ID.
+func AdoptedArtifactID(backend, path string) string {
+	var b []byte
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '/' || c == '.' || c == ' ' {
+			b = append(b, '-')
+			continue
+		}
+		b = append(b, c)
+	}
+	cleaned := string(b)
+	for len(cleaned) > 0 && cleaned[0] == '-' {
+		cleaned = cleaned[1:]
+	}
+	return "adopt-" + backend + "-" + cleaned
+}
