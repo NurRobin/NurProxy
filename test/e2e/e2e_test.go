@@ -570,6 +570,24 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 	}
 	t.Logf("Created provider: %s", providerID)
 
+	// Create a zone under the provider — a domain is created against a zone
+	// (zone_id), not the provider directly.
+	resp = httpDo(t, http.MethodPost, orchURL+"/api/v1/zones", map[string]interface{}{
+		"provider_id": providerID,
+		"external_id": "zone-ext-1",
+		"name":        "testzone.com",
+	}, sessionCookie)
+	var zoneResp map[string]string
+	decodeJSON(t, resp, &zoneResp)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create zone returned %d: %+v", resp.StatusCode, zoneResp)
+	}
+	zoneID := zoneResp["id"]
+	if zoneID == "" {
+		t.Fatal("zone ID is empty")
+	}
+	t.Logf("Created zone: %s", zoneID)
+
 	// -----------------------------------------------------------------------
 	// 4. Agent adoption flow
 	// -----------------------------------------------------------------------
@@ -661,11 +679,11 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 	// -----------------------------------------------------------------------
 
 	resp = httpDo(t, http.MethodPost, orchURL+"/api/v1/domains", map[string]interface{}{
-		"subdomain":   "app",
-		"provider_id": providerID,
-		"server_id":   serverID,
-		"port":        8080,
-		"websocket":   true,
+		"subdomain": "app",
+		"zone_id":   zoneID,
+		"server_id": serverID,
+		"port":      8080,
+		"websocket": true,
 	}, sessionCookie)
 	var domainResp map[string]interface{}
 	decodeJSON(t, resp, &domainResp)
@@ -702,6 +720,18 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 	// methods. The orchestrator stored auth.HashToken(rawToken) which equals
 	// agentTokenHash. The agent API was started with agentTokenHash as its
 	// accepted Bearer token. So the reconciler will authenticate successfully.
+	// Heartbeat first so the agent stays adopted: the reconciler's staleness sweep
+	// marks a never-heartbeating agent offline, and route reconciliation skips
+	// offline agents. A real agent heartbeats continuously; the test does it once.
+	resp = httpDoWithBearer(t, http.MethodPost, orchURL+"/api/v1/agents/"+agentID+"/heartbeat", map[string]interface{}{
+		"public_ip": "203.0.113.1",
+		"version":   "1.0.0-test",
+	}, agentRawToken)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("agent heartbeat returned %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
 	agentClient := newAgentClientAdapter()
 	rec := reconciler.New(database, agentClient, time.Minute)
 
