@@ -259,6 +259,10 @@ func (o *orderingBackend) EnsureServerTLS(ctx context.Context, intents []proxy.T
 	o.tlsIntents = intents
 	return nil
 }
+func (o *orderingBackend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
+	o.calls = append(o.calls, "prune")
+	return 0, nil
+}
 
 func TestApplyIntents_installsCertsBeforeApply(t *testing.T) {
 	be := &orderingBackend{}
@@ -361,6 +365,8 @@ type fileBackend struct {
 	addRouteHit bool
 	applyHit    bool
 	applyErr    error
+	pruneKeep   []proxy.Target // records the keep set Prune was last called with
+	pruneHit    bool
 }
 
 func (f *fileBackend) EnsureServer(ctx context.Context) error { return nil }
@@ -392,6 +398,11 @@ func (f *fileBackend) InstallCerts(ctx context.Context, certs []proxy.CertBundle
 func (f *fileBackend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error {
 	return nil
 }
+func (f *fileBackend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
+	f.pruneHit = true
+	f.pruneKeep = keep
+	return 0, nil
+}
 
 // TestApplyIntents_fileBackendWritesViaApply proves a file backend applies config
 // through Apply (write/validate/reload) rather than the admin-API AddRoute no-op,
@@ -418,6 +429,14 @@ func TestApplyIntents_fileBackendWritesViaApply(t *testing.T) {
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != be.content {
 		t.Fatalf("Apply did not write the config: content=%q err=%v", got, err)
+	}
+	// applyIntents prunes orphaned vhosts over the stream (§3): Prune is called with
+	// the desired file targets so a deleted domain's leftover gets removed.
+	if !be.pruneHit {
+		t.Error("applyIntents must call Prune to remove orphaned vhosts")
+	}
+	if len(be.pruneKeep) != 1 || be.pruneKeep[0].Path != path {
+		t.Errorf("Prune keep set = %+v, want the one desired target %q", be.pruneKeep, path)
 	}
 
 	// The managed checksum tracks the artifact and matches the on-disk content.

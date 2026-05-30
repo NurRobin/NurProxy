@@ -245,6 +245,8 @@ export interface ConfigArtifact {
   drifted: boolean;
   apply_state: ArtifactApplyState;
   last_error?: string;
+  /** Operator's on-disk content captured while drifted (§11): diff baseline + Accept payload. */
+  drift_content?: string;
   updated_at: string;
 }
 

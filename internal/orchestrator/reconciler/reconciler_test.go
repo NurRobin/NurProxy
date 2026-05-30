@@ -22,11 +22,12 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockAgentClient struct {
-	mu         sync.Mutex
-	routes     map[string][]json.RawMessage // agentURL -> routes
-	healthy    map[string]bool              // agentURL -> reachable
-	pushCalls  int
-	pushErrors map[string]error // fqdn -> error
+	mu               sync.Mutex
+	routes           map[string][]json.RawMessage // agentURL -> routes
+	healthy          map[string]bool              // agentURL -> reachable
+	pushCalls        int
+	deleteRouteCalls int              // inbound DeleteRoute invocations (must stay 0 for stream-connected agents)
+	pushErrors       map[string]error // fqdn -> error
 }
 
 func newMockAgentClient() *mockAgentClient {
@@ -76,6 +77,7 @@ func (m *mockAgentClient) PushRoute(_ context.Context, agentURL, _ string, route
 func (m *mockAgentClient) DeleteRoute(_ context.Context, agentURL, _, domain string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.deleteRouteCalls++
 	var filtered []json.RawMessage
 	for _, r := range m.routes[agentURL] {
 		if extractHostFromRoute(r) != domain {
@@ -507,25 +509,33 @@ func TestBuildDesiredRoutes_SkipsDriftedArtifact(t *testing.T) {
 
 	r := New(d, newMockAgentClient(), time.Minute)
 
-	desired, err := r.buildDesiredRoutes(agent)
+	desired, keep, err := r.buildDesiredRoutes(agent)
 	if err != nil {
 		t.Fatalf("buildDesiredRoutes: %v", err)
 	}
 	if len(desired) != 0 {
 		t.Errorf("drifted artifact should be skipped, got %d desired routes", len(desired))
 	}
+	// But the drifted file must be RETAINED (keep), so the agent's prune does not
+	// mistake it for a deleted domain's orphan (invariant #3).
+	if len(keep) != 1 {
+		t.Errorf("drifted artifact path should be in keep, got %d keep paths", len(keep))
+	}
 
-	// With auto-reconcile enabled, the domain is pushed again.
+	// With auto-reconcile enabled, the domain is pushed again (and not in keep-extra).
 	if err := d.SetAgentAutoReconcileConfig(agent.ID, true); err != nil {
 		t.Fatalf("SetAgentAutoReconcileConfig: %v", err)
 	}
 	agent.AutoReconcileConfig = true
-	desired, err = r.buildDesiredRoutes(agent)
+	desired, keep, err = r.buildDesiredRoutes(agent)
 	if err != nil {
 		t.Fatalf("buildDesiredRoutes (auto): %v", err)
 	}
 	if len(desired) != 1 {
 		t.Errorf("auto-reconcile should push the artifact, got %d desired routes", len(desired))
+	}
+	if len(keep) != 0 {
+		t.Errorf("auto-reconcile pushes the artifact, so keep-extra should be empty, got %d", len(keep))
 	}
 }
 
@@ -885,6 +895,12 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	})
 
 	r := New(d, mc, time.Minute)
+	// The agent is stream-connected: route removal must ride the dial-out stream
+	// (a re-push of the now-smaller desired set the agent prunes against), never an
+	// inbound DeleteRoute call (invariant #2, §3 no ghost vhost).
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+	r.SetHub(hub)
 	if err := r.reconcileDeletions(context.Background()); err != nil {
 		t.Fatalf("reconcileDeletions: %v", err)
 	}
@@ -893,9 +909,16 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	if _, ok := mp.getRecord(recID); ok {
 		t.Error("expected DNS record to be deleted")
 	}
-	// Route gone from agent.
-	if len(mc.getRoutes(agent.APIURL)) != 0 {
-		t.Errorf("expected route removed, got %d routes", len(mc.getRoutes(agent.APIURL)))
+	// Route removal rides the stream, not the inbound API.
+	if mc.deleteRouteCalls != 0 {
+		t.Errorf("expected no inbound DeleteRoute calls (dial-out only), got %d", mc.deleteRouteCalls)
+	}
+	// The agent's desired set was re-pushed and is now empty (its only domain was
+	// deleted), so the agent prunes the orphaned on-disk vhost.
+	if set, ok := hub.lastSet(agent.ID); !ok {
+		t.Error("expected a re-push of the desired set over the stream after delete")
+	} else if len(set.Intents) != 0 {
+		t.Errorf("expected empty desired set after the only domain was deleted, got %d intents", len(set.Intents))
 	}
 	// Domain row gone.
 	if _, err := d.GetDomain(dom.ID); err == nil {

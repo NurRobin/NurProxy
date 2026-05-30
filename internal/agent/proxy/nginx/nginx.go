@@ -203,6 +203,21 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 			in.KeyPath = paths.KeyPath
 		}
 	}
+	// Materialize the htpasswd file for a basic-auth route and point the renderer at
+	// it, so basic auth actually works instead of being dropped (§6 capability). The
+	// password is already a bcrypt hash in the intent (the plaintext never travels);
+	// nginx's crypt() validates the $2y$/$2a$ entry. A write failure leaves AuthFile
+	// empty, so nginxgen degrades to dropping basic auth with a warning rather than
+	// referencing a missing file (invariant #4).
+	if !route.IsRaw() && route.Host != "" && route.BasicAuth != nil &&
+		route.BasicAuth.Username != "" && route.BasicAuth.PasswordHash != "" {
+		if authPath, err := b.writeHtpasswd(route.Host, route.BasicAuth.Username, route.BasicAuth.PasswordHash); err != nil {
+			slog.WarnContext(ctx, "nginx: could not write htpasswd; basic auth will be dropped",
+				slog.String("host", route.Host), slog.Any("err", err))
+		} else {
+			in.AuthFile = authPath
+		}
+	}
 
 	res, err := nginxgen.Render(in)
 	if err != nil {
@@ -261,9 +276,9 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 			continue
 		}
 		name := e.Name()
-		// Skip our own in-flight temp files so a concurrent apply never surfaces a
-		// half-written vhost as an adopted artifact.
-		if strings.HasSuffix(name, tempSuffix) {
+		// Skip our own in-flight temp files and per-vhost htpasswd sidecars so a
+		// concurrent apply or a basic-auth file never surfaces as an adopted artifact.
+		if strings.HasSuffix(name, tempSuffix) || strings.HasSuffix(name, htpasswdSuffix) {
 			continue
 		}
 		path := filepath.Join(b.layout.Available, name)
@@ -412,12 +427,71 @@ func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {
 	if err := os.Remove(target.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("removing config %q: %w", target.Path, err)
 	}
+	// Drop the per-vhost htpasswd sidecar, if any, so no stale credential file lingers.
+	if auth := strings.TrimSuffix(target.Path, confSuffix) + htpasswdSuffix; auth != target.Path {
+		_ = os.Remove(auth)
+	}
 	if b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
 			return fmt.Errorf("nginx -s reload after remove failed: %w", err)
 		}
 	}
 	return nil
+}
+
+// Prune removes every NurProxy-generated vhost (the nurproxy- prefix) in
+// sites-available whose path is not in keep, then reloads once if anything was
+// removed (§3, no ghost vhosts on domain delete). It rides the agent's dial-out
+// stream — applyIntents calls it with the full desired set, so a deleted domain's
+// file is gone on the next push without any inbound probe (invariant #2). Operator
+// configs (no nurproxy- prefix) are never touched. A missing file is not an error.
+func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
+	wanted := make(map[string]bool, len(keep))
+	for _, t := range keep {
+		if t.Path != "" {
+			wanted[t.Path] = true
+		}
+	}
+	entries, err := os.ReadDir(b.layout.Available)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("reading nginx sites-available %q: %w", b.layout.Available, err)
+	}
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Only ever prune our own generated files; never an operator's adopted config.
+		if !IsManagedFile(name) || strings.HasSuffix(name, tempSuffix) {
+			continue
+		}
+		path := filepath.Join(b.layout.Available, name)
+		if wanted[path] {
+			continue
+		}
+		if !b.layout.IsConfD() {
+			link := b.enabledLinkFor(path)
+			if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return removed, fmt.Errorf("removing orphan symlink %q: %w", link, err)
+			}
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removed, fmt.Errorf("removing orphan config %q: %w", path, err)
+		}
+		// Drop the orphaned vhost's htpasswd sidecar too, if any.
+		_ = os.Remove(strings.TrimSuffix(path, confSuffix) + htpasswdSuffix)
+		removed++
+	}
+	if removed > 0 && b.runner != nil {
+		if err := b.runner.Reload(ctx); err != nil {
+			return removed, fmt.Errorf("nginx -s reload after prune failed: %w", err)
+		}
+	}
+	return removed, nil
 }
 
 // Validate checks the live config (nginx -t) without applying changes. A test
@@ -465,6 +539,33 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 // file: same base name in the Enabled directory.
 func (b *Backend) enabledLinkFor(availablePath string) string {
 	return filepath.Join(b.layout.Enabled, filepath.Base(availablePath))
+}
+
+// htpasswdSuffix names the per-vhost basic-auth file the agent maintains beside the
+// managed config. It is NOT a .conf, so nginx's include glob never loads it and
+// ReadManaged/Prune treat it as auxiliary (skipped from the artifact set, removed
+// alongside its vhost).
+const htpasswdSuffix = ".htpasswd"
+
+// authFilePath is the htpasswd path for a host's managed vhost: the same
+// nurproxy-<host> base in the config dir, with a .htpasswd suffix.
+func (b *Backend) authFilePath(host string) string {
+	conf := b.layout.AvailablePath(host)
+	return strings.TrimSuffix(conf, confSuffix) + htpasswdSuffix
+}
+
+// writeHtpasswd writes "user:hash" to the host's htpasswd file (creating the config
+// dir if needed) and returns its path. The hash is the bcrypt entry from the intent.
+func (b *Backend) writeHtpasswd(host, user, hash string) (string, error) {
+	if err := os.MkdirAll(b.layout.Available, 0o755); err != nil {
+		return "", fmt.Errorf("ensuring config dir %q: %w", b.layout.Available, err)
+	}
+	path := b.authFilePath(host)
+	line := fmt.Sprintf("%s:%s\n", user, hash)
+	if err := os.WriteFile(path, []byte(line), 0o640); err != nil {
+		return "", fmt.Errorf("writing htpasswd %q: %w", path, err)
+	}
+	return path, nil
 }
 
 // ProbeDirs reports the directories the agent must be able to write to manage

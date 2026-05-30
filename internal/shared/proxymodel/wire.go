@@ -48,6 +48,13 @@ type IntentSet struct {
 	// (preflight ordering, §5/§7). Empty when the orchestrator has no cert material
 	// for this agent (e.g. self-ACME fallback or no TLS).
 	Certs []CertBundle `json:"certs,omitempty"`
+	// Keep lists every NurProxy-generated artifact target that still exists for this
+	// agent — including drifted ones the orchestrator is NOT pushing this round
+	// (they await review). The agent prunes only generated files absent from Keep,
+	// so a deleted domain's vhost is removed (§3, no ghost) while a drifted file is
+	// retained (invariant #3, no overwrite while drifted). When nil, the agent falls
+	// back to the applied targets (older orchestrators / no-prune behavior).
+	Keep []string `json:"keep,omitempty"`
 }
 
 // CertBundle is one leaf certificate plus its private key destined for an agent's
@@ -163,8 +170,10 @@ type LogChunk struct {
 // on-disk (or live admin-API) state (§11). The agent computes the checksum of
 // the artifact it currently has applied; the orchestrator compares it against
 // the accepted checksum in the store and marks the artifact drifted when they
-// diverge. Bandwidth is a non-issue: only the artifact identity + checksum ride
-// the heartbeat, never the full content (that rides the apply-ACK on change).
+// diverge. The checksum alone rides every beat; the full on-disk Content rides
+// along ONLY when it diverges from the last-applied state, so the orchestrator
+// can show the operator a real accepted-vs-on-disk diff and persist the on-disk
+// bytes on Accept (§11). A matching beat carries no content (bandwidth-free).
 type ArtifactChecksum struct {
 	// ArtifactID is the stable identity the agent echoes from the RouteIntent it
 	// applied (e.g. "dom-7"), matching a row in the central store.
@@ -172,6 +181,10 @@ type ArtifactChecksum struct {
 	// Checksum is the SHA-256 (hex) of the artifact's current on-disk/live content,
 	// computed by the agent the same way the orchestrator computes it.
 	Checksum string `json:"checksum"`
+	// Content is the artifact's current on-disk content, sent ONLY when it diverges
+	// from the last-applied (accepted) state — so the orchestrator captures the
+	// drifted bytes for the diff + Accept. Empty when the checksum matches.
+	Content string `json:"content,omitempty"`
 }
 
 // AdoptedArtifact is one config file the agent read off the host (via the

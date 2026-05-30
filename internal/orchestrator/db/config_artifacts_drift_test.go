@@ -14,7 +14,7 @@ func TestReconcileArtifactChecksum_matchingNoOp(t *testing.T) {
 	createTestAgentRow(t, d, "agent-1")
 	art := createTestArtifact(t, d, "art-1", "agent-1")
 
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", art.Checksum)
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", art.Checksum, "")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestReconcileArtifactChecksum_divergenceFlagsDrift(t *testing.T) {
 	createTestAgentRow(t, d, "agent-1")
 	createTestArtifact(t, d, "art-1", "agent-1")
 
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef")
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef", "on-disk operator edit")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -49,6 +49,43 @@ func TestReconcileArtifactChecksum_divergenceFlagsDrift(t *testing.T) {
 	if got.Content != `{"handle":[]}` {
 		t.Errorf("accepted content was overwritten on drift: %q", got.Content)
 	}
+	// The operator's on-disk bytes are captured so the dashboard can diff and Accept
+	// can persist them (§11) — the accepted content stays intact alongside.
+	if got.DriftContent != "on-disk operator edit" {
+		t.Errorf("drift content not captured: %q", got.DriftContent)
+	}
+}
+
+// TestReconcileArtifactChecksum_acceptPersistsCapturedOnDiskBytes proves the full
+// drift-Accept path: a divergent heartbeat captures the on-disk bytes, and Accept
+// (with the captured bytes, as the dashboard sends) persists exactly those bytes as
+// a new manual version and clears the drift + captured bytes.
+func TestReconcileArtifactChecksum_acceptPersistsCapturedOnDiskBytes(t *testing.T) {
+	d := testDB(t)
+	createTestAgentRow(t, d, "agent-1")
+	createTestArtifact(t, d, "art-1", "agent-1")
+
+	onDisk := `{"handle":["operator edit"]}`
+	if _, _, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef", onDisk); err != nil {
+		t.Fatalf("flag drift: %v", err)
+	}
+	ver, err := d.AppendConfigArtifactVersion("art-1", onDisk, models.ArtifactSourceManual, "admin", "accept drift")
+	if err != nil {
+		t.Fatalf("AppendConfigArtifactVersion: %v", err)
+	}
+	if ver.Content != onDisk {
+		t.Errorf("accepted version content = %q, want the on-disk bytes", ver.Content)
+	}
+	got, _ := d.GetConfigArtifact("art-1")
+	if got.Content != onDisk {
+		t.Errorf("live content = %q, want the operator's on-disk edit", got.Content)
+	}
+	if got.Source != models.ArtifactSourceManual {
+		t.Errorf("source = %q, want manual after accepting a hand edit", got.Source)
+	}
+	if got.Drifted || got.DriftContent != "" {
+		t.Errorf("drift not cleared after accept: drifted=%v driftContent=%q", got.Drifted, got.DriftContent)
+	}
 }
 
 // TestReconcileArtifactChecksum_repeatedDivergenceNotReported verifies that a
@@ -59,10 +96,10 @@ func TestReconcileArtifactChecksum_repeatedDivergenceNotReported(t *testing.T) {
 	createTestAgentRow(t, d, "agent-1")
 	createTestArtifact(t, d, "art-1", "agent-1")
 
-	if _, changed, _ := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef"); !changed {
+	if _, changed, _ := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef", "on-disk operator edit"); !changed {
 		t.Fatal("first divergence should report a transition")
 	}
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef")
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef", "on-disk operator edit")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -85,7 +122,7 @@ func TestReconcileArtifactChecksum_backInAgreementClearsDrift(t *testing.T) {
 	if err := d.MarkConfigArtifactDrifted("art-1"); err != nil {
 		t.Fatalf("MarkConfigArtifactDrifted: %v", err)
 	}
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", art.Checksum)
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", art.Checksum, "")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -109,7 +146,7 @@ func TestReconcileArtifactChecksum_applyFailedUntouched(t *testing.T) {
 		t.Fatalf("SetConfigArtifactApplyState: %v", err)
 	}
 
-	_, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "whatever")
+	_, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "whatever", "")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -124,7 +161,7 @@ func TestReconcileArtifactChecksum_applyFailedUntouched(t *testing.T) {
 
 func TestReconcileArtifactChecksum_missingArtifact(t *testing.T) {
 	d := testDB(t)
-	if _, _, err := d.ReconcileArtifactChecksum("nope", "agent-1", "x"); err == nil {
+	if _, _, err := d.ReconcileArtifactChecksum("nope", "agent-1", "x", ""); err == nil {
 		t.Fatal("expected not-found error for missing artifact")
 	}
 }
@@ -139,7 +176,7 @@ func TestReconcileArtifactChecksum_scopedToOwningAgent(t *testing.T) {
 
 	// agent-2 reports a divergent checksum for agent-1's artifact: it must be
 	// treated as not-found (scoped out), never mutating agent-1's row.
-	if _, _, err := d.ReconcileArtifactChecksum("art-1", "agent-2", "deadbeef"); err == nil {
+	if _, _, err := d.ReconcileArtifactChecksum("art-1", "agent-2", "deadbeef", ""); err == nil {
 		t.Fatal("expected not-found: agent-2 must not reconcile agent-1's artifact")
 	}
 	got, _ := d.GetConfigArtifact("art-1")
