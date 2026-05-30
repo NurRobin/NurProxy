@@ -392,6 +392,124 @@ func TestAgentRegistrationAndAdoption(t *testing.T) {
 	}
 }
 
+func TestAgentRegister_storesProxyDetection(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+
+	agentToken := "np_ag_testtoken123456789012345678901234567890123456789012345678"
+
+	// Register carrying a Phase-0 detection result (agent dials out).
+	w := doRequest(t, handler, "POST", "/api/v1/agents/register", map[string]interface{}{
+		"id":      "agent-1",
+		"fqdn":    "edge1.example.com",
+		"token":   agentToken,
+		"version": "1.0.0",
+		"proxy_detection": map[string]interface{}{
+			"installed":   true,
+			"kind":        "nginx",
+			"version":     "1.24.0",
+			"binary_path": "/usr/sbin/nginx",
+			"config_dir":  "/etc/nginx/sites-available",
+			"log_paths":   []string{"/var/log/nginx/error.log"},
+			"port_conflicts": []map[string]interface{}{
+				{"port": 443, "process": "nginx", "pid": 1234},
+			},
+		},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("register: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Stored on the agent row.
+	agent, err := database.GetAgent("agent-1")
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if agent.ProxyDetection == nil {
+		t.Fatalf("ProxyDetection: got nil, want stored detection")
+	}
+	if agent.ProxyDetection.Kind != "nginx" || agent.ProxyDetection.Version != "1.24.0" {
+		t.Errorf("detection: got kind=%q version=%q", agent.ProxyDetection.Kind, agent.ProxyDetection.Version)
+	}
+	if agent.ProxyDetection.ConfigDir != "/etc/nginx/sites-available" {
+		t.Errorf("config_dir: got %q", agent.ProxyDetection.ConfigDir)
+	}
+	if len(agent.ProxyDetection.PortConflicts) != 1 || agent.ProxyDetection.PortConflicts[0].Port != 443 {
+		t.Errorf("port_conflicts: got %+v", agent.ProxyDetection.PortConflicts)
+	}
+	if agent.ProxyDetectedAt == nil {
+		t.Error("ProxyDetectedAt should be set after register with detection")
+	}
+
+	// Exposed read-only via the list endpoint.
+	w = doRequest(t, handler, "GET", "/api/v1/agents", nil, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list agents: expected 200, got %d", w.Code)
+	}
+	var agents []map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&agents)
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+	det, ok := agents[0]["proxy_detection"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("proxy_detection missing/not object in list response: %v", agents[0]["proxy_detection"])
+	}
+	if det["kind"] != "nginx" {
+		t.Errorf("list proxy_detection.kind: got %v, want nginx", det["kind"])
+	}
+}
+
+func TestAgentHeartbeat_updatesProxyDetection(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+
+	agentToken := "np_ag_testtoken123456789012345678901234567890123456789012345678"
+
+	// Register without detection.
+	w := doRequest(t, handler, "POST", "/api/v1/agents/register", map[string]interface{}{
+		"id":    "agent-1",
+		"fqdn":  "edge1.example.com",
+		"token": agentToken,
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("register: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if a, _ := database.GetAgent("agent-1"); a.ProxyDetection != nil {
+		t.Fatalf("ProxyDetection should be nil before any detection report, got %+v", a.ProxyDetection)
+	}
+
+	// Heartbeat carries detection.
+	w = doRequestWithAuth(t, handler, "POST", "/api/v1/agents/agent-1/heartbeat",
+		map[string]interface{}{
+			"public_ip": "5.6.7.8",
+			"proxy_detection": map[string]interface{}{
+				"installed":  true,
+				"kind":       "caddy",
+				"version":    "2.7.6",
+				"config_dir": "/etc/caddy",
+			},
+		}, agentToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	agent, err := database.GetAgent("agent-1")
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if agent.ProxyDetection == nil {
+		t.Fatalf("ProxyDetection: got nil after heartbeat, want stored detection")
+	}
+	if agent.ProxyDetection.Kind != "caddy" || agent.ProxyDetection.Version != "2.7.6" {
+		t.Errorf("detection: got kind=%q version=%q", agent.ProxyDetection.Kind, agent.ProxyDetection.Version)
+	}
+	if agent.ProxyDetectedAt == nil {
+		t.Error("ProxyDetectedAt should be set after a heartbeat with detection")
+	}
+}
+
 func TestAgentReject(t *testing.T) {
 	srv, _ := testServer(t)
 	handler := srv.Handler()
@@ -585,6 +703,33 @@ func TestDomainCRUD(t *testing.T) {
 		t.Fatalf("set manual config: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
+	// Manual config is stored in the per-backend RawConfig escape hatch, tagged
+	// for the caddy backend (§6).
+	withManual, _ := database.GetDomain(domainID)
+	if !withManual.ManualConfig {
+		t.Error("expected manual_config to be true after PUT")
+	}
+	if withManual.ProxyConfig.RawConfig.Backend != "caddy" {
+		t.Errorf("expected RawConfig backend caddy, got %q", withManual.ProxyConfig.RawConfig.Backend)
+	}
+	if withManual.ProxyConfig.RawConfig.Content == "" {
+		t.Error("expected RawConfig content to be set after PUT")
+	}
+
+	// GET now returns the stored manual config verbatim.
+	w = doRequest(t, handler, "GET", "/api/v1/domains/"+strconv.FormatInt(domainID, 10)+"/config", nil, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get manual config: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var manualResp struct {
+		Manual bool            `json:"manual"`
+		Config json.RawMessage `json:"config"`
+	}
+	json.NewDecoder(w.Body).Decode(&manualResp)
+	if !manualResp.Manual {
+		t.Error("expected manual=true in config preview after manual set")
+	}
+
 	// Reset config
 	w = doRequest(t, handler, "POST", "/api/v1/domains/"+strconv.FormatInt(domainID, 10)+"/config/reset", nil, cookie)
 	if w.Code != http.StatusOK {
@@ -594,6 +739,9 @@ func TestDomainCRUD(t *testing.T) {
 	reset, _ := database.GetDomain(domainID)
 	if reset.ManualConfig {
 		t.Error("expected manual_config to be false after reset")
+	}
+	if !reset.ProxyConfig.RawConfig.IsZero() {
+		t.Errorf("expected RawConfig cleared after reset, got %+v", reset.ProxyConfig.RawConfig)
 	}
 
 	// Delete domain (soft delete)

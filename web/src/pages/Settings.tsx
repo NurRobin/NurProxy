@@ -56,6 +56,9 @@ export default function Settings() {
   const [reconcilerInterval, setReconcilerInterval] = useState('');
   const [reconcilerSaving, setReconcilerSaving] = useState(false);
 
+  const [acmeEmail, setAcmeEmail] = useState('');
+  const [acmeSaving, setAcmeSaving] = useState(false);
+
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -73,6 +76,8 @@ export default function Settings() {
       setProviders(p); setZones(z); setSettings(s); setHealth(h); setApiKeyInfo(k);
       const rec = s.find((st) => st.key === 'reconciler_interval');
       if (rec) setReconcilerInterval(rec.value);
+      const email = s.find((st) => st.key === 'acme_email');
+      if (email) setAcmeEmail(email.value);
     } catch (err) {
       toast.error(errMessage(err, t('settings.loadFailed')));
     } finally {
@@ -141,6 +146,20 @@ export default function Settings() {
     try { await api.updateSetting('reconciler_interval', reconcilerInterval); toast.success(t('settings.intervalSaved')); }
     catch (err) { toast.error(errMessage(err, t('settings.saveFailedGeneric'))); }
     finally { setReconcilerSaving(false); }
+  }
+
+  async function handleSaveAcmeEmail() {
+    setAcmeSaving(true);
+    try {
+      await api.updateSetting('acme_email', acmeEmail.trim());
+      setSettings((prev) => {
+        const next = prev.filter((s) => s.key !== 'acme_email');
+        next.push({ key: 'acme_email', value: acmeEmail.trim(), updated_at: new Date().toISOString() });
+        return next;
+      });
+      toast.success(t('settings.acmeSaved'));
+    } catch (err) { toast.error(errMessage(err, t('settings.saveFailedGeneric'))); }
+    finally { setAcmeSaving(false); }
   }
 
   async function handleChangePassword() {
@@ -254,6 +273,18 @@ export default function Settings() {
           </Field>
           <Button onClick={handleSaveReconciler} loading={reconcilerSaving} className="mb-0.5">{t('common.save')}</Button>
         </div>
+      </Section>
+
+      <Section title={t('settings.tls')}>
+        <p className="-mt-1 text-sm text-fg-muted">{t('settings.tlsSub')}</p>
+        <Callout tone="info" title={t('settings.tlsPrivacyTitle')}>{t('settings.tlsPrivacyBody')}</Callout>
+        <div className="mt-4 flex items-end gap-3">
+          <Field label={t('settings.acmeEmail')} className="w-80">
+            <Input type="email" value={acmeEmail} onChange={(e) => setAcmeEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" />
+          </Field>
+          <Button onClick={handleSaveAcmeEmail} loading={acmeSaving} className="mb-0.5">{t('common.save')}</Button>
+        </div>
+        <p className="mt-2 text-xs text-fg-faint">{t('settings.acmeEmailHelp')}</p>
       </Section>
 
       <Section title={t('settings.authentication')}>

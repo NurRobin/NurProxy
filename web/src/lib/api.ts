@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView } from './types';
 
 const BASE = '/api/v1';
 
@@ -11,6 +11,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const body = await res.text();
     throw new Error(`API error ${res.status}: ${body}`);
   }
+  // 204 No Content (and other empty bodies) have nothing to parse — return
+  // undefined rather than letting res.json() throw on the empty stream.
+  if (res.status === 204) return undefined as T;
   return res.json();
 }
 
@@ -38,6 +41,9 @@ export interface TestProviderZone {
 
 export interface DomainConfig {
   manual: boolean;
+  // backend the config is rendered for ("caddy" | "nginx" | "apache"). For caddy,
+  // config is a JSON route object; for nginx/apache it is the native config text.
+  backend?: string;
   config: unknown;
 }
 
@@ -102,6 +108,30 @@ export const api = {
   resetDomainConfig: (id: number) =>
     request<{ message: string }>(`/domains/${id}/config/reset`, { method: 'POST' }),
 
+  // Config artifacts + drift review (§11, Phase 3)
+  listArtifacts: (params?: Record<string, string>) => {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<ConfigArtifact[]>(`/artifacts${qs}`);
+  },
+  getArtifact: (id: string) => request<ConfigArtifact>(`/artifacts/${id}`),
+  listArtifactVersions: (id: string) => request<ConfigArtifactVersion[]>(`/artifacts/${id}/versions`),
+  acceptArtifact: (id: string, content?: string) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/accept`, { method: 'POST', body: JSON.stringify(content !== undefined ? { content } : {}) }),
+  rejectArtifact: (id: string) => request<ConfigArtifact>(`/artifacts/${id}/reject`, { method: 'POST' }),
+  rollbackArtifact: (id: string, version: number) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/rollback`, { method: 'POST', body: JSON.stringify({ version }) }),
+  bulkArtifacts: (action: 'accept' | 'reject', agentId?: string) =>
+    request<{ action: string; resolved: number; total: number }>('/artifacts/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ action, agent_id: agentId ?? '' }),
+    }),
+  // Config UX: structured "mask" + raw edit + reset-to-model (§6, Phase 6)
+  artifactMask: (id: string) => request<ArtifactMask>(`/artifacts/${id}/mask`),
+  editArtifactContent: (id: string, content: string) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/content`, { method: 'PUT', body: JSON.stringify({ content }) }),
+  resetArtifactToModel: (id: string) =>
+    request<ConfigArtifactVersion>(`/artifacts/${id}/reset-to-model`, { method: 'POST' }),
+
   // System
   health: () => request<HealthResponse>('/health'),
   getAuditLog: (params?: Record<string, string>) => {
@@ -111,6 +141,31 @@ export const api = {
   getSettings: () => request<Setting[]>('/settings'),
   updateSetting: (key: string, value: string) =>
     request<{ key: string; value: string }>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+
+  // On-demand log tailing (§15): open → poll → close. The agent tails the file
+  // and posts chunks back up its stream; the dashboard never reaches the agent.
+  startLogTail: (agentId: string, path: string, lines?: number) =>
+    request<{ session_id: string }>(`/agents/${agentId}/logs/tail`, {
+      method: 'POST',
+      body: JSON.stringify({ path, lines: lines ?? 0 }),
+    }),
+  pollLogTail: (agentId: string, sessionId: string, cursor: number) =>
+    request<LogTailPoll>(`/agents/${agentId}/logs/tail/${sessionId}?cursor=${cursor}`),
+  stopLogTail: (agentId: string, sessionId: string) =>
+    request<{ status: string }>(`/agents/${agentId}/logs/tail/${sessionId}`, { method: 'DELETE' }),
+
+  // Agent admin-change channel (§19): prepare a pending op (returns a one-time
+  // confirmation code), list the agent's pending ops, or cancel one. The
+  // privileged apply stays gated on local shell presence on the host.
+  prepareAdminOp: (agentId: string, opType: AdminOpType, payload: unknown) =>
+    request<PreparedAdminOp>(`/agents/${agentId}/admin-ops`, {
+      method: 'POST',
+      body: JSON.stringify({ op_type: opType, payload }),
+    }),
+  listAdminOps: (agentId: string) =>
+    request<{ ops: AdminOpView[] }>(`/agents/${agentId}/admin-ops`),
+  cancelAdminOp: (agentId: string, opId: string) =>
+    request<void>(`/agents/${agentId}/admin-ops/${opId}`, { method: 'DELETE' }),
 
   // Admin API key
   getAPIKey: () => request<{ exists: boolean; masked?: string }>('/api-key'),

@@ -3,6 +3,8 @@ package agenthub
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 func TestPublishToSubscriber(t *testing.T) {
@@ -66,26 +68,33 @@ func TestMultipleSubscribersBothReceive(t *testing.T) {
 	}
 }
 
-func TestPublishRoutes(t *testing.T) {
+func TestPublishIntents(t *testing.T) {
 	h := New()
 	ch, unsub := h.Subscribe("a1")
 	defer unsub()
 
-	routes := []json.RawMessage{json.RawMessage(`{"@id":"r1"}`)}
-	if !h.PublishRoutes("a1", routes) {
-		t.Fatal("PublishRoutes should deliver")
+	intents := []proxymodel.RouteIntent{{
+		ArtifactID: "dom-1",
+		Backend:    "caddy",
+		Route:      proxymodel.Route{Host: "app.example.com"},
+	}}
+	if !h.PublishIntents("a1", intents) {
+		t.Fatal("PublishIntents should deliver")
 	}
 
 	ev := <-ch
 	if ev.Type != EventRoutes {
 		t.Fatalf("got type %q, want %q", ev.Type, EventRoutes)
 	}
-	var got []json.RawMessage
+	var got proxymodel.IntentSet
 	if err := json.Unmarshal(ev.Data, &got); err != nil {
-		t.Fatalf("unmarshal routes: %v", err)
+		t.Fatalf("unmarshal intents: %v", err)
 	}
-	if len(got) != 1 {
-		t.Errorf("got %d routes, want 1", len(got))
+	if len(got.Intents) != 1 {
+		t.Fatalf("got %d intents, want 1", len(got.Intents))
+	}
+	if got.Intents[0].ArtifactID != "dom-1" || got.Intents[0].Route.Host != "app.example.com" {
+		t.Errorf("unexpected intent: %+v", got.Intents[0])
 	}
 }
 

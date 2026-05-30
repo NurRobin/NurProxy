@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NurRobin/NurProxy/internal/agent/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
 
@@ -23,15 +23,40 @@ func SetVersion(v string) {
 	version = v
 }
 
+// caddyBackend is the subset of the bundled-Caddy proxy backend the agent API
+// drives. It is satisfied by *proxy/caddy.Backend (the admin-API Proxy
+// implementation), so the local API reconciles routes through the proxy backend
+// rather than the raw admin client.
+type caddyBackend interface {
+	EnsureServer(ctx context.Context) error
+	ClearRoutes(ctx context.Context) error
+	AddRoute(ctx context.Context, route json.RawMessage) error
+	RemoveRoute(ctx context.Context, routeID string) error
+	GetConfig(ctx context.Context) (json.RawMessage, error)
+}
+
+// reconfigurer is the backend Holder the admin reconfigure endpoint drives (§19
+// hot-switch). It is satisfied by *proxy.Holder. Defining it as an interface keeps
+// the API server free of a hard dependency on the concrete Holder for tests.
+type reconfigurer interface {
+	Reconfigure(ctx context.Context, req proxy.ReconfigureRequest, deps proxy.ReconfigureDeps) proxy.ReconfigureResult
+}
+
 // Server is the agent HTTP API server.
 type Server struct {
 	port        int
-	caddyClient *caddy.Client
+	caddyClient caddyBackend
 	token       string
 	health      *health.State
 	routes      map[string]json.RawMessage // domain -> route config
 	mu          sync.RWMutex
 	server      *http.Server
+
+	// reconfigurer + reconfigureDeps power POST /admin/reconfigure (§19). Nil until
+	// SetReconfigurer is called; the endpoint reports "not available" when unset so
+	// the agent stays back-compatible when the holder is not wired.
+	reconfigurer    reconfigurer
+	reconfigureDeps proxy.ReconfigureDeps
 }
 
 // SetHealth attaches the shared health state so the server can report problems
@@ -40,11 +65,20 @@ func (s *Server) SetHealth(h *health.State) {
 	s.health = h
 }
 
-// New creates a new agent API server.
-func New(port int, caddyClient *caddy.Client, token string) *Server {
+// SetReconfigurer wires the backend Holder and its hot-switch dependencies behind
+// the POST /admin/reconfigure endpoint (§19). Until this is called the endpoint
+// responds 503, so the agent is back-compatible when no holder is provided.
+func (s *Server) SetReconfigurer(r reconfigurer, deps proxy.ReconfigureDeps) {
+	s.reconfigurer = r
+	s.reconfigureDeps = deps
+}
+
+// New creates a new agent API server. backend is the bundled-Caddy proxy
+// backend the agent reconciles routes through.
+func New(port int, backend caddyBackend, token string) *Server {
 	return &Server{
 		port:        port,
-		caddyClient: caddyClient,
+		caddyClient: backend,
 		token:       token,
 		routes:      make(map[string]json.RawMessage),
 	}
@@ -61,6 +95,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/ip", s.authMiddleware(s.handleIP))
 	mux.HandleFunc("/routes", s.authMiddleware(s.handleRoutes))
 	mux.HandleFunc("/caddy/config", s.authMiddleware(s.handleCaddyConfig))
+	mux.HandleFunc("/admin/reconfigure", s.authMiddleware(s.handleReconfigure))
 
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", s.port),
@@ -304,6 +339,85 @@ func (s *Server) handleCaddyConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(config)
+}
+
+// reconfigureRequest is the JSON body of POST /admin/reconfigure (§19). Its
+// snake_case keys mirror the agent's persisted proxy config (agent.yaml /
+// NP_PROXY_*), so the CLI can forward a confirmed admin-op payload verbatim.
+type reconfigureRequest struct {
+	ProxyMode      string   `json:"proxy_mode"`
+	ProxyType      string   `json:"proxy_type"`
+	ProxyConfigDir string   `json:"proxy_config_dir"`
+	ProxyBinary    string   `json:"proxy_binary"`
+	ProxyReloadCmd string   `json:"proxy_reload_cmd"`
+	ProxyTestCmd   string   `json:"proxy_test_cmd"`
+	ProxyService   string   `json:"proxy_service"`
+	ProxyLogPaths  []string `json:"proxy_log_paths"`
+}
+
+// reconfigureResponse is the JSON body returned by POST /admin/reconfigure. It
+// carries the structured hot-switch outcome (§19): ok + a human message, plus the
+// least-privilege remediation when an Existing-mode probe found missing grants
+// (omitted when nil).
+type reconfigureResponse struct {
+	OK          bool                 `json:"ok"`
+	Message     string               `json:"message"`
+	Remediation *remediationResponse `json:"remediation,omitempty"`
+}
+
+type remediationResponse struct {
+	Steps       []remediationStep `json:"steps"`
+	SudoersLine string            `json:"sudoers_line,omitempty"`
+}
+
+type remediationStep struct {
+	Title    string   `json:"title"`
+	Commands []string `json:"commands"`
+}
+
+// handleReconfigure hot-switches the agent's proxy backend (§19). It is gated by
+// the same Bearer-token authMiddleware as the rest of the admin surface — the CLI
+// presents the agent's local token after a confirmation-code claim. A failing
+// permission probe is non-fatal: the switch is reported with ok=false plus the
+// remediation, and the agent stays connected (mirrors §12). The endpoint returns
+// 503 when no holder is wired (back-compat).
+func (s *Server) handleReconfigure(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.reconfigurer == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "reconfigure not available on this agent"})
+		return
+	}
+
+	var req reconfigureRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+
+	result := s.reconfigurer.Reconfigure(r.Context(), proxy.ReconfigureRequest{
+		Mode:      req.ProxyMode,
+		Type:      req.ProxyType,
+		ConfigDir: req.ProxyConfigDir,
+		Binary:    req.ProxyBinary,
+		ReloadCmd: req.ProxyReloadCmd,
+		TestCmd:   req.ProxyTestCmd,
+		Service:   req.ProxyService,
+		LogPaths:  req.ProxyLogPaths,
+	}, s.reconfigureDeps)
+
+	resp := reconfigureResponse{OK: result.OK, Message: result.Message}
+	if result.Remediation != nil {
+		rr := &remediationResponse{SudoersLine: result.Remediation.SudoersLine}
+		for _, st := range result.Remediation.Steps {
+			rr.Steps = append(rr.Steps, remediationStep{Title: st.Title, Commands: st.Commands})
+		}
+		resp.Remediation = rr
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

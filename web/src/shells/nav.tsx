@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { LayoutDashboard, Server, HardDrive, Globe, Settings } from 'lucide-react';
+import { LayoutDashboard, Server, HardDrive, Globe, FileCode, Settings } from 'lucide-react';
 
 export interface NavItem {
   to: string;
@@ -15,5 +15,6 @@ export const NAV: NavItem[] = [
   { to: '/agents', label: 'nav.agents', icon: <Server className={cls} /> },
   { to: '/servers', label: 'nav.servers', icon: <HardDrive className={cls} /> },
   { to: '/domains', label: 'nav.domains', icon: <Globe className={cls} /> },
+  { to: '/config', label: 'nav.config', icon: <FileCode className={cls} /> },
   { to: '/settings', label: 'nav.settings', icon: <Settings className={cls} /> },
 ];

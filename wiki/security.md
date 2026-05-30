@@ -27,3 +27,17 @@ traffic. A few things worth knowing.
 - Only **approve** agents you installed yourself. Approving an agent lets it
   receive proxy and DNS configuration from the orchestrator.
 - Reject anything unexpected in the pending list.
+
+## Existing-mode agents (managing an installed nginx/Apache)
+
+- An agent in **Existing** mode edits proxy config files and reloads the service.
+  Grant it the **least privilege** that works — group-write on the config dir and
+  a sudoers line scoped to exactly the test + reload commands, never blanket
+  `sudo`. Full setup and a copy-paste sudoers snippet:
+  [Existing-mode permissions](existing-proxy-permissions).
+- With **central TLS**, certificate private keys are pushed to the agent and
+  stored encrypted at rest. Prefer **per-host certs** (default) over a shared
+  **wildcard**, which puts one private key on every agent that serves it. See the
+  threat model in [Existing-mode permissions](existing-proxy-permissions).
+- The agent only ever **dials out**; the orchestrator never connects to it. An
+  agent does not need to be reachable from the internet.

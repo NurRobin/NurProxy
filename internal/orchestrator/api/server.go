@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"log"
 	"net/http"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
@@ -17,6 +19,15 @@ type RoutePusher interface {
 	PushAgentRoutes(agentID string) error
 }
 
+// CertIssuer obtains a central TLS certificate for a host on demand (the §7
+// first-issuance fast path). The TLS Renewer implements it; the domain-create
+// handler kicks it asynchronously so a new central-TLS domain gets HTTPS within
+// about a minute instead of waiting for the next renewal scan. Best-effort: a
+// host that needs no cert is a no-op and the periodic scan is the backstop.
+type CertIssuer interface {
+	EnsureCertForHost(ctx context.Context, host string) error
+}
+
 // Server holds the API server state.
 type Server struct {
 	db       *db.DB
@@ -25,6 +36,8 @@ type Server struct {
 	sessions *auth.SessionManager
 	hub      *agenthub.Hub
 	pusher   RoutePusher
+	issuer   CertIssuer
+	logs     *logbroker.Broker
 }
 
 // SetAgentHub wires the live agent connection hub and the route pusher into the
@@ -36,6 +49,13 @@ func (s *Server) SetAgentHub(hub *agenthub.Hub, pusher RoutePusher) {
 	s.pusher = pusher
 }
 
+// SetCertIssuer wires the on-demand TLS issuer so domain creation can trigger
+// first-issuance immediately. Optional: when unset, certs are issued only by the
+// periodic renewal scan (the backstop).
+func (s *Server) SetCertIssuer(issuer CertIssuer) {
+	s.issuer = issuer
+}
+
 // NewServer creates a new API server and registers all routes.
 func NewServer(database *db.DB, version string) *Server {
 	s := &Server{
@@ -43,6 +63,7 @@ func NewServer(database *db.DB, version string) *Server {
 		version:  version,
 		mux:      http.NewServeMux(),
 		sessions: auth.NewSessionManager([]byte("nurproxy-session-key-" + version)),
+		logs:     logbroker.New(),
 	}
 
 	s.registerRoutes()
@@ -89,12 +110,31 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/v1/agents/{id}", s.requireAuth(s.handleDeleteAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/adopt", s.requireAuth(s.handleAdoptAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/reject", s.requireAuth(s.handleRejectAgent))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/auto-reconcile", s.requireAuth(s.handleSetAutoReconcile))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAuth(s.handleAgentStatus))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", s.requireAgentAuth(s.handleAgentHeartbeat))
 	// Live push channel: the agent dials out and holds this open; the
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", s.requireAgentAuth(s.handleAgentRoutesAck))
+	// Adopted-config report (§17): the agent POSTs the host config it read off disk
+	// (existing mode) into the central store. Agent auth, agent dials out.
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/artifacts/adopt", s.requireAgentAuth(s.handleAgentAdoptArtifacts))
+	// On-demand log tail (§15): the agent POSTs tailed chunks up the control plane
+	// (agent auth); the dashboard starts/polls/stops a tail (user auth). The tail
+	// request rides the agent's existing stream — never an inbound probe.
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/chunk", s.requireAgentAuth(s.handleAgentLogChunk))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/tail", s.requireAuth(s.handleStartLogTail))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handlePollLogTail))
+	s.mux.HandleFunc("DELETE /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handleStopLogTail))
+	// Admin-change channel (§19): the dashboard prepares a pending op and gets a
+	// one-time confirmation code (requireAuth); the agent claims it with its local
+	// identity + the code and acks the outcome (requireAgentAuth, scoped to itself).
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/admin-ops", s.requireAuth(s.handlePrepareAdminOp))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/admin-ops", s.requireAuth(s.handleListAdminOps))
+	s.mux.HandleFunc("DELETE /api/v1/agents/{id}/admin-ops/{opId}", s.requireAuth(s.handleCancelAdminOp))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/admin-ops/claim", s.requireAgentAuth(s.handleClaimAdminOp))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/admin-ops/{opId}/ack", s.requireAgentAuth(s.handleAckAdminOp))
 
 	// Servers (auth required)
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/servers", s.requireAuth(s.handleListServers))
@@ -111,6 +151,19 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/domains/{id}/config", s.requireAuth(s.handleGetDomainConfig))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/config", s.requireAuth(s.handleUpdateDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/config/reset", s.requireAuth(s.handleResetDomainConfig))
+
+	// Config artifacts + drift review (auth required, §11 Phase 3)
+	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAuth(s.handleListArtifacts))
+	s.mux.HandleFunc("POST /api/v1/artifacts/bulk", s.requireAuth(s.handleBulkArtifacts))
+	s.mux.HandleFunc("GET /api/v1/artifacts/{id}", s.requireAuth(s.handleGetArtifact))
+	s.mux.HandleFunc("GET /api/v1/artifacts/{id}/versions", s.requireAuth(s.handleListArtifactVersions))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/accept", s.requireAuth(s.handleAcceptArtifact))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/reject", s.requireAuth(s.handleRejectArtifact))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/rollback", s.requireAuth(s.handleRollbackArtifact))
+	// Config UX: the structured "mask" + raw edit + reset-to-model (§6, Phase 6)
+	s.mux.HandleFunc("GET /api/v1/artifacts/{id}/mask", s.requireAuth(s.handleArtifactMask))
+	s.mux.HandleFunc("PUT /api/v1/artifacts/{id}/content", s.requireAuth(s.handleEditArtifactContent))
+	s.mux.HandleFunc("POST /api/v1/artifacts/{id}/reset-to-model", s.requireAuth(s.handleResetArtifactToModel))
 
 	// System (auth required)
 	s.mux.HandleFunc("GET /api/v1/audit-log", s.requireAuth(s.handleAuditLog))

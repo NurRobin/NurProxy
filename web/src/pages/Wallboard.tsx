@@ -5,7 +5,7 @@ import { api } from '../lib/api';
 import type { Agent, Domain } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
 import { usePolling } from '../lib/usePolling';
-import { statusMeta } from '../lib/status';
+import { statusMeta, isDegraded } from '../lib/status';
 
 const count = (arr: { status: string }[], s: string) => arr.filter((x) => x.status === s).length;
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.neverLower'));
@@ -29,7 +29,11 @@ export default function Wallboard() {
 
   const errs = count(agents, 'error') + count(domains, 'error');
   const offline = count(agents, 'offline');
-  const healthy = errs === 0 && offline === 0;
+  // A connected-but-degraded agent (operational error or failed §12 permission
+  // self-test) is a problem the banner must reflect — status alone misses it.
+  const degraded = agents.filter(isDegraded).length;
+  const attention = errs + offline + degraded;
+  const healthy = attention === 0;
 
   return (
     <div className="space-y-5">
@@ -37,7 +41,7 @@ export default function Wallboard() {
         <span className={`h-4 w-4 flex-shrink-0 rounded-full ${healthy ? 'bg-success' : 'bg-danger'} ${healthy ? '' : 'animate-pulse'}`} />
         <div>
           <p className="font-display text-2xl font-bold tracking-tight text-fg">
-            {healthy ? t('wallboard.allNormal') : t('wallboard.attention', { count: errs + offline })}
+            {healthy ? t('wallboard.allNormal') : t('wallboard.attention', { count: attention })}
           </p>
           <p className="text-sm text-fg-muted">{t('wallboard.summary', { agents: t('counts.agents', { count: agents.length }), domains: t('counts.domains', { count: domains.length }), active: count(domains, 'active') })}</p>
         </div>

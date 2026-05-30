@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
@@ -80,7 +81,7 @@ func (p *CloudflareProvider) Info() provider.ProviderInfo {
 		Name:        "Cloudflare",
 		Description: "Cloudflare DNS management via API v4",
 		Website:     "https://www.cloudflare.com",
-		RecordTypes: []string{"A", "AAAA", "CNAME"},
+		RecordTypes: []string{"A", "AAAA", "CNAME", "TXT"},
 	}
 }
 
@@ -213,12 +214,60 @@ func (p *CloudflareProvider) GetRecord(ctx context.Context, config json.RawMessa
 	}
 
 	return &provider.Record{
+		ID:      rec.ID,
 		Type:    rec.Type,
 		Name:    rec.Name,
 		Content: rec.Content,
 		TTL:     rec.TTL,
 		Proxied: rec.Proxied,
 	}, nil
+}
+
+// ListRecords returns the zone's records matching name (and type, if non-empty),
+// each carrying its Cloudflare record ID so the caller can adopt or update it. It
+// backs the reconciler's check-before-create: the CF list endpoint filters
+// server-side by name/type (GET /zones/{zone}/dns_records?name=&type=).
+func (p *CloudflareProvider) ListRecords(ctx context.Context, config json.RawMessage, name, recordType string) ([]provider.Record, error) {
+	cfg, err := parseConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ZoneID == "" {
+		return nil, fmt.Errorf("cloudflare: zone_id is required to list records")
+	}
+
+	q := url.Values{}
+	if name != "" {
+		q.Set("name", name)
+	}
+	if recordType != "" {
+		q.Set("type", recordType)
+	}
+	q.Set("per_page", "100")
+	path := fmt.Sprintf("/zones/%s/dns_records?%s", cfg.ZoneID, q.Encode())
+
+	resp, err := p.doRequest(ctx, cfg.APIToken, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("cloudflare: list records request failed: %w", err)
+	}
+
+	var recs []cfDNSRecord
+	if err := json.Unmarshal(resp.Result, &recs); err != nil {
+		return nil, fmt.Errorf("cloudflare: failed to parse records: %w", err)
+	}
+
+	out := make([]provider.Record, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, provider.Record{
+			ID:      r.ID,
+			Type:    r.Type,
+			Name:    r.Name,
+			Content: r.Content,
+			TTL:     r.TTL,
+			Proxied: r.Proxied,
+		})
+	}
+	return out, nil
 }
 
 func (p *CloudflareProvider) UpdateRecord(ctx context.Context, config json.RawMessage, recordID string, record provider.Record) error {

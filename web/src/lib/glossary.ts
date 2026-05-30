@@ -40,6 +40,11 @@ export const glossary: Record<string, GlossaryEntry> = {
     short: 'The background loop that keeps DNS records and proxy configs matching your desired settings.',
     doc: 'glossary',
   },
+  'proxy-detection': {
+    term: 'Detected proxy',
+    short: 'A read-only report of any reverse proxy already installed on the host (kind, version, config dir, log paths) plus which process holds :80/:443. NurProxy only observes this — it manages nothing here.',
+    doc: 'agents',
+  },
   'force-https': {
     term: 'Force HTTPS',
     short: 'Redirect any plain http:// request to https:// automatically.',
@@ -79,5 +84,10 @@ export const glossary: Record<string, GlossaryEntry> = {
     term: 'Agent',
     short: 'The NurProxy daemon running on an edge server. It runs Caddy and applies the configs you set here.',
     doc: 'agents',
+  },
+  'config-artifact': {
+    term: 'Config artifact',
+    short: 'A versioned unit of proxy config NurProxy manages on a host — built-in Caddy routes or a file. Every change is versioned so you can diff, roll back, and review drift.',
+    doc: 'glossary',
   },
 };

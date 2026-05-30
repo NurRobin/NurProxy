@@ -4,6 +4,8 @@ import agentReachability from '../../../wiki/agent-reachability.md?raw';
 import dnsModes from '../../../wiki/dns-modes.md?raw';
 import domainsDoc from '../../../wiki/domains.md?raw';
 import agentsDoc from '../../../wiki/agents.md?raw';
+import existingProxies from '../../../wiki/existing-proxies.md?raw';
+import existingProxyPermissions from '../../../wiki/existing-proxy-permissions.md?raw';
 import security from '../../../wiki/security.md?raw';
 import glossary from '../../../wiki/glossary.md?raw';
 
@@ -20,6 +22,8 @@ export const TOPICS: Topic[] = [
   { slug: 'agent-reachability', title: 'Agent can’t connect', blurb: 'Fix the #1 setup snag: the orchestrator URL.', content: agentReachability },
   { slug: 'agents', title: 'Agents', blurb: 'Register, approve, and manage edge servers.', content: agentsDoc },
   { slug: 'domains', title: 'Domains', blurb: 'Proxy a subdomain to a server, plus advanced config.', content: domainsDoc },
+  { slug: 'existing-proxies', title: 'Managing existing proxies', blurb: 'Built-in vs Existing, and the apply-code flow.', content: existingProxies },
+  { slug: 'existing-proxy-permissions', title: 'Existing-mode permissions', blurb: 'Least-privilege grants for nginx/Apache, no blanket sudo.', content: existingProxyPermissions },
   { slug: 'dns-modes', title: 'DNS modes', blurb: 'Static vs DDNS — which to choose.', content: dnsModes },
   { slug: 'security', title: 'Security', blurb: 'Passwords, tokens, API keys, agent trust.', content: security },
   { slug: 'glossary', title: 'Glossary', blurb: 'Every term in one place.', content: glossary },

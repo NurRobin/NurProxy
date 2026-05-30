@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // ---------------------------------------------------------------------------
@@ -127,13 +130,15 @@ func (m *mockAgentClient) getPushCalls() int {
 type mockHub struct {
 	mu        sync.Mutex
 	connected map[string]bool
-	published map[string][][]json.RawMessage
+	published map[string][][]proxymodel.RouteIntent
+	sets      map[string][]proxymodel.IntentSet
 }
 
 func newMockHub() *mockHub {
 	return &mockHub{
 		connected: make(map[string]bool),
-		published: make(map[string][][]json.RawMessage),
+		published: make(map[string][][]proxymodel.RouteIntent),
+		sets:      make(map[string][]proxymodel.IntentSet),
 	}
 }
 
@@ -143,11 +148,26 @@ func (m *mockHub) Connected(agentID string) bool {
 	return m.connected[agentID]
 }
 
-func (m *mockHub) PublishRoutes(agentID string, routes []json.RawMessage) bool {
+func (m *mockHub) PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool {
+	return m.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents})
+}
+
+func (m *mockHub) PublishIntentSet(agentID string, set proxymodel.IntentSet) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.published[agentID] = append(m.published[agentID], routes)
+	m.published[agentID] = append(m.published[agentID], set.Intents)
+	m.sets[agentID] = append(m.sets[agentID], set)
 	return m.connected[agentID]
+}
+
+func (m *mockHub) lastSet(agentID string) (proxymodel.IntentSet, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sets := m.sets[agentID]
+	if len(sets) == 0 {
+		return proxymodel.IntentSet{}, false
+	}
+	return sets[len(sets)-1], true
 }
 
 func (m *mockHub) setConnected(agentID string, ok bool) {
@@ -156,7 +176,7 @@ func (m *mockHub) setConnected(agentID string, ok bool) {
 	m.connected[agentID] = ok
 }
 
-func (m *mockHub) lastPublished(agentID string) []json.RawMessage {
+func (m *mockHub) lastPublished(agentID string) []proxymodel.RouteIntent {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	batches := m.published[agentID]
@@ -237,6 +257,34 @@ func (p *mockDNSProvider) GetRecord(_ context.Context, _ json.RawMessage, record
 		return nil, fmt.Errorf("record not found: %s", recordID)
 	}
 	return &rec, nil
+}
+
+func (p *mockDNSProvider) ListRecords(_ context.Context, _ json.RawMessage, name, recordType string) ([]provider.Record, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []provider.Record
+	for id, rec := range p.records {
+		if name != "" && !strings.EqualFold(rec.Name, name) {
+			continue
+		}
+		if recordType != "" && !strings.EqualFold(rec.Type, recordType) {
+			continue
+		}
+		rec.ID = id
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+// seedRecord injects a pre-existing record (simulating one created by a prior run
+// or the operator), returning its ID — used by the check-before-create tests.
+func (p *mockDNSProvider) seedRecord(rec provider.Record) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nextID++
+	id := fmt.Sprintf("seed-%d", p.nextID)
+	p.records[id] = rec
+	return id
 }
 
 func (p *mockDNSProvider) getRecord(id string) (provider.Record, bool) {
@@ -418,13 +466,66 @@ func TestReconcileRoutes_HubPushSkipsInbound(t *testing.T) {
 	// Routes should be delivered over the stream, NOT via the inbound client.
 	pushed := hub.lastPublished(agent.ID)
 	if len(pushed) != 1 {
-		t.Fatalf("expected 1 route published to hub, got %d", len(pushed))
+		t.Fatalf("expected 1 intent published to hub, got %d", len(pushed))
 	}
-	if host := extractHostFromRoute(pushed[0]); host != "app.example.com" {
-		t.Errorf("published route host = %q, want app.example.com", host)
+	if host := pushed[0].Route.Host; host != "app.example.com" {
+		t.Errorf("published intent host = %q, want app.example.com", host)
+	}
+	if pushed[0].ArtifactID == "" {
+		t.Error("published intent should carry a stable artifact id")
 	}
 	if mc.getPushCalls() != 0 {
 		t.Errorf("inbound push should not be used for a connected agent, got %d calls", mc.getPushCalls())
+	}
+}
+
+// TestBuildDesiredRoutes_SkipsDriftedArtifact verifies drift = review, not
+// bulldoze (§11, invariant #3): a domain whose artifact is in an unresolved
+// drifted state is NOT pushed, so the reconciler never overwrites the operator's
+// on-disk change while it awaits review. Enabling the opt-in per-agent
+// auto-reconcile policy restores the push (hands-off auto-correction).
+func TestBuildDesiredRoutes_SkipsDriftedArtifact(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	// Create the domain's artifact and flag it drifted.
+	artifactID := artifactIDForDomain(dom.ID)
+	art := &models.ConfigArtifact{
+		ID:      artifactID,
+		AgentID: agent.ID,
+		Backend: "caddy",
+		Target:  models.Target{Kind: models.TargetKindCaddyRoute, Path: "caddy:route:" + artifactID},
+		Source:  models.ArtifactSourceGenerated,
+		Content: `{"handle":[]}`,
+	}
+	if err := d.CreateConfigArtifact(art, "tester", "seed"); err != nil {
+		t.Fatalf("CreateConfigArtifact: %v", err)
+	}
+	if err := d.MarkConfigArtifactDrifted(artifactID); err != nil {
+		t.Fatalf("MarkConfigArtifactDrifted: %v", err)
+	}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	desired, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes: %v", err)
+	}
+	if len(desired) != 0 {
+		t.Errorf("drifted artifact should be skipped, got %d desired routes", len(desired))
+	}
+
+	// With auto-reconcile enabled, the domain is pushed again.
+	if err := d.SetAgentAutoReconcileConfig(agent.ID, true); err != nil {
+		t.Fatalf("SetAgentAutoReconcileConfig: %v", err)
+	}
+	agent.AutoReconcileConfig = true
+	desired, err = r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes (auto): %v", err)
+	}
+	if len(desired) != 1 {
+		t.Errorf("auto-reconcile should push the artifact, got %d desired routes", len(desired))
 	}
 }
 
@@ -454,6 +555,78 @@ func TestPushAgentRoutes(t *testing.T) {
 	}
 	if hub.lastPublished(agent.ID) != nil {
 		t.Error("expected no publish to a disconnected agent")
+	}
+}
+
+// TestPushAgentRoutes_includesCertsForPreflight verifies the push carries the
+// agent's cert bundles alongside the intents (§5/§7), so the agent installs them
+// before applying the referencing config (preflight ordering). The decrypted key
+// must ride the bundle (re-encrypted at rest on the agent).
+func TestPushAgentRoutes_includesCertsForPreflight(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, _ := setupScenario(t, d)
+
+	if err := d.UpsertCertificate(&models.Certificate{
+		ID:      "cert-1",
+		Host:    "app.example.com",
+		Names:   []string{"app.example.com"},
+		CertPEM: "LEAFCHAIN",
+		KeyPEM:  "PRIVATEKEY",
+	}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.SetHub(hub)
+
+	if err := r.PushAgentRoutes(agent.ID); err != nil {
+		t.Fatalf("PushAgentRoutes: %v", err)
+	}
+
+	set, ok := hub.lastSet(agent.ID)
+	if !ok {
+		t.Fatal("expected an intent set to be published")
+	}
+	if len(set.Intents) != 1 {
+		t.Fatalf("expected 1 intent, got %d", len(set.Intents))
+	}
+	if len(set.Certs) != 1 {
+		t.Fatalf("expected 1 cert bundle in the push, got %d", len(set.Certs))
+	}
+	cb := set.Certs[0]
+	if cb.Host != "app.example.com" {
+		t.Errorf("cert host = %q, want app.example.com", cb.Host)
+	}
+	if cb.CertPEM != "LEAFCHAIN" || cb.KeyPEM != "PRIVATEKEY" {
+		t.Errorf("cert bundle = %+v, want decrypted leaf+key", cb)
+	}
+}
+
+// TestPushAgentRoutes_noCert_omitsBundles verifies that without a stored cert the
+// push carries no cert material (the host falls back to self-ACME, §7) and never
+// fails the push.
+func TestPushAgentRoutes_noCert_omitsBundles(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, _ := setupScenario(t, d)
+
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.SetHub(hub)
+
+	if err := r.PushAgentRoutes(agent.ID); err != nil {
+		t.Fatalf("PushAgentRoutes: %v", err)
+	}
+	set, ok := hub.lastSet(agent.ID)
+	if !ok {
+		t.Fatal("expected an intent set to be published")
+	}
+	if len(set.Certs) != 0 {
+		t.Errorf("expected no cert bundles, got %d", len(set.Certs))
 	}
 }
 
@@ -1069,5 +1242,111 @@ func TestRoutesMatch(t *testing.T) {
 	}
 	if routesMatch(a, c) {
 		t.Error("expected a and c to NOT match")
+	}
+}
+
+// TestCertRenewalStore_firstIssuesCentralDomains verifies the scan now returns a
+// first-issuance target for a central-TLS domain that has no certificate yet, and
+// stops returning it once a cert exists (the renewal path then owns expiry).
+func TestCertRenewalStore_firstIssuesCentralDomains(t *testing.T) {
+	registerMockProvider(t)
+	d := testDB(t)
+	_, _, _, _, _ = setupScenario(t, d) // domain app.example.com, SSLMode auto -> central
+
+	store := NewCertRenewalStore(d)
+
+	targets, err := store.DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatalf("DueForRenewal: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Host != "app.example.com" {
+		t.Fatalf("expected one first-issue target for app.example.com, got %+v", targets)
+	}
+	if targets[0].Provider == nil {
+		t.Error("first-issue target must carry a resolved DNS provider")
+	}
+
+	// TargetForHost resolves the same host on demand.
+	one, err := store.TargetForHost(context.Background(), "app.example.com")
+	if err != nil {
+		t.Fatalf("TargetForHost: %v", err)
+	}
+	if one == nil || one.Host != "app.example.com" {
+		t.Fatalf("TargetForHost returned %+v, want app.example.com", one)
+	}
+
+	// Once a cert exists, the host drops out of first-issuance and TargetForHost.
+	if err := d.UpsertCertificate(&models.Certificate{
+		ID: "app.example.com", Host: "app.example.com",
+		Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K",
+		ExpiresAt: time.Now().UTC().Add(90 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+	targets, err = store.DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatalf("DueForRenewal after cert: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("a domain with a valid cert should not be first-issued, got %+v", targets)
+	}
+	if one, _ := store.TargetForHost(context.Background(), "app.example.com"); one != nil {
+		t.Errorf("TargetForHost should be nil once a cert exists, got %+v", one)
+	}
+}
+
+// TestReconcileDNS_adoptsIdenticalExistingRecord verifies the check-before-create
+// path: when a CNAME identical to the one NurProxy would create already exists
+// (e.g. left over from a prior run), the reconciler adopts its ID instead of
+// blind-creating a duplicate (which the provider would reject as "already exists").
+func TestReconcileDNS_adoptsIdenticalExistingRecord(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	// Seed the exact record NurProxy would create: CNAME app.example.com -> agentFQDN.
+	seedID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.reconcileDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileDNS: %v", err)
+	}
+
+	got, _ := d.GetDomain(dom.ID)
+	if got.DNSRecordID != seedID {
+		t.Errorf("expected the existing record %q to be adopted, got DNSRecordID=%q", seedID, got.DNSRecordID)
+	}
+	// No duplicate created.
+	recs, _ := mp.ListRecords(context.Background(), nil, "app.example.com", "")
+	if len(recs) != 1 {
+		t.Errorf("expected exactly 1 record (adopted, no duplicate), got %d", len(recs))
+	}
+}
+
+// TestReconcileDNS_conflictOnDifferentExistingRecord verifies that a pre-existing
+// record that does NOT match the desired one yields an explicit conflict error
+// (current vs desired) and is never overwritten.
+func TestReconcileDNS_conflictOnDifferentExistingRecord(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, _, _, dom := setupScenario(t, d)
+
+	// Seed a DIFFERENT record on the same name: an A record to some other host.
+	mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99"})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.reconcileDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileDNS: %v", err)
+	}
+
+	got, _ := d.GetDomain(dom.ID)
+	if got.Status != models.DomainStatusError {
+		t.Errorf("expected Error status on conflict, got %q", got.Status)
+	}
+	if got.DNSRecordID != "" {
+		t.Errorf("conflict must not adopt/create a record, got DNSRecordID=%q", got.DNSRecordID)
+	}
+	if !strings.Contains(got.ErrorMsg, "already exists") || !strings.Contains(got.ErrorMsg, "203.0.113.99") {
+		t.Errorf("conflict error should state current vs desired, got %q", got.ErrorMsg)
 	}
 }

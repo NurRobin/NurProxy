@@ -26,3 +26,22 @@ const META: Record<Status, StatusMeta> = {
 export function statusMeta(status: string): StatusMeta {
   return META[status as Status] ?? META.offline;
 }
+
+/**
+ * isDegraded reports whether an agent is connected but not fully healthy: it has
+ * an operational error, or its §12 permission self-test failed (e.g. existing-mode
+ * nginx it can read+write but cannot reload). This is orthogonal to status —
+ * a degraded agent is still 'adopted' — so the UI shows it alongside the status
+ * badge rather than overriding it. Reading/serving keeps working; only pushing
+ * changes live is constrained.
+ */
+export function isDegraded(agent: {
+  status?: string;
+  last_error?: string;
+  proxy_permissions?: { checked?: boolean; ok?: boolean };
+}): boolean {
+  if (agent.status === 'offline' || agent.status === 'error') return false; // own state
+  if (agent.last_error) return true;
+  const p = agent.proxy_permissions;
+  return !!(p?.checked && !p.ok);
+}

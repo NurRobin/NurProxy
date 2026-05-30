@@ -7,6 +7,7 @@ import { api } from '../lib/api';
 import { usePolling } from '../lib/usePolling';
 import type { Agent, Domain, AuditLogEntry } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
+import { isDegraded } from '../lib/status';
 import { buttonClass } from '../components/button-styles';
 import StatusBadge from '../components/StatusBadge';
 import EmptyState from '../components/EmptyState';
@@ -49,7 +50,14 @@ export default function Overview() {
   const errors = count(agents, 'error') + count(domains, 'error');
   const offline = count(agents, 'offline');
   const pendingAgents = count(agents, 'pending');
-  const healthy = errors === 0 && offline === 0;
+  // A degraded agent is connected (status adopted) but reporting an operational
+  // error or a failed §12 permission self-test — e.g. existing-mode nginx it
+  // can't reload. Status alone misses these, which is why the banner used to read
+  // "all normal" while an agent clearly wasn't. isDegraded already excludes
+  // offline/error agents, so offline is not double-counted.
+  const degraded = agents.filter(isDegraded).length;
+  const problemCount = errors + offline + degraded;
+  const healthy = problemCount === 0;
 
   if (loading) {
     return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
@@ -77,7 +85,7 @@ export default function Overview() {
             </span>
             <div>
               <p className="font-medium text-fg">
-                {healthy ? t('overview.allNormal') : t('overview.attention', { count: errors + offline })}
+                {healthy ? t('overview.allNormal') : t('overview.attention', { count: problemCount })}
               </p>
               <p className="text-sm text-fg-muted">
                 {t('overview.summary', { agents: t('counts.agents', { count: agents.length }), domains: t('counts.domains', { count: domains.length }) })}
@@ -89,6 +97,11 @@ export default function Overview() {
             {errors > 0 && (
               <Link to="/domains" className="rounded-lg bg-danger-soft px-3 py-1.5 text-sm font-medium text-danger-fg hover:brightness-105">
                 {t('overview.errorsLink', { count: errors })}
+              </Link>
+            )}
+            {degraded > 0 && (
+              <Link to="/agents" className="rounded-lg bg-warning-soft px-3 py-1.5 text-sm font-medium text-warning-fg hover:brightness-105">
+                {t('overview.degradedLink', { count: degraded })}
               </Link>
             )}
             {offline > 0 && (
@@ -127,7 +140,7 @@ export default function Overview() {
                     <p className="truncate font-medium text-fg">{agent.name}</p>
                     <p className="truncate text-sm text-fg-muted">{agent.fqdn}</p>
                   </div>
-                  <StatusBadge status={agent.status} />
+                  <StatusBadge status={agent.status} degraded={isDegraded(agent)} />
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-fg-faint">
                   {agent.public_ip && <span className="font-mono">{agent.public_ip}</span>}

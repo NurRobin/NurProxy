@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // streamKeepalive is how often the open stream emits a keepalive and refreshes
@@ -114,10 +117,13 @@ func (s *Server) markAgentOnline(r *http.Request, id string) {
 	}
 }
 
-// handleAgentRoutesAck records the agent's report of which routes it applied
-// after a push, updating each domain's status accordingly. This is how domain
-// status converges for NAT'd agents, where the orchestrator can't read routes
-// back inbound.
+// handleAgentRoutesAck records the agent's atomic apply-ACK after an intent push
+// (§3/B1). Each report carries the artifact the agent *rendered natively* plus
+// its checksum; the orchestrator round-trips that rendered content into the
+// central versioned store (create-or-append) so the store is authoritative
+// without modeling the host, and converges each domain's status. This is how
+// state converges for NAT'd agents, where the orchestrator can't read back
+// inbound.
 //
 // POST /api/v1/agents/{id}/routes/ack  (agent auth)
 func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
@@ -127,10 +133,7 @@ func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Applied []string          `json:"applied"` // FQDNs successfully applied
-		Errors  map[string]string `json:"errors"`  // FQDN -> error message
-	}
+	var req proxymodel.ApplyAck
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -141,9 +144,20 @@ func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ack: failed to refresh last_seen for agent %s: %v", id, err)
 	}
 
-	applied := make(map[string]bool, len(req.Applied))
-	for _, f := range req.Applied {
-		applied[f] = true
+	// Index reports by host so domain status converges, and round-trip each
+	// rendered artifact into the central store keyed by its stable artifact ID.
+	applied := make(map[string]bool, len(req.Reports))
+	failed := make(map[string]string, len(req.Reports))
+	for i := range req.Reports {
+		rep := &req.Reports[i]
+		if rep.Host != "" {
+			if rep.Error != "" {
+				failed[rep.Host] = rep.Error
+			} else {
+				applied[rep.Host] = true
+			}
+		}
+		s.storeArtifactReport(r, id, rep)
 	}
 
 	domains, err := s.db.ListDomainsByAgent(id)
@@ -162,7 +176,7 @@ func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
 		}
 		fqdn := dom.FQDN(zone.Name)
 
-		if msg, bad := req.Errors[fqdn]; bad {
+		if msg, bad := failed[fqdn]; bad {
 			if err := s.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, msg); err != nil {
 				log.Printf("ack: failed to set domain %d error: %v", dom.ID, err)
 			}
@@ -176,6 +190,104 @@ func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// storeArtifactReport round-trips one agent-rendered artifact into the central
+// versioned store (§3/B1). It creates the artifact on first sight (version 1) or
+// appends a new version on semantic change; phantom versions from re-serialized
+// content are gated out by the per-backend Equal in AppendConfigArtifactVersion.
+// A failed apply records the apply_failed state with the agent's error rather
+// than writing a (non-live) version. Every store write is audited with source +
+// actor (invariant #5). Best-effort: store failures are logged, not fatal to the
+// ACK (the agent already applied; status convergence above must still proceed).
+func (s *Server) storeArtifactReport(r *http.Request, agentID string, rep *proxymodel.ArtifactReport) {
+	if rep.ArtifactID == "" {
+		return
+	}
+
+	// Invariant #4: the backend dropped one or more unsupported options rather
+	// than failing the render. The agent logged each locally; record them in the
+	// central audit log too (source agent + actor agent) so the operator can see
+	// exactly what was silently dropped. This runs regardless of apply success.
+	for _, w := range rep.Warnings {
+		s.auditAs(r, models.AuditSourceAgent, "config_artifact", rep.ArtifactID, "option_dropped",
+			fmt.Sprintf("%s (%s)", w, rep.Host))
+	}
+
+	existing, err := s.db.GetConfigArtifact(rep.ArtifactID)
+	notFound := err != nil
+
+	// Ownership guard: artifact IDs are a global namespace, but an agent may only
+	// mutate its OWN artifacts. Refuse a cross-agent write (e.g. agent-2 ACKing
+	// agent-1's artifact ID) — log it and leave the stored artifact untouched. This
+	// is defense in depth alongside agent-scoped adopted IDs.
+	if !notFound && existing.AgentID != agentID {
+		log.Printf("ack: agent %s attempted to write artifact %s owned by agent %s; refusing", agentID, rep.ArtifactID, existing.AgentID)
+		return
+	}
+
+	// A per-artifact apply failure: flag the stored artifact (if any) as
+	// apply_failed; nothing to version (the rendered content never went live).
+	if rep.Error != "" {
+		if !notFound {
+			if sErr := s.db.SetConfigArtifactApplyState(rep.ArtifactID, models.ArtifactStateApplyFailed, rep.Error); sErr != nil {
+				log.Printf("ack: failed to flag artifact %s apply_failed: %v", rep.ArtifactID, sErr)
+			}
+		}
+		s.audit(r, "config_artifact", rep.ArtifactID, "apply_failed", rep.Error)
+		return
+	}
+
+	domainID := domainIDFromArtifactID(rep.ArtifactID)
+
+	if notFound {
+		art := &models.ConfigArtifact{
+			ID:      rep.ArtifactID,
+			AgentID: agentID,
+			Backend: rep.Backend,
+			Target: models.Target{
+				Kind: rep.TargetKind,
+				Path: rep.TargetPath,
+			},
+			Source:   models.ArtifactSourceGenerated,
+			DomainID: domainID,
+			Content:  rep.Content,
+			Enabled:  rep.Enabled,
+		}
+		if cErr := s.db.CreateConfigArtifact(art, "agent:"+agentID, "initial apply"); cErr != nil {
+			log.Printf("ack: failed to create artifact %s: %v", rep.ArtifactID, cErr)
+			return
+		}
+		s.audit(r, "config_artifact", rep.ArtifactID, "apply", "initial apply ("+rep.Host+")")
+		return
+	}
+
+	prevVersion := existing.LiveVersion
+	ver, aErr := s.db.AppendConfigArtifactVersion(rep.ArtifactID, rep.Content, models.ArtifactSourceGenerated, "agent:"+agentID, "apply")
+	if aErr != nil {
+		log.Printf("ack: failed to append artifact %s version: %v", rep.ArtifactID, aErr)
+		return
+	}
+	// Only audit a genuine version bump; a no-op (semantic-equal re-serialization)
+	// is not a config change worth an audit line.
+	if ver != nil && ver.Version != prevVersion {
+		s.audit(r, "config_artifact", rep.ArtifactID, "apply", fmt.Sprintf("applied version %d (%s)", ver.Version, rep.Host))
+	}
+}
+
+// domainIDFromArtifactID recovers the domain ID from a generated artifact's
+// stable identity ("dom-<id>"), mirroring the reconciler's artifactIDForDomain.
+// Returns nil for an artifact whose ID is not in that form (e.g. adopted files).
+func domainIDFromArtifactID(artifactID string) *int64 {
+	const prefix = "dom-"
+	if !strings.HasPrefix(artifactID, prefix) {
+		return nil
+	}
+	v, err := strconv.ParseInt(artifactID[len(prefix):], 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &v
 }
 
 // triggerAgentPush pushes an agent's desired routes over its live stream after a

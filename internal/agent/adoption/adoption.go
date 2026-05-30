@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/google/uuid"
 )
 
@@ -25,6 +26,8 @@ type Manager struct {
 	dataDir         string
 	apiPort         int
 	version         string
+	detection       *models.ProxyDetection
+	capabilities    *models.ProxyCapabilities
 	client          *http.Client
 }
 
@@ -36,6 +39,14 @@ type registerRequest struct {
 	APIURL   string `json:"api_url"`
 	PublicIP string `json:"public_ip"`
 	Version  string `json:"version"`
+	// ProxyDetection is the agent's read-only Phase-0 detection (§13.0/§2.1/§9):
+	// installed proxy + version + paths + bind-conflict holder. The agent dials
+	// out and carries it here so the orchestrator can store it on the agent row.
+	ProxyDetection *models.ProxyDetection `json:"proxy_detection,omitempty"`
+	// ProxyCapabilities is the agent's capability matrix (§8) for its selected
+	// backend, including module-probed options. Carried on the outbound register
+	// payload so the orchestrator stores it from first contact.
+	ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities,omitempty"`
 }
 
 // statusResponse is the JSON body from GET /api/v1/agents/{id}/status.
@@ -79,6 +90,20 @@ func (m *Manager) SetVersion(v string) {
 	m.version = v
 }
 
+// SetDetection records the read-only proxy detection result carried in the
+// registration request, so the orchestrator can store it on the agent row from
+// first contact (it is also refreshed on every heartbeat).
+func (m *Manager) SetDetection(d *models.ProxyDetection) {
+	m.detection = d
+}
+
+// SetCapabilities records the backend capability matrix (§8) carried in the
+// registration request, so the orchestrator can store it on the agent row from
+// first contact (it is also refreshed on every heartbeat).
+func (m *Manager) SetCapabilities(c *models.ProxyCapabilities) {
+	m.capabilities = c
+}
+
 // Token returns the agent token.
 func (m *Manager) Token() string {
 	return m.token
@@ -99,12 +124,14 @@ func (m *Manager) Register(ctx context.Context) error {
 	}
 
 	body := registerRequest{
-		ID:       m.agentID,
-		FQDN:     m.fqdn,
-		Token:    m.token,
-		APIURL:   apiURL,
-		PublicIP: publicIP,
-		Version:  m.version,
+		ID:                m.agentID,
+		FQDN:              m.fqdn,
+		Token:             m.token,
+		APIURL:            apiURL,
+		PublicIP:          publicIP,
+		Version:           m.version,
+		ProxyDetection:    m.detection,
+		ProxyCapabilities: m.capabilities,
 	}
 
 	data, err := json.Marshal(body)

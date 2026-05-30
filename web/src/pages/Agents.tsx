@@ -1,11 +1,14 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import i18n from '../lib/i18n';
+import { usePolling } from '../lib/usePolling';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { ChevronLeft } from 'lucide-react';
+import { ChevronLeft, Check, X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Agent, Zone, Server, Domain } from '../lib/types';
+import type { Agent, Zone, Server, Domain, ProxyPermissions } from '../lib/types';
+import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
+import { isDegraded } from '../lib/status';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -16,6 +19,8 @@ import HelpTip from '../components/HelpTip';
 import MultiSelect from '../components/MultiSelect';
 import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
+import ExistingSetup from './ExistingSetup';
+import LogTailViewer from '../components/LogTailViewer';
 
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.never'));
 
@@ -67,7 +72,11 @@ export default function Agents() {
     }
   }, [toast, t]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  // Poll instead of fetching once: an agent's health, live proxy mode, and
+  // detection change out-of-band (e.g. a §19 hot-switch flips it to existing,
+  // or a permission grant clears an error). Polling makes the detail view
+  // reflect those without a full page reload. Pauses while the tab is hidden.
+  usePolling(fetchData, 5000);
 
   const loadServers = useCallback(async (agentId: string) => {
     try {
@@ -222,7 +231,7 @@ export default function Agents() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <h2 className="truncate font-display text-xl font-semibold text-fg">{selected.name}</h2>
-                      <StatusBadge status={selected.status} />
+                      <StatusBadge status={selected.status} degraded={isDegraded(selected)} />
                     </div>
                     <p className="truncate text-sm text-fg-muted">{selected.fqdn}</p>
                   </div>
@@ -240,8 +249,11 @@ export default function Agents() {
                 </div>
 
                 {/* Surface anything wrong the agent (or the orchestrator's DNS
-                    management) is reporting, so problems are visible and fixable. */}
-                {selected.status !== 'pending' && selected.last_error && (
+                    management) is reporting, so problems are visible and fixable.
+                    In existing mode a permission denial is shown granularly (with a
+                    targeted fix) by the detected-proxy block below, so we suppress
+                    the redundant raw-error blob here. */}
+                {selected.status !== 'pending' && selected.last_error && selected.proxy_mode !== 'existing' && (
                   <Callout tone="danger" title={t('agents.agentError')}>{selected.last_error}</Callout>
                 )}
                 {selected.status !== 'pending' && selected.dns_error && (
@@ -263,13 +275,32 @@ export default function Agents() {
                         {selected.public_ip && <Row label={t('agents.ip')} value={selected.public_ip} />}
                         {selected.version && <Row label={t('agents.version')} value={selected.version} />}
                         <Row
-                          label={t('agents.caddyStatus')}
+                          label={t('agents.proxyMode')}
                           value={
-                            <span className={selected.caddy_running === false ? 'text-danger-fg' : 'text-success-fg'}>
-                              {selected.caddy_running === false ? t('agents.notRunning') : t('agents.running')}
-                            </span>
+                            selected.proxy_mode === 'existing'
+                              ? t('agents.proxyModeExisting', { kind: selected.proxy_detection?.kind || t('agents.proxyExternalGeneric') })
+                              : t('agents.proxyModeBuiltIn')
                           }
                         />
+                        {/* The bundled-Caddy running indicator only makes sense in built-in
+                            mode. In existing mode the host proxy owns :80/:443 and the
+                            bundled Caddy is intentionally stopped, so "not running" would be
+                            a false alarm — show that the agent manages the existing proxy. */}
+                        {selected.proxy_mode === 'existing' ? (
+                          <Row
+                            label={t('agents.proxyStatus')}
+                            value={<span className="text-success-fg">{t('agents.managingExisting')}</span>}
+                          />
+                        ) : (
+                          <Row
+                            label={t('agents.caddyStatus')}
+                            value={
+                              <span className={selected.caddy_running === false ? 'text-danger-fg' : 'text-success-fg'}>
+                                {selected.caddy_running === false ? t('agents.notRunning') : t('agents.running')}
+                              </span>
+                            }
+                          />
+                        )}
                         <Row label={t('agents.lastSeen')} value={seen(selected.last_seen)} />
                         <Row label={t('agents.id')} value={<span className="font-mono text-xs">{selected.id}</span>} />
                       </dl>
@@ -314,6 +345,8 @@ export default function Agents() {
                     </div>
                   </div>
                 )}
+
+                {selected.status !== 'pending' && <DetectedProxy agent={selected} />}
               </div>
             )}
           </div>
@@ -430,19 +463,243 @@ export default function Agents() {
 }
 
 function ListRow({ agent, active, tone, onClick }: { agent: Agent; active: boolean; tone?: 'warning'; onClick: () => void }) {
+  // A degraded agent (connected but constrained, e.g. can't reload nginx) gets the
+  // same dezent warning treatment as a pending one, so problems are visible in the
+  // master list without opening the detail view.
+  const degraded = isDegraded(agent);
+  const warn = tone === 'warning' || degraded;
   return (
     <button
       onClick={onClick}
       className={`flex w-full items-center justify-between gap-3 rounded-lg border px-4 py-3 text-left transition-colors ${
-        active ? 'border-accent bg-accent-soft' : tone === 'warning' ? 'border-warning/40 bg-warning-soft/50 hover:border-warning/60' : 'border-border bg-surface hover:border-border-strong'
+        active ? 'border-accent bg-accent-soft' : warn ? 'border-warning/40 bg-warning-soft/50 hover:border-warning/60' : 'border-border bg-surface hover:border-border-strong'
       }`}
     >
       <div className="min-w-0">
         <p className="truncate font-medium text-fg">{agent.name}</p>
         <p className="truncate text-xs text-fg-faint">{agent.fqdn}</p>
       </div>
-      <StatusBadge status={agent.status} />
+      <StatusBadge status={agent.status} degraded={degraded} />
     </button>
+  );
+}
+
+// DetectedProxy renders the agent's read-only Phase-0 detection: which proxy is
+// installed on the host, its version, the discovered paths, and any bind
+// conflict on :80/:443. Phase 0 manages nothing — this is purely informational.
+function DetectedProxy({ agent }: { agent: Agent }) {
+  const { t } = useTranslation();
+  const d = agent.proxy_detection;
+  const [setupOpen, setSetupOpen] = useState(false);
+  // Path of the log currently being tailed on-demand (§15); null = no viewer open.
+  const [tailPath, setTailPath] = useState<string | null>(null);
+
+  // Compose a one-line summary like "nginx 1.24 at /etc/nginx".
+  const summary = () => {
+    if (!d || !d.installed || !d.kind) return null;
+    const name = d.version ? `${d.kind} ${d.version}` : d.kind;
+    return d.config_dir ? t('agents.proxyAt', { name, dir: d.config_dir }) : name;
+  };
+
+  const conflicts = d?.port_conflicts ?? [];
+  const detected = !!(d && d.installed && d.kind);
+  // Once the agent has switched to existing mode (§19), it deliberately manages
+  // the host proxy and the bundled Caddy is stopped — so a :80/:443 "bind
+  // conflict" is the expected steady state, not an error, and the "switch to
+  // existing" CTA is already done. Suppress both and confirm the active mode.
+  const isExisting = agent.proxy_mode === 'existing';
+
+  return (
+    <div className="mt-6 border-t border-border pt-5">
+      <div className="flex items-center justify-between">
+        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">
+          {t('agents.detectedProxy')} <HelpTip term="proxy-detection" />
+        </h3>
+        {agent.proxy_detected_at && (
+          <span className="text-xs text-fg-faint">{t('agents.detectedAt', { when: seen(agent.proxy_detected_at) })}</span>
+        )}
+      </div>
+
+      {!d ? (
+        <p className="mt-2 text-sm text-fg-faint">{t('agents.detectPending')}</p>
+      ) : !d.installed || !d.kind ? (
+        <p className="mt-2 text-sm text-fg-muted">{t('agents.noProxyDetected')}</p>
+      ) : (
+        <div className="mt-3 space-y-3">
+          <p className="text-sm font-medium text-fg">{summary()}</p>
+          <dl className="space-y-2 text-sm">
+            <Row label={t('agents.proxyKind')} value={d.kind} />
+            {d.version && <Row label={t('agents.proxyVersion')} value={d.version} />}
+            {d.binary_path && <Row label={t('agents.proxyBinary')} value={<span className="font-mono text-xs">{d.binary_path}</span>} />}
+            {d.config_dir && <Row label={t('agents.proxyConfigDir')} value={<span className="font-mono text-xs">{d.config_dir}</span>} />}
+            {d.log_paths && d.log_paths.length > 0 && (
+              <Row
+                label={t('agents.proxyLogPaths')}
+                value={
+                  <span className="font-mono text-xs">
+                    {d.log_paths.map((p) => (
+                      <span key={p} className="flex items-center justify-end gap-2">
+                        <span className="truncate">{p}</span>
+                        <button
+                          type="button"
+                          onClick={() => setTailPath(p)}
+                          className="shrink-0 font-sans font-medium text-accent underline underline-offset-2 hover:text-accent-hover"
+                        >
+                          {t('logtail.tailAction')}
+                        </button>
+                      </span>
+                    ))}
+                  </span>
+                }
+              />
+            )}
+          </dl>
+        </div>
+      )}
+
+      {/* Already switched to existing mode: show the §12 permission self-test
+          (granular: config writable? service reloadable?) with the targeted fix
+          for whatever's missing — not a verbose blob. The button reopens setup. */}
+      {isExisting && (
+        <PermissionSelfTest
+          kind={d?.kind || t('agents.proxyExternalGeneric')}
+          perm={agent.proxy_permissions}
+          onAdjust={() => setSetupOpen(true)}
+        />
+      )}
+
+      {/* A detected proxy can be managed directly — this is the guided "Existing"
+          setup entry point, pre-filled from detection (confirm-not-type, §2/§2.1).
+          Hidden once already in existing mode (the confirm block above covers it). */}
+      {detected && !isExisting && (
+        <div className="mt-3">
+          <Button variant="secondary" size="sm" onClick={() => setSetupOpen(true)}>
+            {t('existing.manageThis', { kind: d?.kind })}
+          </Button>
+        </div>
+      )}
+
+      {conflicts.length > 0 && !isExisting && (
+        <div className="mt-3">
+          <Callout tone="warning" title={t('agents.bindConflict')}>
+            <p>{t('agents.bindConflictBody')}</p>
+            <ul className="mt-2 space-y-1">
+              {conflicts.map((c) => (
+                <li key={`${c.port}-${c.pid}`} className="font-mono text-xs">
+                  {t('agents.bindConflictItem', {
+                    port: c.port,
+                    process: c.process || t('agents.unknownProcess'),
+                    pid: c.pid ? ` (pid ${c.pid})` : '',
+                  })}
+                </li>
+              ))}
+            </ul>
+            {/* The two real choices (§2.1), offered inline: keep only the agent
+                (free the port) or switch this agent to manage the existing proxy. */}
+            <div className="mt-3 space-y-2">
+              <p className="font-medium">{t('agents.bindConflictChoices')}</p>
+              <ol className="ml-4 list-decimal space-y-1">
+                <li>{t('agents.bindConflictChoiceFree')}</li>
+                <li>
+                  {t('agents.bindConflictChoiceSwitch')}{' '}
+                  <button
+                    type="button"
+                    onClick={() => setSetupOpen(true)}
+                    className="font-medium text-accent underline underline-offset-2 hover:text-accent-hover"
+                  >
+                    {t('agents.bindConflictSwitchLink')}
+                  </button>
+                </li>
+              </ol>
+            </div>
+          </Callout>
+        </div>
+      )}
+
+      <ExistingSetup agent={agent} open={setupOpen} onClose={() => setSetupOpen(false)} />
+      {tailPath && (
+        <LogTailViewer agentId={agent.id} path={tailPath} open={!!tailPath} onClose={() => setTailPath(null)} />
+      )}
+    </div>
+  );
+}
+
+// PermissionSelfTest renders the agent's §12 permission self-test for an
+// existing-mode backend: a two-line checklist (config dir writable? service
+// reloadable?) and, when a grant is missing, the exact least-privilege commands
+// to fix just that — never the whole blob. It re-reads from the heartbeat-reported
+// proxy_permissions, so once the operator runs the grant the warning clears on the
+// next poll without a reload. perm is undefined for an older agent / first beat.
+function PermissionSelfTest({
+  kind,
+  perm,
+  onAdjust,
+}: {
+  kind: string;
+  perm?: ProxyPermissions;
+  onAdjust: () => void;
+}) {
+  const { t } = useTranslation();
+  const ok = perm?.ok ?? true; // no report yet → don't cry wolf
+  const steps = perm?.remediation?.steps ?? [];
+
+  return (
+    <div className="mt-3 space-y-3">
+      <Callout
+        tone={ok ? 'success' : 'warning'}
+        title={
+          ok
+            ? t('agents.managingExistingTitle', { kind })
+            : t('agents.permFixTitle', { kind })
+        }
+      >
+        {/* The granular checklist replaces the verbose paragraph: each §12 grant
+            with a clear ✓/✗ and, when missing, its actionable reason. */}
+        {perm?.checked ? (
+          <ul className="space-y-1.5">
+            <PermCheckLine ok={perm.can_write} label={t('agents.permWriteCheck')} detail={perm.can_write ? '' : perm.write_error} />
+            <PermCheckLine ok={perm.can_reload} label={t('agents.permReloadCheck')} detail={perm.can_reload ? '' : perm.reload_error} />
+          </ul>
+        ) : (
+          <p>{t('agents.managingExistingShort', { kind })}</p>
+        )}
+      </Callout>
+
+      {/* Targeted fix: only the steps for what's actually missing. */}
+      {!ok && steps.length > 0 && (
+        <div className="space-y-3 rounded-lg border border-border bg-surface-2/40 p-3">
+          <p className="text-xs font-medium text-fg-muted">{t('agents.permFixHint')}</p>
+          {steps.map((s, i) => (
+            <div key={i} className="space-y-1.5">
+              <p className="text-sm font-medium text-fg">{s.title}</p>
+              <CommandBlock text={s.commands.join('\n')} label={t('agents.permStepLabel', { n: i + 1 })} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Button variant="secondary" size="sm" onClick={onAdjust}>
+        {t('existing.adjustThis', { kind })}
+      </Button>
+    </div>
+  );
+}
+
+// PermCheckLine is one ✓/✗ row of the permission self-test, with an optional
+// actionable detail when the grant is missing.
+function PermCheckLine({ ok, label, detail }: { ok: boolean; label: string; detail?: string }) {
+  return (
+    <li className="flex items-start gap-2 text-sm">
+      {ok ? (
+        <Check className="mt-0.5 h-4 w-4 shrink-0 text-success-fg" />
+      ) : (
+        <X className="mt-0.5 h-4 w-4 shrink-0 text-danger-fg" />
+      )}
+      <span>
+        <span className={ok ? '' : 'font-medium'}>{label}</span>
+        {!ok && detail && <span className="block text-xs text-fg-muted">{detail}</span>}
+      </span>
+    </li>
   );
 }
 

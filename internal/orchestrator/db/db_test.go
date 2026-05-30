@@ -34,6 +34,7 @@ func TestMigration_TablesExist(t *testing.T) {
 		"providers", "agents", "servers", "domains",
 		"notifiers", "audit_log", "settings", "schema_version",
 		"zones", "agent_zones",
+		"config_artifacts", "config_artifact_versions",
 	}
 	for _, tbl := range tables {
 		var name string
@@ -448,6 +449,84 @@ func TestAgent_CreateAndGet(t *testing.T) {
 	}
 }
 
+func TestAgent_HealthPersistsProxyMode(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	// A freshly created agent defaults to built-in: CreateAgent doesn't set the
+	// column, so migration #12's DEFAULT 'built-in' fills the row.
+	got, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if got.ProxyMode != "built-in" {
+		t.Errorf("default ProxyMode: got %q, want built-in", got.ProxyMode)
+	}
+
+	// A heartbeat reporting a §19 hot-switch persists the new live mode.
+	if err := d.UpdateAgentHealth(a.ID, "", "", true, "existing"); err != nil {
+		t.Fatalf("UpdateAgentHealth(existing): %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyMode != "existing" {
+		t.Errorf("ProxyMode after switch: got %q, want existing", got.ProxyMode)
+	}
+
+	// A subsequent beat that omits the mode (empty) must NOT reset it to built-in:
+	// an older agent that doesn't report mode shouldn't erase a known-good value.
+	if err := d.UpdateAgentHealth(a.ID, "", "", true, ""); err != nil {
+		t.Fatalf("UpdateAgentHealth(empty): %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyMode != "existing" {
+		t.Errorf("empty mode should leave it untouched: got %q, want existing", got.ProxyMode)
+	}
+}
+
+func TestAgent_PersistsProxyPermissions(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	// A fresh agent has no permission report (NULL column → nil).
+	got, _ := d.GetAgent(a.ID)
+	if got.ProxyPermissions != nil {
+		t.Errorf("fresh agent should have no permissions report, got %+v", got.ProxyPermissions)
+	}
+
+	// A heartbeat carrying a failing self-test persists structured + round-trips.
+	perms := &models.ProxyPermissions{
+		Checked: true, OK: false, CanWrite: true, CanReload: false,
+		ReloadError: "nginx cannot be reloaded",
+		Dirs:        []string{"/etc/nginx/sites-available"},
+		Remediation: &models.Remediation{
+			SudoersLine: "nurproxy ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /usr/sbin/nginx -s reload",
+			Steps:       []models.RemediationStep{{Title: "scoped sudoers", Commands: []string{"echo ... | sudo tee ..."}}},
+		},
+	}
+	if err := d.UpdateAgentPermissions(a.ID, perms); err != nil {
+		t.Fatalf("UpdateAgentPermissions: %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyPermissions == nil {
+		t.Fatal("expected a persisted permissions report")
+	}
+	if got.ProxyPermissions.OK || got.ProxyPermissions.CanReload {
+		t.Errorf("round-trip lost the failing reload state: %+v", got.ProxyPermissions)
+	}
+	if got.ProxyPermissions.Remediation == nil || got.ProxyPermissions.Remediation.SudoersLine == "" {
+		t.Errorf("round-trip lost the remediation: %+v", got.ProxyPermissions)
+	}
+
+	// Reporting nil (built-in mode) clears the column back to NULL.
+	if err := d.UpdateAgentPermissions(a.ID, nil); err != nil {
+		t.Fatalf("UpdateAgentPermissions(nil): %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyPermissions != nil {
+		t.Errorf("nil report should clear the column, got %+v", got.ProxyPermissions)
+	}
+}
+
 func TestAgent_GetByFQDN(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
@@ -534,6 +613,149 @@ func TestAgent_UpdateStatus(t *testing.T) {
 	got, _ := d.GetAgent(a.ID)
 	if got.Status != models.AgentStatusAdopted {
 		t.Errorf("Status: got %q, want %q", got.Status, models.AgentStatusAdopted)
+	}
+}
+
+func TestAgent_Detection_freshAgentIsNil(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	got, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if got.ProxyDetection != nil {
+		t.Errorf("ProxyDetection: got %+v, want nil for an agent that never reported", got.ProxyDetection)
+	}
+	if got.ProxyDetectedAt != nil {
+		t.Errorf("ProxyDetectedAt: got %v, want nil", got.ProxyDetectedAt)
+	}
+}
+
+func TestAgent_UpdateDetection_roundTrips(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	tests := []struct {
+		name string
+		det  *models.ProxyDetection
+	}{
+		{
+			name: "nginx with conflict",
+			det: &models.ProxyDetection{
+				Installed:  true,
+				Kind:       "nginx",
+				Version:    "1.24.0",
+				BinaryPath: "/usr/sbin/nginx",
+				ConfigDir:  "/etc/nginx/sites-available",
+				LogPaths:   []string{"/var/log/nginx/error.log", "/var/log/nginx/access.log"},
+				PortConflicts: []models.ProxyPortConflict{
+					{Port: 443, Process: "nginx", PID: 1234},
+				},
+			},
+		},
+		{
+			name: "nothing installed, no lists",
+			det:  &models.ProxyDetection{Installed: false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := d.UpdateAgentDetection(a.ID, tt.det); err != nil {
+				t.Fatalf("UpdateAgentDetection: %v", err)
+			}
+			got, err := d.GetAgent(a.ID)
+			if err != nil {
+				t.Fatalf("GetAgent: %v", err)
+			}
+			if got.ProxyDetection == nil {
+				t.Fatalf("ProxyDetection: got nil after update, want non-nil")
+			}
+			if got.ProxyDetection.Installed != tt.det.Installed {
+				t.Errorf("Installed: got %t, want %t", got.ProxyDetection.Installed, tt.det.Installed)
+			}
+			if got.ProxyDetection.Kind != tt.det.Kind {
+				t.Errorf("Kind: got %q, want %q", got.ProxyDetection.Kind, tt.det.Kind)
+			}
+			if got.ProxyDetection.Version != tt.det.Version {
+				t.Errorf("Version: got %q, want %q", got.ProxyDetection.Version, tt.det.Version)
+			}
+			if got.ProxyDetection.ConfigDir != tt.det.ConfigDir {
+				t.Errorf("ConfigDir: got %q, want %q", got.ProxyDetection.ConfigDir, tt.det.ConfigDir)
+			}
+			if len(got.ProxyDetection.LogPaths) != len(tt.det.LogPaths) {
+				t.Errorf("LogPaths: got %v, want %v", got.ProxyDetection.LogPaths, tt.det.LogPaths)
+			}
+			if len(got.ProxyDetection.PortConflicts) != len(tt.det.PortConflicts) {
+				t.Errorf("PortConflicts: got %v, want %v", got.ProxyDetection.PortConflicts, tt.det.PortConflicts)
+			}
+			if got.ProxyDetectedAt == nil {
+				t.Error("ProxyDetectedAt should be set after a detection update")
+			}
+		})
+	}
+}
+
+func TestAgent_Capabilities_freshAgentIsNil(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	got, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if got.ProxyCapabilities != nil {
+		t.Errorf("ProxyCapabilities: got %+v, want nil for an agent that never reported", got.ProxyCapabilities)
+	}
+}
+
+func TestAgent_UpdateCapabilities_roundTrips(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	tests := []struct {
+		name string
+		caps *models.ProxyCapabilities
+	}{
+		{
+			name: "ratelimit present",
+			caps: &models.ProxyCapabilities{
+				ReverseProxy: true, WebSocket: true, ForceHTTPS: true,
+				CustomHeaders: true, PathRewrite: true, BasicAuth: true,
+				IPFilter: true, RateLimit: true, CentralTLS: true,
+			},
+		},
+		{
+			name: "ratelimit absent",
+			caps: &models.ProxyCapabilities{
+				ReverseProxy: true, WebSocket: true, ForceHTTPS: true,
+				CustomHeaders: true, PathRewrite: true, BasicAuth: true,
+				IPFilter: true, RateLimit: false, CentralTLS: true,
+			},
+		},
+		{
+			name: "all false",
+			caps: &models.ProxyCapabilities{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := d.UpdateAgentCapabilities(a.ID, tt.caps); err != nil {
+				t.Fatalf("UpdateAgentCapabilities: %v", err)
+			}
+			got, err := d.GetAgent(a.ID)
+			if err != nil {
+				t.Fatalf("GetAgent: %v", err)
+			}
+			if got.ProxyCapabilities == nil {
+				t.Fatalf("ProxyCapabilities: got nil after update, want non-nil")
+			}
+			if *got.ProxyCapabilities != *tt.caps {
+				t.Errorf("ProxyCapabilities: got %+v, want %+v", *got.ProxyCapabilities, *tt.caps)
+			}
+		})
 	}
 }
 
