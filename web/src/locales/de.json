@@ -597,6 +597,10 @@
       "drifted": "Abgewichen",
       "apply_failed": "Anwendung fehlgeschlagen"
     },
+    "enabledState": {
+      "on": "Aktiviert",
+      "off": "Inaktiv"
+    },
     "viewForm": "Formular",
     "viewRaw": "Roh",
     "maskFailed": "Strukturierte Ansicht konnte nicht erstellt werden.",
