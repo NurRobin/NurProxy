@@ -70,6 +70,22 @@ nginx: configuration file test failed in /etc/nginx/sites-enabled/nurproxy-app.e
 			wantLine:    0,
 		},
 		{
+			// Real unprivileged-agent failure: the only "in file:line" clause is on a
+			// benign [warn] about the user directive at nginx.conf:1; the actual fault
+			// is an [emerg] cert-key permission error with no location. We must NOT
+			// attribute the failure to nginx.conf:1.
+			name: "warn-only location is not attributed (cert-key permission failure)",
+			out: `nginx: [alert] could not open error log file: open() "/var/log/nginx/error.log" failed (13: Permission denied)
+2026/05/30 20:55:43 [warn] 474022#474022: the "user" directive makes sense only if the master process runs with super-user privileges, ignored in /etc/nginx/nginx.conf:1
+2026/05/30 20:55:43 [emerg] 474022#474022: cannot load certificate key "/etc/nginx/ssl/llm_P256/private.key": BIO_new_file() failed (SSL: error:8000000D Permission denied)
+nginx: configuration file /etc/nginx/nginx.conf test failed`,
+			ourFile:     ourFile,
+			wantLocated: false,
+			wantOurs:    false,
+			wantFile:    "",
+			wantLine:    0,
+		},
+		{
 			name:        "empty ourFile (Validate) never attributes ours",
 			out:         `nginx: [emerg] unknown directive "foo" in /etc/nginx/sites-enabled/nurproxy-app.example.com.conf:2`,
 			ourFile:     "",

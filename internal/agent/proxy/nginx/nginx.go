@@ -67,6 +67,9 @@ type commandError struct {
 func (e *commandError) Error() string {
 	a := e.Attribution
 	if !a.Located {
+		if a.Permission {
+			return fmt.Sprintf("nginx -t could not complete with the agent's privileges — permission denied reading nginx files (e.g. other vhosts' TLS keys or the error log). Grant the agent privilege to run 'nginx -t' / 'nginx -s reload' (see the agent's permission remediation). nginx output: %s", strings.TrimSpace(a.Raw))
+		}
 		return fmt.Sprintf("nginx -t failed: %s", strings.TrimSpace(a.Raw))
 	}
 	if a.Ours {

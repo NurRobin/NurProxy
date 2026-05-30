@@ -3,6 +3,7 @@ package tls
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/go-acme/lego/v4/challenge/dns01"
@@ -59,6 +60,21 @@ func (p *recordingProvider) GetRecord(_ context.Context, _ json.RawMessage, id s
 		return nil, nil
 	}
 	return &r, nil
+}
+
+func (p *recordingProvider) ListRecords(_ context.Context, _ json.RawMessage, name, recordType string) ([]provider.Record, error) {
+	var out []provider.Record
+	for id, r := range p.records {
+		if name != "" && !strings.EqualFold(r.Name, name) {
+			continue
+		}
+		if recordType != "" && !strings.EqualFold(r.Type, recordType) {
+			continue
+		}
+		r.ID = id
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // TestProviderSolver_dns01_challengeOwnerIsAcmeChallenge_notCNAME proves the

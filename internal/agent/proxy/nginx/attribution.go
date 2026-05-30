@@ -18,6 +18,12 @@ import (
 // manage or in the operator's pre-existing config (§10).
 var nginxErrRe = regexp.MustCompile(`in (\S+):(\d+)`)
 
+// permDeniedRe detects a permission failure in nginx -t output — the agent (run
+// unprivileged) cannot read files nginx -t touches, e.g. other vhosts' TLS
+// private keys or the error log. That is NOT a config error in any file; it means
+// the agent needs privilege to run nginx -t / reload (§12).
+var permDeniedRe = regexp.MustCompile(`(?i)permission denied`)
+
 // ErrAttribution classifies an nginx -t failure as either ours (the file this
 // apply wrote) or the operator's pre-existing config elsewhere in the managed
 // dir (§10). nginx -t validates the WHOLE config, so a long-standing operator
@@ -36,6 +42,11 @@ type ErrAttribution struct {
 	// parseable location (e.g. a permission error) yields Located=false, and the
 	// caller surfaces the raw nginx output unattributed.
 	Located bool
+	// Permission reports that nginx -t failed because the agent lacks permission to
+	// read files nginx touches (e.g. other vhosts' TLS keys), not because any
+	// config is broken. The caller surfaces a "grant the agent privilege" message
+	// rather than blaming a line of config.
+	Permission bool
 	// Raw is the verbatim nginx -t output, always carried so the caller can show
 	// the operator the exact message.
 	Raw string
@@ -53,14 +64,29 @@ type ErrAttribution struct {
 // the LAST one is the innermost frame nginx blames, so we attribute to it.
 func AttributeNginxTestError(out, ourFile string) ErrAttribution {
 	a := ErrAttribution{Raw: out}
+	a.Permission = permDeniedRe.MatchString(out)
 
-	matches := nginxErrRe.FindAllStringSubmatch(out, -1)
-	if len(matches) == 0 {
+	// nginx prints benign [warn]/[alert] lines that can carry an "in file:line"
+	// clause (e.g. the "user" directive "ignored in /etc/nginx/nginx.conf:1") but
+	// are NOT the failure. Skip those lines so the location we attribute comes from
+	// the fatal frame (an [emerg] line, or the final "configuration file ... failed
+	// in <file>:<line>"), not a warning that happens to mention line 1.
+	var loc []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "[warn]") || strings.Contains(line, "[alert]") {
+			continue
+		}
+		if m := nginxErrRe.FindStringSubmatch(line); m != nil {
+			loc = m // keep the last (innermost) frame
+		}
+	}
+	if loc == nil {
+		// No fatal location parsed (e.g. a permission error, or a cert-key load
+		// failure that names no line). The caller surfaces the raw output.
 		return a
 	}
-	last := matches[len(matches)-1]
-	a.File = last[1]
-	if n, err := strconv.Atoi(last[2]); err == nil {
+	a.File = loc[1]
+	if n, err := strconv.Atoi(loc[2]); err == nil {
 		a.Line = n
 	}
 	a.Located = true

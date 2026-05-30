@@ -49,6 +49,10 @@ func (f *fakeProvider) GetRecord(_ context.Context, _ json.RawMessage, _ string)
 	return nil, nil
 }
 
+func (f *fakeProvider) ListRecords(_ context.Context, _ json.RawMessage, _, _ string) ([]Record, error) {
+	return nil, nil
+}
+
 func resetRegistry() {
 	mu.Lock()
 	defer mu.Unlock()
