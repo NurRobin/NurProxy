@@ -134,6 +134,52 @@ func TestAgentAdoptArtifacts_rejectsOtherAgent(t *testing.T) {
 	}
 }
 
+// TestAgentAdoptArtifacts_skipsFileAlreadyTrackedAsGenerated verifies the
+// adopt path does not try to create a second artifact for a file already tracked
+// under a generated "dom-N" ID (the agent's own applied config, which ReadManaged
+// reports back). Creating one would violate the unique (agent,kind,path) target
+// constraint; instead adoption skips it.
+func TestAgentAdoptArtifacts_skipsFileAlreadyTrackedAsGenerated(t *testing.T) {
+	srv, database := testServer(t)
+	makeAgent(t, database, "agent-1", "a.example.com", models.AgentStatusAdopted, nil)
+
+	const path = "/etc/nginx/sites-available/nurproxy-heim.nurrobin.de.conf"
+	// A generated artifact (from a prior apply) already owns this file.
+	if err := database.CreateConfigArtifact(&models.ConfigArtifact{
+		ID: "dom-1", AgentID: "agent-1", Backend: "nginx",
+		Target: models.Target{Kind: "file", Path: path},
+		Source: models.ArtifactSourceGenerated, Content: "server { listen 80; }",
+	}, "agent:agent-1", "apply"); err != nil {
+		t.Fatalf("seed generated artifact: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	report := proxymodel.AdoptedArtifactReport{Host: "a.example.com", Artifacts: []proxymodel.AdoptedArtifact{{
+		ArtifactID: "adopt-agent-1-nginx-etc-nginx-sites-available-nurproxy-heim-nurrobin-de-conf",
+		Backend:    "nginx", TargetKind: "file", TargetPath: path,
+		Content: "server { listen 80; }", Adopted: false,
+	}}}
+	body, _ := json.Marshal(report)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/agents/agent-1/artifacts/adopt", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+"agent-secret-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	var out map[string]int
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if out["created"] != 0 || out["updated"] != 0 {
+		t.Errorf("adoption of an already-tracked file should be a no-op, got %+v", out)
+	}
+	// The generated artifact still owns the path; no duplicate row was created.
+	if _, err := database.GetConfigArtifact("adopt-agent-1-nginx-etc-nginx-sites-available-nurproxy-heim-nurrobin-de-conf"); err == nil {
+		t.Error("a duplicate adopt-… artifact must not be created for an already-tracked file")
+	}
+}
+
 // TestAgentAdoptArtifacts_refusesCollidingForeignID verifies that even a
 // well-authenticated agent cannot overwrite another agent's stored artifact by
 // reporting a crafted, colliding artifact ID (defense in depth behind the now

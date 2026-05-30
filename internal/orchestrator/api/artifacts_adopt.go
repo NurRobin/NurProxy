@@ -78,6 +78,17 @@ func (s *Server) upsertAdoptedArtifact(r *http.Request, agentID, host string, a 
 
 	existing, err := s.db.GetConfigArtifact(a.ArtifactID)
 	if err != nil || existing == nil {
+		// The file may already be tracked under a DIFFERENT artifact ID — typically
+		// a generated "dom-N" the agent just applied, which ReadManaged then reports
+		// back here as an adoptable file. Creating an "adopt-…" row for the same
+		// (agent, kind, path) would violate the unique target constraint, so skip:
+		// the generated artifact already owns this file (apply + heartbeat drift
+		// track it). Only NurProxy-generated files hit this; operator files have
+		// their own unique path.
+		if owner, lErr := s.db.GetConfigArtifactByTarget(agentID, a.TargetKind, a.TargetPath); lErr == nil && owner != nil && owner.ID != a.ArtifactID {
+			log.Printf("adopt: %s already tracked as artifact %s (%s); skipping duplicate adoption", a.TargetPath, owner.ID, owner.Source)
+			return adoptNoop
+		}
 		art := &models.ConfigArtifact{
 			ID:      a.ArtifactID,
 			AgentID: agentID,
