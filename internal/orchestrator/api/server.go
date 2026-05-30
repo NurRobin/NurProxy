@@ -106,6 +106,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/tail", s.requireAuth(s.handleStartLogTail))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handlePollLogTail))
 	s.mux.HandleFunc("DELETE /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handleStopLogTail))
+	// Admin-change channel (§19): the dashboard prepares a pending op and gets a
+	// one-time confirmation code (requireAuth); the agent claims it with its local
+	// identity + the code and acks the outcome (requireAgentAuth, scoped to itself).
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/admin-ops", s.requireAuth(s.handlePrepareAdminOp))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/admin-ops", s.requireAuth(s.handleListAdminOps))
+	s.mux.HandleFunc("DELETE /api/v1/agents/{id}/admin-ops/{opId}", s.requireAuth(s.handleCancelAdminOp))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/admin-ops/claim", s.requireAgentAuth(s.handleClaimAdminOp))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/admin-ops/{opId}/ack", s.requireAgentAuth(s.handleAckAdminOp))
 
 	// Servers (auth required)
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/servers", s.requireAuth(s.handleListServers))
