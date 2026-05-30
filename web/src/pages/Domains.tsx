@@ -58,6 +58,7 @@ export default function Domains() {
   const [editMaxBody, setEditMaxBody] = useState('');
   const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
   const [editRawConfig, setEditRawConfig] = useState('');
+  const [editConfigBackend, setEditConfigBackend] = useState('caddy');
   const [advancedError, setAdvancedError] = useState('');
   const [editLoading, setEditLoading] = useState(false);
 
@@ -151,6 +152,7 @@ export default function Domains() {
       ? Object.entries(d.proxy_config.custom_request_headers).map(([key, value]) => ({ key, value }))
       : []);
     setEditRawConfig('');
+    setEditConfigBackend('caddy');
     setAdvancedError('');
   }
 
@@ -184,7 +186,12 @@ export default function Domains() {
     setAdvancedError('');
     try {
       const cfg = await api.getDomainConfig(detailDomain.id);
-      setEditRawConfig(JSON.stringify(cfg.config, null, 2));
+      const backend = cfg.backend || 'caddy';
+      setEditConfigBackend(backend);
+      // Caddy config is a JSON object; nginx/apache configs are native text.
+      setEditRawConfig(
+        typeof cfg.config === 'string' ? cfg.config : JSON.stringify(cfg.config, null, 2),
+      );
     } catch (err) {
       setAdvancedError(errMessage(err, t('domains.loadConfigFailed')));
     }
@@ -192,17 +199,22 @@ export default function Domains() {
 
   async function handleSaveAdvanced() {
     if (!detailDomain) return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(editRawConfig);
-    } catch (e) {
-      setAdvancedError(t('domains.invalidJson', { msg: e instanceof Error ? e.message : 'could not parse' }));
-      return;
+    let payload: unknown;
+    if (editConfigBackend === 'caddy') {
+      try {
+        payload = JSON.parse(editRawConfig);
+      } catch (e) {
+        setAdvancedError(t('domains.invalidJson', { msg: e instanceof Error ? e.message : 'could not parse' }));
+        return;
+      }
+    } else {
+      // nginx/apache: the override is native config text, sent as a JSON string.
+      payload = editRawConfig;
     }
     setAdvancedError('');
     setEditLoading(true);
     try {
-      await api.updateDomainConfig(detailDomain.id, parsed);
+      await api.updateDomainConfig(detailDomain.id, payload);
       toast.success(t('domains.manualSaved'));
       setDetailDomain(null);
       fetchData();
@@ -465,6 +477,9 @@ export default function Domains() {
                   {t('domains.manualConfigBody')}
                 </Callout>
                 {advancedError && <Callout tone="danger">{advancedError}</Callout>}
+                <p className="text-xs text-fg-faint">
+                  {t('domains.configBackend', { backend: editConfigBackend })}
+                </p>
                 <Textarea value={editRawConfig} onChange={(e) => { setEditRawConfig(e.target.value); setAdvancedError(''); }} rows={14} className="font-mono text-xs" spellCheck={false} />
                 <div className="flex justify-between">
                   <Button variant="secondary" onClick={handleResetConfig} loading={editLoading}>{t('domains.resetAuto')}</Button>

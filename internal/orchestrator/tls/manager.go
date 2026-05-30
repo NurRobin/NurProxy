@@ -49,11 +49,19 @@ type RenewTarget struct {
 // hand-write a fake. It is intentionally narrow so the renewer never touches the
 // database directly.
 type RenewalStore interface {
-	// DueForRenewal returns the certificates whose expiry is within window,
-	// already resolved to their DNS provider so the renewer can re-issue. A host
-	// whose zone/provider can no longer be resolved should be omitted (logged by
-	// the implementer) rather than aborting the whole scan.
+	// DueForRenewal returns the work the renewer should act on within window: both
+	// existing certificates entering the renew window AND domains that need a
+	// central-TLS certificate but have none yet (first issuance). Every target is
+	// already resolved to its DNS provider. A host whose zone/provider can no
+	// longer be resolved should be omitted (logged by the implementer) rather than
+	// aborting the whole scan.
 	DueForRenewal(ctx context.Context, window time.Duration) ([]RenewTarget, error)
+	// TargetForHost resolves the issuance target for a single host on demand (the
+	// on-create fast path): the host's zone/provider plus the name set. It returns
+	// (nil, nil) when the host needs no central cert right now — unresolvable
+	// zone/provider, a non-central TLS policy, or a current cert already on file —
+	// so the caller treats it as a no-op.
+	TargetForHost(ctx context.Context, host string) (*RenewTarget, error)
 	// SaveRenewed persists a freshly issued bundle, overwriting the prior cert for
 	// the host in place (the encrypted-at-rest store keys on host).
 	SaveRenewed(ctx context.Context, res *CertResult, isWildcard bool) error
@@ -184,6 +192,31 @@ func (r *Renewer) RunOnce(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// EnsureCertForHost issues, saves, and pushes a certificate for a single host on
+// demand — the fast path so a freshly created central-TLS domain gets HTTPS in
+// about a minute instead of waiting for the next scan. It is best-effort and
+// idempotent: a host that needs no cert (non-central policy, unresolvable
+// zone/provider, or a current cert already on file) is a no-op, and the periodic
+// scan still covers anything this misses. Safe to call from a goroutine.
+func (r *Renewer) EnsureCertForHost(ctx context.Context, host string) error {
+	if host == "" {
+		return nil
+	}
+	target, err := r.store.TargetForHost(ctx, host)
+	if err != nil {
+		return fmt.Errorf("tls: resolving issue target for %s: %w", host, err)
+	}
+	if target == nil {
+		return nil // nothing to issue (no central cert needed / already have one)
+	}
+	r.logger.InfoContext(ctx, "tls: issuing certificate on demand", slog.String("host", host))
+	if err := r.renewOne(ctx, *target); err != nil {
+		r.auditEvent("certificate", host, "issue_failed", err.Error())
+		return err
+	}
+	return nil
 }
 
 // renewOne re-issues, saves, and re-pushes a single certificate. The re-issue

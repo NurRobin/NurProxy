@@ -64,6 +64,15 @@ func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Rou
 	return route
 }
 
+// TLSPolicyForDomain resolves a domain's public-listener TLS provisioning policy
+// (§7) into the backend-neutral proxymodel.TLSPolicy, exported so the central
+// issuer can decide which domains need a provided cert with exactly the same
+// logic the renderers use (no divergence between "needs a cert" and "renders a
+// TLS listener"). See tlsPolicyFromDomain for the resolution rules.
+func TLSPolicyForDomain(d models.Domain) proxymodel.TLSPolicy {
+	return tlsPolicyFromDomain(d)
+}
+
 // tlsPolicyFromDomain resolves a domain's public-listener TLS provisioning
 // policy (§7) into the backend-neutral proxymodel.TLSPolicy. The explicit
 // per-domain ProxyConfig.TLSPolicy wins; an empty policy defaults to central

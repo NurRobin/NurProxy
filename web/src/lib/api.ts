@@ -41,6 +41,9 @@ export interface TestProviderZone {
 
 export interface DomainConfig {
   manual: boolean;
+  // backend the config is rendered for ("caddy" | "nginx" | "apache"). For caddy,
+  // config is a JSON route object; for nginx/apache it is the native config text.
+  backend?: string;
   config: unknown;
 }
 

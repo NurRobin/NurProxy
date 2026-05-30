@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"log"
 	"net/http"
 
@@ -18,6 +19,15 @@ type RoutePusher interface {
 	PushAgentRoutes(agentID string) error
 }
 
+// CertIssuer obtains a central TLS certificate for a host on demand (the §7
+// first-issuance fast path). The TLS Renewer implements it; the domain-create
+// handler kicks it asynchronously so a new central-TLS domain gets HTTPS within
+// about a minute instead of waiting for the next renewal scan. Best-effort: a
+// host that needs no cert is a no-op and the periodic scan is the backstop.
+type CertIssuer interface {
+	EnsureCertForHost(ctx context.Context, host string) error
+}
+
 // Server holds the API server state.
 type Server struct {
 	db       *db.DB
@@ -26,6 +36,7 @@ type Server struct {
 	sessions *auth.SessionManager
 	hub      *agenthub.Hub
 	pusher   RoutePusher
+	issuer   CertIssuer
 	logs     *logbroker.Broker
 }
 
@@ -36,6 +47,13 @@ type Server struct {
 func (s *Server) SetAgentHub(hub *agenthub.Hub, pusher RoutePusher) {
 	s.hub = hub
 	s.pusher = pusher
+}
+
+// SetCertIssuer wires the on-demand TLS issuer so domain creation can trigger
+// first-issuance immediately. Optional: when unset, certs are issued only by the
+// periodic renewal scan (the backstop).
+func (s *Server) SetCertIssuer(issuer CertIssuer) {
+	s.issuer = issuer
 }
 
 // NewServer creates a new API server and registers all routes.
