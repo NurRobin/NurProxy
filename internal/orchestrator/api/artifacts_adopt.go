@@ -99,6 +99,14 @@ func (s *Server) upsertAdoptedArtifact(r *http.Request, agentID, host string, a 
 		return adoptCreated
 	}
 
+	// Ownership guard: refuse to mutate another agent's artifact even if the IDs
+	// collide. Agent-scoped IDs make this unreachable in normal operation, but a
+	// crafted report must never let agent-2 overwrite agent-1's stored config.
+	if existing.AgentID != agentID {
+		log.Printf("adopt: agent %s attempted to write artifact %s owned by agent %s; refusing", agentID, a.ArtifactID, existing.AgentID)
+		return adoptNoop
+	}
+
 	// The on-host enabled state (sites-enabled present?) can change without the
 	// file content changing — e.g. the operator dis/enables a vhost. That is not a
 	// content version, so AppendConfigArtifactVersion (gated on semantic change)

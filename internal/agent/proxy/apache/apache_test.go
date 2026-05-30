@@ -160,6 +160,48 @@ func TestApply_configtestFails_rollsBack_priorContent(t *testing.T) {
 	}
 }
 
+// TestApply_symlinkFails_restoresPriorContent reproduces the operator setup where
+// the sites-enabled entry is a copied regular file (not a symlink): ensureSymlink
+// refuses to clobber it and Apply fails. The prior content of the live file must
+// be restored — the failed apply must not leave the new (rejected) config on disk.
+func TestApply_symlinkFails_restoresPriorContent(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout := newDebianBackend(t, r)
+
+	if err := os.MkdirAll(layout.Available, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(layout.Enabled, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := layout.AvailablePath("app.example.com")
+	prior := "<VirtualHost *:80># GOOD\n</VirtualHost>\n"
+	if err := os.WriteFile(dest, []byte(prior), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Operator activated by COPYING a regular file into sites-enabled (not a
+	// symlink); ensureSymlink refuses to replace it, so Apply fails mid-iteration.
+	if err := os.WriteFile(layout.EnabledPath("app.example.com"), []byte("copied\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	art := sampleArtifact(b, "app.example.com", "<VirtualHost *:80># NEW\n</VirtualHost>\n")
+	if err := b.Apply(context.Background(), []proxy.Artifact{art}); err == nil {
+		t.Fatal("expected error when sites-enabled holds a regular file")
+	}
+	got, readErr := os.ReadFile(dest)
+	if readErr != nil {
+		t.Fatalf("reading restored file: %v", readErr)
+	}
+	if string(got) != prior {
+		t.Errorf("restored content = %q, want prior %q", got, prior)
+	}
+	if r.tests != 0 {
+		t.Errorf("configtest ran %d times, want 0 (failed before validation)", r.tests)
+	}
+}
+
 func TestApply_reloadFails_rollsBack(t *testing.T) {
 	r := &fakeRunner{reloadErr: errors.New("reload boom")}
 	b, layout := newDebianBackend(t, r)

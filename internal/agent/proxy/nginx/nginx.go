@@ -310,7 +310,7 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 		}
 	}
 
-	staged := make([]stagedFile, 0, len(arts))
+	staged := make([]*stagedFile, 0, len(arts))
 	// rollback discards every temp and restores every snapshot. It is deferred-safe
 	// and idempotent: a committed file's snapshot restore is skipped via committed.
 	rollback := func() {
@@ -335,9 +335,16 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 			return fmt.Errorf("snapshotting %q: %w", dest, err)
 		}
 		s.tempPath = dest + tempSuffix
-		if err := os.WriteFile(s.tempPath, []byte(art.Content), 0o644); err != nil {
+		// Register the staged file in the rollback set BEFORE overwriting the live
+		// path, so any later failure in this iteration (e.g. a symlink clash on a
+		// copied sites-enabled file) still restores dest's prior content rather than
+		// leaving the new config live. staged holds pointers so the symlink fields
+		// set below are visible to rollback.
+		sp := &s
+		staged = append(staged, sp)
+		if err := os.WriteFile(sp.tempPath, []byte(art.Content), 0o644); err != nil {
 			rollback()
-			return fmt.Errorf("writing temp config %q: %w", s.tempPath, err)
+			return fmt.Errorf("writing temp config %q: %w", sp.tempPath, err)
 		}
 		// Stage the temp at the live path so nginx -t validates the new content. The
 		// snapshot lets us restore on failure.
@@ -349,14 +356,13 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 		// in the dir is the activation, so there is no symlink step.
 		if art.Enabled && !b.layout.IsConfD() {
 			link := b.enabledLinkFor(dest)
-			s.enabledLink = link
-			s.linkPreexisted = symlinkPresent(link)
+			sp.enabledLink = link
+			sp.linkPreexisted = symlinkPresent(link)
 			if err := ensureSymlink(dest, link); err != nil {
 				rollback()
 				return fmt.Errorf("enabling %q: %w", dest, err)
 			}
 		}
-		staged = append(staged, s)
 	}
 
 	out, err := b.runner.Test(ctx)

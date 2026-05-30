@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,12 @@ type caddyBackend interface {
 	EnsureServer(ctx context.Context) error
 	ClearRoutes(ctx context.Context) error
 	AddRoute(ctx context.Context, route json.RawMessage) error
+	// Apply writes, validates, and activates file-backed artifacts atomically
+	// (nginx/apache/external caddy, §10). The admin-API built-in Caddy uses
+	// AddRoute instead; applyIntents dispatches by the rendered artifact's target
+	// kind so a file backend actually writes + reloads rather than no-op'ing
+	// through AddRoute.
+	Apply(ctx context.Context, arts []proxy.Artifact) error
 	Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error)
 	// InstallCerts writes the pushed cert bundles to disk before any referencing
 	// config is applied (preflight ordering, §5). It is called first in
@@ -59,6 +66,18 @@ type caddyBackend interface {
 	EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error
 }
 
+// managedArtifact records what the agent applied for one artifact so the
+// heartbeat can report its CURRENT drift signal (§11). For a file backend the
+// live state is the on-disk file, so the heartbeat re-reads targetPath and
+// re-checksums it — a manual edit then surfaces as drift. For the admin-API
+// built-in Caddy the rendered content IS the live state, so the apply-time
+// checksum is authoritative and no file is read.
+type managedArtifact struct {
+	targetKind string
+	targetPath string
+	checksum   string
+}
+
 // Client manages the agent's stream connection and applies pushed routes.
 type Client struct {
 	orchestratorURL string
@@ -69,13 +88,14 @@ type Client struct {
 	http            *http.Client
 
 	// managedMu guards managed, the agent's snapshot of the artifacts it currently
-	// has applied (artifactID -> checksum of the rendered content). It is refreshed
-	// on every successful apply and read by the heartbeat so the orchestrator can
-	// detect drift (on-disk != accepted, §11). For the built-in Caddy admin-API
-	// path the rendered route content IS the live state, so its checksum is the
-	// drift signal.
+	// has applied (artifactID -> applied state). It is refreshed on every successful
+	// apply and read by the heartbeat so the orchestrator can detect drift (on-disk
+	// != accepted, §11). For the built-in Caddy admin-API path the rendered route
+	// content IS the live state, so the apply-time checksum is the drift signal; for
+	// a file backend the live state is the on-disk file, so the heartbeat re-reads
+	// targetPath (see ManagedChecksums).
 	managedMu sync.RWMutex
-	managed   map[string]string
+	managed   map[string]managedArtifact
 
 	// logPaths is the operator-configured proxy_log_paths allowlist (§9). An
 	// on-demand tail (§15) is refused unless its path is within this set, so a
@@ -98,7 +118,7 @@ func New(orchestratorURL, agentID, token string, backend caddyBackend, hs *healt
 		token:           token,
 		caddy:           backend,
 		health:          hs,
-		managed:         make(map[string]string),
+		managed:         make(map[string]managedArtifact),
 		tails:           make(map[string]context.CancelFunc),
 		// No client timeout: this connection is meant to stay open. Reconnects
 		// are driven by the context and by read errors.
@@ -119,18 +139,36 @@ func (c *Client) WithLogPaths(paths []string) *Client {
 // to detect drift. The returned slice is a copy, safe to use after the call.
 func (c *Client) ManagedChecksums() []proxymodel.ArtifactChecksum {
 	c.managedMu.RLock()
-	defer c.managedMu.RUnlock()
-	out := make([]proxymodel.ArtifactChecksum, 0, len(c.managed))
-	for id, sum := range c.managed {
+	snapshot := make(map[string]managedArtifact, len(c.managed))
+	for id, m := range c.managed {
+		snapshot[id] = m
+	}
+	c.managedMu.RUnlock()
+
+	out := make([]proxymodel.ArtifactChecksum, 0, len(snapshot))
+	for id, m := range snapshot {
+		sum := m.checksum
+		// File backends: the live state is on disk, so re-read and re-checksum the
+		// file each beat. A manual edit since the last apply then diverges from the
+		// accepted checksum and the orchestrator flags drift (§11) — the in-memory
+		// apply-time checksum alone would never catch an on-disk change. A read
+		// error (file removed, perms) falls back to the last-applied checksum. The
+		// admin-API built-in Caddy keeps its in-memory checksum: the rendered route
+		// content is itself the live state, with no file to read.
+		if m.targetKind == string(proxy.TargetKindFile) && m.targetPath != "" {
+			if data, err := os.ReadFile(m.targetPath); err == nil {
+				sum = checksum(string(data))
+			}
+		}
 		out = append(out, proxymodel.ArtifactChecksum{ArtifactID: id, Checksum: sum})
 	}
 	return out
 }
 
-// setManaged replaces the managed-artifact checksum snapshot atomically after an
-// apply, so the heartbeat always reports the agent's true current set (added and
-// removed artifacts both reflected).
-func (c *Client) setManaged(m map[string]string) {
+// setManaged replaces the managed-artifact snapshot atomically after an apply, so
+// the heartbeat always reports the agent's true current set (added and removed
+// artifacts both reflected).
+func (c *Client) setManaged(m map[string]managedArtifact) {
 	c.managedMu.Lock()
 	c.managed = m
 	c.managedMu.Unlock()
@@ -348,13 +386,16 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	intents := set.Intents
 	reports := make([]proxymodel.ArtifactReport, 0, len(intents))
 	// managed is the fresh snapshot of artifacts this apply leaves live (artifactID
-	// -> checksum). It replaces the prior snapshot wholesale, so artifacts dropped
-	// from the intent set stop being reported (no stale drift on removed configs).
-	managed := make(map[string]string, len(intents))
+	// -> applied state). It replaces the prior snapshot wholesale, so artifacts
+	// dropped from the intent set stop being reported (no stale drift on removed
+	// configs).
+	managed := make(map[string]managedArtifact, len(intents))
 	applied := 0
 
 	// Ensure the server exists first (creates the config path), then clear, then
-	// add — so clearing doesn't hit a not-yet-created path on a fresh Caddy.
+	// add — so clearing doesn't hit a not-yet-created path on a fresh Caddy. These
+	// admin-API primitives are safe no-ops on a file backend (the Holder forwards
+	// them only when the current backend implements them).
 	if err := c.caddy.EnsureServer(ctx); err != nil {
 		log.Printf("Stream: failed to ensure server: %v", err)
 		if c.health != nil {
@@ -378,6 +419,16 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	// apply (invariant #1: the running Caddy path keeps serving; self-ACME still
 	// covers TLS).
 	c.applyServerTLS(ctx, intents)
+
+	// fileArtifact ties a file-backed render to its slot in reports, so the batch
+	// Apply below can attribute the outcome back per artifact. reportIdx is stable:
+	// reports is fully built by the render loop and never appended to afterwards.
+	type fileArtifact struct {
+		intent    proxymodel.RouteIntent
+		art       proxy.Artifact
+		reportIdx int
+	}
+	var fileArts []fileArtifact
 
 	for _, in := range intents {
 		host := in.Route.Host
@@ -410,6 +461,17 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 			Warnings: art.Warnings,
 		}
 
+		// Dispatch by target kind. A file-backed artifact (nginx/apache/external
+		// caddy) is deferred to the atomic batch Apply below — AddRoute is a no-op
+		// for those backends, so applying through it would ACK success without ever
+		// writing the file or reloading the proxy (§10). The admin-API built-in
+		// Caddy applies its route directly here.
+		if art.Target.Kind == proxy.TargetKindFile {
+			reports = append(reports, report)
+			fileArts = append(fileArts, fileArtifact{intent: in, art: art, reportIdx: len(reports) - 1})
+			continue
+		}
+
 		if err := c.caddy.AddRoute(ctx, json.RawMessage(art.Content)); err != nil {
 			log.Printf("Stream: failed to apply route for %s: %v", host, err)
 			report.Error = err.Error()
@@ -420,7 +482,46 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		reports = append(reports, report)
 		// Track the successfully-applied artifact for the heartbeat drift check.
 		if in.ArtifactID != "" {
-			managed[in.ArtifactID] = report.Checksum
+			managed[in.ArtifactID] = managedArtifact{
+				targetKind: report.TargetKind,
+				targetPath: report.TargetPath,
+				checksum:   report.Checksum,
+			}
+		}
+	}
+
+	// Apply the file-backed artifacts as one atomic batch (write → validate →
+	// reload). On failure the backend rolls back to the prior on-disk state, so we
+	// attribute the error to every artifact in the batch and track none as live (no
+	// false drift signal for config that never went live).
+	if len(fileArts) > 0 {
+		arts := make([]proxy.Artifact, 0, len(fileArts))
+		for _, fa := range fileArts {
+			arts = append(arts, fa.art)
+		}
+		if err := c.caddy.Apply(ctx, arts); err != nil {
+			log.Printf("Stream: failed to apply %d file artifact(s): %v", len(arts), err)
+			if c.health != nil {
+				c.health.SetError(fmt.Sprintf("failed to apply proxy config: %v", err))
+			}
+			for _, fa := range fileArts {
+				reports[fa.reportIdx].Error = err.Error()
+			}
+		} else {
+			if c.health != nil {
+				c.health.SetError("")
+			}
+			for _, fa := range fileArts {
+				applied++
+				rep := reports[fa.reportIdx]
+				if fa.intent.ArtifactID != "" {
+					managed[fa.intent.ArtifactID] = managedArtifact{
+						targetKind: rep.TargetKind,
+						targetPath: rep.TargetPath,
+						checksum:   rep.Checksum,
+					}
+				}
+			}
 		}
 	}
 

@@ -72,8 +72,8 @@ func TestReportAdopted(t *testing.T) {
 	if a.Backend != "nginx" {
 		t.Errorf("backend = %q, want nginx", a.Backend)
 	}
-	// ID must be stable + derived from backend+path (no slashes/dots left raw).
-	want := proxymodel.AdoptedArtifactID("nginx", "/etc/nginx/sites-available/default")
+	// ID must be stable + derived from agent+backend+path (no slashes/dots left raw).
+	want := proxymodel.AdoptedArtifactID("agent-1", "nginx", "/etc/nginx/sites-available/default")
 	if a.ArtifactID != want {
 		t.Errorf("artifact id = %q, want %q", a.ArtifactID, want)
 	}
@@ -98,8 +98,8 @@ func TestReportAdopted_serverError(t *testing.T) {
 }
 
 func TestAdoptedArtifactID_stableAndTokenized(t *testing.T) {
-	a := proxymodel.AdoptedArtifactID("nginx", "/etc/nginx/sites-available/default")
-	b := proxymodel.AdoptedArtifactID("nginx", "/etc/nginx/sites-available/default")
+	a := proxymodel.AdoptedArtifactID("agent-1", "nginx", "/etc/nginx/sites-available/default")
+	b := proxymodel.AdoptedArtifactID("agent-1", "nginx", "/etc/nginx/sites-available/default")
 	if a != b {
 		t.Fatalf("AdoptedArtifactID not deterministic: %q vs %q", a, b)
 	}

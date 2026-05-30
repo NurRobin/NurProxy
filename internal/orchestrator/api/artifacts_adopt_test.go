@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -38,7 +39,7 @@ func TestAgentAdoptArtifacts_createsThenUpserts(t *testing.T) {
 		return out
 	}
 
-	id := proxymodel.AdoptedArtifactID("nginx", "/etc/nginx/sites-available/default")
+	id := proxymodel.AdoptedArtifactID("agent-1", "nginx", "/etc/nginx/sites-available/default")
 	report := proxymodel.AdoptedArtifactReport{
 		Host: "durox.example.com",
 		Artifacts: []proxymodel.AdoptedArtifact{{
@@ -130,5 +131,72 @@ func TestAgentAdoptArtifacts_rejectsOtherAgent(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("cross-agent report status = %d, want 403", resp.StatusCode)
+	}
+}
+
+// TestAgentAdoptArtifacts_refusesCollidingForeignID verifies that even a
+// well-authenticated agent cannot overwrite another agent's stored artifact by
+// reporting a crafted, colliding artifact ID (defense in depth behind the now
+// agent-scoped IDs).
+func TestAgentAdoptArtifacts_refusesCollidingForeignID(t *testing.T) {
+	srv, database := testServer(t)
+	// Distinct tokens so each agent authenticates AS ITSELF (the shared-token
+	// makeAgent helper would resolve both to the first agent).
+	mkAgent := func(id, fqdn, token string) {
+		t.Helper()
+		if err := database.CreateAgent(&models.Agent{
+			ID: id, Name: fqdn, FQDN: fqdn, TokenHash: auth.HashToken(token),
+			Status: models.AgentStatusAdopted, DNSMode: models.DNSModeStatic,
+		}); err != nil {
+			t.Fatalf("CreateAgent %s: %v", id, err)
+		}
+	}
+	const token1, token2 = "tok-agent-1", "tok-agent-2"
+	mkAgent("agent-1", "a.example.com", token1)
+	mkAgent("agent-2", "b.example.com", token2)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(t *testing.T, agentID, token string, report proxymodel.AdoptedArtifactReport) {
+		t.Helper()
+		body, _ := json.Marshal(report)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/agents/"+agentID+"/artifacts/adopt", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	}
+
+	const sharedID = "adopt-shared-nginx-default"
+	mk := func(content string) proxymodel.AdoptedArtifactReport {
+		return proxymodel.AdoptedArtifactReport{
+			Artifacts: []proxymodel.AdoptedArtifact{{
+				ArtifactID: sharedID,
+				Backend:    "nginx",
+				TargetKind: "file",
+				TargetPath: "/etc/nginx/sites-available/default",
+				Content:    content,
+				Adopted:    true,
+			}},
+		}
+	}
+
+	// agent-1 stores its config under the shared ID.
+	post(t, "agent-1", token1, mk("server { # AGENT-1 }"))
+	// agent-2 reports the SAME id (as itself) — the handler must refuse to mutate.
+	post(t, "agent-2", token2, mk("server { # AGENT-2 HIJACK }"))
+
+	art, err := database.GetConfigArtifact(sharedID)
+	if err != nil {
+		t.Fatalf("GetConfigArtifact: %v", err)
+	}
+	if art.AgentID != "agent-1" || art.Content != "server { # AGENT-1 }" {
+		t.Errorf("agent-2 overwrote agent-1's artifact: %+v", art)
 	}
 }

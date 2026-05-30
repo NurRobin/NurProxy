@@ -373,7 +373,7 @@ func (d *DB) MarkConfigArtifactDrifted(id string) error {
 // changed reports whether this call actually transitioned the drift state (so the
 // caller can audit only genuine transitions, not every heartbeat). An artifact in
 // apply_failed state is left untouched (the failure, not drift, is the story).
-func (d *DB) ReconcileArtifactChecksum(id, onDiskChecksum string) (drifted, changed bool, err error) {
+func (d *DB) ReconcileArtifactChecksum(id, agentID, onDiskChecksum string) (drifted, changed bool, err error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	tx, err := d.sql.Begin()
@@ -384,8 +384,10 @@ func (d *DB) ReconcileArtifactChecksum(id, onDiskChecksum string) (drifted, chan
 
 	var accepted, applyState string
 	var wasDrifted int
+	// Scope by agent_id so an agent's heartbeat can only flag/clear drift on its
+	// OWN artifact, never another agent's row that happens to share the ID.
 	row := tx.QueryRow(
-		"SELECT checksum, drifted, apply_state FROM config_artifacts WHERE id = ?", id,
+		"SELECT checksum, drifted, apply_state FROM config_artifacts WHERE id = ? AND agent_id = ?", id, agentID,
 	)
 	if scanErr := row.Scan(&accepted, &wasDrifted, &applyState); scanErr == sql.ErrNoRows {
 		return false, false, fmt.Errorf("config artifact not found: %s", id)

@@ -217,6 +217,15 @@ func (s *Server) storeArtifactReport(r *http.Request, agentID string, rep *proxy
 	existing, err := s.db.GetConfigArtifact(rep.ArtifactID)
 	notFound := err != nil
 
+	// Ownership guard: artifact IDs are a global namespace, but an agent may only
+	// mutate its OWN artifacts. Refuse a cross-agent write (e.g. agent-2 ACKing
+	// agent-1's artifact ID) — log it and leave the stored artifact untouched. This
+	// is defense in depth alongside agent-scoped adopted IDs.
+	if !notFound && existing.AgentID != agentID {
+		log.Printf("ack: agent %s attempted to write artifact %s owned by agent %s; refusing", agentID, rep.ArtifactID, existing.AgentID)
+		return
+	}
+
 	// A per-artifact apply failure: flag the stored artifact (if any) as
 	// apply_failed; nothing to version (the rendered content never went live).
 	if rep.Error != "" {
