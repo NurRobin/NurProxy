@@ -563,6 +563,26 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		}
 	}
 
+	// Carry forward the managed entries for Keep'd paths (drifted artifacts the
+	// orchestrator retained but did not re-push). Keeping them in the managed set
+	// means the heartbeat keeps reporting their checksum, so the drift auto-clears
+	// when the operator reverts the file and drift_content refreshes on a re-edit
+	// (§11). Their last-applied checksum is the accepted baseline the orchestrator
+	// compares against, so this never masks a genuine divergence.
+	if len(set.Keep) > 0 {
+		keepPaths := make(map[string]bool, len(set.Keep))
+		for _, p := range set.Keep {
+			keepPaths[p] = true
+		}
+		c.managedMu.RLock()
+		for id, m := range c.managed {
+			if _, alreadyApplied := managed[id]; !alreadyApplied && keepPaths[m.targetPath] {
+				managed[id] = m
+			}
+		}
+		c.managedMu.RUnlock()
+	}
+
 	// Replace the managed snapshot so the heartbeat reports exactly what is live
 	// now (additions and removals both reflected).
 	c.setManaged(managed)

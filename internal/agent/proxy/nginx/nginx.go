@@ -562,7 +562,7 @@ func (b *Backend) writeHtpasswd(host, user, hash string) (string, error) {
 	}
 	path := b.authFilePath(host)
 	line := fmt.Sprintf("%s:%s\n", user, hash)
-	if err := os.WriteFile(path, []byte(line), 0o640); err != nil {
+	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
 		return "", fmt.Errorf("writing htpasswd %q: %w", path, err)
 	}
 	return path, nil

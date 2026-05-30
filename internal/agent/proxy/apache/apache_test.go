@@ -5,11 +5,94 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
+
+// TestPrune_removesOrphanedGeneratedKeepsOperator mirrors the nginx Prune test:
+// Prune deletes only NurProxy-generated vhosts absent from the keep set, never an
+// operator's adopted config, reloads once, and drops the htpasswd sidecar too.
+func TestPrune_removesOrphanedGeneratedKeepsOperator(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout := newDebianBackend(t, r)
+	ctx := context.Background()
+
+	keep := sampleArtifact(b, "keep.example.com", "<VirtualHost *:80></VirtualHost>\n")
+	orphan := sampleArtifact(b, "gone.example.com", "<VirtualHost *:80></VirtualHost>\n")
+	if err := b.Apply(ctx, []proxy.Artifact{keep, orphan}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	operatorPath := filepath.Join(layout.Available, "operator-site.conf")
+	if err := os.WriteFile(operatorPath, []byte("<VirtualHost *:80></VirtualHost>\n"), 0o644); err != nil {
+		t.Fatalf("seeding operator file: %v", err)
+	}
+	orphanAuth := strings.TrimSuffix(orphan.Target.Path, ".conf") + htpasswdSuffix
+	if err := os.WriteFile(orphanAuth, []byte("admin:x\n"), 0o644); err != nil {
+		t.Fatalf("seeding orphan htpasswd: %v", err)
+	}
+
+	r.reloads = 0
+	n, err := b.Prune(ctx, []proxy.Target{keep.Target})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("pruned = %d, want 1", n)
+	}
+	if _, err := os.Stat(orphan.Target.Path); !os.IsNotExist(err) {
+		t.Errorf("orphaned generated vhost still present")
+	}
+	if _, err := os.Stat(orphanAuth); !os.IsNotExist(err) {
+		t.Errorf("orphaned htpasswd sidecar not removed")
+	}
+	if _, err := os.Stat(keep.Target.Path); err != nil {
+		t.Errorf("kept vhost was removed: %v", err)
+	}
+	if _, err := os.Stat(operatorPath); err != nil {
+		t.Errorf("operator config was removed — must never be pruned: %v", err)
+	}
+	if r.reloads != 1 {
+		t.Errorf("reloads = %d, want 1", r.reloads)
+	}
+}
+
+// TestRender_basicAuth_writesHtpasswdAndReferencesIt proves basic auth is functional
+// on apache: Render writes the htpasswd from the intent's bcrypt entry and the vhost
+// references it via AuthUserFile (instead of dropping it).
+func TestRender_basicAuth_writesHtpasswdAndReferencesIt(t *testing.T) {
+	b, _ := newDebianBackend(t, &fakeRunner{})
+	route := proxymodel.Route{
+		Host:     "secure.example.com",
+		Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8080},
+		BasicAuth: &proxymodel.BasicAuth{
+			Username:     "admin",
+			PasswordHash: "$2y$05$abcdefghijklmnopqrstuvWXYZ0123456789abcdefghijklmO",
+		},
+	}
+	art, err := b.Render(context.Background(), route)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(art.Content, "AuthType Basic") || !strings.Contains(art.Content, "AuthUserFile") {
+		t.Errorf("vhost missing basic-auth directives:\n%s", art.Content)
+	}
+	for _, w := range art.Warnings {
+		if strings.Contains(w, "basic_auth") {
+			t.Errorf("basic_auth should NOT be dropped now: %q", w)
+		}
+	}
+	authPath := b.authFilePath("secure.example.com")
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("htpasswd not written: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "admin:$2y$05$abcdefghijklmnopqrstuvWXYZ0123456789abcdefghijklmO" {
+		t.Errorf("htpasswd content = %q", got)
+	}
+}
 
 // fakeRunner is an injectable Runner that records calls and returns canned
 // results so Apply's atomic orchestration is testable without a real apache.
