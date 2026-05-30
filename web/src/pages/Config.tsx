@@ -193,13 +193,38 @@ function ArtifactRow({ artifact, active, onClick }: { artifact: ConfigArtifact; 
       }`}
     >
       <div className="min-w-0">
-        <p className="truncate font-mono text-sm font-medium text-fg">{shortPath(artifact.target.path)}</p>
+        <p className="truncate font-mono text-sm font-medium text-fg">{fileName(artifact.target.path)}</p>
         <p className="truncate text-xs text-fg-faint">
+          {parentDir(artifact.target.path) && <span className="font-mono">{parentDir(artifact.target.path)} · </span>}
           {artifact.backend} · {t(`config.source.${artifact.source}`)}
         </p>
       </div>
-      <ArtifactStatusBadge state={artifact.apply_state} />
+      <ArtifactRowBadge artifact={artifact} />
     </button>
+  );
+}
+
+// ArtifactRowBadge picks the most important state for the compact list row. A
+// lifecycle problem (drift / apply-failed) takes precedence as a warning; with no
+// problem, the badge reflects whether the artifact is actually ENABLED on the host
+// (e.g. nginx sites-enabled symlink present) rather than always reading "live".
+// This keeps a disabled vhost or a .bak file from showing a misleading green
+// "active".
+function ArtifactRowBadge({ artifact }: { artifact: ConfigArtifact }) {
+  const { t } = useTranslation();
+  if (artifact.apply_state !== 'live') {
+    return <ArtifactStatusBadge state={artifact.apply_state} />;
+  }
+  const on = artifact.enabled;
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${
+        on ? 'bg-success-soft text-success-fg' : 'bg-surface-2 text-fg-muted'
+      }`}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${on ? 'bg-success' : 'bg-fg-faint'}`} />
+      {on ? t('config.enabledState.on') : t('config.enabledState.off')}
+    </span>
   );
 }
 
@@ -675,4 +700,19 @@ function shortPath(p: string): string {
   if (p.length <= 32) return p;
   const parts = p.split('/');
   return '…/' + parts.slice(-2).join('/');
+}
+
+// fileName returns just the basename of a host path, for the compact list row —
+// the full path is shown as a dimmed subtitle so context is not lost. A caddy
+// virtual route handle ("caddy:route:<id>") has no slash, so it returns as-is.
+function fileName(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
+// parentDir returns the directory portion of a host path (everything before the
+// basename), shortened, or "" when there is none.
+function parentDir(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i > 0 ? shortPath(p.slice(0, i)) : '';
 }

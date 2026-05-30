@@ -597,6 +597,10 @@
       "drifted": "Drifted",
       "apply_failed": "Apply failed"
     },
+    "enabledState": {
+      "on": "Enabled",
+      "off": "Inactive"
+    },
     "viewForm": "Form",
     "viewRaw": "Raw",
     "maskFailed": "Failed to parse the structured view.",
