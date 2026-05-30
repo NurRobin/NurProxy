@@ -133,6 +133,27 @@ func (d *DB) GetConfigArtifact(id string) (*models.ConfigArtifact, error) {
 	return art, nil
 }
 
+// GetConfigArtifactByTarget retrieves the artifact occupying a given on-host
+// target (agent_id, target_kind, target_path) — the table's uniqueness key. It
+// lets the adopt path detect that a file is ALREADY tracked under another
+// artifact ID (e.g. a generated "dom-N" the agent just applied) so it skips
+// creating a duplicate "adopt-…" row that would violate the unique constraint.
+// Returns (nil, nil) when no artifact occupies that target.
+func (d *DB) GetConfigArtifactByTarget(agentID, targetKind, targetPath string) (*models.ConfigArtifact, error) {
+	row := d.sql.QueryRow(
+		"SELECT "+configArtifactColumns+" FROM config_artifacts WHERE agent_id = ? AND target_kind = ? AND target_path = ?",
+		agentID, targetKind, targetPath,
+	)
+	art, err := scanConfigArtifact(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying config artifact by target: %w", err)
+	}
+	return art, nil
+}
+
 // ListConfigArtifacts returns artifacts matching the filter, newest-updated
 // first.
 func (d *DB) ListConfigArtifacts(filter ConfigArtifactFilter) ([]models.ConfigArtifact, error) {

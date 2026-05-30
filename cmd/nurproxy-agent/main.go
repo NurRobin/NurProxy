@@ -185,9 +185,18 @@ func main() {
 	// taken by nginx) must NOT stop the agent from connecting and explaining why.
 	hs := health.New()
 
-	// Step 2: Start Caddy subprocess. Failures here are reported, not fatal.
+	// In existing mode the host's nginx/apache owns :80/:443, so the bundled Caddy
+	// must not run — starting it only spawns a subprocess that fails to bind those
+	// ports and logs a spurious "permission denied" error. The Holder is switched
+	// onto the file backend below; Caddy stays dormant.
+	existingMode := cfg.ProxyMode == agentconfig.ProxyModeExisting
+
+	// Step 2: Start Caddy subprocess (built-in mode only). Failures are reported,
+	// not fatal.
 	caddyProc := caddy.NewProcess(cfg.CaddyAdminPort)
-	if err := caddyProc.Start(ctx); err != nil {
+	if existingMode {
+		log.Printf("Existing mode: not starting the bundled Caddy (the host proxy owns :80/:443)")
+	} else if err := caddyProc.Start(ctx); err != nil {
 		log.Printf("WARNING: failed to start Caddy: %v (continuing — agent stays connected)", err)
 		hs.SetCaddyRunning(false)
 		hs.SetError(fmt.Sprintf("failed to start Caddy: %v", err))
@@ -258,9 +267,13 @@ func main() {
 		RemoveRoute(context.Context, string) error
 	} = caddyBackend
 
-	// Ensure the HTTP server exists in Caddy. A bind failure here is the classic
-	// "ports 80/443 already in use" case — report it clearly and keep running.
-	if err := caddyBackend.EnsureServer(ctx); err != nil {
+	// Ensure the HTTP server exists in Caddy (built-in mode only). A bind failure
+	// here is the classic "ports 80/443 already in use" case — report it clearly
+	// and keep running. In existing mode the bundled Caddy is dormant, so binding
+	// the ports would only fail against the host proxy; skip it entirely.
+	if existingMode {
+		hs.SetCaddyRunning(false)
+	} else if err := caddyBackend.EnsureServer(ctx); err != nil {
 		log.Printf("WARNING: Caddy could not start its HTTP server: %v", err)
 		hs.SetCaddyRunning(false)
 		hs.SetError(fmt.Sprintf("Caddy could not bind :80/:443 — are the ports already in use (nginx/apache)? %v", err))
@@ -311,7 +324,7 @@ func main() {
 	// exact same live state as a §19 apply — the Holder reports mode "existing" on
 	// the next beat instead of silently reverting to built-in. Fail-soft: a missing
 	// grant is reported via health, never crashes. Built-in mode skips this entirely.
-	if cfg.ProxyMode == agentconfig.ProxyModeExisting {
+	if existingMode {
 		res := holder.Reconfigure(ctx, proxy.ReconfigureRequest{
 			Mode:      "existing",
 			Type:      cfg.ProxyType,
