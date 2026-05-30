@@ -49,7 +49,17 @@ export default function Overview() {
   const errors = count(agents, 'error') + count(domains, 'error');
   const offline = count(agents, 'offline');
   const pendingAgents = count(agents, 'pending');
-  const healthy = errors === 0 && offline === 0;
+  // A degraded agent is connected (status adopted) but reporting an operational
+  // error or a failed §12 permission self-test — e.g. existing-mode nginx it
+  // can't reload. Status alone misses these, which is why the banner used to read
+  // "all normal" while an agent clearly wasn't. Don't double-count offline agents.
+  const degraded = agents.filter(
+    (a) =>
+      a.status !== 'offline' &&
+      (!!a.last_error || !!(a.proxy_permissions?.checked && !a.proxy_permissions.ok)),
+  ).length;
+  const problemCount = errors + offline + degraded;
+  const healthy = problemCount === 0;
 
   if (loading) {
     return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
@@ -77,7 +87,7 @@ export default function Overview() {
             </span>
             <div>
               <p className="font-medium text-fg">
-                {healthy ? t('overview.allNormal') : t('overview.attention', { count: errors + offline })}
+                {healthy ? t('overview.allNormal') : t('overview.attention', { count: problemCount })}
               </p>
               <p className="text-sm text-fg-muted">
                 {t('overview.summary', { agents: t('counts.agents', { count: agents.length }), domains: t('counts.domains', { count: domains.length }) })}
@@ -89,6 +99,11 @@ export default function Overview() {
             {errors > 0 && (
               <Link to="/domains" className="rounded-lg bg-danger-soft px-3 py-1.5 text-sm font-medium text-danger-fg hover:brightness-105">
                 {t('overview.errorsLink', { count: errors })}
+              </Link>
+            )}
+            {degraded > 0 && (
+              <Link to="/agents" className="rounded-lg bg-warning-soft px-3 py-1.5 text-sm font-medium text-warning-fg hover:brightness-105">
+                {t('overview.degradedLink', { count: degraded })}
               </Link>
             )}
             {offline > 0 && (

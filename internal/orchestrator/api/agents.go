@@ -458,9 +458,12 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if req.CaddyRunning != nil && prev.CaddyRunning != caddyRunning {
 		s.audit(r, "agent", id, "caddy_state", fmt.Sprintf("caddy_running=%t", caddyRunning))
 	}
-	if prev.LastError != req.LastError && req.LastError != "" {
-		s.audit(r, "agent", id, "agent_error", req.LastError)
-	}
+	// NOTE: a recurring agent health error (e.g. an existing-mode reload-permission
+	// denial re-probed every beat) is live telemetry, not an audit event — it is
+	// surfaced as current state via the agent's last_error + proxy_permissions, and
+	// auditing it on every beat just spams the timeline. So we deliberately do NOT
+	// audit agent_error here; the audit log records actions and real transitions
+	// (adopt/reject/update/delete, online/offline, caddy_state, proxy_mode switch).
 	// Audit a live proxy-mode change (e.g. a §19 hot-switch to existing nginx) so
 	// operators see the backend flip in the timeline. Only when the agent actually
 	// reported a mode and it differs from what we had.
