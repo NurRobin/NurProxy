@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView } from './types';
 
 const BASE = '/api/v1';
 
@@ -11,6 +11,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const body = await res.text();
     throw new Error(`API error ${res.status}: ${body}`);
   }
+  // 204 No Content (and other empty bodies) have nothing to parse — return
+  // undefined rather than letting res.json() throw on the empty stream.
+  if (res.status === 204) return undefined as T;
   return res.json();
 }
 
@@ -147,6 +150,19 @@ export const api = {
     request<LogTailPoll>(`/agents/${agentId}/logs/tail/${sessionId}?cursor=${cursor}`),
   stopLogTail: (agentId: string, sessionId: string) =>
     request<{ status: string }>(`/agents/${agentId}/logs/tail/${sessionId}`, { method: 'DELETE' }),
+
+  // Agent admin-change channel (§19): prepare a pending op (returns a one-time
+  // confirmation code), list the agent's pending ops, or cancel one. The
+  // privileged apply stays gated on local shell presence on the host.
+  prepareAdminOp: (agentId: string, opType: AdminOpType, payload: unknown) =>
+    request<PreparedAdminOp>(`/agents/${agentId}/admin-ops`, {
+      method: 'POST',
+      body: JSON.stringify({ op_type: opType, payload }),
+    }),
+  listAdminOps: (agentId: string) =>
+    request<{ ops: AdminOpView[] }>(`/agents/${agentId}/admin-ops`),
+  cancelAdminOp: (agentId: string, opId: string) =>
+    request<void>(`/agents/${agentId}/admin-ops/${opId}`, { method: 'DELETE' }),
 
   // Admin API key
   getAPIKey: () => request<{ exists: boolean; masked?: string }>('/api-key'),

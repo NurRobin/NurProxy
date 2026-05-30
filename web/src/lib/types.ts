@@ -140,6 +140,41 @@ export interface Setting {
   updated_at: string;
 }
 
+/** Op type for a pending agent admin op (§19). Only set_proxy_mode for now. */
+export type AdminOpType = 'set_proxy_mode';
+
+/** Lifecycle of a pending admin op (§19). */
+export type AdminOpStatus = 'pending' | 'applied' | 'expired' | 'canceled';
+
+/** Payload for a set_proxy_mode admin op (§19). Mirrors the agent config keys. */
+export interface SetProxyModePayload {
+  proxy_mode: 'existing' | 'built-in';
+  proxy_type?: string;
+  proxy_config_dir?: string;
+  proxy_reload_cmd?: string;
+  proxy_test_cmd?: string;
+  proxy_service?: string;
+  proxy_log_paths?: string[];
+}
+
+/** The one-time result of preparing an admin op — the code is shown only here (§19). */
+export interface PreparedAdminOp {
+  id: string;
+  code: string;
+  expires_at: string;
+}
+
+/** The code-free projection of a pending admin op returned to the dashboard (§19). */
+export interface AdminOpView {
+  id: string;
+  op_type: AdminOpType;
+  status: AdminOpStatus;
+  created_at: string;
+  expires_at: string;
+  applied_at?: string;
+  result?: string;
+}
+
 export type ArtifactSource = 'generated' | 'manual';
 export type ArtifactApplyState = 'live' | 'drifted' | 'apply_failed';
 export type TargetKind = 'file' | 'caddy-route';
