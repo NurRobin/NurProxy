@@ -163,6 +163,9 @@ export interface ProxyConfig {
   custom_request_headers?: Record<string, string>;
   custom_response_headers?: Record<string, string>;
   upstream_scheme?: string;
+  // tls_policy selects how the public-listener cert is provisioned:
+  // "central" (DNS-01 provided cert, the default), "self-acme", or "off".
+  tls_policy?: string;
 }
 
 export interface AuditLogEntry {

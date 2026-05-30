@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -130,6 +131,36 @@ func TestRenewer_EnsureCertForHost_noTargetIsNoOp(t *testing.T) {
 	}
 	if len(store.saved) != 0 {
 		t.Errorf("nothing should be issued when no target resolves, saved=%v", store.saved)
+	}
+}
+
+func TestRenewer_notConfigured_skipsQuietly(t *testing.T) {
+	fp := newFakeProvider("TXT")
+	acme := &fakeACME{err: ErrACMENotConfigured}
+	audit := &fakeAudit{}
+
+	// RunOnce: a target whose issuance reports "not configured" is not a failure —
+	// the scan returns nil, nothing is saved, and no per-host failure is audited.
+	store := &fakeStore{
+		due:     []RenewTarget{{Host: "a.example.com", Names: []string{"a.example.com"}, Provider: fp}},
+		forHost: map[string]*RenewTarget{"a.example.com": {Host: "a.example.com", Names: []string{"a.example.com"}, Provider: fp}},
+	}
+	r := newRenewer(store, acme, &fakeReloader{}, audit)
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce should swallow not-configured: %v", err)
+	}
+	if len(store.saved) != 0 {
+		t.Errorf("nothing should be saved when ACME is not configured: %v", store.saved)
+	}
+	for _, e := range audit.events {
+		if strings.Contains(e, "renew_failed") || strings.Contains(e, "issue_failed") {
+			t.Errorf("not-configured must not audit a failure, got %q", e)
+		}
+	}
+
+	// EnsureCertForHost: likewise a quiet no-op (no error to the caller).
+	if err := r.EnsureCertForHost(context.Background(), "a.example.com"); err != nil {
+		t.Fatalf("EnsureCertForHost should swallow not-configured: %v", err)
 	}
 }
 
