@@ -54,6 +54,7 @@ func (seedBackend) Render(context.Context, proxymodel.Route) (proxy.Artifact, er
 func (seedBackend) ReadManaged(context.Context) ([]proxy.Artifact, error)  { return nil, nil }
 func (seedBackend) Apply(context.Context, []proxy.Artifact) error          { return nil }
 func (seedBackend) Remove(context.Context, proxy.Target) error             { return nil }
+func (seedBackend) Prune(context.Context, []proxy.Target) (int, error)     { return 0, nil }
 func (seedBackend) Validate(context.Context) error                         { return nil }
 func (seedBackend) InstallCerts(context.Context, []proxy.CertBundle) error { return nil }
 

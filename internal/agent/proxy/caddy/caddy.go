@@ -284,6 +284,14 @@ func (b *Backend) RemoveRoute(ctx context.Context, routeID string) error {
 	return b.client.RemoveRoute(ctx, routeID)
 }
 
+// Prune is a no-op for the admin-API Caddy: applyIntents calls ClearRoutes before
+// re-adding the desired set, so a route absent from the set is already gone — there
+// is no orphaned on-disk vhost to remove (unlike the file backends). It satisfies
+// the proxy.Proxy interface uniformly.
+func (b *Backend) Prune(_ context.Context, _ []proxy.Target) (int, error) {
+	return 0, nil
+}
+
 // Remove deletes a single route from the live config by its admin-API @id,
 // derived from the target handle (§3, no ghost routes).
 func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {

@@ -63,6 +63,15 @@ type Proxy interface {
 	// leaving no ghost vhosts (§3).
 	Remove(ctx context.Context, target Target) error
 
+	// Prune removes every NurProxy-generated artifact the backend manages that is
+	// NOT in keep, leaving no ghost vhost when a domain is deleted (§3). The agent
+	// calls it after applying the full desired intent set received over its
+	// dial-out stream, so removal never needs an inbound probe (invariant #2). It
+	// only ever touches NurProxy-generated files (the nurproxy- prefix), never an
+	// operator's adopted config. The admin-API Caddy is a no-op: ClearRoutes
+	// already drops routes absent from the set. Returns the number removed.
+	Prune(ctx context.Context, keep []Target) (int, error)
+
 	// Validate checks the live config without applying changes (nginx -t /
 	// apachectl configtest / caddy validate).
 	Validate(ctx context.Context) error

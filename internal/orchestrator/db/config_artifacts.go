@@ -89,7 +89,7 @@ func (d *DB) CreateConfigArtifact(art *models.ConfigArtifact, actor, note string
 
 const configArtifactColumns = `id, agent_id, backend, target_kind, target_path,
 	source, domain_id, content, checksum, live_version, enabled, drifted,
-	apply_state, last_error, updated_at`
+	apply_state, last_error, drift_content, updated_at`
 
 func scanConfigArtifact(sc interface {
 	Scan(dest ...any) error
@@ -102,7 +102,7 @@ func scanConfigArtifact(sc interface {
 	err := sc.Scan(
 		&art.ID, &art.AgentID, &art.Backend, &art.Target.Kind, &art.Target.Path,
 		&art.Source, &domainID, &art.Content, &art.Checksum, &art.LiveVersion,
-		&enabled, &drifted, &art.ApplyState, &art.LastError, &updatedAt,
+		&enabled, &drifted, &art.ApplyState, &art.LastError, &art.DriftContent, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -255,7 +255,7 @@ func (d *DB) AppendConfigArtifactVersion(artifactID, content string, source mode
 	if configeq.Equal(backend, curContent, content) {
 		if _, err := tx.Exec(`
 			UPDATE config_artifacts
-			SET drifted = 0, apply_state = ?, last_error = '', updated_at = ?
+			SET drifted = 0, apply_state = ?, last_error = '', drift_content = '', updated_at = ?
 			WHERE id = ?`,
 			models.ArtifactStateLive, now.Format(time.RFC3339), artifactID,
 		); err != nil {
@@ -282,7 +282,7 @@ func (d *DB) AppendConfigArtifactVersion(artifactID, content string, source mode
 	if _, err := tx.Exec(`
 		UPDATE config_artifacts
 		SET content = ?, checksum = ?, live_version = ?, source = ?,
-			drifted = 0, apply_state = ?, last_error = '', updated_at = ?
+			drifted = 0, apply_state = ?, last_error = '', drift_content = '', updated_at = ?
 		WHERE id = ?`,
 		content, checksum, next, source, models.ArtifactStateLive,
 		now.Format(time.RFC3339), artifactID,
@@ -394,7 +394,7 @@ func (d *DB) MarkConfigArtifactDrifted(id string) error {
 // changed reports whether this call actually transitioned the drift state (so the
 // caller can audit only genuine transitions, not every heartbeat). An artifact in
 // apply_failed state is left untouched (the failure, not drift, is the story).
-func (d *DB) ReconcileArtifactChecksum(id, agentID, onDiskChecksum string) (drifted, changed bool, err error) {
+func (d *DB) ReconcileArtifactChecksum(id, agentID, onDiskChecksum, onDiskContent string) (drifted, changed bool, err error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	tx, err := d.sql.Begin()
@@ -425,10 +425,10 @@ func (d *DB) ReconcileArtifactChecksum(id, agentID, onDiskChecksum string) (drif
 	matches := onDiskChecksum == accepted
 	switch {
 	case matches && wasDrifted != 0:
-		// Host came back into agreement — clear drift.
+		// Host came back into agreement — clear drift and the captured on-disk bytes.
 		if _, err := tx.Exec(`
 			UPDATE config_artifacts
-			SET drifted = 0, apply_state = ?, last_error = '', updated_at = ?
+			SET drifted = 0, apply_state = ?, last_error = '', drift_content = '', updated_at = ?
 			WHERE id = ?`,
 			models.ArtifactStateLive, now, id,
 		); err != nil {
@@ -436,18 +436,30 @@ func (d *DB) ReconcileArtifactChecksum(id, agentID, onDiskChecksum string) (drif
 		}
 		return false, true, tx.Commit()
 	case !matches && wasDrifted == 0:
-		// Newly diverged — flag for review. Stored content is left intact.
+		// Newly diverged — flag for review and capture the operator's on-disk bytes
+		// so the dashboard can diff accepted vs on-disk and Accept can persist them
+		// (§11). The accepted content (content/checksum) is left intact.
 		if _, err := tx.Exec(`
 			UPDATE config_artifacts
-			SET drifted = 1, apply_state = ?, updated_at = ?
+			SET drifted = 1, apply_state = ?, drift_content = ?, updated_at = ?
 			WHERE id = ?`,
-			models.ArtifactStateDrifted, now, id,
+			models.ArtifactStateDrifted, onDiskContent, now, id,
 		); err != nil {
 			return false, false, fmt.Errorf("flagging drift: %w", err)
 		}
 		return true, true, tx.Commit()
+	case !matches && wasDrifted != 0 && onDiskContent != "":
+		// Still drifted but the operator edited again — refresh the captured bytes so
+		// the diff/Accept reflect the latest on-disk state. Not a flag transition.
+		if _, err := tx.Exec(`
+			UPDATE config_artifacts SET drift_content = ?, updated_at = ? WHERE id = ?`,
+			onDiskContent, now, id,
+		); err != nil {
+			return true, false, fmt.Errorf("updating drift content: %w", err)
+		}
+		return true, false, tx.Commit()
 	default:
-		// No transition (matches && live, or differs && already drifted).
+		// No transition (matches && live, or differs && already drifted, no content).
 		return wasDrifted != 0, false, tx.Commit()
 	}
 }
@@ -461,7 +473,7 @@ func (d *DB) RejectConfigArtifactDrift(id string) (*models.ConfigArtifact, error
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
 		UPDATE config_artifacts
-		SET drifted = 0, apply_state = ?, last_error = '', updated_at = ?
+		SET drifted = 0, apply_state = ?, last_error = '', drift_content = '', updated_at = ?
 		WHERE id = ?`,
 		models.ArtifactStateLive, now, id,
 	)

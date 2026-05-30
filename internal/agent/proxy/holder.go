@@ -135,6 +135,13 @@ func (h *Holder) Remove(ctx context.Context, target Target) error {
 	return h.current.Remove(ctx, target)
 }
 
+// Prune forwards to the current backend.
+func (h *Holder) Prune(ctx context.Context, keep []Target) (int, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.current.Prune(ctx, keep)
+}
+
 // Validate forwards to the current backend.
 func (h *Holder) Validate(ctx context.Context) error {
 	h.mu.RLock()

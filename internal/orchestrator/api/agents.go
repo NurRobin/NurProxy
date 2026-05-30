@@ -511,7 +511,7 @@ func (s *Server) reconcileArtifactChecksums(r *http.Request, agentID string, che
 		if c.ArtifactID == "" {
 			continue
 		}
-		drifted, changed, err := s.db.ReconcileArtifactChecksum(c.ArtifactID, agentID, c.Checksum)
+		drifted, changed, err := s.db.ReconcileArtifactChecksum(c.ArtifactID, agentID, c.Checksum, c.Content)
 		if err != nil {
 			// Unknown/absent artifact is expected before its first apply-ACK lands;
 			// log at low volume and move on.

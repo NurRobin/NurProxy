@@ -375,11 +375,12 @@ function ArtifactDetail({
   // The accepted (live) version's content, for the drift diff baseline.
   const liveVersion = versions.find((v) => v.version === artifact.live_version);
   const liveContent = liveVersion?.content ?? artifact.content;
-  // The orchestrator preserves the accepted content while an artifact is drifted
-  // and learns the on-disk bytes only on the next apply-ACK (the heartbeat carries
-  // just a checksum). So when the stored content still equals the accepted state
-  // we have a checksum mismatch but no on-disk bytes to diff yet.
-  const onDiskCaptured = artifact.content !== liveContent;
+  // While drifted, the heartbeat ships the operator's on-disk bytes in drift_content
+  // (the accepted content stays in `content`). So we can show a real accepted-vs-on-disk
+  // diff and Accept persists drift_content. A file-less backend (admin-API Caddy) reports
+  // a checksum only, leaving drift_content empty.
+  const onDiskContent = artifact.drift_content ?? '';
+  const onDiskCaptured = onDiskContent !== '';
 
   return (
     <div className="rounded-xl border border-border bg-surface p-6 shadow-card">
@@ -420,7 +421,7 @@ function ArtifactDetail({
             {onDiskCaptured ? (
               <DiffView
                 before={liveContent}
-                after={artifact.content}
+                after={onDiskContent}
                 beforeLabel={t('config.accepted')}
                 afterLabel={t('config.onDisk')}
               />

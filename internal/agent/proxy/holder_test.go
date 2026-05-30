@@ -53,7 +53,11 @@ func (r *recordingBackend) ReadManaged(context.Context) ([]Artifact, error) {
 }
 func (r *recordingBackend) Apply(context.Context, []Artifact) error { r.mark("Apply"); return r.err }
 func (r *recordingBackend) Remove(context.Context, Target) error    { r.mark("Remove"); return r.err }
-func (r *recordingBackend) Validate(context.Context) error          { r.mark("Validate"); return r.err }
+func (r *recordingBackend) Prune(context.Context, []Target) (int, error) {
+	r.mark("Prune")
+	return 0, r.err
+}
+func (r *recordingBackend) Validate(context.Context) error { r.mark("Validate"); return r.err }
 func (r *recordingBackend) InstallCerts(context.Context, []CertBundle) error {
 	r.mark("InstallCerts")
 	return r.err
@@ -189,5 +193,6 @@ func (proxyOnly) Render(context.Context, proxymodel.Route) (Artifact, error) {
 func (proxyOnly) ReadManaged(context.Context) ([]Artifact, error)  { return nil, nil }
 func (proxyOnly) Apply(context.Context, []Artifact) error          { return nil }
 func (proxyOnly) Remove(context.Context, Target) error             { return nil }
+func (proxyOnly) Prune(context.Context, []Target) (int, error)     { return 0, nil }
 func (proxyOnly) Validate(context.Context) error                   { return nil }
 func (proxyOnly) InstallCerts(context.Context, []CertBundle) error { return nil }

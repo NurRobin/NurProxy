@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
@@ -95,6 +96,99 @@ func sampleArtifact(b *Backend, host, content string) proxy.Artifact {
 		Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: b.layout.AvailablePath(host)},
 		Content: content,
 		Enabled: true,
+	}
+}
+
+// TestRender_basicAuth_writesHtpasswdAndReferencesIt proves basic auth is now
+// functional on nginx: Render materializes the htpasswd file from the intent's
+// bcrypt entry and the rendered vhost references it via auth_basic_user_file
+// (instead of dropping basic auth with a warning).
+func TestRender_basicAuth_writesHtpasswdAndReferencesIt(t *testing.T) {
+	b, _ := newBackend(t, &fakeRunner{})
+	route := proxymodel.Route{
+		Host:     "secure.example.com",
+		Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8080},
+		BasicAuth: &proxymodel.BasicAuth{
+			Username:     "admin",
+			PasswordHash: "$2y$12$abcdefghijklmnopqrstuvwxyzABCDEF0123456789abcdeF",
+		},
+	}
+	art, err := b.Render(context.Background(), route)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(art.Content, "auth_basic ") || !strings.Contains(art.Content, "auth_basic_user_file") {
+		t.Errorf("rendered vhost missing basic-auth directives:\n%s", art.Content)
+	}
+	for _, w := range art.Warnings {
+		if strings.Contains(w, "basic_auth") {
+			t.Errorf("basic_auth should NOT be dropped now: %q", w)
+		}
+	}
+	authPath := b.authFilePath("secure.example.com")
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("htpasswd not written: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "admin:$2y$12$abcdefghijklmnopqrstuvwxyzABCDEF0123456789abcdeF" {
+		t.Errorf("htpasswd content = %q", got)
+	}
+	if !strings.Contains(art.Content, authPath) {
+		t.Errorf("vhost does not reference the htpasswd path %q:\n%s", authPath, art.Content)
+	}
+}
+
+// TestPrune_removesOrphanedGeneratedKeepsOperatorAndDesired proves Prune deletes
+// only NurProxy-generated vhosts absent from the keep set (a deleted domain's
+// leftover, §3 no ghost vhost), never an operator's adopted config, and reloads
+// once when something was removed.
+func TestPrune_removesOrphanedGeneratedKeepsOperatorAndDesired(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout := newBackend(t, r)
+	ctx := context.Background()
+
+	keep := sampleArtifact(b, "keep.example.com", "server { listen 80; }\n")   // generated, stays
+	orphan := sampleArtifact(b, "gone.example.com", "server { listen 80; }\n") // generated, deleted
+	if err := b.Apply(ctx, []proxy.Artifact{keep, orphan}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	// An operator-authored config (no nurproxy- prefix) must never be touched.
+	operatorPath := filepath.Join(layout.Available, "operator-site.conf")
+	if err := os.WriteFile(operatorPath, []byte("server { listen 80; }\n"), 0o644); err != nil {
+		t.Fatalf("seeding operator file: %v", err)
+	}
+
+	r.reloads = 0
+	n, err := b.Prune(ctx, []proxy.Target{keep.Target})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("pruned = %d, want 1", n)
+	}
+	if _, err := os.Stat(orphan.Target.Path); !os.IsNotExist(err) {
+		t.Errorf("orphaned generated vhost still present: %v", err)
+	}
+	if _, err := os.Stat(layout.EnabledPath("gone.example.com")); !os.IsNotExist(err) {
+		t.Errorf("orphaned symlink still present")
+	}
+	if _, err := os.Stat(keep.Target.Path); err != nil {
+		t.Errorf("kept generated vhost was removed: %v", err)
+	}
+	if _, err := os.Stat(operatorPath); err != nil {
+		t.Errorf("operator config was removed — must never be pruned: %v", err)
+	}
+	if r.reloads != 1 {
+		t.Errorf("reload calls = %d, want 1 (one reload after pruning)", r.reloads)
+	}
+
+	// A second prune with the same keep set removes nothing and does not reload.
+	r.reloads = 0
+	if n, err := b.Prune(ctx, []proxy.Target{keep.Target}); err != nil || n != 0 {
+		t.Errorf("idempotent prune: n=%d err=%v, want 0,nil", n, err)
+	}
+	if r.reloads != 0 {
+		t.Errorf("no-op prune reloaded %d times, want 0", r.reloads)
 	}
 }
 

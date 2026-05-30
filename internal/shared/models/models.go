@@ -416,8 +416,13 @@ type ConfigArtifact struct {
 	// ApplyState is the lifecycle status (live | apply_failed | drifted).
 	ApplyState ArtifactApplyState `json:"apply_state"`
 	// LastError is the most recent apply/validate/reload error, if any.
-	LastError string    `json:"last_error,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	LastError string `json:"last_error,omitempty"`
+	// DriftContent is the operator's on-disk content captured while the artifact is
+	// drifted (§11): the heartbeat ships the diverged bytes so the dashboard can
+	// diff accepted (Content) vs on-disk (DriftContent) and Accept can persist them.
+	// Empty when the artifact is in agreement.
+	DriftContent string    `json:"drift_content,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // ConfigArtifactVersion is one entry in the append-only version history of a

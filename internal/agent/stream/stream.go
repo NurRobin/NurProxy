@@ -54,6 +54,10 @@ type caddyBackend interface {
 	// kind so a file backend actually writes + reloads rather than no-op'ing
 	// through AddRoute.
 	Apply(ctx context.Context, arts []proxy.Artifact) error
+	// Prune removes NurProxy-generated artifacts not in the desired set, so a
+	// deleted domain leaves no ghost vhost (§3). Called after Apply with the full
+	// desired file-target set; a no-op for the admin-API Caddy.
+	Prune(ctx context.Context, keep []proxy.Target) (int, error)
 	Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error)
 	// InstallCerts writes the pushed cert bundles to disk before any referencing
 	// config is applied (preflight ordering, §5). It is called first in
@@ -148,6 +152,7 @@ func (c *Client) ManagedChecksums() []proxymodel.ArtifactChecksum {
 	out := make([]proxymodel.ArtifactChecksum, 0, len(snapshot))
 	for id, m := range snapshot {
 		sum := m.checksum
+		var content string
 		// File backends: the live state is on disk, so re-read and re-checksum the
 		// file each beat. A manual edit since the last apply then diverges from the
 		// accepted checksum and the orchestrator flags drift (§11) — the in-memory
@@ -158,9 +163,16 @@ func (c *Client) ManagedChecksums() []proxymodel.ArtifactChecksum {
 		if m.targetKind == string(proxy.TargetKindFile) && m.targetPath != "" {
 			if data, err := os.ReadFile(m.targetPath); err == nil {
 				sum = checksum(string(data))
+				// Ship the on-disk bytes ONLY when they diverge from the last-applied
+				// state, so the orchestrator can capture the drifted content for the
+				// accepted-vs-on-disk diff and persist it on Accept (§11). A matching
+				// beat carries no content.
+				if sum != m.checksum {
+					content = string(data)
+				}
 			}
 		}
-		out = append(out, proxymodel.ArtifactChecksum{ArtifactID: id, Checksum: sum})
+		out = append(out, proxymodel.ArtifactChecksum{ArtifactID: id, Checksum: sum, Content: content})
 	}
 	return out
 }
@@ -494,12 +506,14 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	// reload). On failure the backend rolls back to the prior on-disk state, so we
 	// attribute the error to every artifact in the batch and track none as live (no
 	// false drift signal for config that never went live).
+	fileApplyOK := true
 	if len(fileArts) > 0 {
 		arts := make([]proxy.Artifact, 0, len(fileArts))
 		for _, fa := range fileArts {
 			arts = append(arts, fa.art)
 		}
 		if err := c.caddy.Apply(ctx, arts); err != nil {
+			fileApplyOK = false
 			log.Printf("Stream: failed to apply %d file artifact(s): %v", len(arts), err)
 			if c.health != nil {
 				c.health.SetError(fmt.Sprintf("failed to apply proxy config: %v", err))
@@ -522,6 +536,30 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 					}
 				}
 			}
+		}
+	}
+
+	// Prune ghost vhosts: any NurProxy-generated file on disk that is NOT in this
+	// (authoritative) desired set is a deleted domain's leftover. The backend removes
+	// it and reloads — over the dial-out stream, never an inbound probe (§3,
+	// invariant #2). Caddy is a no-op (ClearRoutes already handled it). Skipped when
+	// the file apply rolled back, so we never disturb the restored prior state.
+	if fileApplyOK {
+		keep := make([]proxy.Target, 0, len(fileArts)+len(set.Keep))
+		for _, fa := range fileArts {
+			keep = append(keep, fa.art.Target)
+		}
+		// set.Keep carries generated files the orchestrator deliberately did NOT push
+		// this round but the agent must retain — currently drifted artifacts awaiting
+		// review. Including them stops the prune from clobbering a drifted file
+		// (invariant #3, no overwrite while drifted).
+		for _, p := range set.Keep {
+			keep = append(keep, proxy.Target{Kind: proxy.TargetKindFile, Path: p})
+		}
+		if n, err := c.caddy.Prune(ctx, keep); err != nil {
+			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
+		} else if n > 0 {
+			log.Printf("Stream: pruned %d orphaned vhost(s)", n)
 		}
 	}
 

@@ -95,14 +95,21 @@ func (s *Server) handleAcceptArtifact(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		// Content is the reviewed on-disk content to accept as the new live state.
-		// When empty, Accept just clears the drift flag against the already-stored
-		// content (treating the current stored content as accepted).
+		// When empty, Accept falls back to the on-disk bytes the agent captured on
+		// drift (DriftContent) — so the dashboard's one-click Accept persists the
+		// operator's actual edit. If no drift content was captured (e.g. the
+		// admin-API Caddy, whose route is its own live state), it falls back to the
+		// already-stored content, which just re-affirms the accepted state.
 		Content string `json:"content"`
 	}
 	_ = readJSON(r, &body)
 
 	if body.Content == "" {
-		body.Content = art.Content
+		if art.DriftContent != "" {
+			body.Content = art.DriftContent
+		} else {
+			body.Content = art.Content
+		}
 	}
 
 	ver, err := s.db.AppendConfigArtifactVersion(id, body.Content, models.ArtifactSourceManual,
@@ -196,12 +203,14 @@ func (s *Server) handleBulkArtifacts(w http.ResponseWriter, r *http.Request) {
 		art := &arts[i]
 		switch body.Action {
 		case "accept":
-			// Accept the already-stored content as a fresh manual version, clearing
-			// drift. (The heartbeat reported a checksum mismatch; the operator
-			// reviewed the diff and accepts the host's current state. Where the full
-			// on-disk content was captured on the last apply-ACK it is already
-			// stored; otherwise this records the accepted decision and clears drift.)
-			if _, aErr := s.db.AppendConfigArtifactVersion(art.ID, art.Content, models.ArtifactSourceManual, actorFromCtx(r), "bulk accept drift"); aErr != nil {
+			// Accept the operator's on-disk bytes (captured on drift) as a fresh
+			// manual version, clearing drift. Falls back to the stored accepted
+			// content when no drift bytes were captured (e.g. admin-API Caddy).
+			content := art.DriftContent
+			if content == "" {
+				content = art.Content
+			}
+			if _, aErr := s.db.AppendConfigArtifactVersion(art.ID, content, models.ArtifactSourceManual, actorFromCtx(r), "bulk accept drift"); aErr != nil {
 				continue
 			}
 			s.audit(r, "config_artifact", art.ID, "accept", "bulk accept drift")

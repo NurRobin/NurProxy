@@ -404,6 +404,15 @@ var migrations = []string{
 	`
 	ALTER TABLE agents ADD COLUMN proxy_permissions TEXT;
 	`,
+
+	// Migration 14: capture the drifted on-disk content (§11). The heartbeat now
+	// ships the on-disk bytes when they diverge from the accepted state; we store
+	// them here (separate from content, which stays the accepted state) so the
+	// dashboard can show a real accepted-vs-on-disk diff and Accept can persist the
+	// operator's edit. Empty when the artifact is in agreement.
+	`
+	ALTER TABLE config_artifacts ADD COLUMN drift_content TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

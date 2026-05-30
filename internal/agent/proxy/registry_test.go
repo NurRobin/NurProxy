@@ -23,6 +23,7 @@ func (f fakeProxy) Render(context.Context, proxymodel.Route) (Artifact, error) {
 func (f fakeProxy) ReadManaged(context.Context) ([]Artifact, error)  { return nil, nil }
 func (f fakeProxy) Apply(context.Context, []Artifact) error          { return nil }
 func (f fakeProxy) Remove(context.Context, Target) error             { return nil }
+func (f fakeProxy) Prune(context.Context, []Target) (int, error)     { return 0, nil }
 func (f fakeProxy) Validate(context.Context) error                   { return nil }
 func (f fakeProxy) InstallCerts(context.Context, []CertBundle) error { return nil }
 
