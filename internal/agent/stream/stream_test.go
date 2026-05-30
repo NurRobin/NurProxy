@@ -458,6 +458,46 @@ func TestApplyIntents_fileBackendWritesViaApply(t *testing.T) {
 	}
 }
 
+// TestApplyIntents_keepRetainsDriftedArtifactInManaged proves the §11 drift
+// auto-clear fix: when a later push omits an artifact but lists its path in Keep
+// (the orchestrator skipped a drifted artifact awaiting review), the agent carries
+// it forward in the managed set so the heartbeat keeps reporting its checksum — the
+// drift can still clear when the operator reverts and drift_content can refresh.
+func TestApplyIntents_keepRetainsDriftedArtifactInManaged(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/app.conf"
+	be := &fileBackend{path: path, content: "server { listen 80; }"}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	// First push applies dom-1 → tracked in managed.
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "nginx",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+	})
+	if sums := c.ManagedChecksums(); len(sums) != 1 {
+		t.Fatalf("after first apply: expected 1 managed, got %d", len(sums))
+	}
+
+	// Second push omits dom-1 from intents but retains its path via Keep (the
+	// orchestrator skipped it because it drifted). It must stay tracked.
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: nil,
+		Keep:    []string{path},
+	})
+	sums := c.ManagedChecksums()
+	if len(sums) != 1 || sums[0].ArtifactID != "dom-1" {
+		t.Fatalf("Keep'd drifted artifact dropped from managed: %+v", sums)
+	}
+
+	// A third push WITHOUT the path in Keep (domain truly deleted) drops it.
+	c.applyIntents(context.Background(), proxymodel.IntentSet{Intents: nil})
+	if sums := c.ManagedChecksums(); len(sums) != 0 {
+		t.Fatalf("artifact not in intents or Keep should be dropped, got %+v", sums)
+	}
+}
+
 // TestApplyIntents_fileBackendApplyFailureAttributed proves a failed batch Apply
 // is reported as a per-artifact error and leaves nothing tracked as live.
 func TestApplyIntents_fileBackendApplyFailureAttributed(t *testing.T) {

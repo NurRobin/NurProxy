@@ -554,7 +554,7 @@ func (b *Backend) writeHtpasswd(host, user, hash string) (string, error) {
 		return "", fmt.Errorf("ensuring config dir %q: %w", b.layout.Available, err)
 	}
 	path := b.authFilePath(host)
-	if err := os.WriteFile(path, []byte(fmt.Sprintf("%s:%s\n", user, hash)), 0o640); err != nil {
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("%s:%s\n", user, hash)), 0o644); err != nil {
 		return "", fmt.Errorf("writing htpasswd %q: %w", path, err)
 	}
 	return path, nil
