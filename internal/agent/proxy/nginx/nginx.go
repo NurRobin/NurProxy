@@ -268,11 +268,13 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading nginx config %q: %w", path, err)
 		}
-		// Debian: activation is the sites-enabled symlink. RHEL conf.d: presence in
-		// the dir is the activation, so a read file is enabled by definition.
+		// Debian: activation is an entry in sites-enabled — a symlink (canonical) or
+		// a copied regular file (some operators activate that way). RHEL conf.d:
+		// presence in the dir is the activation, so a read file is enabled by
+		// definition.
 		enabled := true
 		if !b.layout.IsConfD() {
-			enabled = symlinkPresent(filepath.Join(b.layout.Enabled, name))
+			enabled = activationPresent(filepath.Join(b.layout.Enabled, name))
 		}
 		arts = append(arts, proxy.Artifact{
 			Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: path},

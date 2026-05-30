@@ -96,3 +96,17 @@ func symlinkPresent(link string) bool {
 	}
 	return fi.Mode()&os.ModeSymlink != 0
 }
+
+// activationPresent reports whether an entry exists in sites-enabled for this
+// vhost — by symlink (Debian's canonical activation, what NurProxy/a2ensite
+// create) OR by a regular file. Some operators activate by copying the file into
+// sites-enabled instead of symlinking; treating only symlinks as "enabled" would
+// mislabel those live vhosts as inactive. Any present entry counts as enabled; an
+// empty link or a missing entry is disabled.
+func activationPresent(link string) bool {
+	if link == "" {
+		return false
+	}
+	_, err := os.Lstat(link)
+	return err == nil
+}

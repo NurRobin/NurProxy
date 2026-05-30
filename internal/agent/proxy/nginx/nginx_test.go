@@ -336,6 +336,55 @@ func TestReadManaged_adoptsAllFiles_taggingManagedVsOperator(t *testing.T) {
 	}
 }
 
+func TestReadManaged_enabledBySymlinkOrCopiedFile(t *testing.T) {
+	b, layout := newBackend(t, &fakeRunner{})
+	if err := os.MkdirAll(b.layout.Available, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b.layout.Enabled, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Three vhosts in sites-available: one activated by symlink (NurProxy's
+	// canonical way), one activated by a COPIED regular file (some operators do
+	// this), and one not activated at all.
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(b.layout.Available, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("sym.example.com.conf", "server { server_name sym; }\n")
+	write("copy.example.com.conf", "server { server_name copy; }\n")
+	write("off.example.com.conf", "server { server_name off; }\n")
+
+	// Symlink activation.
+	if err := os.Symlink(filepath.Join(b.layout.Available, "sym.example.com.conf"), filepath.Join(layout.Enabled, "sym.example.com.conf")); err != nil {
+		t.Fatal(err)
+	}
+	// Copied-file activation (a real file in sites-enabled, not a symlink).
+	if err := os.WriteFile(filepath.Join(layout.Enabled, "copy.example.com.conf"), []byte("server { server_name copy; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	arts, err := b.ReadManaged(context.Background())
+	if err != nil {
+		t.Fatalf("ReadManaged error: %v", err)
+	}
+	enabled := map[string]bool{}
+	for _, a := range arts {
+		enabled[filepath.Base(a.Target.Path)] = a.Enabled
+	}
+	if !enabled["sym.example.com.conf"] {
+		t.Error("symlink-activated vhost should be Enabled=true")
+	}
+	if !enabled["copy.example.com.conf"] {
+		t.Error("copied-file-activated vhost should be Enabled=true (operators activate by copy too)")
+	}
+	if enabled["off.example.com.conf"] {
+		t.Error("non-activated vhost should be Enabled=false")
+	}
+}
+
 func TestRemove_deletesFileAndSymlink_thenReloads(t *testing.T) {
 	r := &fakeRunner{}
 	b, layout := newBackend(t, r)
