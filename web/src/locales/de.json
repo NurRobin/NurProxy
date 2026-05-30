@@ -251,7 +251,7 @@
     "permsTitle": "Damit der Agent den Proxy schreiben + neu laden darf",
     "permsIntro": "Minimal-Rechte für das Konfigurationsverzeichnis und die Test-/Reload-Befehle. <agent-user> und Gruppe nurproxy sind Platzhalter.",
     "permsHostNote": "Die exakten Befehle für DIESEN Host (mit dem erkannten Benutzer) werden auch beim Ausführen von apply ausgegeben.",
-    "permsWiki": "Das vollständige Rechtemodell und der Threat-Model-Hinweis stehen auf der Wiki-Seite Sicherheit.",
+    "permsWiki": "Das vollständige Rechtemodell und der Threat-Model-Hinweis stehen auf der Wiki-Seite „Existing-mode permissions“.",
     "statusWaiting": "Warte auf Bestätigung auf dem Host…",
     "statusApplied": "Angewendet ✓"
   },

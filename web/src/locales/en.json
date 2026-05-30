@@ -251,7 +251,7 @@
     "permsTitle": "Let the agent write + reload the proxy",
     "permsIntro": "Least-privilege grants for the config dir and the test/reload commands. <agent-user> and group nurproxy are placeholders.",
     "permsHostNote": "The exact commands for THIS host (with the detected user) are also printed when you run apply.",
-    "permsWiki": "See the Security wiki page for the full permission model and threat-model note.",
+    "permsWiki": "See the \"Existing-mode permissions\" wiki page for the full permission model and threat-model note.",
     "statusWaiting": "Waiting for confirmation on the host…",
     "statusApplied": "Applied ✓"
   },
