@@ -30,6 +30,35 @@ export interface ProxyDetection {
   port_conflicts?: ProxyPortConflict[];
 }
 
+/** One ordered remediation step: a human title plus copy-paste shell commands. */
+export interface RemediationStep {
+  title: string;
+  commands: string[];
+}
+
+/** Least-privilege fix for missing existing-mode grants (§12/§19). */
+export interface Remediation {
+  steps?: RemediationStep[];
+  sudoers_line?: string;
+}
+
+/**
+ * The agent's structured §12 permission self-test for an existing-mode backend:
+ * can it WRITE the config dir and RELOAD the service. Carries the targeted
+ * remediation when a grant is missing, so the dashboard shows exactly what to fix
+ * instead of one opaque error. checked=false means built-in mode (nothing to probe).
+ */
+export interface ProxyPermissions {
+  checked: boolean;
+  ok: boolean;
+  can_write: boolean;
+  can_reload: boolean;
+  write_error?: string;
+  reload_error?: string;
+  dirs?: string[];
+  remediation?: Remediation;
+}
+
 // On-demand log tail (§15). The dashboard opens a session, polls for lines past a
 // cursor, and stops the session when the view closes. The agent dials out for
 // every hop — the orchestrator never reads the agent inbound.
@@ -87,6 +116,13 @@ export interface Agent {
   proxy_detection?: ProxyDetection;
   proxy_detected_at?: string;
   proxy_capabilities?: ProxyCapabilities;
+  /**
+   * The agent's §12 permission self-test for an existing-mode backend (config dir
+   * writable? service reloadable?) plus the targeted remediation when a grant is
+   * missing. Re-probed each heartbeat, so it clears on its own once granted.
+   * Absent in built-in mode or before the first existing-mode beat.
+   */
+  proxy_permissions?: ProxyPermissions;
   created_at: string;
   updated_at: string;
   servers?: Server[];
