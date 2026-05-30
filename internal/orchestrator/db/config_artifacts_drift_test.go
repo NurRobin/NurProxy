@@ -14,7 +14,7 @@ func TestReconcileArtifactChecksum_matchingNoOp(t *testing.T) {
 	createTestAgentRow(t, d, "agent-1")
 	art := createTestArtifact(t, d, "art-1", "agent-1")
 
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", art.Checksum)
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", art.Checksum)
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestReconcileArtifactChecksum_divergenceFlagsDrift(t *testing.T) {
 	createTestAgentRow(t, d, "agent-1")
 	createTestArtifact(t, d, "art-1", "agent-1")
 
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "deadbeef")
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -59,10 +59,10 @@ func TestReconcileArtifactChecksum_repeatedDivergenceNotReported(t *testing.T) {
 	createTestAgentRow(t, d, "agent-1")
 	createTestArtifact(t, d, "art-1", "agent-1")
 
-	if _, changed, _ := d.ReconcileArtifactChecksum("art-1", "deadbeef"); !changed {
+	if _, changed, _ := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef"); !changed {
 		t.Fatal("first divergence should report a transition")
 	}
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "deadbeef")
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "deadbeef")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestReconcileArtifactChecksum_backInAgreementClearsDrift(t *testing.T) {
 	if err := d.MarkConfigArtifactDrifted("art-1"); err != nil {
 		t.Fatalf("MarkConfigArtifactDrifted: %v", err)
 	}
-	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", art.Checksum)
+	drifted, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", art.Checksum)
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestReconcileArtifactChecksum_applyFailedUntouched(t *testing.T) {
 		t.Fatalf("SetConfigArtifactApplyState: %v", err)
 	}
 
-	_, changed, err := d.ReconcileArtifactChecksum("art-1", "whatever")
+	_, changed, err := d.ReconcileArtifactChecksum("art-1", "agent-1", "whatever")
 	if err != nil {
 		t.Fatalf("ReconcileArtifactChecksum: %v", err)
 	}
@@ -124,8 +124,27 @@ func TestReconcileArtifactChecksum_applyFailedUntouched(t *testing.T) {
 
 func TestReconcileArtifactChecksum_missingArtifact(t *testing.T) {
 	d := testDB(t)
-	if _, _, err := d.ReconcileArtifactChecksum("nope", "x"); err == nil {
+	if _, _, err := d.ReconcileArtifactChecksum("nope", "agent-1", "x"); err == nil {
 		t.Fatal("expected not-found error for missing artifact")
+	}
+}
+
+// TestReconcileArtifactChecksum_scopedToOwningAgent verifies one agent's heartbeat
+// cannot flag/clear drift on another agent's artifact that shares the ID.
+func TestReconcileArtifactChecksum_scopedToOwningAgent(t *testing.T) {
+	d := testDB(t)
+	createTestAgentRow(t, d, "agent-1")
+	createTestAgentRow(t, d, "agent-2")
+	createTestArtifact(t, d, "art-1", "agent-1")
+
+	// agent-2 reports a divergent checksum for agent-1's artifact: it must be
+	// treated as not-found (scoped out), never mutating agent-1's row.
+	if _, _, err := d.ReconcileArtifactChecksum("art-1", "agent-2", "deadbeef"); err == nil {
+		t.Fatal("expected not-found: agent-2 must not reconcile agent-1's artifact")
+	}
+	got, _ := d.GetConfigArtifact("art-1")
+	if got.Drifted || got.ApplyState != models.ArtifactStateLive {
+		t.Errorf("agent-1's artifact was mutated by agent-2's heartbeat: %+v", got)
 	}
 }
 

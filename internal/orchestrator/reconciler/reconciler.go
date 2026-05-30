@@ -84,7 +84,7 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	if err != nil {
 		return err
 	}
-	intents := intentsFromDesired(desired)
+	intents := intentsFromDesired(desired, backendForAgent(agent))
 	// Preflight ordering (§5/§7): gather the certs the agent needs for these routes
 	// FIRST, then push them with the intents in one "everything is ready, go live"
 	// message. The agent installs the certs (InstallCerts) before applying the
@@ -174,17 +174,32 @@ func (r *Reconciler) gatherCerts(desired map[string]desiredRoute) []proxymodel.C
 }
 
 // intentsFromDesired flattens the desired route map into the intent snapshot
-// pushed over the stream (the canonical wire format, §3/B1).
-func intentsFromDesired(desired map[string]desiredRoute) []proxymodel.RouteIntent {
+// pushed over the stream (the canonical wire format, §3/B1). backend tags each
+// intent with the agent's actual proxy backend so the round-tripped artifact is
+// stored with correct metadata (a hardcoded "caddy" would mislabel nginx/apache
+// agents).
+func intentsFromDesired(desired map[string]desiredRoute, backend string) []proxymodel.RouteIntent {
 	intents := make([]proxymodel.RouteIntent, 0, len(desired))
 	for _, d := range desired {
 		intents = append(intents, proxymodel.RouteIntent{
 			ArtifactID: d.artifactID,
-			Backend:    "caddy",
+			Backend:    backend,
 			Route:      d.intent,
 		})
 	}
 	return intents
+}
+
+// backendForAgent reports the proxy backend an agent renders with, so pushed
+// intents carry the right backend tag (§3/B1). An existing-mode agent uses its
+// detected host proxy (nginx/apache/caddy); a built-in agent — or one whose
+// detection has not landed yet — renders with the bundled Caddy.
+func backendForAgent(agent *models.Agent) string {
+	if agent != nil && agent.ProxyMode == "existing" &&
+		agent.ProxyDetection != nil && agent.ProxyDetection.Kind != "" {
+		return agent.ProxyDetection.Kind
+	}
+	return "caddy"
 }
 
 // Start launches the periodic reconciliation loop in a background goroutine.
@@ -468,7 +483,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 	// diff below is the fallback for same-host / port-forwarded setups where the
 	// orchestrator can reach the agent directly.
 	if r.hub != nil && r.hub.Connected(agent.ID) {
-		r.hub.PublishIntents(agent.ID, intentsFromDesired(desiredByFQDN))
+		r.hub.PublishIntents(agent.ID, intentsFromDesired(desiredByFQDN, backendForAgent(agent)))
 		return nil
 	}
 

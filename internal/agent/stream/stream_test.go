@@ -236,6 +236,10 @@ func (o *orderingBackend) AddRoute(ctx context.Context, route json.RawMessage) e
 	o.calls = append(o.calls, "apply")
 	return nil
 }
+func (o *orderingBackend) Apply(ctx context.Context, arts []proxy.Artifact) error {
+	o.calls = append(o.calls, "fileapply")
+	return nil
+}
 func (o *orderingBackend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
 	return proxy.Artifact{
 		Target:  proxy.Target{Kind: proxy.TargetKindCaddyRoute, Path: "caddy:route:r1"},
@@ -344,6 +348,131 @@ func TestApplyIntents_selfACMEPolicyFlowsToBackend(t *testing.T) {
 	}
 	if be.tlsIntents[0].Policy != proxymodel.TLSPolicySelfACME {
 		t.Errorf("policy = %q, want self-acme (the explicit fallback)", be.tlsIntents[0].Policy)
+	}
+}
+
+// fileBackend is a fake file-based proxy backend: Render emits a file-kind
+// artifact and Apply writes its content to disk (the real backends do this
+// atomically). It records whether AddRoute was (wrongly) used so the test can
+// prove file artifacts go through Apply, not the admin-API no-op.
+type fileBackend struct {
+	path        string
+	content     string
+	addRouteHit bool
+	applyHit    bool
+	applyErr    error
+}
+
+func (f *fileBackend) EnsureServer(ctx context.Context) error { return nil }
+func (f *fileBackend) ClearRoutes(ctx context.Context) error  { return nil }
+func (f *fileBackend) AddRoute(ctx context.Context, route json.RawMessage) error {
+	f.addRouteHit = true
+	return nil
+}
+func (f *fileBackend) Apply(ctx context.Context, arts []proxy.Artifact) error {
+	f.applyHit = true
+	if f.applyErr != nil {
+		return f.applyErr
+	}
+	for _, a := range arts {
+		if err := os.WriteFile(a.Target.Path, []byte(a.Content), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (f *fileBackend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
+	return proxy.Artifact{
+		Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: f.path},
+		Content: f.content,
+		Enabled: true,
+	}, nil
+}
+func (f *fileBackend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) error { return nil }
+func (f *fileBackend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error {
+	return nil
+}
+
+// TestApplyIntents_fileBackendWritesViaApply proves a file backend applies config
+// through Apply (write/validate/reload) rather than the admin-API AddRoute no-op,
+// and that the heartbeat drift signal re-reads the on-disk file so a manual edit
+// surfaces as drift.
+func TestApplyIntents_fileBackendWritesViaApply(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/app.conf"
+	be := &fileBackend{path: path, content: "server { listen 80; }"}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "nginx",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+	})
+
+	if be.addRouteHit {
+		t.Error("file artifact must not go through the admin-API AddRoute no-op")
+	}
+	if !be.applyHit {
+		t.Fatal("file artifact was never applied via Apply")
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != be.content {
+		t.Fatalf("Apply did not write the config: content=%q err=%v", got, err)
+	}
+
+	// The managed checksum tracks the artifact and matches the on-disk content.
+	sums := c.ManagedChecksums()
+	if len(sums) != 1 || sums[0].ArtifactID != "dom-1" {
+		t.Fatalf("expected one managed checksum for dom-1, got %+v", sums)
+	}
+	if sums[0].Checksum != checksum(be.content) {
+		t.Errorf("managed checksum %q does not match applied content", sums[0].Checksum)
+	}
+
+	// A manual on-disk edit must surface as a different checksum (drift, §11) —
+	// the in-memory apply-time checksum alone would miss it.
+	if err := os.WriteFile(path, []byte("server { listen 8080; }"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ManagedChecksums(); got[0].Checksum == checksum(be.content) {
+		t.Error("heartbeat drift signal did not re-read the on-disk file after a manual edit")
+	}
+}
+
+// TestApplyIntents_fileBackendApplyFailureAttributed proves a failed batch Apply
+// is reported as a per-artifact error and leaves nothing tracked as live.
+func TestApplyIntents_fileBackendApplyFailureAttributed(t *testing.T) {
+	ackCh := make(chan proxymodel.ApplyAck, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", func(w http.ResponseWriter, r *http.Request) {
+		var parsed proxymodel.ApplyAck
+		_ = json.NewDecoder(r.Body).Decode(&parsed)
+		ackCh <- parsed
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	be := &fileBackend{path: t.TempDir() + "/x.conf", content: "bad", applyErr: fmt.Errorf("nginx -t failed")}
+	c := New(ts.URL, "agent-1", "tok", be, health.New())
+
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "nginx",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+	})
+
+	select {
+	case ack := <-ackCh:
+		if len(ack.Reports) != 1 || ack.Reports[0].Error == "" {
+			t.Fatalf("a failed batch Apply must be attributed per-artifact: %+v", ack.Reports)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for ack")
+	}
+	if len(c.ManagedChecksums()) != 0 {
+		t.Error("a failed apply must not track the artifact as live (false drift)")
 	}
 }
 

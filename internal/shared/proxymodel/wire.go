@@ -216,12 +216,16 @@ type AdoptedArtifactReport struct {
 	Artifacts []AdoptedArtifact `json:"artifacts"`
 }
 
-// AdoptedArtifactID derives a stable, filesystem-safe artifact identity from a
-// backend and an on-host path, so re-reporting the same file upserts the same
-// central row. The "adopt-" prefix keeps it clearly distinct from generated
-// per-domain IDs ("dom-<id>"), and slashes/dots in the path are replaced so the
-// ID is a single token. It is deterministic: same (backend, path) → same ID.
-func AdoptedArtifactID(backend, path string) string {
+// AdoptedArtifactID derives a stable, filesystem-safe artifact identity from an
+// agent, a backend, and an on-host path, so re-reporting the same file upserts
+// the same central row. It is AGENT-SCOPED: artifact IDs are a global namespace,
+// so two hosts that both have e.g. /etc/nginx/sites-available/default would
+// otherwise collide on one row and clobber each other's stored config. Including
+// agentID gives every host its own row. The "adopt-" prefix keeps it distinct
+// from generated per-domain IDs ("dom-<id>"), and slashes/dots/spaces in the path
+// are replaced so the ID is a single token. Deterministic: same (agentID,
+// backend, path) → same ID.
+func AdoptedArtifactID(agentID, backend, path string) string {
 	var b []byte
 	for i := 0; i < len(path); i++ {
 		c := path[i]
@@ -235,5 +239,5 @@ func AdoptedArtifactID(backend, path string) string {
 	for len(cleaned) > 0 && cleaned[0] == '-' {
 		cleaned = cleaned[1:]
 	}
-	return "adopt-" + backend + "-" + cleaned
+	return "adopt-" + agentID + "-" + backend + "-" + cleaned
 }

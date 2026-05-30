@@ -34,7 +34,7 @@ func (c *Client) ReportAdopted(ctx context.Context, host, backend string, arts [
 	out := make([]proxymodel.AdoptedArtifact, 0, len(arts))
 	for _, a := range arts {
 		out = append(out, proxymodel.AdoptedArtifact{
-			ArtifactID: proxymodel.AdoptedArtifactID(backend, a.Target.Path),
+			ArtifactID: proxymodel.AdoptedArtifactID(c.agentID, backend, a.Target.Path),
 			Backend:    backend,
 			TargetKind: string(a.Target.Kind),
 			TargetPath: a.Target.Path,
