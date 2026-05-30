@@ -106,12 +106,18 @@ func main() {
 	// inbound; certs ride the agent-initiated stream (§7). Started only when an
 	// ACME account can be constructed; failures here are non-fatal (the built-in
 	// Caddy self-ACME fallback keeps hosts served).
-	startRenewer(rootCtx, database, rec, *dataDir)
+	renewer := startRenewer(rootCtx, database, rec, *dataDir)
 
 	// Create API server, wiring in the hub + reconciler so the stream endpoint
 	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
 	srv.SetAgentHub(hub, rec)
+	// Wire the on-demand cert issuer so creating a central-TLS domain kicks
+	// first-issuance immediately (§7). Nil when ACME could not be set up; the
+	// periodic renewal scan remains the backstop.
+	if renewer != nil {
+		srv.SetCertIssuer(renewer)
+	}
 	// Sweep abandoned on-demand log tails (§15): a dashboard view that vanished
 	// without a clean close is reaped and its agent told to stop tailing.
 	srv.StartLogReaper(rootCtx)
@@ -189,11 +195,11 @@ func main() {
 // settings. Any setup failure is logged and renewal is simply skipped — it must
 // never block orchestrator startup, and hosts still serve via stored certs or
 // the Caddy self-ACME fallback.
-func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, dataDir string) {
+func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, dataDir string) *orchtls.Renewer {
 	accountKey, err := orchtls.LoadOrGenerateAccountKey(filepath.Join(dataDir, "acme-account.key"))
 	if err != nil {
 		log.Printf("tls: renewal disabled: %v", err)
-		return
+		return nil
 	}
 
 	email, _ := database.GetSetting("acme_email")
@@ -206,7 +212,7 @@ func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconcil
 	})
 	if err != nil {
 		log.Printf("tls: renewal disabled: %v", err)
-		return
+		return nil
 	}
 
 	issuer := orchtls.NewIssuer(acmeClient, nil)
@@ -217,7 +223,8 @@ func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconcil
 	})
 
 	go renewer.Start(ctx)
-	log.Printf("tls: central renewal loop started (window %s)", orchtls.DefaultRenewWindow)
+	log.Printf("tls: central renewal + first-issuance loop started (window %s)", orchtls.DefaultRenewWindow)
+	return renewer
 }
 
 // dbAuditSink writes renewal audit events to the orchestrator audit log with

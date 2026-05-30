@@ -11,17 +11,25 @@ import (
 // fakeStore is a hand-written RenewalStore. due is what DueForRenewal returns;
 // saved records every SaveRenewed call so tests can assert scope preservation.
 type fakeStore struct {
-	due     []RenewTarget
-	dueErr  error
-	saved   []*CertResult
-	savedWC []bool
-	saveErr error
-	gotWin  time.Duration
+	due       []RenewTarget
+	dueErr    error
+	forHost   map[string]*RenewTarget // TargetForHost lookups
+	forHostEr error
+	saved     []*CertResult
+	savedWC   []bool
+	saveErr   error
+	gotWin    time.Duration
 }
 
 func (s *fakeStore) DueForRenewal(_ context.Context, window time.Duration) ([]RenewTarget, error) {
 	s.gotWin = window
 	return s.due, s.dueErr
+}
+func (s *fakeStore) TargetForHost(_ context.Context, host string) (*RenewTarget, error) {
+	if s.forHostEr != nil {
+		return nil, s.forHostEr
+	}
+	return s.forHost[host], nil
 }
 func (s *fakeStore) SaveRenewed(_ context.Context, res *CertResult, isWildcard bool) error {
 	if s.saveErr != nil {
@@ -87,6 +95,41 @@ func TestRenewer_RunOnce_renewsSavesAndRepushes(t *testing.T) {
 	}
 	if !containsEvent(audit.events, "renewed:a.example.com") {
 		t.Errorf("missing renewed audit event, got %v", audit.events)
+	}
+}
+
+func TestRenewer_EnsureCertForHost_issuesSavesRepushes(t *testing.T) {
+	fp := newFakeProvider("TXT")
+	store := &fakeStore{
+		forHost: map[string]*RenewTarget{
+			"new.example.com": {Host: "new.example.com", Names: []string{"new.example.com"}, Provider: fp},
+		},
+	}
+	acme := &fakeACME{result: &CertResult{CertPEM: []byte("FRESH"), KeyPEM: []byte("K")}}
+	rl := &fakeReloader{}
+	r := newRenewer(store, acme, rl, &fakeAudit{})
+
+	if err := r.EnsureCertForHost(context.Background(), "new.example.com"); err != nil {
+		t.Fatalf("EnsureCertForHost: %v", err)
+	}
+	if len(store.saved) != 1 || string(store.saved[0].CertPEM) != "FRESH" {
+		t.Fatalf("first issuance did not save the cert: %+v", store.saved)
+	}
+	if len(rl.hosts) != 1 || rl.hosts[0] != "new.example.com" {
+		t.Errorf("repushed hosts = %v, want [new.example.com]", rl.hosts)
+	}
+}
+
+func TestRenewer_EnsureCertForHost_noTargetIsNoOp(t *testing.T) {
+	store := &fakeStore{forHost: map[string]*RenewTarget{}} // host resolves to nothing
+	acme := &fakeACME{result: &CertResult{CertPEM: []byte("X")}}
+	r := newRenewer(store, acme, &fakeReloader{}, &fakeAudit{})
+
+	if err := r.EnsureCertForHost(context.Background(), "unknown.example.com"); err != nil {
+		t.Fatalf("EnsureCertForHost no-op should not error: %v", err)
+	}
+	if len(store.saved) != 0 {
+		t.Errorf("nothing should be issued when no target resolves, saved=%v", store.saved)
 	}
 }
 

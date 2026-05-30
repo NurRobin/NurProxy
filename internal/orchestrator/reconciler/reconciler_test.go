@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -1212,5 +1213,55 @@ func TestRoutesMatch(t *testing.T) {
 	}
 	if routesMatch(a, c) {
 		t.Error("expected a and c to NOT match")
+	}
+}
+
+// TestCertRenewalStore_firstIssuesCentralDomains verifies the scan now returns a
+// first-issuance target for a central-TLS domain that has no certificate yet, and
+// stops returning it once a cert exists (the renewal path then owns expiry).
+func TestCertRenewalStore_firstIssuesCentralDomains(t *testing.T) {
+	registerMockProvider(t)
+	d := testDB(t)
+	_, _, _, _, _ = setupScenario(t, d) // domain app.example.com, SSLMode auto -> central
+
+	store := NewCertRenewalStore(d)
+
+	targets, err := store.DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatalf("DueForRenewal: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Host != "app.example.com" {
+		t.Fatalf("expected one first-issue target for app.example.com, got %+v", targets)
+	}
+	if targets[0].Provider == nil {
+		t.Error("first-issue target must carry a resolved DNS provider")
+	}
+
+	// TargetForHost resolves the same host on demand.
+	one, err := store.TargetForHost(context.Background(), "app.example.com")
+	if err != nil {
+		t.Fatalf("TargetForHost: %v", err)
+	}
+	if one == nil || one.Host != "app.example.com" {
+		t.Fatalf("TargetForHost returned %+v, want app.example.com", one)
+	}
+
+	// Once a cert exists, the host drops out of first-issuance and TargetForHost.
+	if err := d.UpsertCertificate(&models.Certificate{
+		ID: "app.example.com", Host: "app.example.com",
+		Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K",
+		ExpiresAt: time.Now().UTC().Add(90 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+	targets, err = store.DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatalf("DueForRenewal after cert: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("a domain with a valid cert should not be first-issued, got %+v", targets)
+	}
+	if one, _ := store.TargetForHost(context.Background(), "app.example.com"); one != nil {
+		t.Errorf("TargetForHost should be nil once a cert exists, got %+v", one)
 	}
 }
