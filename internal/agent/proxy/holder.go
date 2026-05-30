@@ -283,6 +283,14 @@ type ReconfigureDeps struct {
 	// Optional: nil means built-in→built-in / switch-back cannot rebuild the backend
 	// (the Holder keeps the current one and explains via health).
 	CaddyFactory func() Proxy
+	// CertDir is the agent's cert store directory; passed into a hot-switched file
+	// backend (nginx/apache) so InstallCerts can write central bundles and Render
+	// can reference them (§7). Without it an existing-mode agent has no cert store
+	// and silently drops every central TLS listener. Empty disables central TLS.
+	CertDir string
+	// CertKey is the agent-local AES-256 key the file backend uses to encrypt cert
+	// private keys at rest (paired with CertDir). Empty stores keys as plaintext.
+	CertKey []byte
 }
 
 // ReconfigureResult is the structured outcome of a hot-switch, returned so the
@@ -380,6 +388,10 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 		TestCmd:   req.TestCmd,
 		Service:   req.Service,
 		LogPaths:  req.LogPaths,
+		// Wire the agent's cert store so the file backend can install + reference
+		// central TLS bundles (§7); without this an existing-mode agent drops TLS.
+		CertDir:    deps.CertDir,
+		EncryptKey: deps.CertKey,
 	})
 	if err != nil {
 		msg := fmt.Sprintf("reconfigure: %q is not a known proxy backend — cannot switch to it: %v", req.Type, err)
