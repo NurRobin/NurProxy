@@ -19,11 +19,10 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
-	apachebackend "github.com/NurRobin/NurProxy/internal/agent/proxy/apache" // also registers the apache backend in the proxy registry
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/apache" // registers the apache backend in the proxy registry
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
-	nginxbackend "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // also registers the nginx backend in the proxy registry
-	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // registers the nginx backend in the proxy registry
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
@@ -229,7 +228,7 @@ func main() {
 	// existing with no process restart. While nobody calls Reconfigure the Holder
 	// forwards every call to this same caddy backend, so the built-in path stays
 	// byte-for-byte identical (invariant #1).
-	holder := proxy.NewHolder(caddyBackend)
+	holder := proxy.NewHolder(caddyBackend, string(cfg.ProxyMode))
 	// Guard the invariant: the bundled caddy backend must satisfy the admin-API
 	// primitives the Holder forwards, so wrapping it in the Holder is a transparent
 	// pass-through (not a silent no-op). This is a compile-time check via the
@@ -264,7 +263,7 @@ func main() {
 	// health setter, a closure to stop the bundled Caddy subprocess when leaving
 	// built-in, the agent's OS user for the least-privilege remediation, and a
 	// factory to rebuild the bundled caddy backend on a switch back to built-in.
-	apiServer.SetReconfigurer(holder, proxy.ReconfigureDeps{
+	reconfigureDeps := proxy.ReconfigureDeps{
 		Health:    hs,
 		StopCaddy: caddyProc.Stop,
 		OSUser:    currentOSUser(),
@@ -275,21 +274,35 @@ func main() {
 			}
 			return b
 		},
-	})
+	}
+	apiServer.SetReconfigurer(holder, reconfigureDeps)
 	if err := apiServer.Start(ctx); err != nil {
 		log.Printf("WARNING: failed to start agent API server: %v", err)
 		hs.SetError(fmt.Sprintf("failed to start agent API server: %v", err))
 	}
 
-	// Step 3b: Existing-mode permission probe (§12). A file-based backend needs to
-	// WRITE config (group/ownership) and RELOAD the service (scoped sudoers) — two
-	// privileges the built-in Caddy admin-API path never needed. Probe both at
-	// startup and, on a denial, report a clear, actionable health error WITHOUT
-	// crashing — exactly like the bind-failure handling above. The agent stays
-	// connected so the operator can fix the grant from the dashboard. Built-in mode
-	// skips this entirely (no file writes / reloads in the zero-config case).
+	// Step 3b: honor a persisted Existing mode at startup (§19). agent.yaml may say
+	// the agent manages a host-installed nginx/apache (e.g. after a prior hot-switch
+	// or a fresh existing-mode install). The bundled Caddy was wrapped above purely
+	// as the Holder's seed; here we drive the SAME hot-switch path the live
+	// reconfigure uses to swap the Holder onto the existing backend, stop the bundled
+	// Caddy so the host proxy owns :80/:443, and run the §12 permission probe. Doing
+	// it through Reconfigure (not a standalone probe) means a restart lands in the
+	// exact same live state as a §19 apply — the Holder reports mode "existing" on
+	// the next beat instead of silently reverting to built-in. Fail-soft: a missing
+	// grant is reported via health, never crashes. Built-in mode skips this entirely.
 	if cfg.ProxyMode == agentconfig.ProxyModeExisting {
-		probeExistingPermissions(ctx, cfg, hs)
+		res := holder.Reconfigure(ctx, proxy.ReconfigureRequest{
+			Mode:      "existing",
+			Type:      cfg.ProxyType,
+			ConfigDir: cfg.ProxyConfigDir,
+			Binary:    cfg.ProxyBinary,
+			ReloadCmd: cfg.ProxyReloadCmd,
+			TestCmd:   cfg.ProxyTestCmd,
+			Service:   cfg.ProxyService,
+			LogPaths:  cfg.ProxyLogPaths,
+		}, reconfigureDeps)
+		log.Printf("Existing mode honored at startup: %s", res.Message)
 	}
 
 	// Step 4: Create the push stream client. The agent dials out and holds it
@@ -310,6 +323,10 @@ func main() {
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
 	hb.SetCapabilitiesFn(func() *models.ProxyCapabilities { return holder.Current().Capabilities().ToModel() })
+	// Report the agent's current live proxy mode each beat (§19) so the dashboard
+	// reflects a hot-switch (or this persisted-existing startup) instead of
+	// assuming built-in.
+	hb.SetModeFn(holder.Mode)
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
 	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
@@ -385,74 +402,6 @@ func newCertStore(dataDir string) *certstore.Store {
 		return certstore.New(certDir, nil)
 	}
 	return certstore.New(certDir, key)
-}
-
-// fileBackend is the subset of a file-based proxy backend (nginx/apache) the
-// permission probe needs (§12): the dirs that must be writable, the
-// validate-command runner, and the reload command the operator must allow via
-// scoped sudoers. Both nginx.Backend and apache.Backend satisfy it. Defining the
-// interface here keeps the backends from depending on the probe package.
-type fileBackend interface {
-	ProbeDirs() []string
-	ReloadHint() string
-}
-
-// probeExistingPermissions builds the configured Existing-mode backend and runs
-// the startup permission probe (§12), reporting a clear, actionable health error
-// on a denial. It never crashes: a backend that cannot be built, or that does not
-// expose probe hooks, is logged and skipped rather than fatal — the agent stays
-// connected and explains why, mirroring the bind-failure posture. A passing probe
-// clears any prior probe error.
-func probeExistingPermissions(ctx context.Context, cfg *agentconfig.Config, hs *health.State) {
-	if cfg.ProxyType == "" {
-		log.Printf("WARNING: proxy-mode=existing but proxy-type is unset — cannot probe permissions")
-		hs.SetError("Existing proxy mode selected but no proxy_type set (nginx/apache/caddy) — set proxy_type so the agent can manage and reload it.")
-		return
-	}
-	be, err := proxy.Get(cfg.ProxyType, proxy.Config{
-		Type:      cfg.ProxyType,
-		Binary:    cfg.ProxyBinary,
-		ConfigDir: cfg.ProxyConfigDir,
-		ReloadCmd: cfg.ProxyReloadCmd,
-		TestCmd:   cfg.ProxyTestCmd,
-		Service:   cfg.ProxyService,
-		LogPaths:  cfg.ProxyLogPaths,
-	})
-	if err != nil {
-		log.Printf("WARNING: could not build %q backend for permission probe: %v", cfg.ProxyType, err)
-		hs.SetError(fmt.Sprintf("Existing proxy %q is not a known backend — cannot manage or reload it.", cfg.ProxyType))
-		return
-	}
-	fb, ok := be.(fileBackend)
-	if !ok {
-		// An admin-API backend (e.g. external caddy) needs no file/reload probe.
-		log.Printf("Permission probe skipped: %q backend needs no file-write/reload privilege", cfg.ProxyType)
-		return
-	}
-	// The backend's validate-command runner satisfies permcheck.TestRunner (it has
-	// Test(ctx)). Resolve it per concrete backend so the backends stay decoupled
-	// from the probe package.
-	var runner permcheck.TestRunner
-	switch b := be.(type) {
-	case *nginxbackend.Backend:
-		runner = b.Runner()
-	case *apachebackend.Backend:
-		runner = b.Runner()
-	}
-	res := permcheck.Probe(ctx, permcheck.Options{
-		Backend:    cfg.ProxyType,
-		Dirs:       fb.ProbeDirs(),
-		Runner:     runner,
-		ReloadHint: fb.ReloadHint(),
-	})
-	if res.OK() {
-		log.Printf("Permission probe OK: %q config is writable and reloadable", cfg.ProxyType)
-		hs.SetError("")
-		return
-	}
-	msg := res.HealthError()
-	log.Printf("WARNING: permission probe failed: %s", msg)
-	hs.SetError(msg)
 }
 
 // detectCapabilities probes the bundled Caddy backend's capability matrix (§8),

@@ -288,6 +288,7 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 		"public_ip":          agent.PublicIP,
 		"version":            agent.Version,
 		"caddy_running":      agent.CaddyRunning,
+		"proxy_mode":         agent.ProxyMode,
 		"last_error":         agent.LastError,
 		"proxy_detection":    agent.ProxyDetection,
 		"proxy_detected_at":  agent.ProxyDetectedAt,
@@ -371,6 +372,10 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// a pointer so an older agent that omits it doesn't get read as "down".
 		CaddyRunning *bool  `json:"caddy_running"`
 		LastError    string `json:"last_error"`
+		// ProxyMode is the agent's CURRENT live reverse-proxy mode ("built-in" |
+		// "existing"), re-reported each beat (§19) so the dashboard reflects a
+		// hot-switch. Empty leaves the stored mode untouched (older agent).
+		ProxyMode string `json:"proxy_mode"`
 		// ProxyDetection is the agent's read-only Phase-0 detection, re-reported on
 		// each beat (§13.0/§2.1/§9). Stored on the agent row; nil leaves it as-is.
 		ProxyDetection *models.ProxyDetection `json:"proxy_detection"`
@@ -401,7 +406,7 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		caddyRunning = *req.CaddyRunning
 	}
 
-	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning); err != nil {
+	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning, req.ProxyMode); err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
 	}
@@ -441,6 +446,12 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if prev.LastError != req.LastError && req.LastError != "" {
 		s.audit(r, "agent", id, "agent_error", req.LastError)
+	}
+	// Audit a live proxy-mode change (e.g. a §19 hot-switch to existing nginx) so
+	// operators see the backend flip in the timeline. Only when the agent actually
+	// reported a mode and it differs from what we had.
+	if req.ProxyMode != "" && prev.ProxyMode != req.ProxyMode {
+		s.audit(r, "agent", id, "proxy_mode", fmt.Sprintf("proxy_mode=%s", req.ProxyMode))
 	}
 
 	// Re-read the fresh row (UpdateAgentHealth + the offline->adopted flip both

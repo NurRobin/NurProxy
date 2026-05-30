@@ -49,14 +49,22 @@ type caddyOps interface {
 type Holder struct {
 	mu      sync.RWMutex
 	current Proxy
+	// mode is the agent's CURRENT live reverse-proxy mode ("built-in" | "existing"),
+	// updated atomically with current on every Reconfigure. The heartbeat reports it
+	// (§19) so the dashboard reflects a hot-switch instead of always assuming built-in.
+	mode string
 }
 
 // NewHolder seeds the Holder with the agent's initial backend (the bundled caddy
-// backend at startup). The seed must satisfy the concrete admin-API primitives
-// the agent API/stream drive (the bundled *caddy.Backend does); the compile-time
-// assertion lives at the call site in main.go where the concrete type is known.
-func NewHolder(initial Proxy) *Holder {
-	return &Holder{current: initial}
+// backend at startup) and its mode. The seed must satisfy the concrete admin-API
+// primitives the agent API/stream drive (the bundled *caddy.Backend does); the
+// compile-time assertion lives at the call site in main.go where the concrete
+// type is known. An empty mode is normalized to "built-in".
+func NewHolder(initial Proxy, mode string) *Holder {
+	if mode == "" {
+		mode = "built-in"
+	}
+	return &Holder{current: initial, mode: mode}
 }
 
 // Current returns the active backend. The heartbeat reads Current().Capabilities()
@@ -65,6 +73,15 @@ func (h *Holder) Current() Proxy {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.current
+}
+
+// Mode returns the agent's current live reverse-proxy mode ("built-in" |
+// "existing"). The heartbeat reports it each beat so the orchestrator/dashboard
+// reflect a §19 hot-switch (or a restart that honored a persisted existing mode).
+func (h *Holder) Mode() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.mode
 }
 
 // ---- proxy.Proxy forwarding (the Holder is itself a Proxy) -------------------
@@ -386,9 +403,11 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 		}
 	}
 
-	// Swap the live backend atomically.
+	// Swap the live backend atomically, recording the new live mode so the next
+	// heartbeat reports "existing" (§19).
 	h.mu.Lock()
 	h.current = be
+	h.mode = "existing"
 	h.mu.Unlock()
 	// The bundled Caddy subprocess is stopped; it is no longer "running" in the
 	// built-in sense. Health is now governed by the file backend's probe.
@@ -471,6 +490,7 @@ func (h *Holder) reconfigureBuiltIn(deps ReconfigureDeps) ReconfigureResult {
 	be := deps.CaddyFactory()
 	h.mu.Lock()
 	h.current = be
+	h.mode = "built-in"
 	h.mu.Unlock()
 
 	// The Holder cannot restart the Caddy subprocess; note that to the operator so

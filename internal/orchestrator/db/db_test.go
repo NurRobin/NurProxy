@@ -449,6 +449,40 @@ func TestAgent_CreateAndGet(t *testing.T) {
 	}
 }
 
+func TestAgent_HealthPersistsProxyMode(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+
+	// A freshly created agent defaults to built-in: CreateAgent doesn't set the
+	// column, so migration #12's DEFAULT 'built-in' fills the row.
+	got, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if got.ProxyMode != "built-in" {
+		t.Errorf("default ProxyMode: got %q, want built-in", got.ProxyMode)
+	}
+
+	// A heartbeat reporting a §19 hot-switch persists the new live mode.
+	if err := d.UpdateAgentHealth(a.ID, "", "", true, "existing"); err != nil {
+		t.Fatalf("UpdateAgentHealth(existing): %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyMode != "existing" {
+		t.Errorf("ProxyMode after switch: got %q, want existing", got.ProxyMode)
+	}
+
+	// A subsequent beat that omits the mode (empty) must NOT reset it to built-in:
+	// an older agent that doesn't report mode shouldn't erase a known-good value.
+	if err := d.UpdateAgentHealth(a.ID, "", "", true, ""); err != nil {
+		t.Fatalf("UpdateAgentHealth(empty): %v", err)
+	}
+	got, _ = d.GetAgent(a.ID)
+	if got.ProxyMode != "existing" {
+		t.Errorf("empty mode should leave it untouched: got %q, want existing", got.ProxyMode)
+	}
+}
+
 func TestAgent_GetByFQDN(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)

@@ -386,6 +386,15 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_agent_admin_ops_agent_status
 		ON agent_admin_ops(agent_id, status);
 	`,
+
+	// Migration 12: store the agent's CURRENT live reverse-proxy mode (§19) on the
+	// agent row. After a hot-switch to Existing mode the agent reports its mode via
+	// heartbeat; the orchestrator persists it here and exposes it so the dashboard
+	// reflects reality (existing vs built-in) instead of always assuming built-in.
+	// Defaults to 'built-in' for every existing row.
+	`
+	ALTER TABLE agents ADD COLUMN proxy_mode TEXT NOT NULL DEFAULT 'built-in';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

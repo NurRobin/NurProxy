@@ -177,6 +177,7 @@ func scanAgent(sc interface {
 		&det.logPaths, &det.portConflicts, &det.installed, &detectedAt,
 		&capabilities,
 		&autoReconcile,
+		&a.ProxyMode,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -204,6 +205,7 @@ const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
 	detected_installed, detected_at, detected_capabilities,
 	auto_reconcile_config,
+	proxy_mode,
 	created_at, updated_at`
 
 // boolToInt maps a bool to SQLite's integer boolean representation.
@@ -392,17 +394,21 @@ func (d *DB) UpdateAgentHeartbeat(id string, ip string) error {
 }
 
 // UpdateAgentHealth records a full heartbeat from the agent: it refreshes
-// last_seen, the public IP, and the agent's self-reported Caddy state and last
-// error. It is a narrow update so it doesn't clobber fields (name, fqdn, zones,
-// dns_record_id) owned by the orchestrator. A blank IP is ignored.
-func (d *DB) UpdateAgentHealth(id, ip, lastError string, caddyRunning bool) error {
+// last_seen, the public IP, and the agent's self-reported Caddy state, last
+// error, and current live proxy mode (§19). It is a narrow update so it doesn't
+// clobber fields (name, fqdn, zones, dns_record_id) owned by the orchestrator. A
+// blank IP is ignored; a blank proxyMode leaves the stored mode untouched (so an
+// older agent that doesn't report it doesn't reset the row to built-in).
+func (d *DB) UpdateAgentHealth(id, ip, lastError string, caddyRunning bool, proxyMode string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
 		UPDATE agents
 		SET last_seen = ?, public_ip = CASE WHEN ? != '' THEN ? ELSE public_ip END,
-			caddy_running = ?, last_error = ?, updated_at = ?
+			caddy_running = ?, last_error = ?,
+			proxy_mode = CASE WHEN ? != '' THEN ? ELSE proxy_mode END,
+			updated_at = ?
 		WHERE id = ?`,
-		now, ip, ip, boolToInt(caddyRunning), lastError, now, id,
+		now, ip, ip, boolToInt(caddyRunning), lastError, proxyMode, proxyMode, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent health: %w", err)
