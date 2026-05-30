@@ -71,6 +71,10 @@ func nginxLayoutTempDir(t *testing.T) string {
 }
 
 func TestReconfigureBuiltInToExisting_WritableDir(t *testing.T) {
+	// The probe runs the reload/test command; the agent normally wraps it in
+	// `sudo -n` when non-root. This test simulates an already-privileged agent so
+	// the /bin/true stub runs directly and the happy path is exercised.
+	t.Setenv("NURPROXY_NO_SUDO", "1")
 	root := nginxLayoutTempDir(t)
 	h := proxy.NewHolder(seedBackend{}, "built-in")
 	hs := &fakeHealth{}
@@ -204,6 +208,9 @@ func TestReconfigureBackToBuiltIn(t *testing.T) {
 // existing file backend returns a real result + the probed dirs, and surfaces a
 // remediation only when a grant is missing.
 func TestProbePermissions(t *testing.T) {
+	// Simulate an already-privileged agent so the /bin/true reload stub runs
+	// directly (the runner otherwise wraps it in sudo -n when non-root).
+	t.Setenv("NURPROXY_NO_SUDO", "1")
 	// Built-in seed backend: not a file backend → checked=false, no remediation.
 	h := proxy.NewHolder(seedBackend{}, "built-in")
 	res, rem, dirs, checked := h.ProbePermissions(context.Background(), "agentuser")
