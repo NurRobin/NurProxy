@@ -395,6 +395,15 @@ var migrations = []string{
 	`
 	ALTER TABLE agents ADD COLUMN proxy_mode TEXT NOT NULL DEFAULT 'built-in';
 	`,
+
+	// Migration 13: store the agent's §12 permission self-test (config-dir writable?
+	// service reloadable?) + targeted remediation as a JSON blob on the agent row.
+	// The agent re-probes each heartbeat in existing mode; the orchestrator persists
+	// the latest so the dashboard can show exactly which grant is missing and the
+	// fix. NULL means built-in mode / not yet reported.
+	`
+	ALTER TABLE agents ADD COLUMN proxy_permissions TEXT;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

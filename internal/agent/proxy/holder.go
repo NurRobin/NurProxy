@@ -434,6 +434,25 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 	return ReconfigureResult{OK: false, Message: msg, Remediation: rem}
 }
 
+// ProbePermissions runs the §12 permission self-test against the CURRENT backend
+// and returns the structured result, the targeted remediation (nil when nothing
+// is missing), the config dirs that were checked, and whether a probe actually
+// ran. checked is false for a built-in / admin-API backend (no file-write or
+// service-reload privilege to probe) — the caller reports no permission block in
+// that case. It never mutates real config and never panics; it is safe to call on
+// every heartbeat so a granted permission clears on the next beat without a
+// restart. osUser is named in the remediation commands (group membership +
+// scoped sudoers).
+func (h *Holder) ProbePermissions(ctx context.Context, osUser string) (res permcheck.Result, rem *permcheck.Remediation, dirs []string, checked bool) {
+	be := h.Current()
+	fb, ok := be.(fileBackend)
+	if !ok {
+		return permcheck.Result{CanWrite: true, CanReload: true}, nil, nil, false
+	}
+	res, rem = h.probeExisting(ctx, string(be.Info().Kind), osUser, be)
+	return res, rem, fb.ProbeDirs(), true
+}
+
 // probeExisting runs the §12 write+reload permission probe over the backend's
 // ProbeDirs/Runner/ReloadHint and builds the least-privilege remediation from its
 // ResolvedCommands. A backend that exposes no file/reload hooks (an admin-API
@@ -458,15 +477,25 @@ func (h *Holder) probeExisting(ctx context.Context, backend, osUser string, be P
 		return res, nil
 	}
 
+	// Build the remediation for ONLY the grants that are actually missing, so the
+	// dashboard shows exactly what to fix — not the full blob. A present write grant
+	// omits the group/ownership step (empty Dirs), a present reload grant omits the
+	// scoped-sudoers step (empty commands). BuildRemediation already drops a step
+	// whose inputs are empty.
 	test, reload := fb.ResolvedCommands()
-	rem := permcheck.BuildRemediation(permcheck.RemediationOptions{
-		Backend:   backend,
-		User:      osUser,
-		Group:     "nurproxy",
-		Dirs:      fb.ProbeDirs(),
-		TestCmd:   test,
-		ReloadCmd: reload,
-	})
+	opts := permcheck.RemediationOptions{
+		Backend: backend,
+		User:    osUser,
+		Group:   "nurproxy",
+	}
+	if !res.CanWrite {
+		opts.Dirs = fb.ProbeDirs()
+	}
+	if !res.CanReload {
+		opts.TestCmd = test
+		opts.ReloadCmd = reload
+	}
+	rem := permcheck.BuildRemediation(opts)
 	return res, &rem
 }
 

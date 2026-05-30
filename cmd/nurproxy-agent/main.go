@@ -23,6 +23,7 @@ import (
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // registers the nginx backend in the proxy registry
+	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
@@ -327,6 +328,23 @@ func main() {
 	// reflects a hot-switch (or this persisted-existing startup) instead of
 	// assuming built-in.
 	hb.SetModeFn(holder.Mode)
+	// Re-run the §12 permission self-test each beat (existing mode only) and report
+	// it structured: which grant is missing (config-dir write / service reload) and
+	// the targeted remediation. Because it re-probes every beat, granting the right
+	// clears the dashboard warning on its own — no restart. osUser names the grant
+	// commands. Built-in mode reports nothing (checked=false → nil).
+	osUser := currentOSUser()
+	hb.SetPermissionsFn(func() *models.ProxyPermissions {
+		res, rem, dirs, checked := holder.ProbePermissions(ctx, osUser)
+		if checked {
+			// Keep health/last_error in sync with the live probe so the stale startup
+			// blob clears the moment the operator grants the right — the structured
+			// report below is the dashboard's primary surface, this just stops the
+			// generic error channel from lagging behind it.
+			hs.SetError(res.HealthError())
+		}
+		return toProxyPermissions(res, rem, dirs, checked)
+	})
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
 	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
@@ -382,6 +400,34 @@ func currentOSUser() string {
 		return ""
 	}
 	return u.Username
+}
+
+// toProxyPermissions maps the agent-side permcheck result + remediation into the
+// shared model the heartbeat carries (§12). checked=false (built-in / admin-API
+// backend) yields nil so the dashboard shows no permission block. It keeps the
+// proxy package decoupled from shared/models: the conversion lives here, at the
+// agent boundary that already speaks both.
+func toProxyPermissions(res permcheck.Result, rem *permcheck.Remediation, dirs []string, checked bool) *models.ProxyPermissions {
+	if !checked {
+		return nil
+	}
+	pp := &models.ProxyPermissions{
+		Checked:     true,
+		OK:          res.OK(),
+		CanWrite:    res.CanWrite,
+		CanReload:   res.CanReload,
+		WriteError:  res.WriteError,
+		ReloadError: res.ReloadError,
+		Dirs:        dirs,
+	}
+	if rem != nil {
+		mr := &models.Remediation{SudoersLine: rem.SudoersLine}
+		for _, s := range rem.Steps {
+			mr.Steps = append(mr.Steps, models.RemediationStep{Title: s.Title, Commands: s.Commands})
+		}
+		pp.Remediation = mr
+	}
+	return pp
 }
 
 // newCertStore builds the agent's cert store under <dataDir>/certs, loading or

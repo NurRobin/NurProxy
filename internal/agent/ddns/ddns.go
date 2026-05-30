@@ -27,6 +27,7 @@ type Heartbeat struct {
 	modeFn          func() string
 	detectionFn     func() *models.ProxyDetection
 	capabilitiesFn  func() *models.ProxyCapabilities
+	permissionsFn   func() *models.ProxyPermissions
 	checksumsFn     func() []proxymodel.ArtifactChecksum
 	client          *http.Client
 	cancel          context.CancelFunc
@@ -52,6 +53,11 @@ type heartbeatPayload struct {
 	// so the orchestrator's stored copy tracks module changes (e.g. caddy-ratelimit
 	// installed/removed). Omitted when unknown.
 	ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities,omitempty"`
+	// ProxyPermissions re-reports the §12 permission self-test (config writable?
+	// service reloadable?) + targeted remediation each beat (existing mode), so the
+	// dashboard shows exactly what's missing and clears it once granted. Omitted in
+	// built-in mode (no file/reload privilege to probe).
+	ProxyPermissions *models.ProxyPermissions `json:"proxy_permissions,omitempty"`
 	// ArtifactChecksums reports each managed artifact's current on-disk/live
 	// checksum (§11) so the orchestrator can detect drift against the accepted
 	// state. Omitted when the agent manages nothing.
@@ -88,6 +94,14 @@ func (h *Heartbeat) SetModeFn(fn func() string) {
 // agent can refresh detection over time without restarting the heartbeat.
 func (h *Heartbeat) SetDetectionFn(fn func() *models.ProxyDetection) {
 	h.detectionFn = fn
+}
+
+// SetPermissionsFn supplies the §12 permission self-test re-run on each beat in
+// existing mode (config writable? service reloadable? + remediation). It may be
+// nil (no permission report). The function is called per beat so a granted
+// permission clears on the next beat without restarting the agent.
+func (h *Heartbeat) SetPermissionsFn(fn func() *models.ProxyPermissions) {
+	h.permissionsFn = fn
 }
 
 // SetCapabilitiesFn supplies the backend capability matrix (§8) re-reported on
@@ -169,6 +183,11 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		capabilities = h.capabilitiesFn()
 	}
 
+	var permissions *models.ProxyPermissions
+	if h.permissionsFn != nil {
+		permissions = h.permissionsFn()
+	}
+
 	var checksums []proxymodel.ArtifactChecksum
 	if h.checksumsFn != nil {
 		checksums = h.checksumsFn()
@@ -183,6 +202,7 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		ProxyMode:         mode,
 		ProxyDetection:    detection,
 		ProxyCapabilities: capabilities,
+		ProxyPermissions:  permissions,
 		ArtifactChecksums: checksums,
 	}
 
