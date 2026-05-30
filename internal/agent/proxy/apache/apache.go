@@ -465,6 +465,35 @@ func (b *Backend) enabledLinkFor(availablePath string) string {
 	return filepath.Join(b.layout.Enabled, filepath.Base(availablePath))
 }
 
+// ResolvedCommands returns the exact configtest and reload command strings this
+// backend will run (binary+args), so a later slice can feed permcheck's
+// remediation builder the scoped-sudoers commands without re-deriving them. It
+// mirrors execRunner.command: a per-agent override is returned verbatim;
+// otherwise the resolved binary is joined with the default args (configtest,
+// graceful). When the runner is not the default execRunner (e.g. a test fake)
+// the defaults are derived from the backend's resolved binary.
+func (b *Backend) ResolvedCommands() (test string, reload string) {
+	bin := b.binary
+	if bin == "" {
+		bin = "apachectl"
+	}
+	test = bin + " configtest"
+	reload = bin + " graceful"
+	if r, ok := b.runner.(*execRunner); ok {
+		if r.testCmd != "" {
+			test = r.testCmd
+		} else if r.binary != "" {
+			test = r.binary + " configtest"
+		}
+		if r.reloadCmd != "" {
+			reload = r.reloadCmd
+		} else if r.binary != "" {
+			reload = r.binary + " graceful"
+		}
+	}
+	return test, reload
+}
+
 // primaryTarget returns the first artifact's target path, used as "our file" for
 // error attribution.
 func primaryTarget(arts []proxy.Artifact) string {

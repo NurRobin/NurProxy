@@ -488,6 +488,35 @@ func (b *Backend) ReloadHint() string {
 	return bin + " -s reload"
 }
 
+// ResolvedCommands returns the exact test and reload command strings this
+// backend will run (binary+args), so a later slice can feed permcheck's
+// remediation builder the scoped-sudoers commands without re-deriving them. It
+// mirrors execRunner.command: a per-agent override is returned verbatim;
+// otherwise the resolved binary is joined with the default args (-t, -s reload).
+// When the runner is not the default execRunner (e.g. a test fake) the defaults
+// are derived from the backend's resolved binary.
+func (b *Backend) ResolvedCommands() (test string, reload string) {
+	bin := b.binary
+	if bin == "" {
+		bin = "nginx"
+	}
+	test = bin + " -t"
+	reload = bin + " -s reload"
+	if r, ok := b.runner.(*execRunner); ok {
+		if r.testCmd != "" {
+			test = r.testCmd
+		} else if r.binary != "" {
+			test = r.binary + " -t"
+		}
+		if r.reloadCmd != "" {
+			reload = r.reloadCmd
+		} else if r.binary != "" {
+			reload = r.binary + " -s reload"
+		}
+	}
+	return test, reload
+}
+
 // primaryTarget returns the first artifact's target path, used as "our file" for
 // error attribution. A single-domain apply has exactly one; for a multi-file
 // apply the first is a reasonable anchor (the attribution still compares the
