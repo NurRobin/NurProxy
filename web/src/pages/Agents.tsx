@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import i18n from '../lib/i18n';
+import { usePolling } from '../lib/usePolling';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft } from 'lucide-react';
@@ -69,7 +70,11 @@ export default function Agents() {
     }
   }, [toast, t]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  // Poll instead of fetching once: an agent's health, live proxy mode, and
+  // detection change out-of-band (e.g. a §19 hot-switch flips it to existing,
+  // or a permission grant clears an error). Polling makes the detail view
+  // reflect those without a full page reload. Pauses while the tab is hidden.
+  usePolling(fetchData, 5000);
 
   const loadServers = useCallback(async (agentId: string) => {
     try {
@@ -265,13 +270,32 @@ export default function Agents() {
                         {selected.public_ip && <Row label={t('agents.ip')} value={selected.public_ip} />}
                         {selected.version && <Row label={t('agents.version')} value={selected.version} />}
                         <Row
-                          label={t('agents.caddyStatus')}
+                          label={t('agents.proxyMode')}
                           value={
-                            <span className={selected.caddy_running === false ? 'text-danger-fg' : 'text-success-fg'}>
-                              {selected.caddy_running === false ? t('agents.notRunning') : t('agents.running')}
-                            </span>
+                            selected.proxy_mode === 'existing'
+                              ? t('agents.proxyModeExisting', { kind: selected.proxy_detection?.kind || t('agents.proxyExternalGeneric') })
+                              : t('agents.proxyModeBuiltIn')
                           }
                         />
+                        {/* The bundled-Caddy running indicator only makes sense in built-in
+                            mode. In existing mode the host proxy owns :80/:443 and the
+                            bundled Caddy is intentionally stopped, so "not running" would be
+                            a false alarm — show that the agent manages the existing proxy. */}
+                        {selected.proxy_mode === 'existing' ? (
+                          <Row
+                            label={t('agents.proxyStatus')}
+                            value={<span className="text-success-fg">{t('agents.managingExisting')}</span>}
+                          />
+                        ) : (
+                          <Row
+                            label={t('agents.caddyStatus')}
+                            value={
+                              <span className={selected.caddy_running === false ? 'text-danger-fg' : 'text-success-fg'}>
+                                {selected.caddy_running === false ? t('agents.notRunning') : t('agents.running')}
+                              </span>
+                            }
+                          />
+                        )}
                         <Row label={t('agents.lastSeen')} value={seen(selected.last_seen)} />
                         <Row label={t('agents.id')} value={<span className="font-mono text-xs">{selected.id}</span>} />
                       </dl>
@@ -469,6 +493,11 @@ function DetectedProxy({ agent }: { agent: Agent }) {
 
   const conflicts = d?.port_conflicts ?? [];
   const detected = !!(d && d.installed && d.kind);
+  // Once the agent has switched to existing mode (§19), it deliberately manages
+  // the host proxy and the bundled Caddy is stopped — so a :80/:443 "bind
+  // conflict" is the expected steady state, not an error, and the "switch to
+  // existing" CTA is already done. Suppress both and confirm the active mode.
+  const isExisting = agent.proxy_mode === 'existing';
 
   return (
     <div className="mt-6 border-t border-border pt-5">
@@ -518,9 +547,25 @@ function DetectedProxy({ agent }: { agent: Agent }) {
         </div>
       )}
 
+      {/* Already switched to existing mode: confirm it calmly instead of nudging a
+          setup that's done. The button reopens setup to adjust settings. */}
+      {isExisting && (
+        <div className="mt-3">
+          <Callout tone="success" title={t('agents.managingExistingTitle', { kind: d?.kind || t('agents.proxyExternalGeneric') })}>
+            <p>{t('agents.managingExistingBody', { kind: d?.kind || t('agents.proxyExternalGeneric') })}</p>
+          </Callout>
+          <div className="mt-3">
+            <Button variant="secondary" size="sm" onClick={() => setSetupOpen(true)}>
+              {t('existing.adjustThis', { kind: d?.kind || t('agents.proxyExternalGeneric') })}
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* A detected proxy can be managed directly — this is the guided "Existing"
-          setup entry point, pre-filled from detection (confirm-not-type, §2/§2.1). */}
-      {detected && (
+          setup entry point, pre-filled from detection (confirm-not-type, §2/§2.1).
+          Hidden once already in existing mode (the confirm block above covers it). */}
+      {detected && !isExisting && (
         <div className="mt-3">
           <Button variant="secondary" size="sm" onClick={() => setSetupOpen(true)}>
             {t('existing.manageThis', { kind: d?.kind })}
@@ -528,7 +573,7 @@ function DetectedProxy({ agent }: { agent: Agent }) {
         </div>
       )}
 
-      {conflicts.length > 0 && (
+      {conflicts.length > 0 && !isExisting && (
         <div className="mt-3">
           <Callout tone="warning" title={t('agents.bindConflict')}>
             <p>{t('agents.bindConflictBody')}</p>

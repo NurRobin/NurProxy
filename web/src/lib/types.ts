@@ -75,6 +75,13 @@ export interface Agent {
   last_seen?: string;
   version?: string;
   caddy_running?: boolean;
+  /**
+   * The agent's CURRENT live reverse-proxy mode (§19): 'built-in' (bundled Caddy)
+   * or 'existing' (a host-installed nginx/apache/caddy after a hot-switch). Owned
+   * by the agent via heartbeat, so the dashboard reflects reality after a switch
+   * instead of assuming built-in. Defaults to 'built-in'.
+   */
+  proxy_mode?: 'built-in' | 'existing';
   last_error?: string;
   dns_error?: string;
   proxy_detection?: ProxyDetection;
