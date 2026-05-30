@@ -235,6 +235,15 @@ func main() {
 	var certKey []byte
 	if cfg.DataDir != "" {
 		certDir = filepath.Join(cfg.DataDir, "certs")
+		// Absolutize: a file backend embeds this path in the generated config as
+		// ssl_certificate / SSLCertificateFile, and nginx/apache resolve a RELATIVE
+		// path against their own prefix (e.g. /etc/nginx) — so a relative data-dir
+		// would point the proxy at /etc/nginx/<data-dir>/... and fail to load the
+		// cert. The bundled Caddy is unaffected, but the path must be absolute for
+		// the file backends.
+		if abs, err := filepath.Abs(certDir); err == nil {
+			certDir = abs
+		}
 		if k, err := crypto.LoadOrGenerateKey(filepath.Join(cfg.DataDir, "cert.key")); err != nil {
 			log.Printf("WARNING: could not provision at-rest cert key: %v (cert keys will be stored unencrypted)", err)
 		} else {
