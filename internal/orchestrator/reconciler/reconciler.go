@@ -626,52 +626,20 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 		expectedTarget := agent.FQDN
 
 		if dom.DNSRecordID == "" {
-			// No record yet — create it.
-			recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{
-				Type:    "CNAME",
-				Name:    fqdn,
-				Content: expectedTarget,
-				TTL:     0,
-			})
-			if cErr != nil {
-				log.Printf("reconciler: failed to create DNS record for %s: %v", fqdn, cErr)
-				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS create failed: %v", cErr)); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
-				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
-				continue
-			}
-
-			if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
-				log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
-			}
-			r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, expectedTarget))
+			// No record ID on file — resolve by name (adopt an identical existing
+			// record, flag a conflict, or create) instead of blind-creating.
+			r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
 			continue
 		}
 
 		// Record exists — verify content.
 		rec, gErr := dnsProvider.GetRecord(ctx, provConfig, dom.DNSRecordID)
 		if gErr != nil {
-			// Record not found — recreate.
-			log.Printf("reconciler: DNS record %s not found for domain %d, recreating: %v", dom.DNSRecordID, dom.ID, gErr)
-			recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{
-				Type:    "CNAME",
-				Name:    fqdn,
-				Content: expectedTarget,
-				TTL:     0,
-			})
-			if cErr != nil {
-				log.Printf("reconciler: failed to recreate DNS record for %s: %v", fqdn, cErr)
-				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS recreate failed: %v", cErr)); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
-				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_recreate_failed", cErr.Error())
-				continue
-			}
-			if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
-				log.Printf("reconciler: failed to store DNS record ID: %v", dErr)
-			}
-			r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_recreated", fmt.Sprintf("recreated CNAME %s -> %s", fqdn, expectedTarget))
+			// The stored record ID no longer resolves (deleted at the provider, or a
+			// transient read error). Re-resolve by name: adopt the live record if it
+			// still exists, else create — never blind-create into "already exists".
+			log.Printf("reconciler: DNS record %s for domain %d did not resolve, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
+			r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
 			continue
 		}
 
@@ -696,6 +664,128 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ensureDomainCNAME makes the domain's CNAME exist and point at target WITHOUT
+// ever blind-creating a duplicate. It looks the name up at the provider first
+// (so a record left from a prior run, or operator-created, is handled cleanly):
+//   - an identical record present  -> adopt it (store its ID, clear stale error)
+//   - a different record present   -> explicit conflict error (current vs desired)
+//   - nothing present              -> create it
+//
+// It owns the domain's status + record ID + audit writes for this step.
+func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, fqdn, target string, dnsProvider provider.Provider, provConfig json.RawMessage) {
+	existing, lErr := lookupRecordsByName(ctx, dnsProvider, provConfig, fqdn)
+	if lErr != nil {
+		// Lookup failed (transient API/auth). Don't create blind — retry next cycle.
+		log.Printf("reconciler: DNS lookup for %s failed, retrying next cycle: %v", fqdn, lErr)
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS lookup failed: %v", lErr)); dErr != nil {
+			log.Printf("reconciler: failed to update domain status: %v", dErr)
+		}
+		return
+	}
+
+	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
+		// Identical record already exists — adopt it instead of creating a duplicate
+		// ("it's the record we'd set anyway, just skip").
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID); dErr != nil {
+			log.Printf("reconciler: failed to store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
+		}
+		// Clear any stale DNS error; the proxy apply sets the real status next.
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+			log.Printf("reconciler: failed to clear domain status: %v", dErr)
+		}
+		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s", fqdn, target))
+		return
+	}
+
+	if len(existing) > 0 {
+		// A record with this name exists but is NOT the one we want. Never overwrite
+		// a record we didn't create — surface an explicit, actionable error.
+		msg := fmt.Sprintf("a DNS record for %s already exists that does not match the desired CNAME → %s. Current: %s. Resolve it at your DNS provider (delete it or point it at %s); NurProxy won't overwrite a record it didn't create.", fqdn, target, describeRecords(existing), target)
+		log.Printf("reconciler: DNS conflict for %s: %s", fqdn, msg)
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, msg); dErr != nil {
+			log.Printf("reconciler: failed to update domain status: %v", dErr)
+		}
+		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_conflict", msg)
+		return
+	}
+
+	// Nothing exists — create it.
+	recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0})
+	if cErr != nil {
+		log.Printf("reconciler: failed to create DNS record for %s: %v", fqdn, cErr)
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS create failed: %v", cErr)); dErr != nil {
+			log.Printf("reconciler: failed to update domain status: %v", dErr)
+		}
+		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
+		return
+	}
+	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
+		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
+	}
+	r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
+}
+
+// lookupRecordsByName returns the provider's records whose name equals fqdn
+// (normalized), so the reconciler can adopt or diff before creating. An empty
+// result means the name is free.
+func lookupRecordsByName(ctx context.Context, p provider.Provider, config json.RawMessage, fqdn string) ([]provider.Record, error) {
+	recs, err := p.ListRecords(ctx, config, fqdn, "")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]provider.Record, 0, len(recs))
+	for _, rec := range recs {
+		if normalizeDNSName(rec.Name) == normalizeDNSName(fqdn) {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+// matchingRecord returns the first record of the given type whose content equals
+// content (normalized), i.e. the record NurProxy would itself create — the signal
+// to adopt rather than re-create. Returns nil when none matches.
+func matchingRecord(records []provider.Record, recordType, content string) *provider.Record {
+	for i := range records {
+		rec := &records[i]
+		if strings.EqualFold(rec.Type, recordType) && sameRecordContent(rec.Content, content) {
+			return rec
+		}
+	}
+	return nil
+}
+
+// firstRecordOfType returns the first record of the given type, or nil.
+func firstRecordOfType(records []provider.Record, recordType string) *provider.Record {
+	for i := range records {
+		if strings.EqualFold(records[i].Type, recordType) {
+			return &records[i]
+		}
+	}
+	return nil
+}
+
+// sameRecordContent compares record contents tolerant of case and a trailing dot
+// (CNAME targets the provider may canonicalize); IPs compare unchanged.
+func sameRecordContent(a, b string) bool {
+	return normalizeDNSName(a) == normalizeDNSName(b)
+}
+
+// normalizeDNSName lowercases and trims surrounding space and any trailing dot.
+func normalizeDNSName(s string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s)), ".")
+}
+
+// describeRecords renders a record set as "TYPE → content, …" for conflict
+// messages that show the operator the current on-provider state.
+func describeRecords(records []provider.Record) string {
+	parts := make([]string, 0, len(records))
+	for _, rec := range records {
+		parts = append(parts, fmt.Sprintf("%s → %s", rec.Type, rec.Content))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +844,40 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 		rec := provider.Record{Type: "A", Name: a.FQDN, Content: a.PublicIP, TTL: 0}
 
 		if a.DNSRecordID == "" {
+			// Resolve by name before creating: an A record for this FQDN may already
+			// exist (prior run / operator), and blind-creating would hit the
+			// provider's "already exists" error.
+			existing, lErr := lookupRecordsByName(ctx, dnsProvider, provConfig, a.FQDN)
+			if lErr != nil {
+				log.Printf("reconciler: A record lookup for agent %s failed, retrying next cycle: %v", a.ID, lErr)
+				continue
+			}
+			if adopt := firstRecordOfType(existing, "A"); adopt != nil {
+				// The agent owns its anchor FQDN's A record. Adopt the existing one and
+				// correct its IP if it drifted (e.g. adopted from a prior run).
+				a.DNSRecordID = adopt.ID
+				if uErr := r.db.UpdateAgentDNSRecord(a.ID, adopt.ID); uErr != nil {
+					log.Printf("reconciler: failed to persist adopted A record id for agent %s: %v", a.ID, uErr)
+				}
+				if sameRecordContent(adopt.Content, a.PublicIP) {
+					r.audit("agent", a.ID, "a_record_adopted", fmt.Sprintf("adopted existing A %s -> %s", a.FQDN, a.PublicIP))
+				} else if uErr := dnsProvider.UpdateRecord(ctx, provConfig, adopt.ID, rec); uErr != nil {
+					log.Printf("reconciler: failed to correct adopted A record for agent %s: %v", a.ID, uErr)
+					r.audit("agent", a.ID, "a_record_update_failed", uErr.Error())
+				} else {
+					r.audit("agent", a.ID, "a_record_adopted", fmt.Sprintf("adopted + corrected A %s -> %s (was %s)", a.FQDN, a.PublicIP, adopt.Content))
+				}
+				continue
+			}
+			if len(existing) > 0 {
+				// The FQDN is occupied by a non-A record (e.g. a CNAME) — can't place
+				// the agent's A record there. Surface an explicit, actionable error.
+				msg := fmt.Sprintf("cannot create the A record for %s: a different record already exists (%s). The agent's anchor FQDN must be free for an A record — remove the conflicting record or pick a different FQDN.", a.FQDN, describeRecords(existing))
+				log.Printf("reconciler: A record conflict for agent %s: %s", a.ID, msg)
+				r.setAgentDNSError(a, msg)
+				r.audit("agent", a.ID, "a_record_conflict", msg)
+				continue
+			}
 			recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, rec)
 			if cErr != nil {
 				log.Printf("reconciler: failed to create A record for agent %s: %v", a.ID, cErr)

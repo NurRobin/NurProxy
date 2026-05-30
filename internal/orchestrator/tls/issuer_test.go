@@ -55,6 +55,9 @@ func (f *fakeProvider) DeleteRecord(_ context.Context, _ json.RawMessage, id str
 func (f *fakeProvider) GetRecord(context.Context, json.RawMessage, string) (*provider.Record, error) {
 	return nil, nil
 }
+func (f *fakeProvider) ListRecords(context.Context, json.RawMessage, string, string) ([]provider.Record, error) {
+	return nil, nil
+}
 
 // fakeACME is a hand-written ACMEClient seam. It drives the solver (to exercise
 // TXT present/cleanup), then returns canned material or a canned error.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -256,6 +257,34 @@ func (p *mockDNSProvider) GetRecord(_ context.Context, _ json.RawMessage, record
 		return nil, fmt.Errorf("record not found: %s", recordID)
 	}
 	return &rec, nil
+}
+
+func (p *mockDNSProvider) ListRecords(_ context.Context, _ json.RawMessage, name, recordType string) ([]provider.Record, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []provider.Record
+	for id, rec := range p.records {
+		if name != "" && !strings.EqualFold(rec.Name, name) {
+			continue
+		}
+		if recordType != "" && !strings.EqualFold(rec.Type, recordType) {
+			continue
+		}
+		rec.ID = id
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+// seedRecord injects a pre-existing record (simulating one created by a prior run
+// or the operator), returning its ID — used by the check-before-create tests.
+func (p *mockDNSProvider) seedRecord(rec provider.Record) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nextID++
+	id := fmt.Sprintf("seed-%d", p.nextID)
+	p.records[id] = rec
+	return id
 }
 
 func (p *mockDNSProvider) getRecord(id string) (provider.Record, bool) {
@@ -1263,5 +1292,61 @@ func TestCertRenewalStore_firstIssuesCentralDomains(t *testing.T) {
 	}
 	if one, _ := store.TargetForHost(context.Background(), "app.example.com"); one != nil {
 		t.Errorf("TargetForHost should be nil once a cert exists, got %+v", one)
+	}
+}
+
+// TestReconcileDNS_adoptsIdenticalExistingRecord verifies the check-before-create
+// path: when a CNAME identical to the one NurProxy would create already exists
+// (e.g. left over from a prior run), the reconciler adopts its ID instead of
+// blind-creating a duplicate (which the provider would reject as "already exists").
+func TestReconcileDNS_adoptsIdenticalExistingRecord(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	// Seed the exact record NurProxy would create: CNAME app.example.com -> agentFQDN.
+	seedID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.reconcileDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileDNS: %v", err)
+	}
+
+	got, _ := d.GetDomain(dom.ID)
+	if got.DNSRecordID != seedID {
+		t.Errorf("expected the existing record %q to be adopted, got DNSRecordID=%q", seedID, got.DNSRecordID)
+	}
+	// No duplicate created.
+	recs, _ := mp.ListRecords(context.Background(), nil, "app.example.com", "")
+	if len(recs) != 1 {
+		t.Errorf("expected exactly 1 record (adopted, no duplicate), got %d", len(recs))
+	}
+}
+
+// TestReconcileDNS_conflictOnDifferentExistingRecord verifies that a pre-existing
+// record that does NOT match the desired one yields an explicit conflict error
+// (current vs desired) and is never overwritten.
+func TestReconcileDNS_conflictOnDifferentExistingRecord(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, _, _, dom := setupScenario(t, d)
+
+	// Seed a DIFFERENT record on the same name: an A record to some other host.
+	mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99"})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.reconcileDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileDNS: %v", err)
+	}
+
+	got, _ := d.GetDomain(dom.ID)
+	if got.Status != models.DomainStatusError {
+		t.Errorf("expected Error status on conflict, got %q", got.Status)
+	}
+	if got.DNSRecordID != "" {
+		t.Errorf("conflict must not adopt/create a record, got DNSRecordID=%q", got.DNSRecordID)
+	}
+	if !strings.Contains(got.ErrorMsg, "already exists") || !strings.Contains(got.ErrorMsg, "203.0.113.99") {
+		t.Errorf("conflict error should state current vs desired, got %q", got.ErrorMsg)
 	}
 }

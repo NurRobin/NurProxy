@@ -115,6 +115,24 @@ func (p *mockProvider) GetRecord(_ context.Context, _ json.RawMessage, recordID 
 	return &r, nil
 }
 
+func (p *mockProvider) ListRecords(_ context.Context, _ json.RawMessage, name, recordType string) ([]provider.Record, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []provider.Record
+	for id, rec := range p.records {
+		if name != "" && !strings.EqualFold(rec.Name, name) {
+			continue
+		}
+		if recordType != "" && !strings.EqualFold(rec.Type, recordType) {
+			continue
+		}
+		r := *rec
+		r.ID = id
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 func (p *mockProvider) getRecord(id string) (*provider.Record, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

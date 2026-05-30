@@ -14,6 +14,13 @@ type Provider interface {
 	UpdateRecord(ctx context.Context, config json.RawMessage, recordID string, record Record) error
 	DeleteRecord(ctx context.Context, config json.RawMessage, recordID string) error
 	GetRecord(ctx context.Context, config json.RawMessage, recordID string) (*Record, error)
+	// ListRecords returns the records in the zone matching name (the FQDN). When
+	// recordType is non-empty it further filters by type (A, AAAA, CNAME, ...).
+	// It lets the reconciler look a record up by name BEFORE creating one, so a
+	// record left over from a prior run (or created by the operator) is adopted or
+	// reported as a conflict instead of triggering the provider's "already exists"
+	// error. Returned records carry their provider ID so the caller can adopt them.
+	ListRecords(ctx context.Context, config json.RawMessage, name, recordType string) ([]Record, error)
 }
 
 type ProviderInfo struct {
@@ -42,6 +49,9 @@ type Zone struct {
 }
 
 type Record struct {
+	// ID is the provider's record identifier. Empty on a record being created;
+	// populated by GetRecord/ListRecords so a found record can be adopted/updated.
+	ID      string `json:"id,omitempty"`
 	Type    string `json:"type"`    // A, AAAA, CNAME
 	Name    string `json:"name"`    // FQDN
 	Content string `json:"content"` // IP or CNAME target
