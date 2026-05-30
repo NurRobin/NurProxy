@@ -105,7 +105,7 @@ func TestBuildRemediation_table(t *testing.T) {
 			wantSteps:       2,
 			wantSudoersLine: "nurproxy ALL=(root) NOPASSWD: nginx -t, nginx -s reload",
 			wantContains: []string{
-				`# note: "nginx" should be an absolute path`,
+				`# note: use absolute paths in the sudoers line for: nginx`,
 			},
 		},
 		{

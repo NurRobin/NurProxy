@@ -119,13 +119,18 @@ func BuildRemediation(opts RemediationOptions) Remediation {
 			fmt.Sprintf("sudo chmod 0440 %s", sudoersPath),
 			"sudo visudo -c",
 		}
-		// Warn (as a comment line operators see) if a command path is not absolute:
-		// sudoers should name absolute paths so the grant is unambiguous.
+		// Warn (as a single comment line operators see) if any command path is not
+		// absolute: sudoers should name absolute paths so the grant is unambiguous.
+		// One note covers all of them — listing the same advice per command is noise.
 		var notes []string
+		var bare []string
 		for _, c := range cmdList {
 			if !isAbsCommand(c) {
-				notes = append(notes, fmt.Sprintf("# note: %q should be an absolute path in the sudoers line", commandBinary(c)))
+				bare = append(bare, commandBinary(c))
 			}
+		}
+		if len(bare) > 0 {
+			notes = append(notes, fmt.Sprintf("# note: use absolute paths in the sudoers line for: %s", strings.Join(dedupeStrings(bare), ", ")))
 		}
 		rem.Steps = append(rem.Steps, RemediationStep{
 			Title:    title,
@@ -145,6 +150,21 @@ func nonEmpty(in []string) []string {
 		if strings.TrimSpace(s) != "" {
 			out = append(out, s)
 		}
+	}
+	return out
+}
+
+// dedupeStrings returns the input with duplicate values removed, preserving
+// first-seen order.
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
 	}
 	return out
 }
