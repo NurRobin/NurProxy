@@ -12,6 +12,13 @@ import (
 // back cleanly to the Caddy/HTTP-01 mode (§7) rather than failing silently.
 var ErrNoTXTSupport = errors.New("tls: dns provider does not support TXT records (DNS-01 unavailable, fall back to HTTP-01)")
 
+// ErrACMENotConfigured is returned by the ACME client when issuance is attempted
+// before the operator has set the ACME contact email (acme_email). It is NOT a
+// failure to retry or audit per host: the renewer treats it as "skip quietly
+// until configured", so a fresh install with no ACME email doesn't spam the log
+// on every scan. The dashboard surfaces the missing config as a warning instead.
+var ErrACMENotConfigured = errors.New("tls: ACME not configured — set the ACME contact email in Settings to enable certificate issuance")
+
 // RateLimitError is a special error surfaced when Let's Encrypt (or any ACME CA)
 // responds with a 429 / rateLimited problem. It carries the human-verification
 // unblock link so the dashboard can render it as a clickable action (§7). Callers

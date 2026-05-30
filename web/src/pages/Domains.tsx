@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import i18n from '../lib/i18n';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
@@ -33,6 +34,7 @@ export default function Domains() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
+  const [acmeConfigured, setAcmeConfigured] = useState(true);
   const [allServers, setAllServers] = useState<ServerWithAgent[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -68,8 +70,9 @@ export default function Domains() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [d, a, z] = await Promise.all([api.listDomains(), api.listAgents(), api.listAllZones()]);
+      const [d, a, z, s] = await Promise.all([api.listDomains(), api.listAgents(), api.listAllZones(), api.getSettings()]);
       setDomains(d); setAgents(a); setZones(z);
+      setAcmeConfigured(!!s.find((st) => st.key === 'acme_email')?.value?.trim());
       const adopted = a.filter((ag) => ag.status === 'adopted' || ag.status === 'offline');
       const serverResults = await Promise.all(
         adopted.map(async (ag) => {
@@ -271,6 +274,16 @@ export default function Domains() {
 
   if (loading) return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
 
+  // A domain uses central (NurProxy-issued) TLS unless it opts out via ssl_mode
+  // off or a self-acme/off tls_policy — mirrors the orchestrator's
+  // TLSPolicyForDomain. If any such domain exists but no ACME email is set, those
+  // domains won't get HTTPS certificates, so warn and point to Settings.
+  const usesCentralTLS = (d: Domain) =>
+    d.ssl_mode !== 'off' &&
+    d.proxy_config?.tls_policy !== 'self-acme' &&
+    d.proxy_config?.tls_policy !== 'off';
+  const showAcmeWarning = !acmeConfigured && domains.some(usesCentralTLS);
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -280,6 +293,13 @@ export default function Domains() {
         </div>
         <Button onClick={() => { setShowCreate(true); setCreateError(''); }}>{t('domains.newDomain')}</Button>
       </div>
+
+      {showAcmeWarning && (
+        <Callout tone="warning" title={t('domains.acmeWarningTitle')}>
+          {t('domains.acmeWarningBody')}{' '}
+          <Link to="/settings" className="font-medium text-accent hover:underline">{t('domains.acmeWarningLink')}</Link>
+        </Callout>
+      )}
 
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-3">

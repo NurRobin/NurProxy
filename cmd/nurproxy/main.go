@@ -196,19 +196,11 @@ func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconcil
 		return nil
 	}
 
-	email, _ := database.GetSetting("acme_email")
-	caDir, _ := database.GetSetting("acme_directory")
-
-	acmeClient, err := orchtls.NewLegoClient(orchtls.LegoConfig{
-		Email:      email,
-		CADirURL:   caDir,
-		AccountKey: accountKey,
-	})
-	if err != nil {
-		log.Printf("tls: renewal disabled: %v", err)
-		return nil
-	}
-
+	// The ACME client reads the contact email + directory from settings at issuance
+	// time (not boot), so configuring them in the setup wizard / Settings takes
+	// effect WITHOUT an orchestrator restart. Until an email is set, issuance is a
+	// quiet no-op (the dashboard surfaces a warning) rather than a hard-disabled loop.
+	acmeClient := &settingsACMEClient{db: database, accountKey: accountKey}
 	issuer := orchtls.NewIssuer(acmeClient, nil)
 	store := reconciler.NewCertRenewalStore(database)
 	renewer := orchtls.NewRenewer(store, issuer, orchtls.RenewerConfig{
@@ -219,6 +211,37 @@ func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconcil
 	go renewer.Start(ctx)
 	log.Printf("tls: central renewal + first-issuance loop started (window %s)", orchtls.DefaultRenewWindow)
 	return renewer
+}
+
+// settingsACMEClient is an orchtls.ACMEClient that resolves the ACME contact
+// email + directory URL from settings on each issuance, then delegates to a lego
+// client built with the persistent account key. Reading settings lazily means an
+// email set after boot (setup wizard or Settings) enables issuance immediately,
+// with no restart. An unset email returns orchtls.ErrACMENotConfigured, which the
+// renewer treats as a quiet skip.
+type settingsACMEClient struct {
+	db *db.DB
+	// accountKey is the persistent ACME account key (crypto.PrivateKey, which is
+	// an alias for any; typed as any here to avoid shadowing the project's crypto
+	// package imported in this file).
+	accountKey any
+}
+
+func (c *settingsACMEClient) ObtainViaDNS01(ctx context.Context, names []string, solver orchtls.DNSSolver) (*orchtls.CertResult, error) {
+	email, _ := c.db.GetSetting("acme_email")
+	if strings.TrimSpace(email) == "" {
+		return nil, orchtls.ErrACMENotConfigured
+	}
+	caDir, _ := c.db.GetSetting("acme_directory")
+	client, err := orchtls.NewLegoClient(orchtls.LegoConfig{
+		Email:      email,
+		CADirURL:   caDir,
+		AccountKey: c.accountKey,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return client.ObtainViaDNS01(ctx, names, solver)
 }
 
 // dbAuditSink writes renewal audit events to the orchestrator audit log with

@@ -180,6 +180,13 @@ func (r *Renewer) RunOnce(ctx context.Context) error {
 	for i := range targets {
 		t := targets[i]
 		if err := r.renewOne(ctx, t); err != nil {
+			// ACME not configured yet: nothing to retry per host. Stop the scan
+			// quietly — issuance resumes once the operator sets the contact email
+			// (the dashboard surfaces that as a warning).
+			if errors.Is(err, ErrACMENotConfigured) {
+				r.logger.InfoContext(ctx, "tls: skipping issuance — ACME contact email not configured")
+				return nil
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -213,6 +220,12 @@ func (r *Renewer) EnsureCertForHost(ctx context.Context, host string) error {
 	}
 	r.logger.InfoContext(ctx, "tls: issuing certificate on demand", slog.String("host", host))
 	if err := r.renewOne(ctx, *target); err != nil {
+		// Not configured yet: a no-op, not a failure — the periodic scan retries
+		// once the operator sets the contact email.
+		if errors.Is(err, ErrACMENotConfigured) {
+			r.logger.InfoContext(ctx, "tls: on-demand issuance skipped — ACME contact email not configured", slog.String("host", host))
+			return nil
+		}
 		r.auditEvent("certificate", host, "issue_failed", err.Error())
 		return err
 	}

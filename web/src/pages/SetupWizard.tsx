@@ -20,6 +20,7 @@ interface SetupWizardProps {
 
 const STEPS = [
   { key: 'provider', labelKey: 'setup.stepProvider' },
+  { key: 'tls', labelKey: 'setup.stepTls' },
   { key: 'agent', labelKey: 'setup.stepAgent' },
   { key: 'done', labelKey: 'setup.stepDone' },
 ] as const;
@@ -45,7 +46,13 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   // Agent step
   const [agents, setAgents] = useState<Agent[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
-  const pollingAgents = currentStep === 1;
+  const stepKey = STEPS[currentStep].key;
+  const pollingAgents = stepKey === 'agent';
+
+  // TLS / ACME step
+  const [acmeEmail, setAcmeEmail] = useState('');
+  const [acmeSaving, setAcmeSaving] = useState(false);
+  const [acmeError, setAcmeError] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [orchestratorUrl, setOrchestratorUrl] = useState(window.location.origin);
   const [agentFqdn, setAgentFqdn] = useState('');
@@ -69,7 +76,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   }, []);
 
   useEffect(() => {
-    if (currentStep === 1) {
+    if (STEPS[currentStep].key === 'agent') {
       fetchZones();
       pollAgents();
       pollRef.current = setInterval(pollAgents, 3000);
@@ -117,6 +124,21 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
       setProvError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : t('setup.saveFailed'));
     } finally {
       setProvSaveLoading(false);
+    }
+  }
+
+  async function handleSaveAcme() {
+    setAcmeSaving(true);
+    setAcmeError('');
+    try {
+      // Persist the contact email (empty is allowed — issuance just stays off
+      // until it is set). The orchestrator reads it lazily, so no restart needed.
+      await api.updateSetting('acme_email', acmeEmail.trim());
+      setCurrentStep(currentStep + 1);
+    } catch (err) {
+      setAcmeError(err instanceof Error ? err.message.replace(/^API error \d+:\s*/, '') : t('setup.saveFailed'));
+    } finally {
+      setAcmeSaving(false);
     }
   }
 
@@ -210,7 +232,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
 
         <div className="rounded-xl border border-border bg-surface p-6 shadow-card">
           {/* STEP 1 — provider */}
-          {currentStep === 0 && (
+          {stepKey === 'provider' && (
             <div className="space-y-5">
               <div>
                 <h2 className="text-lg font-semibold text-fg">{t('setup.providerTitle')}</h2>
@@ -298,15 +320,50 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                     </div>
                   </Callout>
                   <div className="flex justify-end">
-                    <Button onClick={() => setCurrentStep(1)}>{t('common.continue')}</Button>
+                    <Button onClick={() => setCurrentStep(currentStep + 1)}>{t('common.continue')}</Button>
                   </div>
                 </>
               )}
             </div>
           )}
 
-          {/* STEP 2 — agent */}
-          {currentStep === 1 && (
+          {/* STEP 2 — TLS / ACME contact email */}
+          {stepKey === 'tls' && (
+            <div className="space-y-5">
+              <div>
+                <h2 className="text-lg font-semibold text-fg">{t('setup.tlsTitle')}</h2>
+                <p className="mt-1 text-sm text-fg-muted">{t('setup.tlsSub')}</p>
+              </div>
+
+              <Callout tone="info" title={t('setup.tlsPrivacyTitle')}>
+                {t('setup.tlsPrivacyBody')}
+              </Callout>
+
+              {acmeError && <Callout tone="danger">{acmeError}</Callout>}
+
+              <Field label={t('setup.tlsEmailLabel')}>
+                <Input
+                  type="email"
+                  value={acmeEmail}
+                  onChange={(e) => { setAcmeEmail(e.target.value); setAcmeError(''); }}
+                  placeholder="you@example.com"
+                  autoComplete="email"
+                />
+              </Field>
+              <p className="-mt-2 text-xs text-fg-faint">{t('setup.tlsEmailHelp')}</p>
+
+              <div className="flex justify-between">
+                <Button variant="secondary" onClick={() => setCurrentStep(currentStep - 1)}>{t('common.back')}</Button>
+                <div className="flex gap-2">
+                  <Button variant="secondary" onClick={() => setCurrentStep(currentStep + 1)} disabled={acmeSaving}>{t('setup.tlsSkip')}</Button>
+                  <Button onClick={handleSaveAcme} loading={acmeSaving} disabled={!acmeEmail.trim()}>{t('common.continue')}</Button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* STEP 3 — agent */}
+          {stepKey === 'agent' && (
             <div className="space-y-5">
               <div>
                 <h2 className="text-lg font-semibold text-fg">{t('setup.agentTitle')}</h2>
@@ -418,17 +475,17 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               )}
 
               <div className="flex items-center justify-between pt-1">
-                <Button variant="secondary" onClick={() => setCurrentStep(0)}>{t('common.back')}</Button>
+                <Button variant="secondary" onClick={() => setCurrentStep(currentStep - 1)}>{t('common.back')}</Button>
                 <div className="flex gap-3">
                   <Button variant="ghost" onClick={handleSkipStep}>{t('common.skip')}</Button>
-                  {agentAdopted && <Button onClick={() => setCurrentStep(2)}>{t('common.continue')}</Button>}
+                  {agentAdopted && <Button onClick={() => setCurrentStep(currentStep + 1)}>{t('common.continue')}</Button>}
                 </div>
               </div>
             </div>
           )}
 
-          {/* STEP 3 — done */}
-          {currentStep === 2 && (
+          {/* STEP 4 — done */}
+          {stepKey === 'done' && (
             <div className="text-center">
               <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-success-soft text-success-fg">
                 <Check className="h-7 w-7" />
