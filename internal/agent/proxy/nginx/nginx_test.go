@@ -4,12 +4,61 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
+
+// TestExecRunner_command_sudoAndResolve covers the §12 fix: an unprivileged agent
+// runs the proxy command via `sudo -n` (so a scoped sudoers entry is actually
+// used), a bare override binary is resolved to an absolute path (so it matches an
+// absolute sudoers command), and NURPROXY_NO_SUDO disables the wrapper.
+func TestExecRunner_command_sudoAndResolve(t *testing.T) {
+	r := &execRunner{binary: "/usr/sbin/nginx"}
+
+	t.Run("NURPROXY_NO_SUDO runs directly", func(t *testing.T) {
+		t.Setenv("NURPROXY_NO_SUDO", "1")
+		cmd := r.command(context.Background(), "", "-t")
+		if len(cmd.Args) != 2 || cmd.Args[0] != "/usr/sbin/nginx" || cmd.Args[1] != "-t" {
+			t.Fatalf("want direct [/usr/sbin/nginx -t], got %v", cmd.Args)
+		}
+	})
+
+	t.Run("non-root wraps in sudo -n", func(t *testing.T) {
+		if os.Geteuid() <= 0 {
+			t.Skip("not a non-root POSIX user; sudo wrapping does not apply")
+		}
+		t.Setenv("NURPROXY_NO_SUDO", "")
+		cmd := r.command(context.Background(), "", "-t")
+		want := []string{"sudo", "-n", "/usr/sbin/nginx", "-t"}
+		if len(cmd.Args) != len(want) {
+			t.Fatalf("args = %v, want %v", cmd.Args, want)
+		}
+		for i := range want {
+			if cmd.Args[i] != want[i] {
+				t.Fatalf("args = %v, want %v", cmd.Args, want)
+			}
+		}
+	})
+
+	t.Run("bare override binary resolves to absolute", func(t *testing.T) {
+		abs, err := exec.LookPath("sh")
+		if err != nil {
+			t.Skip("sh not in PATH")
+		}
+		ro := &execRunner{binary: "/usr/sbin/nginx", testCmd: "sh -c ok"}
+		name, args := ro.spec(ro.testCmd, []string{"-t"})
+		if name != abs {
+			t.Errorf("bare override binary = %q, want absolute %q", name, abs)
+		}
+		if len(args) != 2 || args[0] != "-c" || args[1] != "ok" {
+			t.Errorf("args = %v, want [-c ok]", args)
+		}
+	})
+}
 
 // fakeRunner is an injectable Runner that records calls and returns canned
 // results so Apply's atomic orchestration is testable without a real nginx.

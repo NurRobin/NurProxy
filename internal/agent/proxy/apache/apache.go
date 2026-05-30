@@ -479,25 +479,19 @@ func (b *Backend) enabledLinkFor(availablePath string) string {
 // graceful). When the runner is not the default execRunner (e.g. a test fake)
 // the defaults are derived from the backend's resolved binary.
 func (b *Backend) ResolvedCommands() (test string, reload string) {
+	if r, ok := b.runner.(*execRunner); ok {
+		// Return the privileged command the agent actually runs via sudo, binary
+		// resolved to an absolute path (a scoped sudoers entry must name absolute
+		// commands and must match what the agent invokes).
+		tn, ta := r.spec(r.testCmd, []string{"configtest"})
+		rn, ra := r.spec(r.reloadCmd, []string{"graceful"})
+		return joinCommand(tn, ta), joinCommand(rn, ra)
+	}
 	bin := b.binary
 	if bin == "" {
 		bin = "apachectl"
 	}
-	test = bin + " configtest"
-	reload = bin + " graceful"
-	if r, ok := b.runner.(*execRunner); ok {
-		if r.testCmd != "" {
-			test = r.testCmd
-		} else if r.binary != "" {
-			test = r.binary + " configtest"
-		}
-		if r.reloadCmd != "" {
-			reload = r.reloadCmd
-		} else if r.binary != "" {
-			reload = r.binary + " graceful"
-		}
-	}
-	return test, reload
+	return bin + " configtest", bin + " graceful"
 }
 
 // primaryTarget returns the first artifact's target path, used as "our file" for
@@ -570,15 +564,61 @@ func (r *execRunner) Reload(ctx context.Context) error {
 	return nil
 }
 
-// command builds the exec.Cmd for a step: a configured override string is split
-// on whitespace and run as-is; otherwise the resolved binary is invoked with the
-// default args.
+// command builds the exec.Cmd for a step. It resolves the privileged command
+// (see spec) and, when the agent runs unprivileged, invokes it through `sudo -n`
+// so a scoped, passwordless sudoers entry (the §12 remediation) grants exactly
+// these commands instead of requiring the whole agent to run as root.
 func (r *execRunner) command(ctx context.Context, override string, defaultArgs ...string) *exec.Cmd {
+	name, args := r.spec(override, defaultArgs)
+	if elevateNeeded() && filepath.Base(name) != "sudo" {
+		args = append([]string{"-n", name}, args...)
+		name = "sudo"
+	}
+	return exec.CommandContext(ctx, name, args...)
+}
+
+// spec resolves a step to its (name, args) WITHOUT sudo: a per-agent override
+// wins (split on whitespace), otherwise the resolved binary + default args. A
+// bare override binary is resolved to an absolute path (skipping "sudo" and
+// already-absolute paths) so it matches a scoped sudoers entry. Single source of
+// truth for both execution (which wraps it in sudo) and ResolvedCommands (the
+// remediation).
+func (r *execRunner) spec(override string, defaultArgs []string) (name string, args []string) {
 	if override != "" {
 		fields := strings.Fields(override)
-		return exec.CommandContext(ctx, fields[0], fields[1:]...)
+		name, args = fields[0], fields[1:]
+		if name != "sudo" && !filepath.IsAbs(name) {
+			if abs, err := exec.LookPath(name); err == nil {
+				name = abs
+			}
+		}
+		return name, args
 	}
-	return exec.CommandContext(ctx, r.binary, defaultArgs...)
+	name = r.binary
+	if name == "" {
+		name = "apachectl"
+	}
+	return name, defaultArgs
+}
+
+// elevateNeeded reports whether privileged proxy commands should run via sudo:
+// true only for a non-root POSIX user. Geteuid() is 0 for root and -1 on Windows
+// (both return false), so the command runs directly there. NURPROXY_NO_SUDO=1
+// disables the sudo wrapper (agent already privileged / external elevation).
+func elevateNeeded() bool {
+	if os.Getenv("NURPROXY_NO_SUDO") == "1" {
+		return false
+	}
+	return os.Geteuid() > 0
+}
+
+// joinCommand renders a (name, args) pair into a single command string for the
+// remediation's sudoers line.
+func joinCommand(name string, args []string) string {
+	if len(args) == 0 {
+		return name
+	}
+	return name + " " + strings.Join(args, " ")
 }
 
 var _ proxy.Proxy = (*Backend)(nil)
