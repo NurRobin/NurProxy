@@ -3,9 +3,10 @@ import i18n from '../lib/i18n';
 import { usePolling } from '../lib/usePolling';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { ChevronLeft } from 'lucide-react';
+import { ChevronLeft, Check, X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Agent, Zone, Server, Domain } from '../lib/types';
+import type { Agent, Zone, Server, Domain, ProxyPermissions } from '../lib/types';
+import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
@@ -247,8 +248,11 @@ export default function Agents() {
                 </div>
 
                 {/* Surface anything wrong the agent (or the orchestrator's DNS
-                    management) is reporting, so problems are visible and fixable. */}
-                {selected.status !== 'pending' && selected.last_error && (
+                    management) is reporting, so problems are visible and fixable.
+                    In existing mode a permission denial is shown granularly (with a
+                    targeted fix) by the detected-proxy block below, so we suppress
+                    the redundant raw-error blob here. */}
+                {selected.status !== 'pending' && selected.last_error && selected.proxy_mode !== 'existing' && (
                   <Callout tone="danger" title={t('agents.agentError')}>{selected.last_error}</Callout>
                 )}
                 {selected.status !== 'pending' && selected.dns_error && (
@@ -547,19 +551,15 @@ function DetectedProxy({ agent }: { agent: Agent }) {
         </div>
       )}
 
-      {/* Already switched to existing mode: confirm it calmly instead of nudging a
-          setup that's done. The button reopens setup to adjust settings. */}
+      {/* Already switched to existing mode: show the §12 permission self-test
+          (granular: config writable? service reloadable?) with the targeted fix
+          for whatever's missing — not a verbose blob. The button reopens setup. */}
       {isExisting && (
-        <div className="mt-3">
-          <Callout tone="success" title={t('agents.managingExistingTitle', { kind: d?.kind || t('agents.proxyExternalGeneric') })}>
-            <p>{t('agents.managingExistingBody', { kind: d?.kind || t('agents.proxyExternalGeneric') })}</p>
-          </Callout>
-          <div className="mt-3">
-            <Button variant="secondary" size="sm" onClick={() => setSetupOpen(true)}>
-              {t('existing.adjustThis', { kind: d?.kind || t('agents.proxyExternalGeneric') })}
-            </Button>
-          </div>
-        </div>
+        <PermissionSelfTest
+          kind={d?.kind || t('agents.proxyExternalGeneric')}
+          perm={agent.proxy_permissions}
+          onAdjust={() => setSetupOpen(true)}
+        />
       )}
 
       {/* A detected proxy can be managed directly — this is the guided "Existing"
@@ -615,6 +615,85 @@ function DetectedProxy({ agent }: { agent: Agent }) {
         <LogTailViewer agentId={agent.id} path={tailPath} open={!!tailPath} onClose={() => setTailPath(null)} />
       )}
     </div>
+  );
+}
+
+// PermissionSelfTest renders the agent's §12 permission self-test for an
+// existing-mode backend: a two-line checklist (config dir writable? service
+// reloadable?) and, when a grant is missing, the exact least-privilege commands
+// to fix just that — never the whole blob. It re-reads from the heartbeat-reported
+// proxy_permissions, so once the operator runs the grant the warning clears on the
+// next poll without a reload. perm is undefined for an older agent / first beat.
+function PermissionSelfTest({
+  kind,
+  perm,
+  onAdjust,
+}: {
+  kind: string;
+  perm?: ProxyPermissions;
+  onAdjust: () => void;
+}) {
+  const { t } = useTranslation();
+  const ok = perm?.ok ?? true; // no report yet → don't cry wolf
+  const steps = perm?.remediation?.steps ?? [];
+
+  return (
+    <div className="mt-3 space-y-3">
+      <Callout
+        tone={ok ? 'success' : 'warning'}
+        title={
+          ok
+            ? t('agents.managingExistingTitle', { kind })
+            : t('agents.permFixTitle', { kind })
+        }
+      >
+        {/* The granular checklist replaces the verbose paragraph: each §12 grant
+            with a clear ✓/✗ and, when missing, its actionable reason. */}
+        {perm?.checked ? (
+          <ul className="space-y-1.5">
+            <PermCheckLine ok={perm.can_write} label={t('agents.permWriteCheck')} detail={perm.can_write ? '' : perm.write_error} />
+            <PermCheckLine ok={perm.can_reload} label={t('agents.permReloadCheck')} detail={perm.can_reload ? '' : perm.reload_error} />
+          </ul>
+        ) : (
+          <p>{t('agents.managingExistingShort', { kind })}</p>
+        )}
+      </Callout>
+
+      {/* Targeted fix: only the steps for what's actually missing. */}
+      {!ok && steps.length > 0 && (
+        <div className="space-y-3 rounded-lg border border-border bg-surface-2/40 p-3">
+          <p className="text-xs font-medium text-fg-muted">{t('agents.permFixHint')}</p>
+          {steps.map((s, i) => (
+            <div key={i} className="space-y-1.5">
+              <p className="text-sm font-medium text-fg">{s.title}</p>
+              <CommandBlock text={s.commands.join('\n')} label={t('agents.permStepLabel', { n: i + 1 })} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Button variant="secondary" size="sm" onClick={onAdjust}>
+        {t('existing.adjustThis', { kind })}
+      </Button>
+    </div>
+  );
+}
+
+// PermCheckLine is one ✓/✗ row of the permission self-test, with an optional
+// actionable detail when the grant is missing.
+function PermCheckLine({ ok, label, detail }: { ok: boolean; label: string; detail?: string }) {
+  return (
+    <li className="flex items-start gap-2 text-sm">
+      {ok ? (
+        <Check className="mt-0.5 h-4 w-4 shrink-0 text-success-fg" />
+      ) : (
+        <X className="mt-0.5 h-4 w-4 shrink-0 text-danger-fg" />
+      )}
+      <span>
+        <span className={ok ? '' : 'font-medium'}>{label}</span>
+        {!ok && detail && <span className="block text-xs text-fg-muted">{detail}</span>}
+      </span>
+    </li>
   );
 }
 

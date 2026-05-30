@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, ChevronDown, ChevronRight, Copy, Loader2 } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
 import Modal from '../components/Modal';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import { Field, Input, Select } from '../components/Field';
-import { copyText } from '../lib/clipboard';
+import { CommandBlock } from '../components/CommandBlock';
 import { api } from '../lib/api';
 import { usePolling } from '../lib/usePolling';
 import type { Agent, ProxyDetection, PreparedAdminOp } from '../lib/types';
@@ -440,40 +440,6 @@ function ResultPanel({
   );
 }
 
-// CommandBlock is a <pre> with a working copy button (copyText) — used for the
-// apply commands, the permission block, and the advanced YAML.
-function CommandBlock({ text, label }: { text: string; label: string }) {
-  const { t } = useTranslation();
-  const [copied, setCopied] = useState(false);
-
-  async function copy() {
-    // copyText works over plain http too (hidden-textarea fallback); the text
-    // also stays visible in the <pre> for manual selection if it fails.
-    if (await copyText(text)) {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  }
-
-  return (
-    <div>
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-fg-muted">{label}</span>
-        <button
-          type="button"
-          onClick={copy}
-          className="inline-flex items-center gap-1 rounded-md border border-border bg-surface px-2 py-1 text-xs font-medium text-fg-muted transition-colors hover:text-fg"
-        >
-          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-          {copied ? t('common.copied') : t('common.copy')}
-        </button>
-      </div>
-      <pre className="overflow-x-auto rounded-lg border border-border bg-surface-2 p-3 font-mono text-xs leading-relaxed text-fg">
-        {text}
-      </pre>
-    </div>
-  );
-}
 
 // ConfirmField is a labelled input that signals when its value was pre-filled
 // from live detection (a green check) — reinforcing the confirm-not-type flow —
