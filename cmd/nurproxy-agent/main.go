@@ -314,6 +314,24 @@ func main() {
 	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), holder, hs).
 		WithLogPaths(cfg.ProxyLogPaths)
 
+	// In existing mode, report the host config the agent can READ into the central
+	// store (§17 "adoption reads all files") so it shows under Config immediately —
+	// even before any domain is applied, and crucially even when the agent lacks
+	// reload permission. Reading is independent of reloading: a limited-permission
+	// agent is degraded (can't push changes live) but its config is still visible.
+	// One-shot at startup, best-effort: a read/report failure is logged, never fatal
+	// (mirrors the never-die-on-host-problems posture). Built-in Caddy reports its
+	// config through the normal apply path, so this is scoped to existing mode.
+	if holder.Mode() == "existing" {
+		if arts, rerr := holder.Current().ReadManaged(ctx); rerr != nil {
+			log.Printf("WARNING: could not read existing config for the central store: %v", rerr)
+		} else if perr := streamClient.ReportAdopted(ctx, cfg.FQDN, cfg.ProxyType, arts); perr != nil {
+			log.Printf("WARNING: could not report existing config to the central store: %v", perr)
+		} else if len(arts) > 0 {
+			log.Printf("Reported %d existing config artifact(s) to the central store", len(arts))
+		}
+	}
+
 	// Step 5: Start heartbeat loop. It carries the health snapshot so the
 	// dashboard always sees the agent and any problems it's reporting.
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)

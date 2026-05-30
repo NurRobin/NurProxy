@@ -99,6 +99,9 @@ func (s *Server) registerRoutes() {
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", s.requireAgentAuth(s.handleAgentRoutesAck))
+	// Adopted-config report (§17): the agent POSTs the host config it read off disk
+	// (existing mode) into the central store. Agent auth, agent dials out.
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/artifacts/adopt", s.requireAgentAuth(s.handleAgentAdoptArtifacts))
 	// On-demand log tail (§15): the agent POSTs tailed chunks up the control plane
 	// (agent auth); the dashboard starts/polls/stops a tail (user auth). The tail
 	// request rides the agent's existing stream — never an inbound probe.
