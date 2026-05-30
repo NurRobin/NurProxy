@@ -68,6 +68,9 @@ func main() {
 		case "uninstall":
 			cmdUninstall(os.Args[2:])
 			return
+		case "apply":
+			cmdApply(os.Args[2:])
+			return
 		}
 	}
 
@@ -150,6 +153,18 @@ func main() {
 
 	log.Printf("Agent ID: %s", mgr.AgentID())
 	log.Printf("Agent Token: %s...%s", mgr.Token()[:10], mgr.Token()[len(mgr.Token())-4:])
+
+	// Record runtime facts so `nurproxy-agent apply <code>` works zero-arg on this
+	// host (§19): the CLI resolves orchestrator/api-port/agent-id from here without
+	// re-deriving identity. Non-destructive and non-fatal — a write failure just
+	// means the operator passes the flags explicitly.
+	if err := agentconfig.SaveRuntimeInfo(cfg.DataDir, agentconfig.RuntimeInfo{
+		OrchestratorURL: cfg.OrchestratorURL,
+		APIPort:         cfg.APIPort,
+		AgentID:         mgr.AgentID(),
+	}); err != nil {
+		log.Printf("WARNING: could not write runtime.json: %v (the apply CLI will need explicit flags)", err)
+	}
 
 	if err := mgr.Register(ctx); err != nil {
 		log.Printf("Registration failed (orchestrator may be unavailable): %v", err)
