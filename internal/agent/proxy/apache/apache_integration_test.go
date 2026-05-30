@@ -74,7 +74,7 @@ ErrorLog /proc/self/fd/2
 LogLevel warn
 LogFormat "%%h %%l %%u %%t \"%%r\" %%>s %%b" common
 CustomLog /proc/self/fd/1 common
-Include %s/*.conf
+IncludeOptional %s/*.conf
 `
 
 // dockerAvailable reports whether a usable Docker daemon is reachable. When it is
