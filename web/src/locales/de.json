@@ -638,7 +638,8 @@
     "pending": "Ausstehend",
     "error": "Fehler",
     "offline": "Offline",
-    "deleting": "Wird gelöscht"
+    "deleting": "Wird gelöscht",
+    "degraded": "Eingeschränkt"
   },
   "confirm": {
     "typeToConfirm": "Tippe <0>{{text}}</0> zum Bestätigen"

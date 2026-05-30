@@ -7,6 +7,7 @@ import { api } from '../lib/api';
 import { usePolling } from '../lib/usePolling';
 import type { Agent, Domain, AuditLogEntry } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
+import { isDegraded } from '../lib/status';
 import { buttonClass } from '../components/button-styles';
 import StatusBadge from '../components/StatusBadge';
 import EmptyState from '../components/EmptyState';
@@ -52,12 +53,9 @@ export default function Overview() {
   // A degraded agent is connected (status adopted) but reporting an operational
   // error or a failed §12 permission self-test — e.g. existing-mode nginx it
   // can't reload. Status alone misses these, which is why the banner used to read
-  // "all normal" while an agent clearly wasn't. Don't double-count offline agents.
-  const degraded = agents.filter(
-    (a) =>
-      a.status !== 'offline' &&
-      (!!a.last_error || !!(a.proxy_permissions?.checked && !a.proxy_permissions.ok)),
-  ).length;
+  // "all normal" while an agent clearly wasn't. isDegraded already excludes
+  // offline/error agents, so offline is not double-counted.
+  const degraded = agents.filter(isDegraded).length;
   const problemCount = errors + offline + degraded;
   const healthy = problemCount === 0;
 
@@ -142,7 +140,7 @@ export default function Overview() {
                     <p className="truncate font-medium text-fg">{agent.name}</p>
                     <p className="truncate text-sm text-fg-muted">{agent.fqdn}</p>
                   </div>
-                  <StatusBadge status={agent.status} />
+                  <StatusBadge status={agent.status} degraded={isDegraded(agent)} />
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-fg-faint">
                   {agent.public_ip && <span className="font-mono">{agent.public_ip}</span>}

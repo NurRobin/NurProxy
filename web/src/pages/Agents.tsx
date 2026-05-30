@@ -8,6 +8,7 @@ import { api } from '../lib/api';
 import type { Agent, Zone, Server, Domain, ProxyPermissions } from '../lib/types';
 import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
+import { isDegraded } from '../lib/status';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -230,7 +231,7 @@ export default function Agents() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <h2 className="truncate font-display text-xl font-semibold text-fg">{selected.name}</h2>
-                      <StatusBadge status={selected.status} />
+                      <StatusBadge status={selected.status} degraded={isDegraded(selected)} />
                     </div>
                     <p className="truncate text-sm text-fg-muted">{selected.fqdn}</p>
                   </div>
@@ -462,18 +463,23 @@ export default function Agents() {
 }
 
 function ListRow({ agent, active, tone, onClick }: { agent: Agent; active: boolean; tone?: 'warning'; onClick: () => void }) {
+  // A degraded agent (connected but constrained, e.g. can't reload nginx) gets the
+  // same dezent warning treatment as a pending one, so problems are visible in the
+  // master list without opening the detail view.
+  const degraded = isDegraded(agent);
+  const warn = tone === 'warning' || degraded;
   return (
     <button
       onClick={onClick}
       className={`flex w-full items-center justify-between gap-3 rounded-lg border px-4 py-3 text-left transition-colors ${
-        active ? 'border-accent bg-accent-soft' : tone === 'warning' ? 'border-warning/40 bg-warning-soft/50 hover:border-warning/60' : 'border-border bg-surface hover:border-border-strong'
+        active ? 'border-accent bg-accent-soft' : warn ? 'border-warning/40 bg-warning-soft/50 hover:border-warning/60' : 'border-border bg-surface hover:border-border-strong'
       }`}
     >
       <div className="min-w-0">
         <p className="truncate font-medium text-fg">{agent.name}</p>
         <p className="truncate text-xs text-fg-faint">{agent.fqdn}</p>
       </div>
-      <StatusBadge status={agent.status} />
+      <StatusBadge status={agent.status} degraded={degraded} />
     </button>
   );
 }
