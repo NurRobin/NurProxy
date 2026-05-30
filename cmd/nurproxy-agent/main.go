@@ -218,7 +218,24 @@ func main() {
 	// invariant #2) and are installed BEFORE the referencing config is applied
 	// (preflight ordering). A failure to provision the at-rest key is non-fatal: the
 	// agent stays connected and the built-in Caddy can self-ACME as the fallback.
-	certStore := newCertStore(cfg.DataDir)
+	// Compute the cert store dir + at-rest key explicitly (rather than hiding them
+	// in a constructor) so the SAME dir+key can also be handed to a hot-switched
+	// file backend (nginx/apache) via ReconfigureDeps — otherwise an existing-mode
+	// agent would have no cert store and drop every central TLS listener (§7).
+	var certDir string
+	var certKey []byte
+	if cfg.DataDir != "" {
+		certDir = filepath.Join(cfg.DataDir, "certs")
+		if k, err := crypto.LoadOrGenerateKey(filepath.Join(cfg.DataDir, "cert.key")); err != nil {
+			log.Printf("WARNING: could not provision at-rest cert key: %v (cert keys will be stored unencrypted)", err)
+		} else {
+			certKey = k
+		}
+	}
+	var certStore *certstore.Store
+	if certDir != "" {
+		certStore = certstore.New(certDir, certKey)
+	}
 	if certStore != nil {
 		caddyBackend.WithCertStore(certStore)
 	}
@@ -268,6 +285,8 @@ func main() {
 		Health:    hs,
 		StopCaddy: caddyProc.Stop,
 		OSUser:    currentOSUser(),
+		CertDir:   certDir,
+		CertKey:   certKey,
 		CaddyFactory: func() proxy.Proxy {
 			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort))
 			if certStore != nil {
@@ -446,26 +465,6 @@ func toProxyPermissions(res permcheck.Result, rem *permcheck.Remediation, dirs [
 		pp.Remediation = mr
 	}
 	return pp
-}
-
-// newCertStore builds the agent's cert store under <dataDir>/certs, loading or
-// generating an agent-local AES-256 key (<dataDir>/cert.key) to encrypt cert
-// private keys at rest (§7). A failure to provision the at-rest key is non-fatal:
-// it logs and returns a store with no key (plaintext PEM) so central TLS still
-// works while the operator fixes permissions, rather than crashing the agent
-// (mirrors the never-die-on-host-problems posture). Returns nil only if dataDir is
-// empty.
-func newCertStore(dataDir string) *certstore.Store {
-	if dataDir == "" {
-		return nil
-	}
-	certDir := filepath.Join(dataDir, "certs")
-	key, err := crypto.LoadOrGenerateKey(filepath.Join(dataDir, "cert.key"))
-	if err != nil {
-		log.Printf("WARNING: could not provision at-rest cert key: %v (cert keys will be stored unencrypted)", err)
-		return certstore.New(certDir, nil)
-	}
-	return certstore.New(certDir, key)
 }
 
 // detectCapabilities probes the bundled Caddy backend's capability matrix (§8),
