@@ -99,6 +99,16 @@ func (s *Server) upsertAdoptedArtifact(r *http.Request, agentID, host string, a 
 		return adoptCreated
 	}
 
+	// The on-host enabled state (sites-enabled present?) can change without the
+	// file content changing — e.g. the operator dis/enables a vhost. That is not a
+	// content version, so AppendConfigArtifactVersion (gated on semantic change)
+	// won't carry it; update the flag directly so the dashboard reflects reality.
+	if existing.Enabled != a.Enabled {
+		if eErr := s.db.SetConfigArtifactEnabled(a.ArtifactID, a.Enabled); eErr != nil {
+			log.Printf("adopt: failed to update enabled flag for %s: %v", a.ArtifactID, eErr)
+		}
+	}
+
 	prevVersion := existing.LiveVersion
 	ver, aErr := s.db.AppendConfigArtifactVersion(a.ArtifactID, a.Content, source, "agent:"+agentID, "adopted from host")
 	if aErr != nil {

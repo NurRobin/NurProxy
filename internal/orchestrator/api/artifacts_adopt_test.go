@@ -71,6 +71,10 @@ func TestAgentAdoptArtifacts_createsThenUpserts(t *testing.T) {
 		t.Errorf("live version = %d, want 1", art.LiveVersion)
 	}
 
+	if !art.Enabled {
+		t.Error("first report had Enabled=true; stored artifact should be enabled")
+	}
+
 	// Re-reporting identical content is a no-op (no phantom version).
 	if out := post(t, report); out["created"] != 0 || out["updated"] != 0 {
 		t.Fatalf("identical re-report should be a no-op, got %+v", out)
@@ -79,6 +83,22 @@ func TestAgentAdoptArtifacts_createsThenUpserts(t *testing.T) {
 	if art.LiveVersion != 1 {
 		t.Errorf("no-op re-report bumped version to %d", art.LiveVersion)
 	}
+
+	// The on-host enabled state can flip without the content changing (operator
+	// disabled the vhost). That must update the flag even though it is not a new
+	// content version.
+	report.Artifacts[0].Enabled = false
+	if out := post(t, report); out["created"] != 0 || out["updated"] != 0 {
+		t.Fatalf("enabled-only change is not a content version, got %+v", out)
+	}
+	art, _ = database.GetConfigArtifact(id)
+	if art.Enabled {
+		t.Error("enabled flag should be updated to false on re-report, even without a content change")
+	}
+	if art.LiveVersion != 1 {
+		t.Errorf("enabled-only change should not bump version, got %d", art.LiveVersion)
+	}
+	report.Artifacts[0].Enabled = true // restore for the next step
 
 	// A semantic change appends version 2.
 	report.Artifacts[0].Content = "server { listen 8080; }"
