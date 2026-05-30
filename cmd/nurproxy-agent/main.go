@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -201,9 +202,28 @@ func main() {
 	// invariant #2) and are installed BEFORE the referencing config is applied
 	// (preflight ordering). A failure to provision the at-rest key is non-fatal: the
 	// agent stays connected and the built-in Caddy can self-ACME as the fallback.
-	if store := newCertStore(cfg.DataDir); store != nil {
-		caddyBackend.WithCertStore(store)
+	certStore := newCertStore(cfg.DataDir)
+	if certStore != nil {
+		caddyBackend.WithCertStore(certStore)
 	}
+
+	// Wrap the bundled caddy backend in the mutable, mutex-guarded Holder (§19).
+	// The stream, the local agent API, and the heartbeat all consult the Holder
+	// instead of the fixed caddy backend, so the agent can hot-switch built-in ↔
+	// existing with no process restart. While nobody calls Reconfigure the Holder
+	// forwards every call to this same caddy backend, so the built-in path stays
+	// byte-for-byte identical (invariant #1).
+	holder := proxy.NewHolder(caddyBackend)
+	// Guard the invariant: the bundled caddy backend must satisfy the admin-API
+	// primitives the Holder forwards, so wrapping it in the Holder is a transparent
+	// pass-through (not a silent no-op). This is a compile-time check via the
+	// concrete type; if a future caddy refactor drops one of these methods the build
+	// fails here rather than the route path silently going dead.
+	var _ interface {
+		EnsureServer(context.Context) error
+		ClearRoutes(context.Context) error
+		RemoveRoute(context.Context, string) error
+	} = caddyBackend
 
 	// Ensure the HTTP server exists in Caddy. A bind failure here is the classic
 	// "ports 80/443 already in use" case — report it clearly and keep running.
@@ -220,8 +240,26 @@ func main() {
 	// Step 3: Start Agent API server (non-fatal: a bind failure is reported via
 	// health and the agent keeps heartbeating).
 	api.SetVersion(version)
-	apiServer := api.New(cfg.APIPort, caddyBackend, mgr.Token())
+	apiServer := api.New(cfg.APIPort, holder, mgr.Token())
 	apiServer.SetHealth(hs)
+
+	// Wire the hot-switch endpoint (§19): POST /admin/reconfigure drives the Holder.
+	// The deps let the Holder act without importing concrete agent packages — a
+	// health setter, a closure to stop the bundled Caddy subprocess when leaving
+	// built-in, the agent's OS user for the least-privilege remediation, and a
+	// factory to rebuild the bundled caddy backend on a switch back to built-in.
+	apiServer.SetReconfigurer(holder, proxy.ReconfigureDeps{
+		Health:    hs,
+		StopCaddy: caddyProc.Stop,
+		OSUser:    currentOSUser(),
+		CaddyFactory: func() proxy.Proxy {
+			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort))
+			if certStore != nil {
+				b.WithCertStore(certStore)
+			}
+			return b
+		},
+	})
 	if err := apiServer.Start(ctx); err != nil {
 		log.Printf("WARNING: failed to start agent API server: %v", err)
 		hs.SetError(fmt.Sprintf("failed to start agent API server: %v", err))
@@ -243,7 +281,7 @@ func main() {
 	// changes — no inbound reachability required. The client also tracks the
 	// artifacts it has applied so the heartbeat can report their checksums for
 	// drift detection (§11).
-	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), caddyBackend, hs).
+	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), holder, hs).
 		WithLogPaths(cfg.ProxyLogPaths)
 
 	// Step 5: Start heartbeat loop. It carries the health snapshot so the
@@ -255,7 +293,7 @@ func main() {
 	// Re-report the capability matrix on each beat so module changes (e.g.
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
-	hb.SetCapabilitiesFn(func() *models.ProxyCapabilities { return caddyBackend.Capabilities().ToModel() })
+	hb.SetCapabilitiesFn(func() *models.ProxyCapabilities { return holder.Current().Capabilities().ToModel() })
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
 	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
@@ -298,6 +336,19 @@ func detectProxy(ctx context.Context) *models.ProxyDetection {
 		return nil
 	}
 	return det.ToModel()
+}
+
+// currentOSUser returns the OS user the agent runs as, for the §19 hot-switch
+// remediation (the user added to the config-dir's owning group and named in the
+// scoped sudoers line). A lookup failure yields "" — BuildRemediation tolerates an
+// empty user (it omits the user-specific commands) so this never fails the switch.
+func currentOSUser() string {
+	u, err := user.Current()
+	if err != nil {
+		log.Printf("WARNING: could not resolve current OS user for reconfigure remediation: %v", err)
+		return ""
+	}
+	return u.Username
 }
 
 // newCertStore builds the agent's cert store under <dataDir>/certs, loading or
