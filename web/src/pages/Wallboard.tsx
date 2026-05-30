@@ -5,7 +5,7 @@ import { api } from '../lib/api';
 import type { Agent, Domain } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
 import { usePolling } from '../lib/usePolling';
-import { statusMeta } from '../lib/status';
+import { statusMeta, isDegraded } from '../lib/status';
 
 const count = (arr: { status: string }[], s: string) => arr.filter((x) => x.status === s).length;
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.neverLower'));
@@ -31,11 +31,7 @@ export default function Wallboard() {
   const offline = count(agents, 'offline');
   // A connected-but-degraded agent (operational error or failed §12 permission
   // self-test) is a problem the banner must reflect — status alone misses it.
-  const degraded = agents.filter(
-    (a) =>
-      a.status !== 'offline' &&
-      (!!a.last_error || !!(a.proxy_permissions?.checked && !a.proxy_permissions.ok)),
-  ).length;
+  const degraded = agents.filter(isDegraded).length;
   const attention = errs + offline + degraded;
   const healthy = attention === 0;
 

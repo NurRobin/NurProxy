@@ -638,7 +638,8 @@
     "pending": "Pending",
     "error": "Error",
     "offline": "Offline",
-    "deleting": "Deleting"
+    "deleting": "Deleting",
+    "degraded": "Limited"
   },
   "confirm": {
     "typeToConfirm": "Type <0>{{text}}</0> to confirm"
