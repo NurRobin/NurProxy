@@ -17,6 +17,7 @@ PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
 ReadWritePaths=/var/lib/nurproxy-agent
+ReadWritePaths=-/etc/nginx -/var/log/nginx -/var/lib/nginx -/var/cache/nginx -/etc/apache2 -/etc/httpd -/var/log/apache2 -/var/log/httpd -/etc/caddy -/var/lib/caddy -/var/log/caddy -/run
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 

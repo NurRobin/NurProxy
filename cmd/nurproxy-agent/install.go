@@ -29,6 +29,7 @@ func agentService(bin, dataDir string, cfg agentconfig.Config, user string) (ins
 		Args:         []string{"--data-dir", dataDir},
 		User:         user,
 		DataDir:      dataDir,
+		WritePaths:   install.AgentProxyWritePaths,
 		ConfigFile:   filepath.Join(dataDir, "agent.yaml"),
 		ConfigData:   string(data),
 		Capabilities: []string{"CAP_NET_BIND_SERVICE"},

@@ -19,6 +19,21 @@ import (
 	"strings"
 )
 
+// AgentProxyWritePaths are the proxy-backend trees the agent must be able to
+// write/reload through ProtectSystem=strict: config under /etc, plus the log,
+// cache and runtime dirs that nginx -t / -s reload (and apache/caddy) touch.
+// Each is prefixed with "-" so systemd ignores a path absent on this host
+// instead of refusing to start the unit — only the installed backend's dirs
+// exist on any given box. This is what makes the dashboard's "config writable"
+// and "reloadable" checks pass for a file-based backend; without it the mount
+// stays read-only regardless of group/ownership, surfacing as EROFS.
+var AgentProxyWritePaths = []string{
+	"-/etc/nginx", "-/var/log/nginx", "-/var/lib/nginx", "-/var/cache/nginx",
+	"-/etc/apache2", "-/etc/httpd", "-/var/log/apache2", "-/var/log/httpd",
+	"-/etc/caddy", "-/var/lib/caddy", "-/var/log/caddy",
+	"-/run",
+}
+
 // Service describes a NurProxy service to install. The same descriptor is
 // consumed by every Manager; fields without meaning on a given OS are ignored.
 type Service struct {
@@ -28,6 +43,7 @@ type Service struct {
 	Args         []string          // extra ExecStart arguments
 	User         string            // service user (e.g. "root")
 	DataDir      string            // data directory (made ReadWritePaths)
+	WritePaths   []string          // extra ReadWritePaths to punch through ProtectSystem=strict (e.g. proxy config/log/cache trees); prefix an entry with "-" to ignore it when absent
 	EnvFile      string            // optional EnvironmentFile path (systemd)
 	Env          map[string]string // environment variables for the service
 	ConfigFile   string            // optional extra config file to write (e.g. agent.yaml)
@@ -91,6 +107,13 @@ func RenderUnit(s Service) string {
 	w("ProtectKernelTunables=true\n")
 	if s.DataDir != "" {
 		w("ReadWritePaths=%s\n", s.DataDir)
+	}
+	// Proxy backends (nginx/apache/caddy) edit config under /etc and reload, which
+	// writes log/cache/runtime files — all read-only under ProtectSystem=strict.
+	// Punch exactly those trees through; the caller prefixes each with "-" so a
+	// path absent on this host is ignored rather than failing the unit's start.
+	if len(s.WritePaths) > 0 {
+		w("ReadWritePaths=%s\n", strings.Join(s.WritePaths, " "))
 	}
 	if len(s.Capabilities) > 0 {
 		caps := strings.Join(s.Capabilities, " ")
