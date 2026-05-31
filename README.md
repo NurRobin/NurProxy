@@ -68,53 +68,102 @@ Each agent gets an A record at your DNS provider (pointing to the server's publi
 
 ## Installation
 
-### Orchestrator
+The fastest path on Linux, macOS, and FreeBSD is the one-line installer. It
+downloads the right binary for your OS and architecture, installs it, and
+registers a hardened service (systemd, OpenRC, launchd, or rc.d — auto-detected)
+in one step.
+
+**Orchestrator** (on the host you log into):
 
 ```bash
-# Download the latest release
-curl -fsSL https://github.com/NurRobin/NurProxy/releases/latest/download/nurproxy-linux-amd64 -o nurproxy
-chmod +x nurproxy
-
-# Run it
-./nurproxy --port 8080 --data-dir /var/lib/nurproxy
+curl -fsSL https://raw.githubusercontent.com/NurRobin/NurProxy/main/scripts/install.sh \
+  | sh -s -- orchestrator --port 8080
 ```
 
-Or with Docker:
+Then open `http://your-server:8080` to run the setup wizard.
+
+**Agent** (on each server that should serve traffic):
 
 ```bash
-docker run -d \
-  -p 8080:8080 \
-  -v nurproxy-data:/data \
-  ghcr.io/nurrobin/nurproxy
+curl -fsSL https://raw.githubusercontent.com/NurRobin/NurProxy/main/scripts/install.sh \
+  | sh -s -- agent --orchestrator http://orchestrator-ip:8080 --fqdn edge1.example.com
 ```
 
-Open `http://your-server:8080` in your browser to start the setup wizard.
+The agent registers itself with the orchestrator; adopt it from the dashboard.
+Any flag after the component name is passed straight to the service install, so
+`--data-dir`, `--user`, etc. work too. Add `--no-service` (or use the `binary`
+component) to install just the binary without registering a service. Remove a
+component with `sudo nurproxy uninstall` / `sudo nurproxy-agent uninstall`
+(add `--purge` to delete its data).
 
-### Agent
-
-```bash
-# Download the latest release
-curl -fsSL https://github.com/NurRobin/NurProxy/releases/latest/download/nurproxy-agent-linux-amd64 -o nurproxy-agent
-chmod +x nurproxy-agent
-
-# Run it (the orchestrator URL must be reachable from this machine)
-./nurproxy-agent \
-  --orchestrator http://orchestrator-ip:8080 \
-  --fqdn edge1.example.com
-```
-
-Or with Docker:
+### Docker
 
 ```bash
-docker run -d \
-  -p 80:80 -p 443:443 \
+# Orchestrator
+docker run -d -p 8080:8080 -v nurproxy-data:/data ghcr.io/nurrobin/nurproxy
+
+# Agent (host networking so Caddy can bind :80/:443)
+docker run -d --network host \
   -v nurproxy-agent-data:/data \
   -e NP_ORCHESTRATOR=http://orchestrator-ip:8080 \
   -e NP_FQDN=edge1.example.com \
   ghcr.io/nurrobin/nurproxy-agent
 ```
 
-The agent registers itself with the orchestrator. Go to the dashboard and adopt it.
+Or use [`deploy/docker-compose.yml`](deploy/docker-compose.yml): `docker compose -f deploy/docker-compose.yml up -d`.
+
+### Debian / Ubuntu / RHEL packages
+
+Download the `.deb` or `.rpm` for your component and architecture from the
+[latest release](https://github.com/NurRobin/NurProxy/releases/latest):
+
+```bash
+# Debian/Ubuntu
+sudo dpkg -i nurproxy_*_linux_amd64.deb           # or nurproxy-agent_*.deb
+# RHEL/Fedora
+sudo rpm -i  nurproxy-*.x86_64.rpm
+```
+
+The orchestrator package starts automatically. The agent package installs the
+service **disabled** — edit `/etc/nurproxy-agent/agent.env` (set `NP_ORCHESTRATOR`
+and `NP_FQDN`), then `sudo systemctl enable --now nurproxy-agent`.
+
+For automatic updates via `apt`/`dnf`, add the signed package repository (setup
+commands are at [nurrobin.github.io/NurProxy](https://nurrobin.github.io/NurProxy)),
+then `apt install nurproxy` / `dnf install nurproxy`.
+
+### Homebrew (macOS)
+
+```bash
+brew install NurRobin/tap/nurproxy          # or: nurproxy-agent
+```
+
+### Arch Linux
+
+```bash
+yay -S nurproxy-bin                          # or: nurproxy-agent-bin
+```
+
+### Manual binary
+
+Prefer to place the binary yourself? Grab the tarball for your platform from
+the [releases page](https://github.com/NurRobin/NurProxy/releases/latest),
+extract it, and run `./nurproxy --port 8080` or
+`./nurproxy-agent --orchestrator <URL> --fqdn <host.zone>` directly.
+
+### Supported platforms
+
+| OS | amd64 | arm64 | armv7 | Notes |
+|---|:---:|:---:|:---:|---|
+| Linux | ✅ | ✅ | ✅ | full support; `.deb`/`.rpm` for systemd distros, OpenRC on Alpine |
+| macOS (darwin) | ✅ | ✅ | — | launchd; agent is experimental (see below) |
+| FreeBSD | ✅ | ✅ | — | rc.d (incl. OPNsense/pfSense/TrueNAS); agent is experimental |
+
+> Windows isn't supported: production reverse proxies don't run on bare Windows
+> — use WSL2, a Linux VM, or Docker. The orchestrator runs fully on every
+> platform above; the **agent** is Linux-first because a few host probes
+> (port-conflict detection, existing-proxy discovery) are Linux-only and degrade
+> gracefully elsewhere, so macOS/FreeBSD agents are experimental for now.
 
 > **A note on IP addresses and URLs**: When setting up an agent, the orchestrator URL must be reachable from the agent's machine, not from your browser. If you access the dashboard through Tailscale but the agent is in the same LAN as the orchestrator, use the LAN address. The same applies when adding backend servers to an agent: enter IP addresses as the agent sees them.
 
