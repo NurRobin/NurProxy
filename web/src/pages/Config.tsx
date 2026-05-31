@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronLeft, FileCode, RotateCcw, History, LayoutGrid, Code, Save, X } from 'lucide-react';
+import { ChevronLeft, ChevronDown, ChevronRight, FileCode, RotateCcw, History, LayoutGrid, Code, Save, X, Search } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Agent, ConfigArtifact, ConfigArtifactVersion, ArtifactMask } from '../lib/types';
+import type { Agent, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, Domain, Server } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
 import { usePolling } from '../lib/usePolling';
 import ArtifactStatusBadge from '../components/ArtifactStatusBadge';
@@ -28,16 +28,35 @@ export default function Config() {
   const toast = useToast();
   const [artifacts, setArtifacts] = useState<ConfigArtifact[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [domains, setDomains] = useState<Domain[]>([]);
+  const [serversById, setServersById] = useState<Record<string, Server>>({});
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkBusy, setBulkBusy] = useState(false);
 
+  // Scale controls (§53): a free-text filter and a drifted-only toggle keep the
+  // list usable at 100+ artifacts, and agent/server groups collapse.
+  const [query, setQuery] = useState('');
+  const [driftedOnly, setDriftedOnly] = useState(false);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+
   const fetchData = useCallback(async () => {
     try {
-      const [arts, ags] = await Promise.all([api.listArtifacts(), api.listAgents()]);
+      const [arts, ags, doms] = await Promise.all([api.listArtifacts(), api.listAgents(), api.listDomains()]);
       setArtifacts(arts);
       setAgents(ags);
+      setDomains(doms);
+      // Servers are per-agent; load them so an artifact can be grouped under the
+      // server it ultimately proxies to (artifact → domain → server). Best-effort:
+      // an agent whose servers fail to load just yields no server grouping.
+      const managed = ags.filter((a) => a.status === 'adopted' || a.status === 'offline');
+      const lists = await Promise.all(managed.map(async (a) => {
+        try { return await api.listServers(a.id); } catch { return [] as Server[]; }
+      }));
+      const map: Record<string, Server> = {};
+      for (const list of lists) for (const s of list) map[s.id] = s;
+      setServersById(map);
     } catch (err) {
       toast.error(errMessage(err, t('config.loadFailed')));
     } finally {
@@ -56,16 +75,69 @@ export default function Config() {
   const drifted = useMemo(() => artifacts.filter((a) => a.drifted), [artifacts]);
   const selected = artifacts.find((a) => a.id === selectedId) ?? null;
 
-  // Group artifacts by agent for the master list.
-  const groups = useMemo(() => {
+  const domainById = useMemo(() => {
+    const m = new Map<number, Domain>();
+    for (const d of domains) m.set(d.id, d);
+    return m;
+  }, [domains]);
+
+  // serverGroupFor resolves the server an artifact ultimately proxies to, via its
+  // domain link. Hand-written / adopted artifacts have no domain, so they fall
+  // into one "other" bucket — the common case for an externally-managed nginx.
+  const serverGroupFor = useCallback((a: ConfigArtifact): { key: string; label: string } => {
+    const dom = a.domain_id != null ? domainById.get(a.domain_id) : undefined;
+    const srv = dom ? serversById[dom.server_id] : undefined;
+    return srv ? { key: srv.id, label: srv.name } : { key: '__other__', label: t('config.otherGroup') };
+  }, [domainById, serversById, t]);
+
+  // Group filtered artifacts by agent, then by server. Search matches across the
+  // path, backend, source, the linked domain, the agent and the server name; the
+  // drifted-only toggle narrows to what needs review.
+  const { agentGroups, shown } = useMemo(() => {
+    const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const haystack = (a: ConfigArtifact) => {
+      const dom = a.domain_id != null ? domainById.get(a.domain_id) : undefined;
+      return [a.target.path, a.backend, a.source, dom?.subdomain ?? '', agentName(a.agent_id), serverGroupFor(a).label]
+        .join(' ').toLowerCase();
+    };
+    const filtered = artifacts.filter((a) => {
+      if (driftedOnly && !a.drifted) return false;
+      if (tokens.length === 0) return true;
+      const hay = haystack(a);
+      return tokens.every((tok) => hay.includes(tok));
+    });
+
     const byAgent = new Map<string, ConfigArtifact[]>();
-    for (const a of artifacts) {
-      const list = byAgent.get(a.agent_id) ?? [];
-      list.push(a);
-      byAgent.set(a.agent_id, list);
+    for (const a of filtered) {
+      byAgent.set(a.agent_id, [...(byAgent.get(a.agent_id) ?? []), a]);
     }
-    return [...byAgent.entries()].sort((x, y) => agentName(x[0]).localeCompare(agentName(y[0])));
-  }, [artifacts, agentName]);
+    const groups = [...byAgent.entries()]
+      .sort((x, y) => agentName(x[0]).localeCompare(agentName(y[0])))
+      .map(([agentId, list]) => {
+        const bySrv = new Map<string, { label: string; items: ConfigArtifact[] }>();
+        for (const a of list) {
+          const g = serverGroupFor(a);
+          const e = bySrv.get(g.key) ?? { label: g.label, items: [] };
+          e.items.push(a);
+          bySrv.set(g.key, e);
+        }
+        // "other" sorts last; named servers alphabetically.
+        const servers = [...bySrv.entries()].sort((x, y) => {
+          if (x[0] === '__other__') return 1;
+          if (y[0] === '__other__') return -1;
+          return x[1].label.localeCompare(y[1].label);
+        }).map(([key, v]) => ({ key, label: v.label, items: v.items }));
+        return { agentId, name: agentName(agentId), items: list, servers, driftCount: list.filter((a) => a.drifted).length };
+      });
+    return { agentGroups: groups, shown: filtered.length };
+  }, [artifacts, query, driftedOnly, domainById, serverGroupFor, agentName]);
+
+  const toggleCollapse = (key: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
 
   async function handleBulk(action: 'accept' | 'reject') {
     setBulkBusy(true);
@@ -112,26 +184,84 @@ export default function Config() {
         />
       ) : (
         <div className="grid gap-6 md:grid-cols-[22rem_1fr]">
-          {/* Master list, grouped by agent */}
-          <div className={selected ? 'hidden md:block' : 'block'}>
-            <div className="space-y-5">
-              {groups.map(([agentID, list]) => (
-                <div key={agentID}>
-                  <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-fg-faint">
-                    {agentName(agentID)}
-                  </h2>
-                  <div className="space-y-2">
-                    {list.map((a) => (
-                      <ArtifactRow key={a.id} active={selectedId === a.id} artifact={a} onClick={() => setSelectedId(a.id)} />
-                    ))}
-                  </div>
-                </div>
-              ))}
+          {/* Master list, grouped by agent → server, searchable */}
+          <div className={`min-w-0 ${selected ? 'hidden md:block' : 'block'}`}>
+            {/* Filter bar: free-text + drifted-only, for 100+ artifacts (§53). */}
+            <div className="mb-3 space-y-2">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-fg-faint" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder={t('config.searchPlaceholder')}
+                  className="w-full rounded-lg border border-border bg-surface py-2 pl-8 pr-8 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none"
+                />
+                {query && (
+                  <button onClick={() => setQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-fg-faint hover:text-fg" aria-label={t('common.clear')}>
+                    <X className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center justify-between px-0.5 text-xs text-fg-faint">
+                <label className="inline-flex cursor-pointer items-center gap-1.5 hover:text-fg">
+                  <input type="checkbox" checked={driftedOnly} onChange={(e) => setDriftedOnly(e.target.checked)} className="accent-accent" />
+                  {t('config.driftedOnly')}{drifted.length > 0 && ` (${drifted.length})`}
+                </label>
+                <span>{t('config.shownOfTotal', { shown, total: artifacts.length })}</span>
+              </div>
             </div>
+
+            {shown === 0 ? (
+              <p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-fg-faint">{t('config.noMatches')}</p>
+            ) : (
+              <div className="space-y-4">
+                {agentGroups.map((ag) => {
+                  const agentCollapsed = collapsed.has(ag.agentId);
+                  return (
+                    <div key={ag.agentId}>
+                      <button
+                        onClick={() => toggleCollapse(ag.agentId)}
+                        className="flex w-full items-center gap-1.5 px-1 py-1 text-left text-xs font-semibold uppercase tracking-wide text-fg-faint hover:text-fg"
+                      >
+                        {agentCollapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                        <span className="truncate">{ag.name}</span>
+                        <span className="font-sans normal-case text-fg-faint">· {ag.items.length}</span>
+                        {ag.driftCount > 0 && (
+                          <span className="rounded-full bg-warning-soft px-1.5 py-0.5 font-sans text-[10px] font-medium normal-case text-warning-fg">
+                            {t('config.driftCount', { count: ag.driftCount })}
+                          </span>
+                        )}
+                      </button>
+                      {!agentCollapsed && (
+                        <div className="mt-2 space-y-3">
+                          {ag.servers.map((sg) => {
+                            // Only show a server sub-header when the agent has more than the
+                            // single "other" bucket — no point labelling one ungrouped pile.
+                            const showSub = ag.servers.length > 1 || sg.key !== '__other__';
+                            return (
+                              <div key={sg.key}>
+                                {showSub && (
+                                  <p className="mb-1.5 px-1 text-[11px] font-medium text-fg-faint">{sg.label} · {sg.items.length}</p>
+                                )}
+                                <div className="space-y-2">
+                                  {sg.items.map((a) => (
+                                    <ArtifactRow key={a.id} active={selectedId === a.id} artifact={a} onClick={() => setSelectedId(a.id)} />
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Detail */}
-          <div className={selected ? 'block' : 'hidden md:block'}>
+          <div className={`min-w-0 ${selected ? 'block' : 'hidden md:block'}`}>
             {!selected ? (
               <div className="flex h-full min-h-48 items-center justify-center rounded-xl border border-dashed border-border text-sm text-fg-faint">
                 {t('config.select')}
