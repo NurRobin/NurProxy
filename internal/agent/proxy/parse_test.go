@@ -221,11 +221,15 @@ func TestResolvePaths_nothingOnDisk_fallsBackToPrimaryDefault(t *testing.T) {
 // stubFS replaces the package dir/file existence hooks with synthetic layouts
 // and returns a restore func.
 func stubFS(dirs, files map[string]bool) func() {
-	origDir, origFile := dirExists, fileExists
+	origDir, origFile, origGather := dirExists, fileExists, gatherNginxConfig
 	dirExists = func(p string) bool { return dirs[p] }
 	fileExists = func(p string) bool { return files[p] }
+	// Detect()'s nginx upstream discovery reads real host config; neutralize it so
+	// detection tests stay hermetic. Tests that exercise discovery stub it directly.
+	gatherNginxConfig = func(string) string { return "" }
 	return func() {
 		dirExists = origDir
 		fileExists = origFile
+		gatherNginxConfig = origGather
 	}
 }

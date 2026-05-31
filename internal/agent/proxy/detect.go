@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/nginxdiscover"
 )
 
 // Kind identifies a supported reverse-proxy implementation.
@@ -47,6 +48,10 @@ type Detection struct {
 	LogPaths []string `json:"log_paths,omitempty"`
 	// PortConflicts lists the holders of :80/:443 when those ports are occupied.
 	PortConflicts []PortConflict `json:"port_conflicts,omitempty"`
+	// DiscoveredUpstreams are the backend targets the host proxy already points at,
+	// scanned read-only from its config (§52) so the dashboard can suggest them as
+	// Servers. nginx only for now; empty otherwise.
+	DiscoveredUpstreams []nginxdiscover.Upstream `json:"discovered_upstreams,omitempty"`
 }
 
 // PortConflict identifies which process holds a listening port (§2.1). It is
@@ -74,6 +79,14 @@ func (d Detection) ToModel() *models.ProxyDetection {
 			Port:    c.Port,
 			Process: c.Process,
 			PID:     c.PID,
+		})
+	}
+	for _, u := range d.DiscoveredUpstreams {
+		m.DiscoveredUpstreams = append(m.DiscoveredUpstreams, models.DiscoveredUpstream{
+			Scheme:      u.Scheme,
+			Host:        u.Host,
+			Port:        u.Port,
+			ServerNames: u.ServerNames,
 		})
 	}
 	return m
@@ -157,6 +170,9 @@ func (d *Detector) Detect(ctx context.Context) (Detection, error) {
 		paths := ResolvePaths(c.kind)
 		det.ConfigDir = paths.ConfigDir
 		det.LogPaths = paths.LogPaths
+		if c.kind == KindNginx {
+			det.DiscoveredUpstreams = nginxdiscover.Discover(gatherNginxConfig(paths.ConfigDir))
+		}
 		break
 	}
 

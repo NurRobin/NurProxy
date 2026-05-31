@@ -413,6 +413,13 @@ var migrations = []string{
 	`
 	ALTER TABLE config_artifacts ADD COLUMN drift_content TEXT NOT NULL DEFAULT '';
 	`,
+
+	// Migration 15: backend targets discovered in an existing nginx config (§52),
+	// stored as a JSON array on the agent row alongside the other detection
+	// columns. Read-only suggestions for Servers; empty until an agent reports them.
+	`
+	ALTER TABLE agents ADD COLUMN detected_upstreams TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

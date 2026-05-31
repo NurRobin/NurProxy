@@ -28,6 +28,16 @@ export interface ProxyDetection {
   config_dir?: string;
   log_paths?: string[];
   port_conflicts?: ProxyPortConflict[];
+  discovered_upstreams?: DiscoveredUpstream[];
+}
+
+/** A backend target found in the host proxy's existing config — a suggestion
+ *  source for Servers (§52). */
+export interface DiscoveredUpstream {
+  scheme?: string;
+  host: string;
+  port?: number;
+  server_names?: string[];
 }
 
 /** One ordered remediation step: a human title plus copy-paste shell commands. */
