@@ -12,6 +12,7 @@ package install
 import (
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -132,3 +133,30 @@ func runTool(out io.Writer, bin string, args ...string) error {
 
 // systemctl runs a systemctl command, streaming output.
 func systemctl(out io.Writer, args ...string) error { return runTool(out, "systemctl", args...) }
+
+// WriteEnvFile writes env to path (mode 0640), creating the parent directory.
+// Used by the agent's `setup` command to fill an already-installed unit's
+// EnvironmentFile without rewriting the unit itself.
+func WriteEnvFile(path string, env map[string]string, out io.Writer) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return fmt.Errorf("creating config dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(RenderEnv(env)), 0o640); err != nil {
+		return fmt.Errorf("writing env file %s: %w", path, err)
+	}
+	fprintf(out, "• env file %s\n", path)
+	return nil
+}
+
+// EnableService daemon-reloads systemd and enables+starts the named unit. It is
+// the activation half of an install for a unit that already exists on disk.
+func EnableService(name string, out io.Writer) error {
+	if err := systemctl(out, "daemon-reload"); err != nil {
+		return err
+	}
+	if err := systemctl(out, "enable", "--now", name); err != nil {
+		return err
+	}
+	fprintf(out, "✓ %s enabled and started. Logs: journalctl -u %s -f\n", name, name)
+	return nil
+}
