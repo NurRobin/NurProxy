@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -24,6 +23,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // registers the nginx backend in the proxy registry
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
+	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
@@ -306,10 +306,16 @@ func main() {
 	// health setter, a closure to stop the bundled Caddy subprocess when leaving
 	// built-in, the agent's OS user for the least-privilege remediation, and a
 	// factory to rebuild the bundled caddy backend on a switch back to built-in.
+	// Inspect HOW the agent runs (OS/distro, service manager, root, sandbox) once.
+	// This selects which remediation the §12 probe surfaces — a root agent under a
+	// systemd sandbox needs a ReadWritePaths drop-in, an unprivileged one needs
+	// group ownership + scoped sudoers — for both the hot-switch and the heartbeat,
+	// and is reported to the dashboard as context behind the fix.
+	env := runtimeenv.Detect()
 	reconfigureDeps := proxy.ReconfigureDeps{
 		Health:    hs,
 		StopCaddy: caddyProc.Stop,
-		OSUser:    currentOSUser(),
+		Env:       env,
 		CertDir:   certDir,
 		CertKey:   certKey,
 		CaddyFactory: func() proxy.Proxy {
@@ -395,9 +401,8 @@ func main() {
 	// the targeted remediation. Because it re-probes every beat, granting the right
 	// clears the dashboard warning on its own — no restart. osUser names the grant
 	// commands. Built-in mode reports nothing (checked=false → nil).
-	osUser := currentOSUser()
 	hb.SetPermissionsFn(func() *models.ProxyPermissions {
-		res, rem, dirs, checked := holder.ProbePermissions(ctx, osUser)
+		res, rem, dirs, checked := holder.ProbePermissions(ctx, env)
 		if checked {
 			// Keep health/last_error in sync with the live probe so the stale startup
 			// blob clears the moment the operator grants the right — the structured
@@ -405,7 +410,7 @@ func main() {
 			// generic error channel from lagging behind it.
 			hs.SetError(res.HealthError())
 		}
-		return toProxyPermissions(res, rem, dirs, checked)
+		return toProxyPermissions(res, rem, dirs, checked, env)
 	})
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
@@ -451,25 +456,12 @@ func detectProxy(ctx context.Context) *models.ProxyDetection {
 	return det.ToModel()
 }
 
-// currentOSUser returns the OS user the agent runs as, for the §19 hot-switch
-// remediation (the user added to the config-dir's owning group and named in the
-// scoped sudoers line). A lookup failure yields "" — BuildRemediation tolerates an
-// empty user (it omits the user-specific commands) so this never fails the switch.
-func currentOSUser() string {
-	u, err := user.Current()
-	if err != nil {
-		log.Printf("WARNING: could not resolve current OS user for reconfigure remediation: %v", err)
-		return ""
-	}
-	return u.Username
-}
-
 // toProxyPermissions maps the agent-side permcheck result + remediation into the
 // shared model the heartbeat carries (§12). checked=false (built-in / admin-API
 // backend) yields nil so the dashboard shows no permission block. It keeps the
 // proxy package decoupled from shared/models: the conversion lives here, at the
 // agent boundary that already speaks both.
-func toProxyPermissions(res permcheck.Result, rem *permcheck.Remediation, dirs []string, checked bool) *models.ProxyPermissions {
+func toProxyPermissions(res permcheck.Result, rem *permcheck.Remediation, dirs []string, checked bool, env runtimeenv.Env) *models.ProxyPermissions {
 	if !checked {
 		return nil
 	}
@@ -481,6 +473,7 @@ func toProxyPermissions(res permcheck.Result, rem *permcheck.Remediation, dirs [
 		WriteError:  res.WriteError,
 		ReloadError: res.ReloadError,
 		Dirs:        dirs,
+		RuntimeEnv:  toRuntimeEnv(env),
 	}
 	if rem != nil {
 		mr := &models.Remediation{SudoersLine: rem.SudoersLine}
@@ -490,6 +483,22 @@ func toProxyPermissions(res permcheck.Result, rem *permcheck.Remediation, dirs [
 		pp.Remediation = mr
 	}
 	return pp
+}
+
+// toRuntimeEnv maps the agent-side runtime inspection into the shared wire model
+// carried alongside the permission report, so the dashboard can show how the
+// agent is installed (and thereby why a given remediation applies).
+func toRuntimeEnv(env runtimeenv.Env) *models.RuntimeEnv {
+	return &models.RuntimeEnv{
+		OS:         env.OS,
+		Distro:     env.Distro,
+		InitSystem: env.Init,
+		Managed:    env.Managed,
+		Unit:       env.Unit,
+		Sandboxed:  env.Sandboxed,
+		User:       env.User,
+		IsRoot:     env.IsRoot,
+	}
 }
 
 // detectCapabilities probes the bundled Caddy backend's capability matrix (§8),

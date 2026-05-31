@@ -43,6 +43,24 @@ export interface Remediation {
 }
 
 /**
+ * How the agent is installed and running: OS/distro, the service manager that
+ * started it, whether it runs as root, and whether its filesystem is sandboxed.
+ * This is the context that decides which remediation applies — a root agent under
+ * a systemd sandbox needs a ReadWritePaths drop-in, an unprivileged one needs
+ * group ownership + scoped sudoers.
+ */
+export interface RuntimeEnv {
+  os?: string;
+  distro?: string;
+  init_system?: string;
+  managed: boolean;
+  unit?: string;
+  sandboxed: boolean;
+  user?: string;
+  is_root: boolean;
+}
+
+/**
  * The agent's structured §12 permission self-test for an existing-mode backend:
  * can it WRITE the config dir and RELOAD the service. Carries the targeted
  * remediation when a grant is missing, so the dashboard shows exactly what to fix
@@ -57,6 +75,8 @@ export interface ProxyPermissions {
   reload_error?: string;
   dirs?: string[];
   remediation?: Remediation;
+  /** How the agent is installed/running — the context behind the remediation. */
+  runtime_env?: RuntimeEnv;
 }
 
 // On-demand log tail (§15). The dashboard opens a session, polls for lines past a

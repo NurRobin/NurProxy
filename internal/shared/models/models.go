@@ -139,6 +139,37 @@ type ProxyPermissions struct {
 	// Remediation carries the least-privilege fix commands when a grant is missing;
 	// nil when everything is in order.
 	Remediation *Remediation `json:"remediation,omitempty"`
+	// RuntimeEnv describes HOW the agent runs (OS/distro, service manager, root,
+	// sandbox) — the context that decides which remediation applies. The dashboard
+	// shows it so an operator sees, e.g., "systemd service on Debian, running as
+	// root" next to the fix. Nil when the agent has not reported it.
+	RuntimeEnv *RuntimeEnv `json:"runtime_env,omitempty"`
+}
+
+// RuntimeEnv is the agent's read-only report of how it is installed and running
+// (see internal/agent/runtimeenv). It is carried inside ProxyPermissions because
+// it is the context that selects the remediation: a root agent under a systemd
+// sandbox needs a ReadWritePaths drop-in, an unprivileged agent needs group
+// ownership + scoped sudoers. Empty fields mean "unknown".
+type RuntimeEnv struct {
+	// OS is the agent's operating system ("linux", "darwin", "windows", …).
+	OS string `json:"os,omitempty"`
+	// Distro is the Linux distribution ID (e.g. "debian", "rhel"), empty otherwise.
+	Distro string `json:"distro,omitempty"`
+	// InitSystem is the service manager the agent runs under ("systemd",
+	// "openrc", "launchd", "windows-service"), empty when run directly.
+	InitSystem string `json:"init_system,omitempty"`
+	// Managed reports whether a service manager started the agent (vs foreground).
+	Managed bool `json:"managed"`
+	// Unit is the service unit name when known (e.g. "nurproxy-agent.service").
+	Unit string `json:"unit,omitempty"`
+	// Sandboxed reports whether the agent's filesystem view is read-only-protected
+	// (systemd ProtectSystem=), the usual cause of an EROFS on config writes.
+	Sandboxed bool `json:"sandboxed"`
+	// User is the OS user the agent runs as.
+	User string `json:"user,omitempty"`
+	// IsRoot reports whether the agent runs as root.
+	IsRoot bool `json:"is_root"`
 }
 
 // Remediation is the least-privilege fix for missing Existing-mode grants (§12/
