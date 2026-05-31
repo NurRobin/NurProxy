@@ -128,7 +128,11 @@ func BuildRemediation(opts RemediationOptions) Remediation {
 		// Make sure the dirs that actually failed are covered, even a custom config
 		// dir not in the default list. "-" prefix keeps every entry optional.
 		paths = dedupeStrings(append(optionalPaths(nonEmpty(opts.Dirs)), paths...))
-		rem.Steps = append(rem.Steps, systemdSandboxStep(opts.UnitName, paths))
+		// A root agent also needs CAP_DAC_OVERRIDE in the drop-in: the hardened unit
+		// drops it, so root obeys file bits and cannot read the proxy's TLS keys
+		// (0600) or write its logs (often non-root-owned). Non-root agents get the
+		// group + sudoers grants below instead, never a capability.
+		rem.Steps = append(rem.Steps, systemdSandboxStep(opts.UnitName, paths, opts.RunAsRoot))
 		if opts.RunAsRoot {
 			return rem
 		}
@@ -197,23 +201,39 @@ func BuildRemediation(opts RemediationOptions) Remediation {
 	return rem
 }
 
-// systemdSandboxStep builds the drop-in that opens the unit's ProtectSystem=
-// sandbox for the proxy's dirs. It writes a numbered drop-in (so it composes with
-// the shipped unit instead of replacing it), daemon-reloads, and restarts the
-// agent. The commands are copy-paste ready; the agent never runs them.
-func systemdSandboxStep(unit string, paths []string) RemediationStep {
+// systemdSandboxStep builds the drop-in that opens the unit's sandbox. It always
+// grants the proxy's dirs via ReadWritePaths (the read-only mount); when withCaps
+// is set (a root agent) it also restores CAP_DAC_OVERRIDE, since the hardened unit
+// drops it and root then cannot read the proxy's TLS keys or write its logs. It
+// writes a numbered drop-in (so it composes with the shipped unit instead of
+// replacing it), daemon-reloads, and restarts the agent. Copy-paste ready; the
+// agent never runs them.
+func systemdSandboxStep(unit string, paths []string, withCaps bool) RemediationStep {
 	if unit == "" {
 		unit = defaultUnit
 	} else if !strings.HasSuffix(unit, ".service") {
 		unit += ".service"
 	}
 	dropinDir := fmt.Sprintf("/etc/systemd/system/%s.d", unit)
-	line := "ReadWritePaths=" + strings.Join(paths, " ")
+
+	lines := []string{"ReadWritePaths=" + strings.Join(paths, " ")}
+	title := "Open the service sandbox so the agent can write + reload the proxy (systemd ReadWritePaths drop-in)"
+	if withCaps {
+		lines = append(lines,
+			"AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE",
+			"CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE",
+		)
+		title = "Open the service sandbox so the root agent can read the proxy's keys + write its config/logs (systemd drop-in)"
+	}
+	// strings joined with a literal \n so the single-quoted printf renders the
+	// multi-line drop-in body when the operator runs it.
+	body := strings.Join(lines, `\n`)
+
 	return RemediationStep{
-		Title: "Open the service sandbox so the agent can write + reload the proxy (systemd ReadWritePaths drop-in)",
+		Title: title,
 		Commands: []string{
 			fmt.Sprintf("sudo mkdir -p %s", dropinDir),
-			fmt.Sprintf("printf '[Service]\\n%s\\n' | sudo tee %s/10-nurproxy-writepaths.conf", line, dropinDir),
+			fmt.Sprintf("printf '[Service]\\n%s\\n' | sudo tee %s/10-nurproxy-writepaths.conf", body, dropinDir),
 			"sudo systemctl daemon-reload",
 			fmt.Sprintf("sudo systemctl restart %s", unit),
 		},

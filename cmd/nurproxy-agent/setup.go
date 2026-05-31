@@ -72,7 +72,7 @@ func cmdSetup(args []string) {
 			WritePaths:   install.AgentProxyWritePaths,
 			EnvFile:      agentEnvFile,
 			Env:          env,
-			Capabilities: []string{"CAP_NET_BIND_SERVICE"},
+			Capabilities: install.AgentCapabilities,
 		}
 		if err := install.Install(svc, os.Stdout); err != nil {
 			log.Fatalf("setup failed: %v", err)
