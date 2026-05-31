@@ -230,6 +230,8 @@ func TestBuildRemediation_systemdRoot(t *testing.T) {
 		"ReadWritePaths=",
 		"-/etc/nginx/sites-available", // the failed dir is covered, optionalized
 		"-/var/log/nginx",             // plus the default proxy log/runtime trees
+		"CAP_DAC_OVERRIDE",            // root needs it to read keys / write logs
+		"AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE",
 		"systemctl daemon-reload",
 		"systemctl restart nurproxy-agent.service",
 	} {
@@ -273,6 +275,11 @@ func TestBuildRemediation_systemdNonRoot(t *testing.T) {
 	}
 	if rem.SudoersLine == "" {
 		t.Error("non-root agent should still get the scoped sudoers line")
+	}
+	// A non-root agent must NOT be handed CAP_DAC_OVERRIDE — it gets group
+	// ownership + readable certs instead, not a capability that re-roots it.
+	if strings.Contains(all, "CAP_DAC_OVERRIDE") {
+		t.Errorf("non-root remediation should not grant CAP_DAC_OVERRIDE\n%s", all)
 	}
 }
 
