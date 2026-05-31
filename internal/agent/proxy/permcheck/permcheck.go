@@ -37,6 +37,12 @@ import (
 // or apache conf.d globbing.
 const probeFileName = ".nurproxy-permcheck"
 
+// InitSystemdName is the Options.InitSystem value (matching runtimeenv.InitSystemd)
+// that switches messages and remediation onto the systemd-sandbox path. It is a
+// plain string, not an import of runtimeenv, so permcheck stays dependency-free
+// and purely table-testable.
+const InitSystemdName = "systemd"
+
 // TestRunner runs the backend's config-validate command (nginx -t / apachectl
 // configtest). It is the same shape as the backends' Runner.Test, injected so the
 // reload-privilege probe is unit-testable without a real proxy or sudo. The probe
@@ -107,6 +113,18 @@ type Options struct {
 	// (e.g. "/usr/sbin/nginx -s reload"), woven into the ReloadError so the docs'
 	// sudoers snippet is one copy-paste away. Optional.
 	ReloadHint string
+	// RunAsRoot reports whether the agent runs as root. When true the messages drop
+	// the group-ownership / sudo advice (neither applies to root) and point at the
+	// service sandbox instead — the actual blocker for a root agent.
+	RunAsRoot bool
+	// InitSystem names the service manager the agent runs under ("systemd", …) or
+	// "" when run directly. "systemd" switches the messages to the unit-sandbox
+	// (ProtectSystem=/ReadWritePaths) explanation, since that — not file
+	// permissions — is what makes the config dir a read-only mount (EROFS).
+	InitSystem string
+	// UnitName is the agent's service unit (e.g. "nurproxy-agent.service"), woven
+	// into the systemd remediation hint so `systemctl edit <unit>` is exact.
+	UnitName string
 }
 
 // Probe runs the write and reload checks and returns a Result. It never panics
@@ -120,14 +138,14 @@ func Probe(ctx context.Context, opts Options) Result {
 	if len(opts.Dirs) > 0 {
 		if err := probeWrite(opts.Dirs); err != nil {
 			res.CanWrite = false
-			res.WriteError = writeMessage(opts.Backend, err)
+			res.WriteError = writeMessage(opts, err)
 		}
 	}
 
 	if opts.Runner != nil {
 		if err := probeReload(ctx, opts.Runner); err != nil {
 			res.CanReload = false
-			res.ReloadError = reloadMessage(opts.Backend, opts.ReloadHint, err)
+			res.ReloadError = reloadMessage(opts, err)
 		}
 	}
 
@@ -228,31 +246,82 @@ func isPermissionDenied(err error, output string) bool {
 	return false
 }
 
-// writeMessage builds the actionable health message for a failed write probe,
-// pointing the operator at the group/ownership fix (§12), not sudo.
-func writeMessage(backend string, err error) string {
-	b := backendLabel(backend)
-	return fmt.Sprintf(
-		"%s config is not writable: %v — add the agent user to the group that owns the config dir "+
-			"(or point it at a NurProxy-owned include dir). See the least-privilege setup docs. "+
-			"The agent stays connected; existing config is untouched.",
-		b, err)
-}
+// writeMessage builds the actionable health message for a failed write probe.
+// Which fix it points at depends on the runtime context: a read-only filesystem
+// under systemd is the unit sandbox (ProtectSystem=), fixed with a ReadWritePaths
+// drop-in — NOT group ownership; a root agent is never a group/ownership problem;
+// otherwise the §12 group/ownership grant is the fix.
+func writeMessage(opts Options, err error) string {
+	b := backendLabel(opts.Backend)
+	const tail = "See the least-privilege setup docs. The agent stays connected; existing config is untouched."
 
-// reloadMessage builds the actionable health message for a failed reload probe,
-// pointing the operator at the scoped-sudoers fix (§12), not blanket sudo. When a
-// ReloadHint is set the exact command to allow is included so the docs' sudoers
-// snippet is a copy-paste away.
-func reloadMessage(backend, hint string, err error) string {
-	b := backendLabel(backend)
-	cmd := ""
-	if hint != "" {
-		cmd = fmt.Sprintf(" (NOPASSWD for exactly %q and the matching test command)", hint)
+	if isReadOnlyFS(err) && opts.InitSystem == InitSystemdName {
+		return fmt.Sprintf(
+			"%s config is not writable: %v — this is the systemd unit's filesystem sandbox "+
+				"(ProtectSystem=), not a file-permission problem: it makes the config dir a read-only mount. "+
+				"Grant write by adding the proxy's dirs to ReadWritePaths in a %s drop-in, then restart. %s",
+			b, err, unitLabel(opts.UnitName), tail)
+	}
+	if opts.RunAsRoot {
+		return fmt.Sprintf(
+			"%s config is not writable: %v — the agent runs as root, so this is not a group/ownership "+
+				"problem; check the service sandbox (ProtectSystem=/ReadWritePaths) or an immutable/read-only "+
+				"mount. %s",
+			b, err, tail)
 	}
 	return fmt.Sprintf(
-		"%s cannot be reloaded: %v — grant a narrowly-scoped sudoers entry%s, not blanket sudo. "+
-			"See the least-privilege setup docs. The agent stays connected; existing config is untouched.",
-		b, err, cmd)
+		"%s config is not writable: %v — add the agent user to the group that owns the config dir "+
+			"(or point it at a NurProxy-owned include dir). %s",
+		b, err, tail)
+}
+
+// reloadMessage builds the actionable health message for a failed reload probe.
+// For a root agent the fix is never sudo: under systemd the unit sandbox
+// (ProtectSystem= / NoNewPrivileges) blocks the reload's log/runtime writes,
+// fixed with a ReadWritePaths drop-in. For an unprivileged agent it is the §12
+// scoped-sudoers grant; when a ReloadHint is set the exact command is included.
+func reloadMessage(opts Options, err error) string {
+	b := backendLabel(opts.Backend)
+	const tail = "See the least-privilege setup docs. The agent stays connected; existing config is untouched."
+
+	if opts.RunAsRoot {
+		if opts.InitSystem == InitSystemdName {
+			return fmt.Sprintf(
+				"%s cannot be reloaded: %v — the agent runs as root, so this is not a sudo problem: the "+
+					"systemd unit's sandbox (ProtectSystem= / NoNewPrivileges) blocks the reload's log/runtime "+
+					"writes. Grant the proxy's log + runtime dirs via a %s ReadWritePaths drop-in, then restart. %s",
+				b, err, unitLabel(opts.UnitName), tail)
+		}
+		return fmt.Sprintf(
+			"%s cannot be reloaded: %v — the agent runs as root; verify the reload command path and that the "+
+				"service is running. %s",
+			b, err, tail)
+	}
+
+	cmd := ""
+	if opts.ReloadHint != "" {
+		cmd = fmt.Sprintf(" (NOPASSWD for exactly %q and the matching test command)", opts.ReloadHint)
+	}
+	return fmt.Sprintf(
+		"%s cannot be reloaded: %v — grant a narrowly-scoped sudoers entry%s, not blanket sudo. %s",
+		b, err, cmd, tail)
+}
+
+// isReadOnlyFS reports whether a write failure is an EROFS (read-only filesystem)
+// — the systemd-sandbox tell — rather than a DAC permission denial. Matched on
+// the error text (portable across OSes, consistent with isPermissionDenied)
+// rather than syscall.EROFS, which is not defined on every build target.
+func isReadOnlyFS(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "read-only file system")
+}
+
+// unitLabel returns a unit name for a `systemctl edit`-style hint, defaulting to
+// a generic phrase when the agent could not resolve its own unit.
+func unitLabel(unit string) string {
+	if unit == "" {
+		return "systemctl edit (the agent unit)"
+	}
+	return "systemctl edit " + unit
 }
 
 // backendLabel returns a human label for a backend name, defaulting to "proxy".

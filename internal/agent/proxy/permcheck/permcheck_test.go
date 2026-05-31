@@ -197,6 +197,78 @@ func TestProbe_neverPanics_onDegenerateInput(t *testing.T) {
 	}
 }
 
+// TestWriteMessage_runtimeAware asserts the write-failure message points at the
+// fix that actually applies for the runtime context, not always group ownership.
+func TestWriteMessage_runtimeAware(t *testing.T) {
+	roErr := errors.New(`cannot write to config directory "/etc/nginx": open /etc/nginx/.x: read-only file system`)
+	eaccesErr := errors.New(`cannot write to config directory "/etc/nginx": permission denied`)
+
+	tests := []struct {
+		name    string
+		opts    Options
+		err     error
+		want    string // substring that must appear
+		notWant string // substring that must NOT appear
+	}{
+		{
+			name:    "read-only fs under systemd → sandbox/ReadWritePaths, not group",
+			opts:    Options{Backend: "nginx", InitSystem: InitSystemdName, UnitName: "nurproxy-agent.service", RunAsRoot: true},
+			err:     roErr,
+			want:    "ReadWritePaths",
+			notWant: "group that owns",
+		},
+		{
+			name: "read-only fs under systemd names the unit for systemctl edit",
+			opts: Options{Backend: "nginx", InitSystem: InitSystemdName, UnitName: "nurproxy-agent.service"},
+			err:  roErr,
+			want: "systemctl edit nurproxy-agent.service",
+		},
+		{
+			name:    "root without systemd is not a group problem",
+			opts:    Options{Backend: "nginx", RunAsRoot: true},
+			err:     eaccesErr,
+			want:    "runs as root",
+			notWant: "group that owns",
+		},
+		{
+			name: "unprivileged keeps the group/ownership fix",
+			opts: Options{Backend: "nginx"},
+			err:  eaccesErr,
+			want: "group that owns",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := writeMessage(tt.opts, tt.err)
+			if !strings.Contains(msg, tt.want) {
+				t.Errorf("message %q missing %q", msg, tt.want)
+			}
+			if tt.notWant != "" && strings.Contains(msg, tt.notWant) {
+				t.Errorf("message %q should not contain %q", msg, tt.notWant)
+			}
+		})
+	}
+}
+
+// TestReloadMessage_runtimeAware asserts a root agent is never told to fix reload
+// with sudo (it doesn't use sudo) — under systemd it's the sandbox.
+func TestReloadMessage_runtimeAware(t *testing.T) {
+	err := errors.New("exit status 1")
+
+	rootSystemd := reloadMessage(Options{Backend: "nginx", RunAsRoot: true, InitSystem: InitSystemdName, UnitName: "nurproxy-agent.service"}, err)
+	if strings.Contains(rootSystemd, "sudoers") {
+		t.Errorf("root agent should not be pointed at sudoers: %q", rootSystemd)
+	}
+	if !strings.Contains(rootSystemd, "ReadWritePaths") || !strings.Contains(rootSystemd, "not a sudo problem") {
+		t.Errorf("root+systemd reload message should explain the sandbox: %q", rootSystemd)
+	}
+
+	unpriv := reloadMessage(Options{Backend: "nginx", ReloadHint: "/usr/sbin/nginx -s reload"}, err)
+	if !strings.Contains(unpriv, "narrowly-scoped sudoers") || !strings.Contains(unpriv, "/usr/sbin/nginx -s reload") {
+		t.Errorf("unprivileged reload message should keep the scoped-sudoers fix + hint: %q", unpriv)
+	}
+}
+
 func TestResult_HealthError_okWhenBothPresent(t *testing.T) {
 	r := Result{CanWrite: true, CanReload: true}
 	if r.HealthError() != "" {

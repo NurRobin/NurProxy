@@ -12,6 +12,7 @@ import (
 	// real file backend, exercising the full hot-switch probe path.
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/apache"
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
+	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -84,7 +85,7 @@ func TestReconfigureBuiltInToExisting_WritableDir(t *testing.T) {
 	deps := proxy.ReconfigureDeps{
 		Health:    hs,
 		StopCaddy: func() error { stopped = true; return nil },
-		OSUser:    "agentuser",
+		Env:       runtimeenv.Env{User: "agentuser"},
 	}
 
 	res := h.Reconfigure(context.Background(), proxy.ReconfigureRequest{
@@ -124,7 +125,7 @@ func TestReconfigureBuiltInToExisting_BogusDirFailsButSwaps(t *testing.T) {
 	deps := proxy.ReconfigureDeps{
 		Health:    hs,
 		StopCaddy: func() error { stopped = true; return nil },
-		OSUser:    "agentuser",
+		Env:       runtimeenv.Env{User: "agentuser"},
 	}
 
 	res := func() (r proxy.ReconfigureResult) {
@@ -214,7 +215,7 @@ func TestProbePermissions(t *testing.T) {
 	t.Setenv("NURPROXY_NO_SUDO", "1")
 	// Built-in seed backend: not a file backend → checked=false, no remediation.
 	h := proxy.NewHolder(seedBackend{}, "built-in")
-	res, rem, dirs, checked := h.ProbePermissions(context.Background(), "agentuser")
+	res, rem, dirs, checked := h.ProbePermissions(context.Background(), runtimeenv.Env{User: "agentuser"})
 	if checked {
 		t.Error("built-in backend should not be permission-checked")
 	}
@@ -233,7 +234,7 @@ func TestProbePermissions(t *testing.T) {
 		Mode: "existing", Type: "nginx", ConfigDir: root, TestCmd: "/bin/true",
 	}, deps)
 
-	res, rem, dirs, checked = h.ProbePermissions(context.Background(), "agentuser")
+	res, rem, dirs, checked = h.ProbePermissions(context.Background(), runtimeenv.Env{User: "agentuser"})
 	if !checked {
 		t.Fatal("existing nginx backend should be permission-checked")
 	}
@@ -249,7 +250,7 @@ func TestProbePermissions(t *testing.T) {
 	h2.Reconfigure(context.Background(), proxy.ReconfigureRequest{
 		Mode: "existing", Type: "nginx", ConfigDir: "/nonexistent/nurproxy/bogus", TestCmd: "/bin/true",
 	}, deps)
-	res, rem, _, checked = h2.ProbePermissions(context.Background(), "agentuser")
+	res, rem, _, checked = h2.ProbePermissions(context.Background(), runtimeenv.Env{User: "agentuser"})
 	if !checked || res.OK() {
 		t.Errorf("bogus-dir probe should be checked and not OK, got checked=%v OK=%v", checked, res.OK())
 	}

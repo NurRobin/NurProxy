@@ -206,6 +206,94 @@ func TestBuildRemediation_deterministic(t *testing.T) {
 	}
 }
 
+// TestBuildRemediation_systemdRoot: a root agent under systemd gets ONLY the
+// ReadWritePaths drop-in — group ownership and sudo never apply to root.
+func TestBuildRemediation_systemdRoot(t *testing.T) {
+	rem := BuildRemediation(RemediationOptions{
+		Backend:    "nginx",
+		RunAsRoot:  true,
+		InitSystem: InitSystemdName,
+		UnitName:   "nurproxy-agent.service",
+		Dirs:       []string{"/etc/nginx/sites-available"},
+		TestCmd:    "/usr/sbin/nginx -t",
+		ReloadCmd:  "/usr/sbin/nginx -s reload",
+	})
+	if len(rem.Steps) != 1 {
+		t.Fatalf("root+systemd should yield exactly the drop-in step, got %d: %+v", len(rem.Steps), rem.Steps)
+	}
+	if rem.SudoersLine != "" {
+		t.Errorf("root agent should get no sudoers line, got %q", rem.SudoersLine)
+	}
+	all := allCommands(rem)
+	for _, want := range []string{
+		"mkdir -p /etc/systemd/system/nurproxy-agent.service.d",
+		"ReadWritePaths=",
+		"-/etc/nginx/sites-available", // the failed dir is covered, optionalized
+		"-/var/log/nginx",             // plus the default proxy log/runtime trees
+		"systemctl daemon-reload",
+		"systemctl restart nurproxy-agent.service",
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("drop-in step missing %q\n%s", want, all)
+		}
+	}
+	for _, notWant := range []string{"groupadd", "usermod", "sudoers.d"} {
+		if strings.Contains(all, notWant) {
+			t.Errorf("root remediation should not contain %q\n%s", notWant, all)
+		}
+	}
+}
+
+// TestBuildRemediation_systemdNonRoot: an unprivileged agent under systemd needs
+// BOTH the sandbox drop-in (to open the read-only mount) AND the group + sudoers
+// grants (DAC write + reload privilege).
+func TestBuildRemediation_systemdNonRoot(t *testing.T) {
+	rem := BuildRemediation(RemediationOptions{
+		Backend:    "nginx",
+		User:       "nurproxy",
+		InitSystem: InitSystemdName,
+		UnitName:   "nurproxy-agent", // no .service suffix → normalized
+		Dirs:       []string{"/etc/nginx/sites-available"},
+		TestCmd:    "/usr/sbin/nginx -t",
+		ReloadCmd:  "/usr/sbin/nginx -s reload",
+	})
+	if len(rem.Steps) != 3 {
+		t.Fatalf("non-root systemd should yield drop-in + group + sudoers (3 steps), got %d", len(rem.Steps))
+	}
+	all := allCommands(rem)
+	for _, want := range []string{
+		"mkdir -p /etc/systemd/system/nurproxy-agent.service.d", // .service appended
+		"sudo groupadd -f nurproxy",
+		"sudo chgrp -R nurproxy /etc/nginx/sites-available",
+		"sudo tee /etc/sudoers.d/nurproxy-agent",
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("non-root systemd remediation missing %q\n%s", want, all)
+		}
+	}
+	if rem.SudoersLine == "" {
+		t.Error("non-root agent should still get the scoped sudoers line")
+	}
+}
+
+// TestBuildRemediation_systemdCustomWritePaths: a caller may supply backend-
+// specific paths instead of the default set.
+func TestBuildRemediation_systemdCustomWritePaths(t *testing.T) {
+	rem := BuildRemediation(RemediationOptions{
+		Backend:           "nginx",
+		RunAsRoot:         true,
+		InitSystem:        InitSystemdName,
+		SandboxWritePaths: []string{"-/srv/nginx", "-/var/log/nginx"},
+	})
+	all := allCommands(rem)
+	if !strings.Contains(all, "ReadWritePaths=-/srv/nginx -/var/log/nginx") {
+		t.Errorf("custom SandboxWritePaths not honored\n%s", all)
+	}
+	if strings.Contains(all, "-/etc/nginx ") {
+		t.Errorf("default paths should not leak when custom ones are given\n%s", all)
+	}
+}
+
 func TestBuildRemediation_emptyDirEntriesIgnored(t *testing.T) {
 	rem := BuildRemediation(RemediationOptions{
 		User: "nurproxy",
