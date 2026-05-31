@@ -38,6 +38,26 @@ func TestRenderUnitHardening(t *testing.T) {
 	}
 }
 
+func TestRenderUnitWritePaths(t *testing.T) {
+	s := Service{
+		Name:       "nurproxy-agent",
+		BinaryPath: "/usr/local/bin/nurproxy-agent",
+		DataDir:    "/var/lib/nurproxy-agent",
+		WritePaths: []string{"-/etc/nginx", "-/var/log/nginx"},
+	}
+	unit := RenderUnit(s)
+	// DataDir keeps its own line; the extra proxy trees join one further line so
+	// ProtectSystem=strict no longer makes /etc/nginx a read-only mount.
+	for _, m := range []string{
+		"ReadWritePaths=/var/lib/nurproxy-agent\n",
+		"ReadWritePaths=-/etc/nginx -/var/log/nginx\n",
+	} {
+		if !strings.Contains(unit, m) {
+			t.Errorf("unit missing %q\n---\n%s", m, unit)
+		}
+	}
+}
+
 func TestRenderUnitOptionalsOmitted(t *testing.T) {
 	// No caps, no env file, no data dir → those lines must be absent.
 	s := Service{Name: "nurproxy", Description: "NurProxy", BinaryPath: "/usr/local/bin/nurproxy", User: "root"}
