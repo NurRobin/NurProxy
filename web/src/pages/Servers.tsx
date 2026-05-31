@@ -54,11 +54,26 @@ export default function Servers() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  function openAdd(agentId?: string) {
+  function openAdd(agentId?: string, prefill?: { name?: string; address?: string; notes?: string }) {
     setFormAgent(agentId ?? eligible[0]?.id ?? '');
-    setName(''); setAddress(''); setNotes(''); setError('');
+    setName(prefill?.name ?? ''); setAddress(prefill?.address ?? ''); setNotes(prefill?.notes ?? ''); setError('');
     setShowAdd(true);
   }
+
+  // suggestionsFor turns an agent's discovered nginx upstreams (§52) into Server
+  // suggestions: collapse by address, merge the vhost names, and drop any address
+  // that is already a Server. The operator confirms each with a name/notes — the
+  // orchestrator never creates these on its own.
+  const suggestionsFor = (agent: Agent, servers: Server[]) => {
+    const existing = new Set(servers.map((s) => s.address.trim()));
+    const byAddr = new Map<string, string[]>();
+    for (const u of agent.proxy_detection?.discovered_upstreams ?? []) {
+      const addr = u.port ? `${u.host}:${u.port}` : u.host;
+      if (existing.has(addr)) continue;
+      byAddr.set(addr, [...(byAddr.get(addr) ?? []), ...(u.server_names ?? [])]);
+    }
+    return [...byAddr.entries()].map(([addr, names]) => ({ addr, names: [...new Set(names)] }));
+  };
 
   async function handleCreate() {
     if (!formAgent || !name || !address) return;
@@ -85,6 +100,7 @@ export default function Servers() {
 
   const domainsForServer = (sid: string) => domains.filter((d) => d.server_id === sid && d.status !== 'deleting').length;
   const totalServers = Object.values(serversByAgent).reduce((n, s) => n + s.length, 0);
+  const totalSuggestions = eligible.reduce((n, a) => n + suggestionsFor(a, serversByAgent[a.id] ?? []).length, 0);
 
   if (loading) return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
 
@@ -106,7 +122,7 @@ export default function Servers() {
           description={t('servers.approveFirstBody')}
           action={<Link to="/agents" className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:bg-accent-hover">{t('servers.goToAgents')}</Link>}
         />
-      ) : totalServers === 0 ? (
+      ) : totalServers === 0 && totalSuggestions === 0 ? (
         <EmptyState
           title={t('servers.noneYet')}
           description={t('servers.noneYetBody')}
@@ -116,6 +132,7 @@ export default function Servers() {
         <div className="space-y-5">
           {eligible.map((agent) => {
             const servers = serversByAgent[agent.id] ?? [];
+            const suggestions = suggestionsFor(agent, servers);
             return (
               <section key={agent.id} className="overflow-hidden rounded-xl border border-border bg-surface shadow-card">
                 <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3">
@@ -146,6 +163,33 @@ export default function Servers() {
                       );
                     })}
                   </ul>
+                )}
+                {suggestions.length > 0 && (
+                  <div className="border-t border-border bg-surface-2/30 px-5 py-3">
+                    <p className="mb-2 text-xs font-medium text-fg-muted">{t('servers.suggestedTitle')}</p>
+                    <ul className="space-y-2">
+                      {suggestions.map((s) => (
+                        <li key={s.addr} className="flex items-center justify-between gap-4">
+                          <div className="min-w-0">
+                            <p className="truncate font-mono text-xs text-fg">{s.addr}</p>
+                            {s.names.length > 0 && (
+                              <p className="truncate text-xs text-fg-faint">{t('servers.suggestedUsedBy', { names: s.names.join(', ') })}</p>
+                            )}
+                          </div>
+                          <button
+                            onClick={() => openAdd(agent.id, {
+                              name: s.names[0] ?? s.addr,
+                              address: s.addr,
+                              notes: s.names.length > 0 ? t('servers.suggestedNote', { names: s.names.join(', ') }) : '',
+                            })}
+                            className="flex-shrink-0 text-xs font-medium text-accent hover:underline"
+                          >
+                            {t('servers.addSuggestion')}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
                 )}
               </section>
             );

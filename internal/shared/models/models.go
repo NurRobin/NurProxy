@@ -111,6 +111,21 @@ type ProxyDetection struct {
 	LogPaths []string `json:"log_paths,omitempty"`
 	// PortConflicts lists the holders of :80/:443 when those ports are occupied.
 	PortConflicts []ProxyPortConflict `json:"port_conflicts,omitempty"`
+	// DiscoveredUpstreams are the backend targets the host proxy already points at,
+	// scanned read-only from its config (§52), so the dashboard can suggest them as
+	// Servers. nginx only for now; empty otherwise.
+	DiscoveredUpstreams []DiscoveredUpstream `json:"discovered_upstreams,omitempty"`
+}
+
+// DiscoveredUpstream is one backend target found in the host proxy's existing
+// config: where it points (scheme/host/port) and the vhost server_name(s) that
+// reference it. It is a suggestion source for Servers (§52) — read-only, never
+// auto-created; the operator adds it with a name/notes.
+type DiscoveredUpstream struct {
+	Scheme      string   `json:"scheme,omitempty"`
+	Host        string   `json:"host"`
+	Port        int      `json:"port,omitempty"`
+	ServerNames []string `json:"server_names,omitempty"`
 }
 
 // ProxyPermissions is the agent's structured §12 permission self-test for an
