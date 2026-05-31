@@ -45,3 +45,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional publishing channels. Each stays inert (skip_upload) until
+          # its secret is set, so releases never fail for a missing one.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          AUR_KEY: ${{ secrets.AUR_KEY }}

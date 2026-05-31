@@ -1,0 +1,86 @@
+name: Package repo
+
+# Builds a signed APT + YUM repository from the .deb/.rpm assets across all
+# releases and publishes it to GitHub Pages. Inert until GPG_PRIVATE_KEY is set.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check for signing key
+        id: guard
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GPG_PRIVATE_KEY secret not set — skipping package repo build"
+          fi
+
+      - name: Install tools
+        if: steps.guard.outputs.enabled == 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev createrepo-c rpm gnupg
+
+      - name: Import GPG key
+        if: steps.guard.outputs.enabled == 'true'
+        id: gpg
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')"
+          echo "key_id=$KEYID" >> "$GITHUB_OUTPUT"
+
+      - name: Download release packages
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p packages
+          for tag in $(gh release list --limit 200 --json tagName --jq '.[].tagName'); do
+            gh release download "$tag" -D packages -p '*.deb' -p '*.rpm' --clobber || true
+          done
+          ls -la packages || true
+
+      - name: Build repository
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          GPG_KEY_ID: ${{ steps.gpg.outputs.key_id }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          owner="${{ github.repository_owner }}"
+          repo="${{ github.event.repository.name }}"
+          export REPO_BASE_URL="https://${owner,,}.github.io/${repo}"
+          chmod +x scripts/build-repo.sh
+          scripts/build-repo.sh packages public
+
+      - name: Upload Pages artifact
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to Pages
+        if: steps.guard.outputs.enabled == 'true'
+        id: deploy
+        uses: actions/deploy-pages@v4
