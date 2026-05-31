@@ -2,7 +2,13 @@ version: 2
 
 before:
   hooks:
-    - go mod tidy
+    # download (not tidy) — read-only, can't dirty go.mod/go.sum mid-release.
+    - go mod download
+
+# 0.x tags publish as normal releases; a future -rc/-beta tag auto-marks as a
+# GitHub pre-release (and gates the Docker :latest manifests below).
+release:
+  prerelease: auto
 
 # Shared target matrix for both binaries. 32-bit arm is linux-only (homelab
 # boards, Raspberry Pi); darwin/freebsd ship amd64+arm64 only.
@@ -116,10 +122,10 @@ homebrew_casks:
       owner: NurRobin
       name: homebrew-tap
       branch: main
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
     homepage: "https://github.com/NurRobin/NurProxy"
     description: "NurProxy orchestrator — reverse proxy and DNS management dashboard"
-    skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if envOrDefault "HOMEBREW_TAP_TOKEN" "" }}false{{ else }}true{{ end }}'
     hooks:
       post:
         install: |
@@ -131,10 +137,10 @@ homebrew_casks:
       owner: NurRobin
       name: homebrew-tap
       branch: main
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
     homepage: "https://github.com/NurRobin/NurProxy"
     description: "NurProxy agent — manages a local reverse proxy on an edge server"
-    skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if envOrDefault "HOMEBREW_TAP_TOKEN" "" }}false{{ else }}true{{ end }}'
     hooks:
       post:
         install: |
@@ -149,9 +155,9 @@ aurs:
     description: "NurProxy orchestrator — reverse proxy and DNS management dashboard"
     license: MIT
     maintainers: ['NurRobin <grambrobin@gmail.com>']
-    private_key: '{{ .Env.AUR_KEY }}'
+    private_key: '{{ envOrDefault "AUR_KEY" "" }}'
     git_url: 'ssh://aur@aur.archlinux.org/nurproxy-bin.git'
-    skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if envOrDefault "AUR_KEY" "" }}false{{ else }}true{{ end }}'
     package: |-
       install -Dm755 "./nurproxy" "${pkgdir}/usr/bin/nurproxy"
   - name: nurproxy-agent-bin
@@ -160,9 +166,9 @@ aurs:
     description: "NurProxy agent — manages a local reverse proxy on an edge server"
     license: MIT
     maintainers: ['NurRobin <grambrobin@gmail.com>']
-    private_key: '{{ .Env.AUR_KEY }}'
+    private_key: '{{ envOrDefault "AUR_KEY" "" }}'
     git_url: 'ssh://aur@aur.archlinux.org/nurproxy-agent-bin.git'
-    skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if envOrDefault "AUR_KEY" "" }}false{{ else }}true{{ end }}'
     package: |-
       install -Dm755 "./nurproxy-agent" "${pkgdir}/usr/bin/nurproxy-agent"
 
@@ -208,6 +214,7 @@ docker_manifests:
     image_templates:
       - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-amd64"
       - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-arm64"
+    skip_push: '{{ if .Prerelease }}true{{ else }}false{{ end }}'
 
   - name_template: "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}"
     image_templates:
@@ -217,6 +224,7 @@ docker_manifests:
     image_templates:
       - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-amd64"
       - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-arm64"
+    skip_push: '{{ if .Prerelease }}true{{ else }}false{{ end }}'
 
 checksum:
   name_template: 'checksums.txt'
