@@ -420,6 +420,13 @@ var migrations = []string{
 	`
 	ALTER TABLE agents ADD COLUMN detected_upstreams TEXT NOT NULL DEFAULT '';
 	`,
+
+	// Migration 16: IP subnets attached to the agent host's interfaces (§38), a
+	// JSON array alongside the other detection columns. Suggestions for the Server
+	// dialog; empty until an agent reports them.
+	`
+	ALTER TABLE agents ADD COLUMN detected_networks TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

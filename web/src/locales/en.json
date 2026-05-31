@@ -310,6 +310,7 @@
     "noneYet": "No servers yet",
     "noneYetBody": "Register the first backend an agent should forward traffic to — e.g. a web app on your LAN.",
     "onAgentNone": "No servers on this agent yet.",
+    "detectedNets": "Detected:",
     "suggestedTitle": "Suggested from this agent's nginx config",
     "suggestedUsedBy": "referenced by {{names}}",
     "suggestedNote": "Discovered in nginx config; referenced by {{names}}",

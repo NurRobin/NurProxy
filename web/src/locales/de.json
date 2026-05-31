@@ -310,6 +310,7 @@
     "noneYet": "Noch keine Server",
     "noneYetBody": "Registriere das erste Backend, an das ein Agent weiterleiten soll — z. B. eine Web-App in deinem LAN.",
     "onAgentNone": "Noch keine Server auf diesem Agent.",
+    "detectedNets": "Erkannt:",
     "suggestedTitle": "Vorschläge aus der nginx-Config dieses Agents",
     "suggestedUsedBy": "referenziert von {{names}}",
     "suggestedNote": "In der nginx-Config gefunden; referenziert von {{names}}",

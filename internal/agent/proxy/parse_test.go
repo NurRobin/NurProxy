@@ -3,6 +3,8 @@ package proxy
 import (
 	"reflect"
 	"testing"
+
+	"github.com/NurRobin/NurProxy/internal/shared/netdiscover"
 )
 
 func TestParseVersion_capturedOutputs_extractsVersion(t *testing.T) {
@@ -221,15 +223,17 @@ func TestResolvePaths_nothingOnDisk_fallsBackToPrimaryDefault(t *testing.T) {
 // stubFS replaces the package dir/file existence hooks with synthetic layouts
 // and returns a restore func.
 func stubFS(dirs, files map[string]bool) func() {
-	origDir, origFile, origGather := dirExists, fileExists, gatherNginxConfig
+	origDir, origFile, origGather, origNet := dirExists, fileExists, gatherNginxConfig, collectNetworks
 	dirExists = func(p string) bool { return dirs[p] }
 	fileExists = func(p string) bool { return files[p] }
-	// Detect()'s nginx upstream discovery reads real host config; neutralize it so
-	// detection tests stay hermetic. Tests that exercise discovery stub it directly.
+	// Detect() reads real host config + interfaces; neutralize both so detection
+	// tests stay hermetic. Tests that exercise them stub the hooks directly.
 	gatherNginxConfig = func(string) string { return "" }
+	collectNetworks = func() []netdiscover.Network { return nil }
 	return func() {
 		dirExists = origDir
 		fileExists = origFile
 		gatherNginxConfig = origGather
+		collectNetworks = origNet
 	}
 }

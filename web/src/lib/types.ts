@@ -29,6 +29,16 @@ export interface ProxyDetection {
   log_paths?: string[];
   port_conflicts?: ProxyPortConflict[];
   discovered_upstreams?: DiscoveredUpstream[];
+  networks?: DiscoveredNetwork[];
+}
+
+/** An IP subnet attached to the agent host — a CIDR suggestion for the Server
+ *  address dialog (§38). */
+export interface DiscoveredNetwork {
+  interface?: string;
+  address?: string;
+  prefix_length?: number;
+  network: string;
 }
 
 /** A backend target found in the host proxy's existing config — a suggestion
