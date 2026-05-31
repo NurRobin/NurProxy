@@ -44,6 +44,12 @@ func main() {
 		case "version":
 			fmt.Printf("nurproxy %s\n", version)
 			return
+		default:
+			// Management CLI subcommands (provider/zone/agent/server/domain/...).
+			// If handled, we're done; otherwise fall through to running the server.
+			if runCLI(os.Args[1], os.Args[2:]) {
+				return
+			}
 		}
 	}
 
