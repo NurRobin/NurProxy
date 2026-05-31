@@ -663,7 +663,7 @@
   },
   "status": {
     "active": "Aktiv",
-    "adopted": "Übernommen",
+    "adopted": "Eingebunden",
     "pending": "Ausstehend",
     "error": "Fehler",
     "offline": "Offline",

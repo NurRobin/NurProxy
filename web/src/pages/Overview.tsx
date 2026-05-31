@@ -132,7 +132,7 @@ export default function Overview() {
             {agents.map((agent) => (
               <Link
                 key={agent.id}
-                to="/agents"
+                to={`/agents?agent=${agent.id}`}
                 className="group rounded-xl border border-border bg-surface p-4 shadow-card transition-colors hover:border-border-strong"
               >
                 <div className="flex items-start justify-between gap-2">

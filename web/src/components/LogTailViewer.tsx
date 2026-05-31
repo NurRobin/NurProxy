@@ -42,9 +42,12 @@ export default function LogTailViewer({ agentId, path, open, onClose }: Props) {
         const res = await api.pollLogTail(agentId, sessionId, cursor);
         if (cancelled) return;
         cursor = res.cursor;
-        if (res.lines.length > 0) {
+        // The agent serializes an empty batch as JSON null, so `lines` can be null
+        // even though the type says array — guard it or `.length` throws.
+        const batch = res.lines ?? [];
+        if (batch.length > 0) {
           setLines((prev) => {
-            const next = [...prev, ...res.lines];
+            const next = [...prev, ...batch];
             return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
           });
         }
@@ -117,7 +120,10 @@ export default function LogTailViewer({ agentId, path, open, onClose }: Props) {
           <p className="text-fg-faint">{t('logtail.empty')}</p>
         ) : (
           lines.map((l) => (
-            <div key={l.seq} className="whitespace-pre-wrap break-all">
+            <div
+              key={l.seq}
+              className="whitespace-pre-wrap break-words rounded px-1 -mx-1 hover:bg-white/5"
+            >
               {l.text}
             </div>
           ))
