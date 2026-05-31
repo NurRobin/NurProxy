@@ -212,6 +212,11 @@
     "permFixTitle": "{{kind}}: missing permissions",
     "permFixHint": "Run exactly these commands on the host (least-privilege, no blanket sudo):",
     "permStepLabel": "Step {{n}}",
+    "permWhyTitle": "Why do I need this?",
+    "permWhyBody": "NurProxy asks for the least it needs to manage your existing proxy: write its config directory, reload the service, and (as root) read its TLS keys. It never asks for blanket sudo or to run unconfined. Each command below grants exactly one of those, so you can see and audit what you give it. Run them on the host — the orchestrator never gets these rights itself.",
+    "permExplainSandbox": "The agent runs under a locked-down systemd unit that mounts the filesystem read-only and drops capabilities. This drop-in re-opens only the proxy's own config, log and runtime directories (ReadWritePaths) and, for a root agent, restores CAP_DAC_OVERRIDE so it can read the TLS keys and write the logs. Nothing else is loosened.",
+    "permExplainSudoers": "The agent runs as an unprivileged user, so reloading the proxy needs elevation. This grants a passwordless sudoers entry for exactly the test and reload commands, not blanket sudo. It lives in its own file under /etc/sudoers.d so it is easy to audit and remove.",
+    "permExplainGroup": "This makes the proxy's config directory group-writable and adds the agent's user to that group, so it can write config without sudo. The setgid bit makes new files inherit the group. No elevation, just file ownership.",
     "permEnvLabel": "Detected install",
     "permEnvRoot": "running as root",
     "permEnvUser": "running as {{user}}",
@@ -282,6 +287,9 @@
     "permsWiki": "See the \"Existing-mode permissions\" wiki page for the full permission model and threat-model note.",
     "statusWaiting": "Waiting for confirmation on the host…",
     "statusApplied": "Applied ✓"
+  },
+  "commandBlock": {
+    "whatIsThis": "What is this for?"
   },
   "logtail": {
     "title": "Log tail",

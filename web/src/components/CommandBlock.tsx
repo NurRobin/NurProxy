@@ -8,8 +8,12 @@ import { copyText } from '../lib/clipboard';
  * copy button. It uses copyText so it works over plain http too (hidden-textarea
  * fallback); the text also stays visible for manual selection if the copy fails.
  * Shared by the Existing-setup flow and the agent permission self-test block.
+ *
+ * An optional `explanation` adds a collapsible "What is this for?" disclosure
+ * (§54) so an operator can understand a command before pasting it as root,
+ * instead of running an opaque block on trust.
  */
-export function CommandBlock({ text, label }: { text: string; label: string }) {
+export function CommandBlock({ text, label, explanation }: { text: string; label: string; explanation?: string }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
 
@@ -36,6 +40,15 @@ export function CommandBlock({ text, label }: { text: string; label: string }) {
       <pre className="overflow-x-auto rounded-lg border border-border bg-surface-2 p-3 font-mono text-xs leading-relaxed text-fg">
         {text}
       </pre>
+      {explanation && (
+        <details className="group mt-1.5">
+          <summary className="cursor-pointer list-none text-xs font-medium text-fg-muted hover:text-fg">
+            <span className="mr-1 inline-block select-none transition-transform group-open:rotate-90">▸</span>
+          {t('commandBlock.whatIsThis')}
+          </summary>
+          <p className="mt-1.5 whitespace-pre-line text-xs leading-relaxed text-fg-faint">{explanation}</p>
+        </details>
+      )}
     </div>
   );
 }
