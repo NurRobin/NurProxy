@@ -60,10 +60,22 @@ archives:
     ids: [nurproxy]
     name_template: "nurproxy_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
     formats: [tar.gz]
+    files:
+      - LICENSE
+      - src: deploy/packaging/nurproxy.service
+        strip_parent: true
+      - src: deploy/packaging/nurproxy.env.example
+        strip_parent: true
   - id: nurproxy-agent
     ids: [nurproxy-agent]
     name_template: "nurproxy-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
     formats: [tar.gz]
+    files:
+      - LICENSE
+      - src: deploy/packaging/nurproxy-agent.service
+        strip_parent: true
+      - src: deploy/packaging/nurproxy-agent.env.example
+        strip_parent: true
 
 # Native Linux packages (systemd-based distros). Alpine/OpenRC and other inits
 # are handled by the install.sh path, which auto-detects the service manager.
@@ -79,7 +91,7 @@ nfpms:
     bindir: /usr/bin
     contents:
       - src: deploy/packaging/nurproxy.service
-        dst: /lib/systemd/system/nurproxy.service
+        dst: /usr/lib/systemd/system/nurproxy.service
       - src: deploy/packaging/nurproxy.env.example
         dst: /etc/nurproxy/nurproxy.env
         type: "config|noreplace"
@@ -88,6 +100,8 @@ nfpms:
         file_info: { mode: 0750 }
     scripts:
       postinstall: deploy/packaging/postinstall-orchestrator.sh
+      preremove: deploy/packaging/preremove-orchestrator.sh
+      postremove: deploy/packaging/postremove.sh
 
   - id: nurproxy-agent
     package_name: nurproxy-agent
@@ -100,7 +114,7 @@ nfpms:
     bindir: /usr/bin
     contents:
       - src: deploy/packaging/nurproxy-agent.service
-        dst: /lib/systemd/system/nurproxy-agent.service
+        dst: /usr/lib/systemd/system/nurproxy-agent.service
       - src: deploy/packaging/nurproxy-agent.env.example
         dst: /etc/nurproxy-agent/agent.env
         type: "config|noreplace"
@@ -109,6 +123,8 @@ nfpms:
         file_info: { mode: 0750 }
     scripts:
       postinstall: deploy/packaging/postinstall-agent.sh
+      preremove: deploy/packaging/preremove-agent.sh
+      postremove: deploy/packaging/postremove.sh
 
 # Homebrew tap (macOS). Casks install our unsigned binaries, so a post-install
 # hook strips the Gatekeeper quarantine flag. Activates once HOMEBREW_TAP_TOKEN
@@ -158,8 +174,14 @@ aurs:
     private_key: '{{ .Env.AUR_KEY }}'
     git_url: 'ssh://aur@aur.archlinux.org/nurproxy-bin.git'
     skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
+    provides: ['nurproxy']
+    conflicts: ['nurproxy']
+    backup: ['etc/nurproxy/nurproxy.env']
     package: |-
       install -Dm755 "./nurproxy" "${pkgdir}/usr/bin/nurproxy"
+      install -Dm644 "./nurproxy.service" "${pkgdir}/usr/lib/systemd/system/nurproxy.service"
+      install -Dm644 "./nurproxy.env.example" "${pkgdir}/etc/nurproxy/nurproxy.env"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/nurproxy-bin/LICENSE"
   - name: nurproxy-agent-bin
     ids: [nurproxy-agent]
     homepage: "https://github.com/NurRobin/NurProxy"
@@ -169,8 +191,14 @@ aurs:
     private_key: '{{ .Env.AUR_KEY }}'
     git_url: 'ssh://aur@aur.archlinux.org/nurproxy-agent-bin.git'
     skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
+    provides: ['nurproxy-agent']
+    conflicts: ['nurproxy-agent']
+    backup: ['etc/nurproxy-agent/agent.env']
     package: |-
       install -Dm755 "./nurproxy-agent" "${pkgdir}/usr/bin/nurproxy-agent"
+      install -Dm644 "./nurproxy-agent.service" "${pkgdir}/usr/lib/systemd/system/nurproxy-agent.service"
+      install -Dm644 "./nurproxy-agent.env.example" "${pkgdir}/etc/nurproxy-agent/agent.env"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/nurproxy-agent-bin/LICENSE"
 
 dockers:
   - image_templates:
@@ -228,6 +256,24 @@ docker_manifests:
 
 checksum:
   name_template: 'checksums.txt'
+
+# SBOMs for every archive (syft must be on PATH; release.yml installs it).
+sboms:
+  - artifacts: archive
+
+# Keyless cosign signature over the checksums file. Needs cosign on PATH and
+# id-token: write in release.yml; verifiable with `cosign verify-blob`.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    output: true
+    certificate: '${artifact}.pem'
+    args:
+      - sign-blob
+      - '--output-certificate=${certificate}'
+      - '--output-signature=${signature}'
+      - '${artifact}'
+      - '--yes'
 
 changelog:
   sort: asc
