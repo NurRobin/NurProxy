@@ -14,8 +14,9 @@ import (
 
 // agentService builds the agent's install.Service. Agent config is written as
 // agent.yaml in the data dir (not env) to sidestep the data-dir flag/env
-// precedence and to use the agent's native config file. CAP_NET_BIND_SERVICE
-// lets the managed Caddy bind :80/:443 without running unconfined as root.
+// precedence and to use the agent's native config file. install.AgentCapabilities
+// keeps the unit narrow: CAP_NET_BIND_SERVICE for the bundled Caddy's ports and
+// CAP_DAC_OVERRIDE so existing-mode `nginx -t` can read TLS keys and write logs.
 func agentService(bin, dataDir string, cfg agentconfig.Config, user string) (install.Service, error) {
 	cfg.DataDir = dataDir
 	data, err := yaml.Marshal(cfg)
@@ -32,7 +33,7 @@ func agentService(bin, dataDir string, cfg agentconfig.Config, user string) (ins
 		WritePaths:   install.AgentProxyWritePaths,
 		ConfigFile:   filepath.Join(dataDir, "agent.yaml"),
 		ConfigData:   string(data),
-		Capabilities: []string{"CAP_NET_BIND_SERVICE"},
+		Capabilities: install.AgentCapabilities,
 	}, nil
 }
 

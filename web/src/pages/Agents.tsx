@@ -1,7 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import i18n from '../lib/i18n';
 import { usePolling } from '../lib/usePolling';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, Check, X } from 'lucide-react';
 import { api } from '../lib/api';
@@ -91,6 +91,21 @@ export default function Agents() {
     setSelectedId(agent.id);
     if ((agent.status === 'adopted' || agent.status === 'offline') && !servers[agent.id]) loadServers(agent.id);
   }
+
+  // Deep-link: Overview links agents as /agents?agent=<id>. Open that agent once
+  // it has loaded (the appliedRef guard keeps polling from re-selecting it after
+  // the operator navigates to another agent).
+  const [searchParams] = useSearchParams();
+  const wantAgent = searchParams.get('agent');
+  const appliedParamRef = useRef(false);
+  useEffect(() => {
+    if (appliedParamRef.current || !wantAgent) return;
+    const a = agents.find((x) => x.id === wantAgent);
+    if (!a) return;
+    appliedParamRef.current = true;
+    setSelectedId(a.id);
+    if ((a.status === 'adopted' || a.status === 'offline') && !servers[a.id]) loadServers(a.id);
+  }, [agents, wantAgent, servers, loadServers]);
 
   function startAdopt(agent: Agent) {
     setAdoptAgent(agent); setAdoptName(agent.fqdn); setAdoptFqdn(agent.fqdn); setAdoptZoneIds(new Set());
@@ -191,7 +206,7 @@ export default function Agents() {
       ) : (
         <div className="grid gap-6 md:grid-cols-[20rem_1fr]">
           {/* Master list */}
-          <div className={selected ? 'hidden md:block' : 'block'}>
+          <div className={`min-w-0 ${selected ? 'hidden md:block' : 'block'}`}>
             <div className="space-y-4">
               {pendingAgents.length > 0 && (
                 <div>
@@ -215,7 +230,7 @@ export default function Agents() {
           </div>
 
           {/* Detail */}
-          <div className={selected ? 'block' : 'hidden md:block'}>
+          <div className={`min-w-0 ${selected ? 'block' : 'hidden md:block'}`}>
             {!selected ? (
               <div className="flex h-full min-h-48 items-center justify-center rounded-xl border border-dashed border-border text-sm text-fg-faint">
                 {t('agents.select')}

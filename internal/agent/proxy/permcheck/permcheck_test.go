@@ -251,21 +251,44 @@ func TestWriteMessage_runtimeAware(t *testing.T) {
 }
 
 // TestReloadMessage_runtimeAware asserts a root agent is never told to fix reload
-// with sudo (it doesn't use sudo) — under systemd it's the sandbox.
+// with sudo (it doesn't use sudo): under systemd it's the sandbox AND the dropped
+// capability, both named, and the proxy's real output is appended.
 func TestReloadMessage_runtimeAware(t *testing.T) {
 	err := errors.New("exit status 1")
+	nginxOut := `cannot load certificate key "/etc/nginx/ssl/x/private.key": ... Permission denied`
 
-	rootSystemd := reloadMessage(Options{Backend: "nginx", RunAsRoot: true, InitSystem: InitSystemdName, UnitName: "nurproxy-agent.service"}, err)
+	rootSystemd := reloadMessage(Options{Backend: "nginx", RunAsRoot: true, InitSystem: InitSystemdName, UnitName: "nurproxy-agent.service"}, err, nginxOut)
 	if strings.Contains(rootSystemd, "sudoers") {
 		t.Errorf("root agent should not be pointed at sudoers: %q", rootSystemd)
 	}
-	if !strings.Contains(rootSystemd, "ReadWritePaths") || !strings.Contains(rootSystemd, "not a sudo problem") {
-		t.Errorf("root+systemd reload message should explain the sandbox: %q", rootSystemd)
+	for _, want := range []string{"ReadWritePaths", "CAP_DAC_OVERRIDE", "not a sudo problem", "Proxy output:", "private.key"} {
+		if !strings.Contains(rootSystemd, want) {
+			t.Errorf("root+systemd reload message missing %q: %q", want, rootSystemd)
+		}
 	}
 
-	unpriv := reloadMessage(Options{Backend: "nginx", ReloadHint: "/usr/sbin/nginx -s reload"}, err)
+	// Root without systemd: still not sudo, point at file permissions, no caps drop-in.
+	rootBare := reloadMessage(Options{Backend: "nginx", RunAsRoot: true}, err, "")
+	if strings.Contains(rootBare, "sudoers") || !strings.Contains(rootBare, "ownership") {
+		t.Errorf("root non-systemd reload message should point at file ownership, not sudo: %q", rootBare)
+	}
+
+	unpriv := reloadMessage(Options{Backend: "nginx", ReloadHint: "/usr/sbin/nginx -s reload"}, err, "")
 	if !strings.Contains(unpriv, "narrowly-scoped sudoers") || !strings.Contains(unpriv, "/usr/sbin/nginx -s reload") {
 		t.Errorf("unprivileged reload message should keep the scoped-sudoers fix + hint: %q", unpriv)
+	}
+}
+
+// TestProxyOutputSuffix_caps asserts the appended proxy output is trimmed and
+// capped so a huge config dump never floods the dashboard.
+func TestProxyOutputSuffix_caps(t *testing.T) {
+	if proxyOutputSuffix("   ") != "" {
+		t.Error("blank output should add nothing")
+	}
+	big := strings.Repeat("x", 2000)
+	s := proxyOutputSuffix(big)
+	if len(s) > 700 || !strings.Contains(s, "…") {
+		t.Errorf("long output should be capped and elided, got len=%d", len(s))
 	}
 }
 

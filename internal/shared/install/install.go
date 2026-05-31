@@ -34,6 +34,20 @@ var AgentProxyWritePaths = []string{
 	"-/run",
 }
 
+// AgentCapabilities are the Linux capabilities the agent unit keeps. The agent
+// runs as root but with a restricted bounding set, so it only holds what it
+// needs:
+//   - CAP_NET_BIND_SERVICE: the bundled Caddy binds :80/:443 without full root.
+//   - CAP_DAC_OVERRIDE: in existing mode the agent drives a host nginx/Apache,
+//     and `nginx -t` must read the proxy's TLS private keys (mode 0600, often
+//     not owned by the agent) and write its log files (often owned by www-data).
+//     Without it a root agent obeys the file-permission bits and the reload
+//     self-test fails with "permission denied" on the key or log — even though
+//     ReadWritePaths already made the mount writable (DAC and the read-only
+//     mount are independent). The bundled-Caddy path does not need it, but the
+//     unit is static and cannot know the mode at install time.
+var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE", "CAP_DAC_OVERRIDE"}
+
 // Service describes a NurProxy service to install. The same descriptor is
 // consumed by every Manager; fields without meaning on a given OS are ignored.
 type Service struct {

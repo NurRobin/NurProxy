@@ -143,9 +143,9 @@ func Probe(ctx context.Context, opts Options) Result {
 	}
 
 	if opts.Runner != nil {
-		if err := probeReload(ctx, opts.Runner); err != nil {
+		if out, err := probeReload(ctx, opts.Runner); err != nil {
 			res.CanReload = false
-			res.ReloadError = reloadMessage(opts, err)
+			res.ReloadError = reloadMessage(opts, err, out)
 		}
 	}
 
@@ -200,27 +200,32 @@ func probeWrite(dirs []string) error {
 // (the privilege is present) and the operator's config simply needs fixing —
 // that is the drift/apply path's job, not the permission probe's. A
 // command-not-found / not-executable error is treated as a permission/setup
-// problem.
-func probeReload(ctx context.Context, r TestRunner) error {
+// problem. It returns the command's combined output in both cases so the caller
+// can surface the proxy's real diagnostic (e.g. which key or log it could not
+// open) instead of a bare "exit status 1".
+func probeReload(ctx context.Context, r TestRunner) (string, error) {
 	out, err := r.Test(ctx)
 	if err == nil {
-		return nil
+		return out, nil
 	}
 	if isPermissionDenied(err, out) {
-		return err
+		return out, err
 	}
 	// Command ran but the config is invalid (or some non-permission failure): the
 	// reload privilege itself is present, so the probe passes. The config error is
 	// surfaced elsewhere (Apply/Validate, §10), not here.
-	return nil
+	return out, nil
 }
 
 // isPermissionDenied reports whether a validate-command failure is a privilege
-// problem (the scoped sudoers entry is missing or wrong) rather than a
-// config-invalid result. It checks both the Go error (os.ErrPermission,
+// problem (missing sudoers, a dropped capability, an unreadable key) rather than
+// a config-invalid result. It checks both the Go error (os.ErrPermission,
 // exec.ErrNotFound surface as wrapped errors) and the command output for the
 // usual denial phrasings ("permission denied", "a password is required",
-// "not allowed", "sudo: ..."). Matching is conservative: anything not clearly a
+// "not allowed", "sudo: ..."). It deliberately does NOT match a bare "no such
+// file or directory": that string is far more often a config error (a missing
+// include or cert) than a missing binary, which exec.ErrNotFound and "executable
+// file not found" already catch. Matching is conservative: anything not clearly a
 // denial is treated as a benign config error so we never over-report.
 func isPermissionDenied(err error, output string) bool {
 	if errors.Is(err, os.ErrPermission) {
@@ -236,7 +241,6 @@ func isPermissionDenied(err error, output string) bool {
 		"is not allowed to execute",
 		"not in the sudoers file",
 		"command not found",
-		"no such file or directory",
 		"executable file not found",
 	} {
 		if strings.Contains(hay, needle) {
@@ -276,35 +280,58 @@ func writeMessage(opts Options, err error) string {
 }
 
 // reloadMessage builds the actionable health message for a failed reload probe.
-// For a root agent the fix is never sudo: under systemd the unit sandbox
-// (ProtectSystem= / NoNewPrivileges) blocks the reload's log/runtime writes,
-// fixed with a ReadWritePaths drop-in. For an unprivileged agent it is the §12
-// scoped-sudoers grant; when a ReloadHint is set the exact command is included.
-func reloadMessage(opts Options, err error) string {
+// For a root agent the fix is never sudo: under systemd the unit sandbox can
+// block the reload two independent ways — a read-only mount (ProtectSystem=,
+// fixed with ReadWritePaths) and a dropped capability (CapabilityBoundingSet
+// without CAP_DAC_OVERRIDE, so root obeys file bits and cannot read the proxy's
+// TLS keys or write its logs). Both are named. For an unprivileged agent it is
+// the §12 scoped-sudoers grant; when a ReloadHint is set the exact command is
+// included. The proxy's own output is appended in every case, since the bare
+// exit status hides which key or log actually failed.
+func reloadMessage(opts Options, err error, output string) string {
 	b := backendLabel(opts.Backend)
 	const tail = "See the least-privilege setup docs. The agent stays connected; existing config is untouched."
 
-	if opts.RunAsRoot {
-		if opts.InitSystem == InitSystemdName {
-			return fmt.Sprintf(
-				"%s cannot be reloaded: %v — the agent runs as root, so this is not a sudo problem: the "+
-					"systemd unit's sandbox (ProtectSystem= / NoNewPrivileges) blocks the reload's log/runtime "+
-					"writes. Grant the proxy's log + runtime dirs via a %s ReadWritePaths drop-in, then restart. %s",
-				b, err, unitLabel(opts.UnitName), tail)
-		}
-		return fmt.Sprintf(
-			"%s cannot be reloaded: %v — the agent runs as root; verify the reload command path and that the "+
-				"service is running. %s",
+	var msg string
+	switch {
+	case opts.RunAsRoot && opts.InitSystem == InitSystemdName:
+		msg = fmt.Sprintf(
+			"%s cannot be reloaded: %v — the agent runs as root, so this is not a sudo problem. The systemd "+
+				"unit's sandbox blocks the validate/reload two ways: a read-only mount (add the proxy's config, "+
+				"log and runtime dirs to ReadWritePaths) and a dropped capability (add CAP_DAC_OVERRIDE so root "+
+				"may read the TLS keys and write the logs). Apply both in a %s drop-in, then restart. %s",
+			b, err, unitLabel(opts.UnitName), tail)
+	case opts.RunAsRoot:
+		msg = fmt.Sprintf(
+			"%s cannot be reloaded: %v — the agent runs as root; this is not a sudo problem. Check that it can "+
+				"read the proxy's TLS keys and write its logs (file ownership/permissions), and verify the reload "+
+				"command path. %s",
 			b, err, tail)
+	default:
+		cmd := ""
+		if opts.ReloadHint != "" {
+			cmd = fmt.Sprintf(" (NOPASSWD for exactly %q and the matching test command)", opts.ReloadHint)
+		}
+		msg = fmt.Sprintf(
+			"%s cannot be reloaded: %v — grant a narrowly-scoped sudoers entry%s, not blanket sudo. %s",
+			b, err, cmd, tail)
 	}
+	return msg + proxyOutputSuffix(output)
+}
 
-	cmd := ""
-	if opts.ReloadHint != "" {
-		cmd = fmt.Sprintf(" (NOPASSWD for exactly %q and the matching test command)", opts.ReloadHint)
+// proxyOutputSuffix renders the proxy's own validate output for the health
+// message, trimmed and capped so a verbose config dump never floods the
+// dashboard. Empty output adds nothing.
+func proxyOutputSuffix(output string) string {
+	out := strings.TrimSpace(output)
+	if out == "" {
+		return ""
 	}
-	return fmt.Sprintf(
-		"%s cannot be reloaded: %v — grant a narrowly-scoped sudoers entry%s, not blanket sudo. %s",
-		b, err, cmd, tail)
+	const max = 600
+	if len(out) > max {
+		out = "…" + out[len(out)-max:]
+	}
+	return " Proxy output: " + out
 }
 
 // isReadOnlyFS reports whether a write failure is an EROFS (read-only filesystem)
