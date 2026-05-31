@@ -118,6 +118,35 @@ The agent registers itself with the orchestrator. Go to the dashboard and adopt 
 
 > **A note on IP addresses and URLs**: When setting up an agent, the orchestrator URL must be reachable from the agent's machine, not from your browser. If you access the dashboard through Tailscale but the agent is in the same LAN as the orchestrator, use the LAN address. The same applies when adding backend servers to an agent: enter IP addresses as the agent sees them.
 
+## Headless & CLI
+
+For servers and CI you can run a **headless orchestrator** — the same API, no embedded dashboard:
+
+```bash
+make build-headless    # produces ./nurproxy-headless (no embedded web/dist)
+```
+
+Everything the dashboard does is reachable from the built-in management CLI, which is a thin client over the REST API. It works against any orchestrator (headless or not):
+
+```bash
+export NP_API_URL=http://localhost:8080
+
+# Bootstrap a fresh install with nothing but the binary:
+nurproxy auth setup --password 'choose-a-strong-one'
+nurproxy apikey create --password 'choose-a-strong-one'   # prints the key once
+
+export NP_API_KEY=np_ak_...   # the key from above
+
+nurproxy provider add --type cloudflare --name "CF" --config '{"api_token":"..."}'
+nurproxy zone add --provider <provider-id> --name example.com
+nurproxy agent list
+nurproxy agent adopt <agent-id> --name edge1 --zones <zone-id>
+nurproxy server add <agent-id> --name app --address 10.0.0.5:8080
+nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port 8080
+```
+
+Auth comes from `NP_API_KEY` (Bearer) or `NP_API_PASSWORD` (the CLI logs in for you). Add `--json` to any command for script-friendly output. See [wiki/cli.md](wiki/cli.md) for the full command reference.
+
 ## Tech stack
 
 - **Backend**: Go, SQLite (embedded, no CGo), single binary
