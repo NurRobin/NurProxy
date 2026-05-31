@@ -3,6 +3,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { copyText } from '../lib/clipboard';
+import { agentInstallCommand } from '../lib/install';
 import type { Agent, Zone } from '../lib/types';
 import type { TestProviderZone } from '../lib/api';
 import { Check } from 'lucide-react';
@@ -180,10 +181,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     else await handleFinish();
   }
 
-  const installCommand =
-    `curl -fsSL https://get.nurproxy.dev | sh -s -- agent \\\n` +
-    `  --orchestrator ${orchestratorUrl || 'https://your-dashboard-url'} \\\n` +
-    `  --fqdn ${agentFqdn || 'edge1.example.com'}`;
+  const installCommand = agentInstallCommand(orchestratorUrl, agentFqdn);
 
   async function copyToClipboard(text: string) {
     // copyText falls back to execCommand on insecure origins (plain http on a
