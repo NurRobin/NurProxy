@@ -46,6 +46,9 @@ if ls "$apt_root"/pool/main/*.deb >/dev/null 2>&1; then
       dpkg-scanpackages -a "$arch" -m pool/main > "dists/stable/main/binary-$arch/Packages" 2>/dev/null
       gzip -9kf "dists/stable/main/binary-$arch/Packages"
     done
+    # apt-ftparchive does NOT auto-populate Date; modern apt rejects a Release
+    # without it. Valid-Until is deliberately omitted so a long gap between
+    # releases never expires the repo.
     apt-ftparchive \
       -o APT::FTPArchive::Release::Origin=NurProxy \
       -o APT::FTPArchive::Release::Label=NurProxy \
@@ -53,6 +56,7 @@ if ls "$apt_root"/pool/main/*.deb >/dev/null 2>&1; then
       -o APT::FTPArchive::Release::Codename=stable \
       -o APT::FTPArchive::Release::Components=main \
       -o "APT::FTPArchive::Release::Architectures=$arches" \
+      -o "APT::FTPArchive::Release::Date=$(date -Ru)" \
       release dists/stable > dists/stable/Release
     gpg_sign -abs -o dists/stable/Release.gpg dists/stable/Release
     gpg_sign --clearsign -o dists/stable/InRelease dists/stable/Release
@@ -66,12 +70,10 @@ cp "$PKG_DIR"/*.rpm "$yum_root/" 2>/dev/null || true
 
 if ls "$yum_root"/*.rpm >/dev/null 2>&1; then
   echo "==> building YUM repo"
-  if command -v rpmsign >/dev/null 2>&1; then
-    rpmsign --define "_gpg_name $GPG_KEY_ID" --addsign "$yum_root"/*.rpm || \
-      echo "! rpm signing failed (packages remain unsigned)"
-  else
-    echo "! rpmsign not found — packages unsigned (set gpgcheck=0 client-side)"
-  fi
+  # The generated .repo enables gpgcheck=1 + repo_gpgcheck=1, so unsigned RPMs
+  # would fail on the client. Sign mandatorily and fail loudly otherwise.
+  command -v rpmsign >/dev/null 2>&1 || { echo "error: rpmsign not found (install the 'rpm' package)"; exit 1; }
+  rpmsign --define "_gpg_name $GPG_KEY_ID" --addsign "$yum_root"/*.rpm
   createrepo_c "$yum_root"
   gpg_sign --detach-sign --armor "$yum_root/repodata/repomd.xml"
 fi
