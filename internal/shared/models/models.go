@@ -115,6 +115,18 @@ type ProxyDetection struct {
 	// scanned read-only from its config (§52), so the dashboard can suggest them as
 	// Servers. nginx only for now; empty otherwise.
 	DiscoveredUpstreams []DiscoveredUpstream `json:"discovered_upstreams,omitempty"`
+	// Networks are the IP subnets attached to the agent host's interfaces (§38), so
+	// the dashboard can suggest a CIDR when adding a Server.
+	Networks []DiscoveredNetwork `json:"networks,omitempty"`
+}
+
+// DiscoveredNetwork is one IP subnet attached to the agent host (§38): the host's
+// own address, the surrounding network CIDR (the suggestion), and the interface.
+type DiscoveredNetwork struct {
+	Interface    string `json:"interface,omitempty"`
+	Address      string `json:"address,omitempty"`
+	PrefixLength int    `json:"prefix_length,omitempty"`
+	Network      string `json:"network"`
 }
 
 // DiscoveredUpstream is one backend target found in the host proxy's existing

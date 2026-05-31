@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
-import type { Agent, Server, Domain } from '../lib/types';
+import type { Agent, Server, Domain, DiscoveredNetwork } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -12,6 +12,19 @@ import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
 import { Field, Input, Select } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
+
+// prefillFromNetwork turns a detected subnet into a Server-address prefill (§38).
+// For an IPv4 network on an octet boundary it drops the host octets so the
+// operator types only the host part (192.168.178.0/24 → "192.168.178."); for
+// other prefixes / IPv6 it returns the network base for hand-editing.
+function prefillFromNetwork(n: DiscoveredNetwork): string {
+  const [base, plenStr] = n.network.split('/');
+  const plen = n.prefix_length ?? parseInt(plenStr || '0', 10);
+  if (base.includes('.') && plen > 0 && plen < 32 && plen % 8 === 0) {
+    return base.split('.').slice(0, plen / 8).join('.') + '.';
+  }
+  return base;
+}
 
 export default function Servers() {
   const { t } = useTranslation();
@@ -211,6 +224,30 @@ export default function Servers() {
             hint={t('servers.addressHint')}
           >
             <Input value={address} onChange={(e) => setAddress(e.target.value)} className="font-mono" placeholder={t('servers.addressPh')} />
+            {/* Detected-subnet shortcuts (§38): prefill the network prefix so the
+                operator only types the host part. Always still editable. */}
+            {(() => {
+              const nets = agents.find((a) => a.id === formAgent)?.proxy_detection?.networks ?? [];
+              if (nets.length === 0) return null;
+              const seen = new Set<string>();
+              const unique = nets.filter((n) => !seen.has(n.network) && seen.add(n.network));
+              return (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-fg-faint">{t('servers.detectedNets')}</span>
+                  {unique.map((n) => (
+                    <button
+                      key={n.network}
+                      type="button"
+                      onClick={() => setAddress(prefillFromNetwork(n))}
+                      className="rounded-md border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-fg-muted hover:border-border-strong hover:text-fg"
+                      title={n.interface}
+                    >
+                      {n.network}
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
           </Field>
           <Field label={t('common.notesOptional')} hint={t('common.optional')}><Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('servers.notesPh')} /></Field>
           <div className="flex justify-end gap-3 pt-1">
