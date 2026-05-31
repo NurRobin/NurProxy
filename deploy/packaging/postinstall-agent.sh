@@ -8,6 +8,9 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
 fi
 
-echo "NurProxy agent installed. Configure it, then enable the service:"
-echo "  edit /etc/nurproxy-agent/agent.env   # set NP_ORCHESTRATOR and NP_FQDN"
-echo "  systemctl enable --now nurproxy-agent"
+echo "NurProxy agent installed. Finish setup with:"
+echo "  sudo nurproxy-agent setup"
+echo
+echo "That asks for the orchestrator URL and this agent's FQDN, then starts the"
+echo "service. (Manual alternative: edit /etc/nurproxy-agent/agent.env and run"
+echo "'systemctl enable --now nurproxy-agent'.)"

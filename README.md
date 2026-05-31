@@ -125,8 +125,14 @@ sudo rpm -i  nurproxy-*.x86_64.rpm
 ```
 
 The orchestrator package starts automatically. The agent package installs the
-service **disabled** — edit `/etc/nurproxy-agent/agent.env` (set `NP_ORCHESTRATOR`
-and `NP_FQDN`), then `sudo systemctl enable --now nurproxy-agent`.
+service disabled; finish it with the guided setup, which asks for the
+orchestrator URL and this agent's FQDN, then starts the service:
+
+```bash
+sudo nurproxy-agent setup
+```
+
+(Non-interactive: `sudo nurproxy-agent setup --orchestrator <URL> --fqdn <host.zone>`. Or edit `/etc/nurproxy-agent/agent.env` by hand and run `sudo systemctl enable --now nurproxy-agent`.)
 
 For automatic updates via `apt`/`dnf`, add the signed package repository (setup
 commands are at [nurrobin.github.io/NurProxy](https://nurrobin.github.io/NurProxy)),
