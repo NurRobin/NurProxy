@@ -2,9 +2,14 @@ name: Package repo
 
 # Builds a signed APT + YUM repository from the .deb/.rpm assets across all
 # releases and publishes it to GitHub Pages. Inert until GPG_PRIVATE_KEY is set.
+#
+# Triggered via workflow_run (not 'release: published'): a release created by
+# release.yml with GITHUB_TOKEN does NOT fire the release event, by GitHub's
+# anti-recursion rule. workflow_run is exempt and runs on the default branch.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -19,6 +24,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Only after a successful release, or when run by hand.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
