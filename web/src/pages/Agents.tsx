@@ -5,7 +5,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, Check, X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv } from '../lib/types';
+import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv, RemediationStep } from '../lib/types';
 import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
 import { isDegraded } from '../lib/status';
@@ -16,6 +16,7 @@ import EmptyState from '../components/EmptyState';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
+import { useHelp } from '../components/help-context';
 import MultiSelect from '../components/MultiSelect';
 import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
@@ -655,6 +656,7 @@ function PermissionSelfTest({
   onAdjust: () => void;
 }) {
   const { t } = useTranslation();
+  const { openHelp } = useHelp();
   const ok = perm?.ok ?? true; // no report yet → don't cry wolf
   const steps = perm?.remediation?.steps ?? [];
 
@@ -688,10 +690,30 @@ function PermissionSelfTest({
       {!ok && steps.length > 0 && (
         <div className="space-y-3 rounded-lg border border-border bg-surface-2/40 p-3">
           <p className="text-xs font-medium text-fg-muted">{t('agents.permFixHint')}</p>
+          {/* Why these commands — least-privilege rationale, so an operator
+              understands what they paste as root rather than running it on trust. */}
+          <details className="group rounded-md bg-surface-2/60 p-2">
+            <summary className="cursor-pointer list-none text-xs font-medium text-fg-muted hover:text-fg">
+              <span className="mr-1 inline-block select-none transition-transform group-open:rotate-90">▸</span>
+              {t('agents.permWhyTitle')}
+            </summary>
+            <p className="mt-2 whitespace-pre-line text-xs leading-relaxed text-fg-faint">{t('agents.permWhyBody')}</p>
+            <button
+              type="button"
+              onClick={() => openHelp('existing-proxy-permissions')}
+              className="mt-2 text-xs font-medium text-accent hover:underline"
+            >
+              {t('common.learnMore')}
+            </button>
+          </details>
           {steps.map((s, i) => (
             <div key={i} className="space-y-1.5">
               <p className="text-sm font-medium text-fg">{s.title}</p>
-              <CommandBlock text={s.commands.join('\n')} label={t('agents.permStepLabel', { n: i + 1 })} />
+              <CommandBlock
+                text={s.commands.join('\n')}
+                label={t('agents.permStepLabel', { n: i + 1 })}
+                explanation={stepExplanation(s, t)}
+              />
             </div>
           ))}
         </div>
@@ -702,6 +724,18 @@ function PermissionSelfTest({
       </Button>
     </div>
   );
+}
+
+// stepExplanation returns a plain-language "what does this command do, and why
+// is it scoped this way" note for a remediation step (§54), chosen from the
+// step's content. Empty when we have nothing specific to add (CommandBlock then
+// shows no disclosure).
+function stepExplanation(step: RemediationStep, t: (key: string) => string): string {
+  const hay = (step.title + ' ' + step.commands.join(' ')).toLowerCase();
+  if (hay.includes('readwritepaths') || hay.includes('cap_dac_override')) return t('agents.permExplainSandbox');
+  if (hay.includes('sudoers')) return t('agents.permExplainSudoers');
+  if (hay.includes('groupadd') || hay.includes('chgrp')) return t('agents.permExplainGroup');
+  return '';
 }
 
 // PermCheckLine is one ✓/✗ row of the permission self-test, with an optional
