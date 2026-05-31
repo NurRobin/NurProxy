@@ -5,7 +5,7 @@ import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, Check, X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Agent, Zone, Server, Domain, ProxyPermissions } from '../lib/types';
+import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv } from '../lib/types';
 import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
 import { isDegraded } from '../lib/status';
@@ -663,6 +663,10 @@ function PermissionSelfTest({
         ) : (
           <p>{t('agents.managingExistingShort', { kind })}</p>
         )}
+        {/* How the agent is installed — the context that decides which fix applies
+            (a root systemd agent needs a ReadWritePaths drop-in, an unprivileged
+            one needs group + sudoers). Shown so the operator can sanity-check it. */}
+        {perm?.runtime_env && <EnvLine env={perm.runtime_env} />}
       </Callout>
 
       {/* Targeted fix: only the steps for what's actually missing. */}
@@ -700,6 +704,26 @@ function PermCheckLine({ ok, label, detail }: { ok: boolean; label: string; deta
         {!ok && detail && <span className="block text-xs text-fg-muted">{detail}</span>}
       </span>
     </li>
+  );
+}
+
+// EnvLine renders a compact one-line summary of how the agent is installed
+// (service manager, OS/distro, user, sandbox). It is the context behind the
+// remediation: the same missing-write error means different fixes for a root
+// systemd agent vs an unprivileged foreground one.
+function EnvLine({ env }: { env: RuntimeEnv }) {
+  const { t } = useTranslation();
+  const parts: string[] = [];
+  parts.push(env.init_system ? t('agents.permEnvService', { init: env.init_system }) : t('agents.permEnvForeground'));
+  const osBit = [env.os, env.distro].filter(Boolean).join('/');
+  if (osBit) parts.push(osBit);
+  parts.push(env.is_root ? t('agents.permEnvRoot') : t('agents.permEnvUser', { user: env.user || '?' }));
+  if (env.sandboxed) parts.push(t('agents.permEnvSandboxed'));
+  return (
+    <p className="mt-2 text-xs text-fg-faint">
+      <span className="font-medium">{t('agents.permEnvLabel')}:</span> {parts.join(' · ')}
+      {env.unit ? ` (${env.unit})` : ''}
+    </p>
   );
 }
 

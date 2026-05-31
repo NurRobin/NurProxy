@@ -16,6 +16,23 @@ const defaultGroup = "nurproxy"
 // to remove, and never touches the main /etc/sudoers.
 const sudoersPath = "/etc/sudoers.d/nurproxy-agent"
 
+// defaultUnit is the systemd unit the drop-in targets when the agent could not
+// resolve its own unit name.
+const defaultUnit = "nurproxy-agent.service"
+
+// DefaultSandboxWritePaths are the proxy config/log/cache/runtime trees a systemd
+// unit must expose via ReadWritePaths so the agent can write config and reload
+// (which appends logs) under ProtectSystem=strict. Each is "-" prefixed so a path
+// absent on this host is ignored rather than failing the unit's start — only the
+// installed backend's dirs exist on any given box. Used when RemediationOptions
+// supplies no backend-specific SandboxWritePaths.
+var DefaultSandboxWritePaths = []string{
+	"-/etc/nginx", "-/var/log/nginx", "-/var/lib/nginx", "-/var/cache/nginx",
+	"-/etc/apache2", "-/etc/httpd", "-/var/log/apache2", "-/var/log/httpd",
+	"-/etc/caddy", "-/var/lib/caddy", "-/var/log/caddy",
+	"-/run",
+}
+
 // RemediationOptions describes what the agent needs in order to manage and
 // reload a file-based proxy on this host. It is the input to BuildRemediation,
 // which turns it into copy-paste operator commands (§19 hard requirement: show
@@ -40,6 +57,21 @@ type RemediationOptions struct {
 	// ReloadCmd is the resolved reload command, e.g. "/usr/sbin/nginx -s reload".
 	// Empty omits it from the sudoers line.
 	ReloadCmd string
+	// RunAsRoot reports whether the agent runs as root. As root, group ownership
+	// and sudo do not apply: under systemd the sandbox drop-in is the whole fix,
+	// so the group + sudoers steps are omitted.
+	RunAsRoot bool
+	// InitSystem names the service manager ("systemd", …) or "". "systemd" adds a
+	// ReadWritePaths drop-in step, since ProtectSystem= makes the config/log/
+	// runtime dirs read-only mounts regardless of file permissions.
+	InitSystem string
+	// UnitName is the agent's service unit (e.g. "nurproxy-agent.service"), used to
+	// target the systemd drop-in. Defaults to "nurproxy-agent.service" when empty.
+	UnitName string
+	// SandboxWritePaths overrides the ReadWritePaths entries for the systemd drop-in.
+	// Empty uses DefaultSandboxWritePaths (union'd with Dirs), which covers the
+	// common nginx/apache/caddy trees with "-" prefixes so absent paths are ignored.
+	SandboxWritePaths []string
 }
 
 // RemediationStep is one ordered chunk of the fix: a human title plus the exact
@@ -83,6 +115,30 @@ func BuildRemediation(opts RemediationOptions) Remediation {
 	user := opts.User
 
 	var rem Remediation
+
+	// Step 0 (systemd only): open the unit's filesystem sandbox. ProtectSystem=
+	// makes the proxy's config/log/runtime dirs read-only mounts regardless of file
+	// permissions, so this drop-in is required under systemd — and for a root agent
+	// it is the COMPLETE fix (group ownership and sudo do not apply to root).
+	if opts.InitSystem == InitSystemdName {
+		paths := nonEmpty(opts.SandboxWritePaths)
+		if len(paths) == 0 {
+			paths = DefaultSandboxWritePaths
+		}
+		// Make sure the dirs that actually failed are covered, even a custom config
+		// dir not in the default list. "-" prefix keeps every entry optional.
+		paths = dedupeStrings(append(optionalPaths(nonEmpty(opts.Dirs)), paths...))
+		rem.Steps = append(rem.Steps, systemdSandboxStep(opts.UnitName, paths))
+		if opts.RunAsRoot {
+			return rem
+		}
+	}
+
+	// As root without systemd there is no group/ownership or sudo grant that
+	// applies; the sandbox step above (if any) is all we can offer.
+	if opts.RunAsRoot {
+		return rem
+	}
 
 	// Step 1: make the config dir group-writable, no sudo for the agent itself.
 	dirs := nonEmpty(opts.Dirs)
@@ -139,6 +195,44 @@ func BuildRemediation(opts RemediationOptions) Remediation {
 	}
 
 	return rem
+}
+
+// systemdSandboxStep builds the drop-in that opens the unit's ProtectSystem=
+// sandbox for the proxy's dirs. It writes a numbered drop-in (so it composes with
+// the shipped unit instead of replacing it), daemon-reloads, and restarts the
+// agent. The commands are copy-paste ready; the agent never runs them.
+func systemdSandboxStep(unit string, paths []string) RemediationStep {
+	if unit == "" {
+		unit = defaultUnit
+	} else if !strings.HasSuffix(unit, ".service") {
+		unit += ".service"
+	}
+	dropinDir := fmt.Sprintf("/etc/systemd/system/%s.d", unit)
+	line := "ReadWritePaths=" + strings.Join(paths, " ")
+	return RemediationStep{
+		Title: "Open the service sandbox so the agent can write + reload the proxy (systemd ReadWritePaths drop-in)",
+		Commands: []string{
+			fmt.Sprintf("sudo mkdir -p %s", dropinDir),
+			fmt.Sprintf("printf '[Service]\\n%s\\n' | sudo tee %s/10-nurproxy-writepaths.conf", line, dropinDir),
+			"sudo systemctl daemon-reload",
+			fmt.Sprintf("sudo systemctl restart %s", unit),
+		},
+	}
+}
+
+// optionalPaths prefixes each path with "-" (systemd's "ignore if absent" marker)
+// unless it already carries one, so a path missing on this host never fails the
+// unit's start.
+func optionalPaths(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		if strings.HasPrefix(p, "-") {
+			out = append(out, p)
+			continue
+		}
+		out = append(out, "-"+p)
+	}
+	return out
 }
 
 // nonEmpty returns the input with empty strings dropped, preserving order. It

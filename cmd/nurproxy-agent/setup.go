@@ -69,6 +69,7 @@ func cmdSetup(args []string) {
 			Args:         []string{"--data-dir", *dataDir},
 			User:         *user,
 			DataDir:      *dataDir,
+			WritePaths:   install.AgentProxyWritePaths,
 			EnvFile:      agentEnvFile,
 			Env:          env,
 			Capabilities: []string{"CAP_NET_BIND_SERVICE"},

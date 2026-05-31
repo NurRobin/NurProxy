@@ -24,6 +24,7 @@ func TestPackagedAgentUnitMatchesRenderUnit(t *testing.T) {
 		Name: "nurproxy-agent", Description: "NurProxy agent",
 		BinaryPath: "/usr/bin/nurproxy-agent", Args: []string{"--data-dir", "/var/lib/nurproxy-agent"},
 		User: "root", DataDir: "/var/lib/nurproxy-agent", EnvFile: "/etc/nurproxy-agent/agent.env",
+		WritePaths:   AgentProxyWritePaths,
 		Capabilities: []string{"CAP_NET_BIND_SERVICE"},
 	}
 	assertPackagedUnit(t, "nurproxy-agent.service", svc)

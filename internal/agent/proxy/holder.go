@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
+	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -283,9 +284,10 @@ type ReconfigureDeps struct {
 	// the host's nginx/apache can own :80/:443. Optional: nil means "nothing to
 	// stop" (e.g. Caddy never started). A stop error is reported, never fatal.
 	StopCaddy func() error
-	// OSUser is the OS user the agent runs as, named in the remediation (group
-	// membership + scoped sudoers line). Empty omits the user from those commands.
-	OSUser string
+	// Env is how the agent runs (OS/service manager/root/sandbox); it selects the
+	// hot-switch remediation just like the heartbeat probe does. Its zero value
+	// yields the conservative non-root group + sudoers path.
+	Env runtimeenv.Env
 	// CaddyFactory rebuilds the bundled caddy backend for a switch back to built-in.
 	// Optional: nil means built-in→built-in / switch-back cannot rebuild the backend
 	// (the Holder keeps the current one and explains via health).
@@ -412,7 +414,7 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 	// Run the §12 permission probe + remediation BEFORE swapping the live backend.
 	// The probe never mutates real config and never panics; a denial is reported,
 	// never fatal.
-	probe, rem := h.probeExisting(ctx, req.Type, deps.OSUser, be)
+	probe, rem := h.probeExisting(ctx, req.Type, deps.Env, be)
 
 	// Leaving built-in: stop the bundled Caddy so the host proxy can bind :80/:443.
 	// A stop error is reported but never aborts the switch.
@@ -460,15 +462,17 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 // service-reload privilege to probe) — the caller reports no permission block in
 // that case. It never mutates real config and never panics; it is safe to call on
 // every heartbeat so a granted permission clears on the next beat without a
-// restart. osUser is named in the remediation commands (group membership +
-// scoped sudoers).
-func (h *Holder) ProbePermissions(ctx context.Context, osUser string) (res permcheck.Result, rem *permcheck.Remediation, dirs []string, checked bool) {
+// restart. env describes how the agent runs (OS/service manager/root/sandbox) so
+// the probe selects the right remediation: a root agent under a systemd sandbox
+// gets a ReadWritePaths drop-in, an unprivileged agent gets group membership +
+// scoped sudoers. env.User is named in the sudoers/group commands.
+func (h *Holder) ProbePermissions(ctx context.Context, env runtimeenv.Env) (res permcheck.Result, rem *permcheck.Remediation, dirs []string, checked bool) {
 	be := h.Current()
 	fb, ok := be.(fileBackend)
 	if !ok {
 		return permcheck.Result{CanWrite: true, CanReload: true}, nil, nil, false
 	}
-	res, rem = h.probeExisting(ctx, string(be.Info().Kind), osUser, be)
+	res, rem = h.probeExisting(ctx, string(be.Info().Kind), env, be)
 	return res, rem, fb.ProbeDirs(), true
 }
 
@@ -477,7 +481,7 @@ func (h *Holder) ProbePermissions(ctx context.Context, osUser string) (res permc
 // ResolvedCommands. A backend that exposes no file/reload hooks (an admin-API
 // backend, e.g. external caddy) needs no probe: it returns an all-clear Result and
 // nil remediation. It never panics and never touches real config.
-func (h *Holder) probeExisting(ctx context.Context, backend, osUser string, be Proxy) (permcheck.Result, *permcheck.Remediation) {
+func (h *Holder) probeExisting(ctx context.Context, backend string, env runtimeenv.Env, be Proxy) (permcheck.Result, *permcheck.Remediation) {
 	fb, ok := be.(fileBackend)
 	if !ok {
 		// Admin-API backend: no file write / service reload privilege to probe.
@@ -491,6 +495,9 @@ func (h *Holder) probeExisting(ctx context.Context, backend, osUser string, be P
 		Dirs:       fb.ProbeDirs(),
 		Runner:     runner,
 		ReloadHint: fb.ReloadHint(),
+		RunAsRoot:  env.IsRoot,
+		InitSystem: env.Init,
+		UnitName:   env.Unit,
 	})
 	if res.OK() {
 		return res, nil
@@ -503,9 +510,12 @@ func (h *Holder) probeExisting(ctx context.Context, backend, osUser string, be P
 	// whose inputs are empty.
 	test, reload := fb.ResolvedCommands()
 	opts := permcheck.RemediationOptions{
-		Backend: backend,
-		User:    osUser,
-		Group:   "nurproxy",
+		Backend:    backend,
+		User:       env.User,
+		Group:      "nurproxy",
+		RunAsRoot:  env.IsRoot,
+		InitSystem: env.Init,
+		UnitName:   env.Unit,
 	}
 	if !res.CanWrite {
 		opts.Dirs = fb.ProbeDirs()
