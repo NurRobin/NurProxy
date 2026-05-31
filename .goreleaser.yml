@@ -122,10 +122,10 @@ homebrew_casks:
       owner: NurRobin
       name: homebrew-tap
       branch: main
-      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: "https://github.com/NurRobin/NurProxy"
     description: "NurProxy orchestrator — reverse proxy and DNS management dashboard"
-    skip_upload: '{{ if envOrDefault "HOMEBREW_TAP_TOKEN" "" }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
     hooks:
       post:
         install: |
@@ -137,10 +137,10 @@ homebrew_casks:
       owner: NurRobin
       name: homebrew-tap
       branch: main
-      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: "https://github.com/NurRobin/NurProxy"
     description: "NurProxy agent — manages a local reverse proxy on an edge server"
-    skip_upload: '{{ if envOrDefault "HOMEBREW_TAP_TOKEN" "" }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
     hooks:
       post:
         install: |
@@ -155,9 +155,9 @@ aurs:
     description: "NurProxy orchestrator — reverse proxy and DNS management dashboard"
     license: MIT
     maintainers: ['NurRobin <grambrobin@gmail.com>']
-    private_key: '{{ envOrDefault "AUR_KEY" "" }}'
+    private_key: '{{ .Env.AUR_KEY }}'
     git_url: 'ssh://aur@aur.archlinux.org/nurproxy-bin.git'
-    skip_upload: '{{ if envOrDefault "AUR_KEY" "" }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
     package: |-
       install -Dm755 "./nurproxy" "${pkgdir}/usr/bin/nurproxy"
   - name: nurproxy-agent-bin
@@ -166,9 +166,9 @@ aurs:
     description: "NurProxy agent — manages a local reverse proxy on an edge server"
     license: MIT
     maintainers: ['NurRobin <grambrobin@gmail.com>']
-    private_key: '{{ envOrDefault "AUR_KEY" "" }}'
+    private_key: '{{ .Env.AUR_KEY }}'
     git_url: 'ssh://aur@aur.archlinux.org/nurproxy-agent-bin.git'
-    skip_upload: '{{ if envOrDefault "AUR_KEY" "" }}false{{ else }}true{{ end }}'
+    skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
     package: |-
       install -Dm755 "./nurproxy-agent" "${pkgdir}/usr/bin/nurproxy-agent"
 
