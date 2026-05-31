@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
 type contextKey string
@@ -15,26 +16,29 @@ type contextKey string
 const (
 	ctxActor   contextKey = "actor"
 	ctxAgentID contextKey = "agent_id"
+	ctxSource  contextKey = "source"
 )
 
 // requireAuth wraps a handler to require authentication.
 // Checks: 1) session cookie, 2) Bearer token (admin API key), 3) agent token.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 1) Session cookie
+		// 1) Session cookie → dashboard (UI)
 		if cookie, err := r.Cookie("nurproxy_session"); err == nil {
 			if _, err := s.sessions.Verify(cookie.Value); err == nil {
 				ctx := context.WithValue(r.Context(), ctxActor, "admin")
+				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceUI)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 		}
 
-		// 2) Bearer token — admin API key
+		// 2) Bearer token — admin API key → REST API
 		if token := bearerToken(r); token != "" {
 			apiKey, err := s.db.GetSetting("admin_api_key")
 			if err == nil && apiKey != "" && apiKey == token {
 				ctx := context.WithValue(r.Context(), ctxActor, "api_key")
+				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -47,6 +51,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 					if a.TokenHash == tokenHash {
 						ctx := context.WithValue(r.Context(), ctxActor, "agent:"+a.ID)
 						ctx = context.WithValue(ctx, ctxAgentID, a.ID)
+						ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAgent)
 						next.ServeHTTP(w, r.WithContext(ctx))
 						return
 					}
@@ -78,6 +83,7 @@ func (s *Server) requireAgentAuth(next http.HandlerFunc) http.HandlerFunc {
 			if a.TokenHash == tokenHash {
 				ctx := context.WithValue(r.Context(), ctxActor, "agent:"+a.ID)
 				ctx = context.WithValue(ctx, ctxAgentID, a.ID)
+				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAgent)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}

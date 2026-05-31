@@ -1,0 +1,104 @@
+name: Package repo
+
+# Builds a signed APT + YUM repository from the .deb/.rpm assets across all
+# releases and publishes it to GitHub Pages. Inert until GPG_PRIVATE_KEY is set.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check for signing key
+        id: guard
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GPG_PRIVATE_KEY secret not set — skipping package repo build"
+          fi
+
+      - name: Install tools
+        if: steps.guard.outputs.enabled == 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev createrepo-c rpm gnupg
+
+      - name: Import GPG key
+        if: steps.guard.outputs.enabled == 'true'
+        id: gpg
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')"
+          echo "key_id=$KEYID" >> "$GITHUB_OUTPUT"
+
+      - name: Download release packages
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p packages
+          # On a release event the 'published' webhook can fire before GoReleaser
+          # finishes uploading assets — wait (up to 5 min) for this tag's packages.
+          if [ -n "${TAG:-}" ]; then
+            n=0
+            for i in $(seq 1 30); do
+              n=$(gh release view "$TAG" --json assets \
+                    --jq '[.assets[].name | select(endswith(".deb") or endswith(".rpm"))] | length')
+              echo "attempt $i: $n deb/rpm assets on $TAG"
+              [ "$n" -gt 0 ] && break
+              sleep 10
+            done
+            [ "$n" -gt 0 ] || { echo "::error::no .deb/.rpm assets on $TAG after waiting 5m"; exit 1; }
+          fi
+          # Rebuild the repo from every release's packages so it stays complete.
+          for tag in $(gh release list --limit 200 --json tagName --jq '.[].tagName'); do
+            gh release download "$tag" -D packages -p '*.deb' -p '*.rpm' --clobber || true
+          done
+          count=$(find packages -name '*.deb' -o -name '*.rpm' | wc -l)
+          echo "downloaded $count package files"
+          [ "$count" -gt 0 ] || { echo "::error::no packages downloaded — aborting repo build"; exit 1; }
+
+      - name: Build repository
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          GPG_KEY_ID: ${{ steps.gpg.outputs.key_id }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          owner="${{ github.repository_owner }}"
+          repo="${{ github.event.repository.name }}"
+          export REPO_BASE_URL="https://${owner,,}.github.io/${repo}"
+          chmod +x scripts/build-repo.sh
+          scripts/build-repo.sh packages public
+
+      - name: Upload Pages artifact
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to Pages
+        if: steps.guard.outputs.enabled == 'true'
+        id: deploy
+        uses: actions/deploy-pages@v4

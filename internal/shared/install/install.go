@@ -1,0 +1,134 @@
+// Package install provides native service installation for the NurProxy
+// orchestrator and agent across operating systems. A Service describes the
+// daemon in OS-neutral terms; a Manager (systemd, launchd, OpenRC, or FreeBSD
+// rc.d) renders the host's service definition and wires it in. Detect() picks
+// the right Manager for the running host.
+//
+// The render functions (RenderUnit/RenderEnv/RenderPlist/RenderOpenRC/
+// RenderRCd) are pure and unit-tested; the Manager Install/Uninstall methods
+// perform the privileged filesystem and service actions and require root.
+package install
+
+import (
+	"fmt"
+	"io"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+// Service describes a NurProxy service to install. The same descriptor is
+// consumed by every Manager; fields without meaning on a given OS are ignored.
+type Service struct {
+	Name         string            // unit base name, e.g. "nurproxy" -> nurproxy.service
+	Description  string            // human-readable description
+	BinaryPath   string            // absolute path to the executable
+	Args         []string          // extra ExecStart arguments
+	User         string            // service user (e.g. "root")
+	DataDir      string            // data directory (made ReadWritePaths)
+	EnvFile      string            // optional EnvironmentFile path (systemd)
+	Env          map[string]string // environment variables for the service
+	ConfigFile   string            // optional extra config file to write (e.g. agent.yaml)
+	ConfigData   string            // contents of ConfigFile
+	Capabilities []string          // ambient capabilities, e.g. CAP_NET_BIND_SERVICE (systemd-only)
+}
+
+// fprintf writes progress to the caller's writer; output errors are non-fatal.
+func fprintf(w io.Writer, format string, a ...any) {
+	_, _ = fmt.Fprintf(w, format, a...)
+}
+
+// UnitPath is where the systemd unit is written.
+func (s Service) UnitPath() string {
+	return filepath.Join("/etc/systemd/system", s.Name+".service")
+}
+
+// sortedKeys returns the keys of m in ascending order for deterministic output.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// RenderUnit renders a hardened systemd unit for the service. Output is
+// deterministic so it can be diffed and tested.
+func RenderUnit(s Service) string {
+	var b strings.Builder
+	w := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
+
+	w("[Unit]\n")
+	w("Description=%s\n", s.Description)
+	w("After=network-online.target\n")
+	w("Wants=network-online.target\n\n")
+
+	w("[Service]\n")
+	w("Type=simple\n")
+	if s.User != "" {
+		w("User=%s\n", s.User)
+	}
+	if s.EnvFile != "" {
+		w("EnvironmentFile=%s\n", s.EnvFile)
+	}
+	execStart := s.BinaryPath
+	if len(s.Args) > 0 {
+		execStart += " " + strings.Join(s.Args, " ")
+	}
+	w("ExecStart=%s\n", execStart)
+	w("Restart=on-failure\n")
+	w("RestartSec=5\n")
+
+	// Security hardening.
+	w("NoNewPrivileges=true\n")
+	w("ProtectSystem=strict\n")
+	w("ProtectHome=true\n")
+	w("PrivateTmp=true\n")
+	w("ProtectControlGroups=true\n")
+	w("ProtectKernelTunables=true\n")
+	if s.DataDir != "" {
+		w("ReadWritePaths=%s\n", s.DataDir)
+	}
+	if len(s.Capabilities) > 0 {
+		caps := strings.Join(s.Capabilities, " ")
+		w("AmbientCapabilities=%s\n", caps)
+		w("CapabilityBoundingSet=%s\n", caps)
+	}
+	w("\n[Install]\n")
+	w("WantedBy=multi-user.target\n")
+
+	return b.String()
+}
+
+// RenderEnv renders an EnvironmentFile body with keys sorted for stable output.
+func RenderEnv(env map[string]string) string {
+	var b strings.Builder
+	for _, k := range sortedKeys(env) {
+		fmt.Fprintf(&b, "%s=%s\n", k, env[k])
+	}
+	return b.String()
+}
+
+// runTool runs an external service tool (systemctl, launchctl, rc-service,
+// sysrc, …), streaming output. It is a no-op with a warning when the tool
+// isn't present, so installs proceed up to the point of service activation on
+// hosts without it.
+func runTool(out io.Writer, bin string, args ...string) error {
+	path, err := exec.LookPath(bin)
+	if err != nil {
+		fprintf(out, "! %s not found — skipping '%s %s' (configure the service manually)\n", bin, bin, strings.Join(args, " "))
+		return nil
+	}
+	cmd := exec.Command(path, args...)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// systemctl runs a systemctl command, streaming output.
+func systemctl(out io.Writer, args ...string) error { return runTool(out, "systemctl", args...) }

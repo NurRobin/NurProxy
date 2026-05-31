@@ -12,6 +12,8 @@ package agenthub
 import (
 	"encoding/json"
 	"sync"
+
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // Event is a single message pushed to an agent over its stream.
@@ -22,10 +24,20 @@ type Event struct {
 
 // Event type constants.
 const (
-	// EventRoutes carries the agent's full desired route set (a sync snapshot).
+	// EventRoutes carries the agent's full desired intent set (a sync snapshot).
+	// As of Phase 3 the payload is a proxymodel.IntentSet, not pre-rendered Caddy
+	// JSON: the agent renders the intent natively and reports the rendered
+	// artifact back in its apply-ACK (§3/B1).
 	EventRoutes = "routes"
 	// EventPing is a keepalive used to detect dead connections promptly.
 	EventPing = "ping"
+	// EventLogTail asks the agent to start an on-demand log tail (§15). The payload
+	// is a proxymodel.LogTailRequest. The agent tails the file and POSTs LogChunks
+	// back up the control plane; it never opens an inbound connection (invariant #2).
+	EventLogTail = "log_tail"
+	// EventLogTailStop asks the agent to stop a tail session (§15). The payload is a
+	// proxymodel.LogTailStop. Pushed when the operator closes the dashboard log view.
+	EventLogTailStop = "log_tail_stop"
 )
 
 // subscriber is one live connection for an agent.
@@ -108,9 +120,22 @@ func (h *Hub) Publish(agentID string, ev Event) bool {
 	return true
 }
 
-// PublishRoutes is a convenience wrapper that pushes a full route-set snapshot.
-func (h *Hub) PublishRoutes(agentID string, routes []json.RawMessage) bool {
-	data, err := json.Marshal(routes)
+// PublishIntents is a convenience wrapper that pushes a full intent-set snapshot
+// (the agent's complete desired state) with no cert material. The agent renders
+// each intent natively and reconciles its managed set against the snapshot
+// (§3/B1).
+func (h *Hub) PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool {
+	return h.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents})
+}
+
+// PublishIntentSet pushes a full intent-set snapshot that may carry cert bundles
+// alongside the intents (§5/§7). The orchestrator gathers/issues the certs first,
+// then pushes them with the config in one "everything is ready, go live" message;
+// the agent installs the certs (InstallCerts) before applying any referencing
+// config (preflight ordering). Certs ride this agent-initiated stream — there is
+// no inbound probe of the agent (invariant #2).
+func (h *Hub) PublishIntentSet(agentID string, set proxymodel.IntentSet) bool {
+	data, err := json.Marshal(set)
 	if err != nil {
 		return false
 	}

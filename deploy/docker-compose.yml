@@ -1,0 +1,38 @@
+# NurProxy orchestrator (the dashboard + API). Run this on the host you log
+# into; agents run separately on your edge servers (see the agent example
+# below, or the README).
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Then open http://<this-host>:8080 to run the setup wizard.
+
+services:
+  orchestrator:
+    image: ghcr.io/nurrobin/nurproxy:latest
+    container_name: nurproxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - nurproxy-data:/data
+    command: ["--data-dir", "/data", "--port", "8080"]
+
+  # An agent usually runs on a different machine (the edge server that serves
+  # traffic). Uncomment to run one alongside the orchestrator, and set
+  # NP_ORCHESTRATOR to a URL reachable FROM this container and NP_FQDN to a
+  # hostname inside one of the zones you'll assign it.
+  #
+  # agent:
+  #   image: ghcr.io/nurrobin/nurproxy-agent:latest
+  #   container_name: nurproxy-agent
+  #   restart: unless-stopped
+  #   network_mode: host          # needed so Caddy can bind :80/:443 directly
+  #   environment:
+  #     NP_ORCHESTRATOR: "http://orchestrator-host:8080"
+  #     NP_FQDN: "edge1.example.com"
+  #   volumes:
+  #     - nurproxy-agent-data:/data
+
+volumes:
+  nurproxy-data:
+  # nurproxy-agent-data:

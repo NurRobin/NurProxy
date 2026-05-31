@@ -16,7 +16,9 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
+	"github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // AgentClient defines the operations the reconciler needs from an agent.
@@ -32,7 +34,10 @@ type AgentClient interface {
 // push routes to agents over their live (outbound-initiated) stream.
 type RouteHub interface {
 	Connected(agentID string) bool
-	PublishRoutes(agentID string, routes []json.RawMessage) bool
+	PublishIntents(agentID string, intents []proxymodel.RouteIntent) bool
+	// PublishIntentSet pushes the intents together with any cert bundles the agent
+	// must install before Apply (preflight ordering, §5/§7).
+	PublishIntentSet(agentID string, set proxymodel.IntentSet) bool
 }
 
 // Reconciler periodically syncs desired state (database) with actual state
@@ -75,16 +80,126 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	if err != nil {
 		return fmt.Errorf("loading agent %s: %w", agentID, err)
 	}
-	desired, err := r.buildDesiredRoutes(agent)
+	desired, keepExtra, err := r.buildDesiredRoutes(agent)
 	if err != nil {
 		return err
 	}
-	routes := make([]json.RawMessage, 0, len(desired))
-	for _, d := range desired {
-		routes = append(routes, d.route)
-	}
-	r.hub.PublishRoutes(agentID, routes)
+	intents := intentsFromDesired(desired, backendForAgent(agent))
+	// Preflight ordering (§5/§7): gather the certs the agent needs for these routes
+	// FIRST, then push them with the intents in one "everything is ready, go live"
+	// message. The agent installs the certs (InstallCerts) before applying the
+	// referencing config, so a generated config never validates against a missing
+	// cert file. Certs ride this agent-initiated stream — no inbound probe.
+	certs := r.gatherCerts(desired)
+	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents, Certs: certs, Keep: keepExtra})
 	return nil
+}
+
+// RepushCertForHost re-pushes the config + cert bundle for the agent serving
+// host (an FQDN), so a centrally-renewed certificate reaches that agent and is
+// reloaded. It is the post-renewal hook the TLS Renewer calls (§7): it resolves
+// host -> domain -> server -> agent, then re-runs the agent's instant push,
+// which gathers the now-renewed cert from the store and rides it down the
+// agent-initiated stream ahead of the intents (preflight ordering). It satisfies
+// tls.Reloader. Best-effort by contract: if the agent is offline PushAgentRoutes
+// is a no-op and the agent re-syncs (with the fresh cert) on reconnect.
+func (r *Reconciler) RepushCertForHost(_ context.Context, host string) error {
+	agentID, err := r.agentServingHost(host)
+	if err != nil {
+		return err
+	}
+	if agentID == "" {
+		// No domain matches this host (e.g. it was deleted). Nothing to push; the
+		// stored cert simply has no current consumer.
+		return nil
+	}
+	return r.PushAgentRoutes(agentID)
+}
+
+// agentServingHost resolves an FQDN to the id of the agent currently serving it,
+// by matching the host against each domain's computed FQDN and following
+// domain -> server -> agent. Returns "" (no error) when no domain matches.
+func (r *Reconciler) agentServingHost(host string) (string, error) {
+	domains, err := r.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return "", fmt.Errorf("listing domains to resolve host %q: %w", host, err)
+	}
+	for i := range domains {
+		dom := &domains[i]
+		zone, zErr := r.db.GetZone(dom.ZoneID)
+		if zErr != nil {
+			continue
+		}
+		if dom.FQDN(zone.Name) != host {
+			continue
+		}
+		srv, sErr := r.db.GetServer(dom.ServerID)
+		if sErr != nil {
+			return "", fmt.Errorf("resolving server for host %q: %w", host, sErr)
+		}
+		return srv.AgentID, nil
+	}
+	return "", nil
+}
+
+// gatherCerts collects the cert bundles for the FQDNs in the desired route set, so
+// they can ride the push and be installed before Apply (preflight ordering,
+// §5/§7). A host with no stored certificate is simply skipped (built-in Caddy
+// self-ACME fallback, §7); a lookup error is logged and skipped rather than failing
+// the whole push (invariant #4). The returned bundles carry the decrypted private
+// key only for the in-memory hop onto the TLS stream — the agent re-encrypts it at
+// rest on install.
+func (r *Reconciler) gatherCerts(desired map[string]desiredRoute) []proxymodel.CertBundle {
+	if len(desired) == 0 {
+		return nil
+	}
+	bundles := make([]proxymodel.CertBundle, 0, len(desired))
+	for fqdn := range desired {
+		cert, err := r.db.GetCertificate(fqdn)
+		if err != nil {
+			// No cert for this host yet (or lookup failed): skip — the host either
+			// has no central cert or falls back to self-ACME. Never fail the push.
+			continue
+		}
+		bundles = append(bundles, proxymodel.CertBundle{
+			Host:    cert.Host,
+			CertPEM: cert.CertPEM,
+			KeyPEM:  cert.KeyPEM,
+		})
+	}
+	if len(bundles) == 0 {
+		return nil
+	}
+	return bundles
+}
+
+// intentsFromDesired flattens the desired route map into the intent snapshot
+// pushed over the stream (the canonical wire format, §3/B1). backend tags each
+// intent with the agent's actual proxy backend so the round-tripped artifact is
+// stored with correct metadata (a hardcoded "caddy" would mislabel nginx/apache
+// agents).
+func intentsFromDesired(desired map[string]desiredRoute, backend string) []proxymodel.RouteIntent {
+	intents := make([]proxymodel.RouteIntent, 0, len(desired))
+	for _, d := range desired {
+		intents = append(intents, proxymodel.RouteIntent{
+			ArtifactID: d.artifactID,
+			Backend:    backend,
+			Route:      d.intent,
+		})
+	}
+	return intents
+}
+
+// backendForAgent reports the proxy backend an agent renders with, so pushed
+// intents carry the right backend tag (§3/B1). An existing-mode agent uses its
+// detected host proxy (nginx/apache/caddy); a built-in agent — or one whose
+// detection has not landed yet — renders with the bundled Caddy.
+func backendForAgent(agent *models.Agent) string {
+	if agent != nil && agent.ProxyMode == "existing" &&
+		agent.ProxyDetection != nil && agent.ProxyDetection.Kind != "" {
+		return agent.ProxyDetection.Kind
+	}
+	return "caddy"
 }
 
 // Start launches the periodic reconciliation loop in a background goroutine.
@@ -279,13 +394,19 @@ func (r *Reconciler) offlineTimeout() time.Duration {
 // FQDN, straight from the database. It is shared by the inbound reconcile path
 // and by PushAgentRoutes (which delivers the same set over the agent's stream),
 // so both paths always agree on desired state.
-func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desiredRoute, error) {
+func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desiredRoute, []string, error) {
 	domains, err := r.db.ListDomainsByAgent(agent.ID)
 	if err != nil {
-		return nil, fmt.Errorf("listing domains for agent %s: %w", agent.ID, err)
+		return nil, nil, fmt.Errorf("listing domains for agent %s: %w", agent.ID, err)
 	}
 
 	zoneNames := make(map[string]string) // zoneID -> name
+
+	// keepExtra holds generated artifact paths the agent must RETAIN even though
+	// they are not in the pushed intents this round — currently the drifted ones we
+	// skip (awaiting review). The agent's prune keeps applied-targets ∪ keepExtra,
+	// so a drifted file is never mistaken for a deleted domain's orphan (invariant #3).
+	var keepExtra []string
 
 	desiredByFQDN := make(map[string]desiredRoute)
 	for i := range domains {
@@ -317,27 +438,74 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
-		route, gErr := caddygen.GenerateRoute(caddygen.ConfigFromDomain(*dom, fqdn, srv.Address))
-		if gErr != nil {
-			log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
-			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
-				log.Printf("reconciler: failed to update domain status: %v", dErr)
+		artifactID := artifactIDForDomain(dom.ID)
+		storedArt, artErr := r.db.GetConfigArtifact(artifactID)
+
+		// Drift = review, not bulldoze (§11, invariant #3): if this domain's
+		// artifact is in an unresolved drifted state, do NOT push it — leave the
+		// operator's on-disk change in place until they Accept or Reject it. The
+		// opt-in per-agent auto-reconcile policy overrides this, restoring the old
+		// hands-off auto-correction (the artifact is pushed normally so the agent
+		// re-applies the generated content over the drift). DNS reconciliation is
+		// untouched by this gate — it stays automatic.
+		if !agent.AutoReconcileConfig && artErr == nil && storedArt.Drifted {
+			log.Printf("reconciler: skipping push for %s (artifact %s drifted, awaiting review)", fqdn, artifactID)
+			// Retain the drifted file: it is under review, not deleted. Without this
+			// the agent's prune would treat the skipped file as an orphan and remove
+			// it, clobbering the operator's edit (invariant #3).
+			if storedArt.Target.Path != "" {
+				keepExtra = append(keepExtra, storedArt.Target.Path)
 			}
 			continue
 		}
 
+		var intent proxymodel.Route
+		if artErr == nil && storedArt.Source == models.ArtifactSourceManual {
+			// The operator's accepted hand-edit (drift-accept / raw-edit / rollback to
+			// a manual version) is authoritative: push the stored content verbatim as a
+			// raw intent so the agent re-applies exactly those bytes (idempotent with
+			// on-disk) instead of re-rendering from the domain and clobbering the edit
+			// (§6/§11). The artifact stays in the desired set, so the Fix-1 prune never
+			// mistakes it for an orphan.
+			intent = proxymodel.Route{
+				Host: fqdn,
+				Raw:  proxymodel.RawConfig{Backend: backendForAgent(agent), Content: storedArt.Content},
+			}
+		} else {
+			intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+		}
+
+		// route (Caddy JSON) feeds only the inbound same-host fallback; the stream
+		// path uses intent. A raw intent for a file backend can't render to Caddy
+		// JSON, so fall back to the stored bytes there (the fallback never serves a
+		// file backend anyway).
+		route, gErr := caddygen.GenerateRoute(intent)
+		if gErr != nil {
+			if intent.IsRaw() {
+				route = json.RawMessage(storedArt.Content)
+			} else {
+				log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
+				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
+					log.Printf("reconciler: failed to update domain status: %v", dErr)
+				}
+				continue
+			}
+		}
+
 		desiredByFQDN[fqdn] = desiredRoute{
-			domain: dom,
-			fqdn:   fqdn,
-			route:  route,
+			domain:     dom,
+			fqdn:       fqdn,
+			route:      route,
+			intent:     intent,
+			artifactID: artifactID,
 		}
 	}
 
-	return desiredByFQDN, nil
+	return desiredByFQDN, keepExtra, nil
 }
 
 func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) error {
-	desiredByFQDN, err := r.buildDesiredRoutes(agent)
+	desiredByFQDN, keepExtra, err := r.buildDesiredRoutes(agent)
 	if err != nil {
 		return err
 	}
@@ -347,13 +515,13 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 	// agent dialed us) and the one to rely on in production; the agent applies
 	// the set locally and reports domain status back via its ACK. The inbound
 	// diff below is the fallback for same-host / port-forwarded setups where the
-	// orchestrator can reach the agent directly.
+	// orchestrator can reach the agent directly. Keep carries the drifted-but-retained
+	// paths so the agent's prune doesn't mistake them for orphans (invariant #3).
 	if r.hub != nil && r.hub.Connected(agent.ID) {
-		routes := make([]json.RawMessage, 0, len(desiredByFQDN))
-		for _, d := range desiredByFQDN {
-			routes = append(routes, d.route)
-		}
-		r.hub.PublishRoutes(agent.ID, routes)
+		r.hub.PublishIntentSet(agent.ID, proxymodel.IntentSet{
+			Intents: intentsFromDesired(desiredByFQDN, backendForAgent(agent)),
+			Keep:    keepExtra,
+		})
 		return nil
 	}
 
@@ -496,52 +664,20 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 		expectedTarget := agent.FQDN
 
 		if dom.DNSRecordID == "" {
-			// No record yet — create it.
-			recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{
-				Type:    "CNAME",
-				Name:    fqdn,
-				Content: expectedTarget,
-				TTL:     0,
-			})
-			if cErr != nil {
-				log.Printf("reconciler: failed to create DNS record for %s: %v", fqdn, cErr)
-				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS create failed: %v", cErr)); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
-				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
-				continue
-			}
-
-			if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
-				log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
-			}
-			r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, expectedTarget))
+			// No record ID on file — resolve by name (adopt an identical existing
+			// record, flag a conflict, or create) instead of blind-creating.
+			r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
 			continue
 		}
 
 		// Record exists — verify content.
 		rec, gErr := dnsProvider.GetRecord(ctx, provConfig, dom.DNSRecordID)
 		if gErr != nil {
-			// Record not found — recreate.
-			log.Printf("reconciler: DNS record %s not found for domain %d, recreating: %v", dom.DNSRecordID, dom.ID, gErr)
-			recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{
-				Type:    "CNAME",
-				Name:    fqdn,
-				Content: expectedTarget,
-				TTL:     0,
-			})
-			if cErr != nil {
-				log.Printf("reconciler: failed to recreate DNS record for %s: %v", fqdn, cErr)
-				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS recreate failed: %v", cErr)); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
-				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_recreate_failed", cErr.Error())
-				continue
-			}
-			if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
-				log.Printf("reconciler: failed to store DNS record ID: %v", dErr)
-			}
-			r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_recreated", fmt.Sprintf("recreated CNAME %s -> %s", fqdn, expectedTarget))
+			// The stored record ID no longer resolves (deleted at the provider, or a
+			// transient read error). Re-resolve by name: adopt the live record if it
+			// still exists, else create — never blind-create into "already exists".
+			log.Printf("reconciler: DNS record %s for domain %d did not resolve, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
+			r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
 			continue
 		}
 
@@ -566,6 +702,128 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ensureDomainCNAME makes the domain's CNAME exist and point at target WITHOUT
+// ever blind-creating a duplicate. It looks the name up at the provider first
+// (so a record left from a prior run, or operator-created, is handled cleanly):
+//   - an identical record present  -> adopt it (store its ID, clear stale error)
+//   - a different record present   -> explicit conflict error (current vs desired)
+//   - nothing present              -> create it
+//
+// It owns the domain's status + record ID + audit writes for this step.
+func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, fqdn, target string, dnsProvider provider.Provider, provConfig json.RawMessage) {
+	existing, lErr := lookupRecordsByName(ctx, dnsProvider, provConfig, fqdn)
+	if lErr != nil {
+		// Lookup failed (transient API/auth). Don't create blind — retry next cycle.
+		log.Printf("reconciler: DNS lookup for %s failed, retrying next cycle: %v", fqdn, lErr)
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS lookup failed: %v", lErr)); dErr != nil {
+			log.Printf("reconciler: failed to update domain status: %v", dErr)
+		}
+		return
+	}
+
+	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
+		// Identical record already exists — adopt it instead of creating a duplicate
+		// ("it's the record we'd set anyway, just skip").
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID); dErr != nil {
+			log.Printf("reconciler: failed to store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
+		}
+		// Clear any stale DNS error; the proxy apply sets the real status next.
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+			log.Printf("reconciler: failed to clear domain status: %v", dErr)
+		}
+		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s", fqdn, target))
+		return
+	}
+
+	if len(existing) > 0 {
+		// A record with this name exists but is NOT the one we want. Never overwrite
+		// a record we didn't create — surface an explicit, actionable error.
+		msg := fmt.Sprintf("a DNS record for %s already exists that does not match the desired CNAME → %s. Current: %s. Resolve it at your DNS provider (delete it or point it at %s); NurProxy won't overwrite a record it didn't create.", fqdn, target, describeRecords(existing), target)
+		log.Printf("reconciler: DNS conflict for %s: %s", fqdn, msg)
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, msg); dErr != nil {
+			log.Printf("reconciler: failed to update domain status: %v", dErr)
+		}
+		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_conflict", msg)
+		return
+	}
+
+	// Nothing exists — create it.
+	recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0})
+	if cErr != nil {
+		log.Printf("reconciler: failed to create DNS record for %s: %v", fqdn, cErr)
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS create failed: %v", cErr)); dErr != nil {
+			log.Printf("reconciler: failed to update domain status: %v", dErr)
+		}
+		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
+		return
+	}
+	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
+		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
+	}
+	r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
+}
+
+// lookupRecordsByName returns the provider's records whose name equals fqdn
+// (normalized), so the reconciler can adopt or diff before creating. An empty
+// result means the name is free.
+func lookupRecordsByName(ctx context.Context, p provider.Provider, config json.RawMessage, fqdn string) ([]provider.Record, error) {
+	recs, err := p.ListRecords(ctx, config, fqdn, "")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]provider.Record, 0, len(recs))
+	for _, rec := range recs {
+		if normalizeDNSName(rec.Name) == normalizeDNSName(fqdn) {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+// matchingRecord returns the first record of the given type whose content equals
+// content (normalized), i.e. the record NurProxy would itself create — the signal
+// to adopt rather than re-create. Returns nil when none matches.
+func matchingRecord(records []provider.Record, recordType, content string) *provider.Record {
+	for i := range records {
+		rec := &records[i]
+		if strings.EqualFold(rec.Type, recordType) && sameRecordContent(rec.Content, content) {
+			return rec
+		}
+	}
+	return nil
+}
+
+// firstRecordOfType returns the first record of the given type, or nil.
+func firstRecordOfType(records []provider.Record, recordType string) *provider.Record {
+	for i := range records {
+		if strings.EqualFold(records[i].Type, recordType) {
+			return &records[i]
+		}
+	}
+	return nil
+}
+
+// sameRecordContent compares record contents tolerant of case and a trailing dot
+// (CNAME targets the provider may canonicalize); IPs compare unchanged.
+func sameRecordContent(a, b string) bool {
+	return normalizeDNSName(a) == normalizeDNSName(b)
+}
+
+// normalizeDNSName lowercases and trims surrounding space and any trailing dot.
+func normalizeDNSName(s string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s)), ".")
+}
+
+// describeRecords renders a record set as "TYPE → content, …" for conflict
+// messages that show the operator the current on-provider state.
+func describeRecords(records []provider.Record) string {
+	parts := make([]string, 0, len(records))
+	for _, rec := range records {
+		parts = append(parts, fmt.Sprintf("%s → %s", rec.Type, rec.Content))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +882,40 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 		rec := provider.Record{Type: "A", Name: a.FQDN, Content: a.PublicIP, TTL: 0}
 
 		if a.DNSRecordID == "" {
+			// Resolve by name before creating: an A record for this FQDN may already
+			// exist (prior run / operator), and blind-creating would hit the
+			// provider's "already exists" error.
+			existing, lErr := lookupRecordsByName(ctx, dnsProvider, provConfig, a.FQDN)
+			if lErr != nil {
+				log.Printf("reconciler: A record lookup for agent %s failed, retrying next cycle: %v", a.ID, lErr)
+				continue
+			}
+			if adopt := firstRecordOfType(existing, "A"); adopt != nil {
+				// The agent owns its anchor FQDN's A record. Adopt the existing one and
+				// correct its IP if it drifted (e.g. adopted from a prior run).
+				a.DNSRecordID = adopt.ID
+				if uErr := r.db.UpdateAgentDNSRecord(a.ID, adopt.ID); uErr != nil {
+					log.Printf("reconciler: failed to persist adopted A record id for agent %s: %v", a.ID, uErr)
+				}
+				if sameRecordContent(adopt.Content, a.PublicIP) {
+					r.audit("agent", a.ID, "a_record_adopted", fmt.Sprintf("adopted existing A %s -> %s", a.FQDN, a.PublicIP))
+				} else if uErr := dnsProvider.UpdateRecord(ctx, provConfig, adopt.ID, rec); uErr != nil {
+					log.Printf("reconciler: failed to correct adopted A record for agent %s: %v", a.ID, uErr)
+					r.audit("agent", a.ID, "a_record_update_failed", uErr.Error())
+				} else {
+					r.audit("agent", a.ID, "a_record_adopted", fmt.Sprintf("adopted + corrected A %s -> %s (was %s)", a.FQDN, a.PublicIP, adopt.Content))
+				}
+				continue
+			}
+			if len(existing) > 0 {
+				// The FQDN is occupied by a non-A record (e.g. a CNAME) — can't place
+				// the agent's A record there. Surface an explicit, actionable error.
+				msg := fmt.Sprintf("cannot create the A record for %s: a different record already exists (%s). The agent's anchor FQDN must be free for an A record — remove the conflicting record or pick a different FQDN.", a.FQDN, describeRecords(existing))
+				log.Printf("reconciler: A record conflict for agent %s: %s", a.ID, msg)
+				r.setAgentDNSError(a, msg)
+				r.audit("agent", a.ID, "a_record_conflict", msg)
+				continue
+			}
 			recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, rec)
 			if cErr != nil {
 				log.Printf("reconciler: failed to create A record for agent %s: %v", a.ID, cErr)
@@ -725,8 +1017,19 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 		return fmt.Errorf("listing domains to delete: %w", err)
 	}
 
+	// affectedAgents collects the agents whose desired set changed, so after the
+	// rows are gone we re-push their (now smaller) intent set over the dial-out
+	// stream. The agent prunes the orphaned vhost on apply — no inbound probe
+	// (invariant #2), no ghost vhost (§3).
+	affectedAgents := make(map[string]bool)
+
 	for i := range domains {
 		dom := &domains[i]
+
+		// Note the owning agent before teardown so we can re-push its set afterwards.
+		if srv, sErr := r.db.GetServer(dom.ServerID); sErr == nil {
+			affectedAgents[srv.AgentID] = true
+		}
 
 		// Best-effort DNS record cleanup.
 		if dom.DNSRecordID != "" {
@@ -742,17 +1045,20 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 			}
 		}
 
-		// Best-effort route cleanup on the owning agent.
-		if zone, err := r.db.GetZone(dom.ZoneID); err == nil {
-			fqdn := dom.FQDN(zone.Name)
-			if srv, sErr := r.db.GetServer(dom.ServerID); sErr == nil {
-				if agent, aErr := r.db.GetAgent(srv.AgentID); aErr == nil {
-					if rErr := r.agentClient.DeleteRoute(ctx, agent.APIURL, agent.TokenHash, fqdn); rErr != nil {
-						// Agent may be offline; the route will be flagged as
-						// unmanaged later. Don't block domain deletion on it.
-						log.Printf("reconciler: failed to delete route %s on agent %s: %v", fqdn, agent.ID, rErr)
-					}
-				}
+		// Route cleanup on the host rides the dial-out stream (the re-push after this
+		// loop), not an inbound call to the agent — the orchestrator never probes the
+		// agent inbound (invariant #2). Deleting the artifact below shrinks the desired
+		// set; the re-push then makes the agent prune the orphaned vhost.
+
+		// Remove the domain's config artifact from the central store so no ghost
+		// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
+		// applied) is fine.
+		artifactID := artifactIDForDomain(dom.ID)
+		if _, aErr := r.db.GetConfigArtifact(artifactID); aErr == nil {
+			if dErr := r.db.DeleteConfigArtifact(artifactID); dErr != nil {
+				log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)
+			} else {
+				r.audit("config_artifact", artifactID, "remove", "domain deleted")
 			}
 		}
 
@@ -762,6 +1068,16 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 			continue
 		}
 		r.audit("domain", fmt.Sprintf("%d", dom.ID), "deleted", "domain removed after cleanup")
+	}
+
+	// Re-push each affected agent's now-smaller desired set over its stream so it
+	// prunes the deleted domains' vhosts promptly (the periodic cycle would also
+	// catch it, but this makes delete prompt). Best-effort: an offline agent simply
+	// prunes on its next apply.
+	for agentID := range affectedAgents {
+		if err := r.PushAgentRoutes(agentID); err != nil {
+			log.Printf("reconciler: re-push after delete failed for agent %s: %v", agentID, err)
+		}
 	}
 
 	return nil
@@ -795,7 +1111,26 @@ func (r *Reconciler) resolveDNS(zoneID string) (*models.Zone, *models.Provider, 
 type desiredRoute struct {
 	domain *models.Domain
 	fqdn   string
-	route  json.RawMessage
+	// route is the rendered Caddy route JSON, kept for the inbound-HTTP fallback
+	// path (the agent's local REST API still speaks Caddy JSON for same-host /
+	// port-forwarded setups).
+	route json.RawMessage
+	// intent is the backend-neutral Route pushed over the live stream (the
+	// canonical wire format, §3/B1): the agent renders it natively and reports
+	// back the rendered artifact.
+	intent proxymodel.Route
+	// artifactID is the stable, orchestrator-assigned identity of this domain's
+	// config artifact, echoed back by the agent in its apply-ACK so the rendered
+	// content round-trips into the correct store row.
+	artifactID string
+}
+
+// artifactIDForDomain derives the stable artifact identity for a generated
+// (model-backed) domain config. It is deterministic per domain so the agent can
+// echo it back across reconnects without the orchestrator persisting a mapping
+// before the first apply-ACK.
+func artifactIDForDomain(domainID int64) string {
+	return fmt.Sprintf("dom-%d", domainID)
 }
 
 // mergeZoneIDIntoConfig injects the zone's external ID into the provider config
@@ -826,19 +1161,13 @@ func extractHostFromRoute(raw json.RawMessage) string {
 	return ""
 }
 
-// routesMatch compares two route JSON blobs for semantic equality.
-// It normalizes by unmarshaling into maps and re-marshaling.
+// routesMatch compares two Caddy route JSON blobs for semantic equality. It
+// delegates to the shared caddyeq comparator (the single source of truth for
+// Caddy semantic equality, also used to gate version writes in §4/§11), so the
+// reconciler's reload-suppression and the store's phantom-version suppression
+// stay in lock-step.
 func routesMatch(a, b json.RawMessage) bool {
-	var ma, mb interface{}
-	if err := json.Unmarshal(a, &ma); err != nil {
-		return false
-	}
-	if err := json.Unmarshal(b, &mb); err != nil {
-		return false
-	}
-	ja, _ := json.Marshal(ma)
-	jb, _ := json.Marshal(mb)
-	return string(ja) == string(jb)
+	return caddyeq.Equal(string(a), string(b))
 }
 
 // audit is a convenience wrapper that logs to both the audit table and stderr.
@@ -849,6 +1178,7 @@ func (r *Reconciler) audit(entityType, entityID, action, details string) {
 		EntityID:   entityID,
 		Action:     action,
 		Actor:      "reconciler",
+		Source:     models.AuditSourceSystem,
 		Details:    details,
 	}
 	if err := r.db.InsertAuditLog(entry); err != nil {

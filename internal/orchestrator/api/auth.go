@@ -76,12 +76,13 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	// Create session
 	s.setSessionCookie(w)
 
-	// Audit log
+	// Audit log — bootstrap happens through the dashboard, so source is ui.
 	if err := s.db.InsertAuditLog(&models.AuditLogEntry{
 		EntityType: "system",
 		EntityID:   "setup",
 		Action:     "setup",
 		Actor:      "admin",
+		Source:     models.AuditSourceUI,
 		Details:    "initial admin password configured",
 	}); err != nil {
 		log.Printf("failed to insert audit log: %v", err)

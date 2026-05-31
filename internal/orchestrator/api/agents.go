@@ -5,9 +5,11 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // GET /api/v1/agents
@@ -47,12 +49,14 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 // No auth required (agent doesn't have a token yet — it's registering one).
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID       string `json:"id"`
-		FQDN     string `json:"fqdn"`
-		Token    string `json:"token"`
-		APIURL   string `json:"api_url"`
-		PublicIP string `json:"public_ip"`
-		Version  string `json:"version"`
+		ID                string                    `json:"id"`
+		FQDN              string                    `json:"fqdn"`
+		Token             string                    `json:"token"`
+		APIURL            string                    `json:"api_url"`
+		PublicIP          string                    `json:"public_ip"`
+		Version           string                    `json:"version"`
+		ProxyDetection    *models.ProxyDetection    `json:"proxy_detection"`
+		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -85,6 +89,16 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		// Assume healthy until the agent reports otherwise via heartbeat, so a
 		// freshly registered agent doesn't surface a spurious "Caddy down" error.
 		CaddyRunning: true,
+		// Phase-0 read-only detection (§13.0/§2.1/§9), carried on the agent's
+		// outbound register payload. Stored as-is; refreshed by heartbeats.
+		ProxyDetection: req.ProxyDetection,
+		// Capability matrix (§8) for the agent's selected backend, including
+		// module-probed options. Stored as-is; refreshed by heartbeats.
+		ProxyCapabilities: req.ProxyCapabilities,
+	}
+	if req.ProxyDetection != nil {
+		now := time.Now().UTC()
+		agent.ProxyDetectedAt = &now
 	}
 
 	if err := s.db.CreateAgent(agent); err != nil {
@@ -96,7 +110,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.audit(r, "agent", agent.ID, "register", agent.FQDN)
+	s.auditAs(r, models.AuditSourceAgent, "agent", agent.ID, "register", agent.FQDN)
 
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"id":     agent.ID,
@@ -268,13 +282,18 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":            agent.ID,
-		"status":        agent.Status,
-		"last_seen":     agent.LastSeen,
-		"public_ip":     agent.PublicIP,
-		"version":       agent.Version,
-		"caddy_running": agent.CaddyRunning,
-		"last_error":    agent.LastError,
+		"id":                 agent.ID,
+		"status":             agent.Status,
+		"last_seen":          agent.LastSeen,
+		"public_ip":          agent.PublicIP,
+		"version":            agent.Version,
+		"caddy_running":      agent.CaddyRunning,
+		"proxy_mode":         agent.ProxyMode,
+		"last_error":         agent.LastError,
+		"proxy_detection":    agent.ProxyDetection,
+		"proxy_detected_at":  agent.ProxyDetectedAt,
+		"proxy_capabilities": agent.ProxyCapabilities,
+		"proxy_permissions":  agent.ProxyPermissions,
 	})
 }
 
@@ -354,6 +373,26 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// a pointer so an older agent that omits it doesn't get read as "down".
 		CaddyRunning *bool  `json:"caddy_running"`
 		LastError    string `json:"last_error"`
+		// ProxyMode is the agent's CURRENT live reverse-proxy mode ("built-in" |
+		// "existing"), re-reported each beat (§19) so the dashboard reflects a
+		// hot-switch. Empty leaves the stored mode untouched (older agent).
+		ProxyMode string `json:"proxy_mode"`
+		// ProxyDetection is the agent's read-only Phase-0 detection, re-reported on
+		// each beat (§13.0/§2.1/§9). Stored on the agent row; nil leaves it as-is.
+		ProxyDetection *models.ProxyDetection `json:"proxy_detection"`
+		// ProxyCapabilities is the agent's capability matrix (§8) for its selected
+		// backend, re-reported each beat. Stored on the agent row; nil leaves it
+		// as-is (so a transient probe failure doesn't erase a known-good matrix).
+		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
+		// ProxyPermissions is the agent's §12 permission self-test (config writable?
+		// service reloadable? + remediation), re-probed each beat in existing mode.
+		// Stored on the agent row; built-in mode reports nil and we clear the column.
+		ProxyPermissions *models.ProxyPermissions `json:"proxy_permissions"`
+		// ArtifactChecksums is the agent's per-beat report of each managed
+		// artifact's on-disk/live checksum (§11). The orchestrator compares each
+		// against the accepted state and flags drift (on-disk != accepted), never
+		// overwriting while unresolved. Empty/omitted leaves drift state untouched.
+		ArtifactChecksums []proxymodel.ArtifactChecksum `json:"artifact_checksums"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -372,9 +411,36 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		caddyRunning = *req.CaddyRunning
 	}
 
-	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning); err != nil {
+	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning, req.ProxyMode); err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
+	}
+
+	// Persist the agent's read-only proxy detection (§13.0). It's a narrow update
+	// so it doesn't clobber operator-owned fields or the health self-report just
+	// written above. Only update when the agent actually reported detection.
+	if req.ProxyDetection != nil {
+		if uerr := s.db.UpdateAgentDetection(id, req.ProxyDetection); uerr != nil {
+			log.Printf("failed to update agent %s detection: %v", id, uerr)
+		}
+	}
+
+	// Persist the agent's reported capability matrix (§8). Like detection, it's a
+	// narrow update that doesn't clobber the health self-report; only update when
+	// the agent actually reported capabilities (nil leaves the stored copy as-is).
+	if req.ProxyCapabilities != nil {
+		if uerr := s.db.UpdateAgentCapabilities(id, req.ProxyCapabilities); uerr != nil {
+			log.Printf("failed to update agent %s capabilities: %v", id, uerr)
+		}
+	}
+
+	// Persist the §12 permission self-test reported this beat. Unlike detection, we
+	// store it unconditionally (including nil → SQL NULL): an existing-mode agent
+	// always reports a result, and built-in mode reporting nil is the correct
+	// "no permission state" — so the stored value always tracks the agent's truth,
+	// and a granted permission clears the dashboard warning on the next beat.
+	if uerr := s.db.UpdateAgentPermissions(id, req.ProxyPermissions); uerr != nil {
+		log.Printf("failed to update agent %s permissions: %v", id, uerr)
 	}
 
 	// A heartbeat is proof of life: an agent the orchestrator had marked offline
@@ -392,8 +458,17 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if req.CaddyRunning != nil && prev.CaddyRunning != caddyRunning {
 		s.audit(r, "agent", id, "caddy_state", fmt.Sprintf("caddy_running=%t", caddyRunning))
 	}
-	if prev.LastError != req.LastError && req.LastError != "" {
-		s.audit(r, "agent", id, "agent_error", req.LastError)
+	// NOTE: a recurring agent health error (e.g. an existing-mode reload-permission
+	// denial re-probed every beat) is live telemetry, not an audit event — it is
+	// surfaced as current state via the agent's last_error + proxy_permissions, and
+	// auditing it on every beat just spams the timeline. So we deliberately do NOT
+	// audit agent_error here; the audit log records actions and real transitions
+	// (adopt/reject/update/delete, online/offline, caddy_state, proxy_mode switch).
+	// Audit a live proxy-mode change (e.g. a §19 hot-switch to existing nginx) so
+	// operators see the backend flip in the timeline. Only when the agent actually
+	// reported a mode and it differs from what we had.
+	if req.ProxyMode != "" && prev.ProxyMode != req.ProxyMode {
+		s.audit(r, "agent", id, "proxy_mode", fmt.Sprintf("proxy_mode=%s", req.ProxyMode))
 	}
 
 	// Re-read the fresh row (UpdateAgentHealth + the offline->adopted flip both
@@ -412,8 +487,46 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Drift detection (§11): compare each reported on-disk checksum against the
+	// accepted state. A divergence flags the artifact for review (never
+	// overwriting the stored/accepted content); a match clears any prior drift.
+	s.reconcileArtifactChecksums(r, id, req.ArtifactChecksums)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":    agent.Status,
 		"last_seen": agent.LastSeen,
 	})
+}
+
+// reconcileArtifactChecksums compares the agent's heartbeat-reported on-disk
+// checksums against the accepted state in the central store and flags/clears
+// drift accordingly (§11, invariant #3). It never overwrites stored content; the
+// accepted state is preserved for the operator's review (accept/reject). Only a
+// genuine drift transition is audited (source + actor), not every heartbeat
+// (invariant #5). Best-effort and resilient: an unknown artifact ID (e.g. a
+// manual/adopted artifact the orchestrator hasn't created yet) is skipped, not
+// fatal to the heartbeat.
+func (s *Server) reconcileArtifactChecksums(r *http.Request, agentID string, checksums []proxymodel.ArtifactChecksum) {
+	for _, c := range checksums {
+		if c.ArtifactID == "" {
+			continue
+		}
+		drifted, changed, err := s.db.ReconcileArtifactChecksum(c.ArtifactID, agentID, c.Checksum, c.Content)
+		if err != nil {
+			// Unknown/absent artifact is expected before its first apply-ACK lands;
+			// log at low volume and move on.
+			log.Printf("heartbeat: drift check for artifact %s on agent %s: %v", c.ArtifactID, agentID, err)
+			continue
+		}
+		if !changed {
+			continue
+		}
+		if drifted {
+			s.auditAs(r, models.AuditSourceAgent, "config_artifact", c.ArtifactID, "drifted",
+				fmt.Sprintf("on-disk content diverged from accepted state (agent %s)", agentID))
+		} else {
+			s.auditAs(r, models.AuditSourceAgent, "config_artifact", c.ArtifactID, "drift_resolved",
+				fmt.Sprintf("on-disk content back in agreement (agent %s)", agentID))
+		}
+	}
 }

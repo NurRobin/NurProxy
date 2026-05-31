@@ -23,17 +23,36 @@ permissions.
 Install the agent on the server that will actually serve your traffic:
 
 ```
-curl -fsSL https://get.nurproxy.dev | sh -s -- agent \
+curl -fsSL https://raw.githubusercontent.com/NurRobin/NurProxy/main/scripts/install.sh | sh -s -- agent \
   --orchestrator https://your-dashboard-url \
   --fqdn edge1.example.com
 ```
 
-The agent registers itself and shows up here for **approval** (we also call this
-"adoption"). Approving it lets NurProxy manage its proxy and DNS.
+This single command downloads the agent, installs it, and registers it as a
+hardened service (systemd on most Linux, OpenRC on Alpine, launchd on macOS,
+rc.d on FreeBSD — auto-detected). The agent then registers itself with the
+orchestrator and shows up here for **approval** (we also call this "adoption").
+Approving it lets NurProxy manage its proxy and DNS.
 
 > The `--orchestrator` address must be reachable **from the edge server** — it is
 > often different from the URL you use in your browser. If your agent never shows
 > up, that's almost always why. See [Agent can't connect](agent-reachability).
+
+## Managing the service
+
+The installer starts the service and enables it on boot. Follow logs with
+`journalctl -u nurproxy-agent -f` (or `-u nurproxy` on the orchestrator host).
+Remove a component with `sudo nurproxy-agent uninstall` (add `--purge` to also
+delete its data).
+
+To install the **orchestrator** the same way, on the dashboard host:
+
+```
+curl -fsSL https://raw.githubusercontent.com/NurRobin/NurProxy/main/scripts/install.sh | sh -s -- orchestrator --port 8080
+```
+
+Prefer native packages or Docker? See the [README](https://github.com/NurRobin/NurProxy#installation)
+for `.deb`/`.rpm`, Homebrew, and Docker Compose instructions.
 
 ## After setup
 

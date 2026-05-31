@@ -3,7 +3,7 @@ import { Eye, EyeOff } from 'lucide-react';
 import HelpTip from './HelpTip';
 
 const fieldBase =
-  'block w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint transition-colors focus:border-accent focus-visible:outline-none focus:ring-2 focus:ring-accent/30';
+  'block w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint transition-colors focus:border-accent focus-visible:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-not-allowed disabled:opacity-50';
 
 export function Input({ className = '', ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={`${fieldBase} ${className}`} {...rest} />;
@@ -66,12 +66,17 @@ export function Field({ label, htmlFor, hint, help, children, className = '' }: 
   );
 }
 
-export function Checkbox({ className = '', label, ...rest }: InputHTMLAttributes<HTMLInputElement> & { label: ReactNode }) {
+export function Checkbox({ className = '', label, disabled, ...rest }: InputHTMLAttributes<HTMLInputElement> & { label: ReactNode }) {
   return (
-    <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
+    <label
+      className={`flex items-center gap-2 text-sm text-fg ${
+        disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+      }`}
+    >
       <input
         type="checkbox"
-        className={`h-4 w-4 rounded border-border accent-[var(--accent)] ${className}`}
+        disabled={disabled}
+        className={`h-4 w-4 rounded border-border accent-[var(--accent)] ${disabled ? 'cursor-not-allowed' : ''} ${className}`}
         {...rest}
       />
       {label}

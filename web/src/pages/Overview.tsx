@@ -7,6 +7,7 @@ import { api } from '../lib/api';
 import { usePolling } from '../lib/usePolling';
 import type { Agent, Domain, AuditLogEntry } from '../lib/types';
 import { formatRelativeTime } from '../lib/utils';
+import { isDegraded } from '../lib/status';
 import { buttonClass } from '../components/button-styles';
 import StatusBadge from '../components/StatusBadge';
 import EmptyState from '../components/EmptyState';
@@ -49,7 +50,14 @@ export default function Overview() {
   const errors = count(agents, 'error') + count(domains, 'error');
   const offline = count(agents, 'offline');
   const pendingAgents = count(agents, 'pending');
-  const healthy = errors === 0 && offline === 0;
+  // A degraded agent is connected (status adopted) but reporting an operational
+  // error or a failed §12 permission self-test — e.g. existing-mode nginx it
+  // can't reload. Status alone misses these, which is why the banner used to read
+  // "all normal" while an agent clearly wasn't. isDegraded already excludes
+  // offline/error agents, so offline is not double-counted.
+  const degraded = agents.filter(isDegraded).length;
+  const problemCount = errors + offline + degraded;
+  const healthy = problemCount === 0;
 
   if (loading) {
     return <div className="py-12 text-center text-sm text-fg-muted">{t('common.loading')}</div>;
@@ -77,7 +85,7 @@ export default function Overview() {
             </span>
             <div>
               <p className="font-medium text-fg">
-                {healthy ? t('overview.allNormal') : t('overview.attention', { count: errors + offline })}
+                {healthy ? t('overview.allNormal') : t('overview.attention', { count: problemCount })}
               </p>
               <p className="text-sm text-fg-muted">
                 {t('overview.summary', { agents: t('counts.agents', { count: agents.length }), domains: t('counts.domains', { count: domains.length }) })}
@@ -89,6 +97,11 @@ export default function Overview() {
             {errors > 0 && (
               <Link to="/domains" className="rounded-lg bg-danger-soft px-3 py-1.5 text-sm font-medium text-danger-fg hover:brightness-105">
                 {t('overview.errorsLink', { count: errors })}
+              </Link>
+            )}
+            {degraded > 0 && (
+              <Link to="/agents" className="rounded-lg bg-warning-soft px-3 py-1.5 text-sm font-medium text-warning-fg hover:brightness-105">
+                {t('overview.degradedLink', { count: degraded })}
               </Link>
             )}
             {offline > 0 && (
@@ -127,7 +140,7 @@ export default function Overview() {
                     <p className="truncate font-medium text-fg">{agent.name}</p>
                     <p className="truncate text-sm text-fg-muted">{agent.fqdn}</p>
                   </div>
-                  <StatusBadge status={agent.status} />
+                  <StatusBadge status={agent.status} degraded={isDegraded(agent)} />
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-fg-faint">
                   {agent.public_ip && <span className="font-mono">{agent.public_ip}</span>}
@@ -148,10 +161,13 @@ export default function Overview() {
             <ul className="divide-y divide-border">
               {auditLog.map((entry) => (
                 <li key={entry.id} className="flex items-center justify-between gap-4 px-4 py-3">
-                  <p className="min-w-0 truncate text-sm text-fg-muted">
-                    <span className="font-medium text-fg">{entry.action}</span>{' '}
-                    <span>{entry.entity_type}</span>
-                    {entry.details && <span className="text-fg-faint"> — {entry.details}</span>}
+                  <p className="flex min-w-0 items-center gap-2 truncate text-sm text-fg-muted">
+                    {entry.source && <SourceBadge source={entry.source} />}
+                    <span className="truncate">
+                      <span className="font-medium text-fg">{entry.action}</span>{' '}
+                      <span>{entry.entity_type}</span>
+                      {entry.details && <span className="text-fg-faint"> — {entry.details}</span>}
+                    </span>
                   </p>
                   <span className="flex-shrink-0 text-xs text-fg-faint">{seen(entry.created_at)}</span>
                 </li>
@@ -161,5 +177,23 @@ export default function Overview() {
         </section>
       )}
     </div>
+  );
+}
+
+// SourceBadge renders the audit entry's origin channel as a small colored chip.
+const SOURCE_STYLES: Record<string, string> = {
+  ui: 'bg-accent-soft text-accent',
+  api: 'bg-surface-2 text-fg-muted',
+  mcp: 'bg-warning-soft text-warning-fg',
+  agent: 'bg-success-soft text-success-fg',
+  system: 'bg-surface-2 text-fg-faint',
+};
+
+function SourceBadge({ source }: { source: string }) {
+  const cls = SOURCE_STYLES[source] ?? 'bg-surface-2 text-fg-faint';
+  return (
+    <span className={`flex-shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
+      {source}
+    </span>
   );
 }
