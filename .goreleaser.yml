@@ -2,8 +2,16 @@ version: 2
 
 before:
   hooks:
-    - go mod tidy
+    # download (not tidy) — read-only, can't dirty go.mod/go.sum mid-release.
+    - go mod download
 
+# 0.x tags publish as normal releases; a future -rc/-beta tag auto-marks as a
+# GitHub pre-release (and gates the Docker :latest manifests below).
+release:
+  prerelease: auto
+
+# Shared target matrix for both binaries. 32-bit arm is linux-only (homelab
+# boards, Raspberry Pi); darwin/freebsd ship amd64+arm64 only.
 builds:
   - id: nurproxy
     main: ./cmd/nurproxy
@@ -12,12 +20,17 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
+      - darwin
+      - freebsd
     goarch:
       - amd64
       - arm64
       - arm
     goarm:
       - "7"
+    ignore:
+      - { goos: darwin, goarch: arm }
+      - { goos: freebsd, goarch: arm }
     ldflags:
       - -s -w -X main.version={{.Version}}
 
@@ -28,24 +41,164 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
+      - darwin
+      - freebsd
     goarch:
       - amd64
       - arm64
       - arm
     goarm:
       - "7"
+    ignore:
+      - { goos: darwin, goarch: arm }
+      - { goos: freebsd, goarch: arm }
     ldflags:
       - -s -w -X main.version={{.Version}}
 
 archives:
   - id: nurproxy
-    builds: [nurproxy]
+    ids: [nurproxy]
     name_template: "nurproxy_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
-    format: tar.gz
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - src: deploy/packaging/nurproxy.service
+        strip_parent: true
+      - src: deploy/packaging/nurproxy.env.example
+        strip_parent: true
   - id: nurproxy-agent
-    builds: [nurproxy-agent]
+    ids: [nurproxy-agent]
     name_template: "nurproxy-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
-    format: tar.gz
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - src: deploy/packaging/nurproxy-agent.service
+        strip_parent: true
+      - src: deploy/packaging/nurproxy-agent.env.example
+        strip_parent: true
+
+# Native Linux packages (systemd-based distros). Alpine/OpenRC and other inits
+# are handled by the install.sh path, which auto-detects the service manager.
+nfpms:
+  - id: nurproxy
+    package_name: nurproxy
+    ids: [nurproxy]
+    formats: [deb, rpm]
+    maintainer: "NurRobin <grambrobin@gmail.com>"
+    description: "NurProxy orchestrator — reverse proxy and DNS management dashboard"
+    homepage: "https://github.com/NurRobin/NurProxy"
+    license: MIT
+    bindir: /usr/bin
+    contents:
+      - src: deploy/packaging/nurproxy.service
+        dst: /usr/lib/systemd/system/nurproxy.service
+      - src: deploy/packaging/nurproxy.env.example
+        dst: /etc/nurproxy/nurproxy.env
+        type: "config|noreplace"
+      - dst: /var/lib/nurproxy
+        type: dir
+        file_info: { mode: 0750 }
+    scripts:
+      postinstall: deploy/packaging/postinstall-orchestrator.sh
+      preremove: deploy/packaging/preremove-orchestrator.sh
+      postremove: deploy/packaging/postremove.sh
+
+  - id: nurproxy-agent
+    package_name: nurproxy-agent
+    ids: [nurproxy-agent]
+    formats: [deb, rpm]
+    maintainer: "NurRobin <grambrobin@gmail.com>"
+    description: "NurProxy agent — manages a local reverse proxy on an edge server"
+    homepage: "https://github.com/NurRobin/NurProxy"
+    license: MIT
+    bindir: /usr/bin
+    contents:
+      - src: deploy/packaging/nurproxy-agent.service
+        dst: /usr/lib/systemd/system/nurproxy-agent.service
+      - src: deploy/packaging/nurproxy-agent.env.example
+        dst: /etc/nurproxy-agent/agent.env
+        type: "config|noreplace"
+      - dst: /var/lib/nurproxy-agent
+        type: dir
+        file_info: { mode: 0750 }
+    scripts:
+      postinstall: deploy/packaging/postinstall-agent.sh
+      preremove: deploy/packaging/preremove-agent.sh
+      postremove: deploy/packaging/postremove.sh
+
+# Homebrew tap (macOS). Casks install our unsigned binaries, so a post-install
+# hook strips the Gatekeeper quarantine flag. Activates once HOMEBREW_TAP_TOKEN
+# (a GitHub PAT with repo scope on NurRobin/homebrew-tap) is set; until then
+# skip_upload leaves the cask ungenerated so a release never fails for it.
+homebrew_casks:
+  - name: nurproxy
+    ids: [nurproxy]
+    binaries: [nurproxy]
+    repository:
+      owner: NurRobin
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/NurRobin/NurProxy"
+    description: "NurProxy orchestrator — reverse proxy and DNS management dashboard"
+    skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/nurproxy"]
+  - name: nurproxy-agent
+    ids: [nurproxy-agent]
+    binaries: [nurproxy-agent]
+    repository:
+      owner: NurRobin
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/NurRobin/NurProxy"
+    description: "NurProxy agent — manages a local reverse proxy on an edge server"
+    skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/nurproxy-agent"]
+
+# Arch User Repository. Activates once AUR_KEY (the PEM of an SSH key registered
+# with your AUR account) is set; skip_upload guards releases until then.
+aurs:
+  - name: nurproxy-bin
+    ids: [nurproxy]
+    homepage: "https://github.com/NurRobin/NurProxy"
+    description: "NurProxy orchestrator — reverse proxy and DNS management dashboard"
+    license: MIT
+    maintainers: ['NurRobin <grambrobin@gmail.com>']
+    private_key: '{{ .Env.AUR_KEY }}'
+    git_url: 'ssh://aur@aur.archlinux.org/nurproxy-bin.git'
+    skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
+    provides: ['nurproxy']
+    conflicts: ['nurproxy']
+    backup: ['etc/nurproxy/nurproxy.env']
+    package: |-
+      install -Dm755 "./nurproxy" "${pkgdir}/usr/bin/nurproxy"
+      install -Dm644 "./nurproxy.service" "${pkgdir}/usr/lib/systemd/system/nurproxy.service"
+      install -Dm644 "./nurproxy.env.example" "${pkgdir}/etc/nurproxy/nurproxy.env"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/nurproxy-bin/LICENSE"
+  - name: nurproxy-agent-bin
+    ids: [nurproxy-agent]
+    homepage: "https://github.com/NurRobin/NurProxy"
+    description: "NurProxy agent — manages a local reverse proxy on an edge server"
+    license: MIT
+    maintainers: ['NurRobin <grambrobin@gmail.com>']
+    private_key: '{{ .Env.AUR_KEY }}'
+    git_url: 'ssh://aur@aur.archlinux.org/nurproxy-agent-bin.git'
+    skip_upload: '{{ if .Env.AUR_KEY }}false{{ else }}true{{ end }}'
+    provides: ['nurproxy-agent']
+    conflicts: ['nurproxy-agent']
+    backup: ['etc/nurproxy-agent/agent.env']
+    package: |-
+      install -Dm755 "./nurproxy-agent" "${pkgdir}/usr/bin/nurproxy-agent"
+      install -Dm644 "./nurproxy-agent.service" "${pkgdir}/usr/lib/systemd/system/nurproxy-agent.service"
+      install -Dm644 "./nurproxy-agent.env.example" "${pkgdir}/etc/nurproxy-agent/agent.env"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/nurproxy-agent-bin/LICENSE"
 
 dockers:
   - image_templates:
@@ -89,6 +242,7 @@ docker_manifests:
     image_templates:
       - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-amd64"
       - "ghcr.io/nurrobin/nurproxy:{{ .Version }}-arm64"
+    skip_push: '{{ if .Prerelease }}true{{ else }}false{{ end }}'
 
   - name_template: "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}"
     image_templates:
@@ -98,9 +252,28 @@ docker_manifests:
     image_templates:
       - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-amd64"
       - "ghcr.io/nurrobin/nurproxy-agent:{{ .Version }}-arm64"
+    skip_push: '{{ if .Prerelease }}true{{ else }}false{{ end }}'
 
 checksum:
   name_template: 'checksums.txt'
+
+# SBOMs for every archive (syft must be on PATH; release.yml installs it).
+sboms:
+  - artifacts: archive
+
+# Keyless cosign signature over the checksums file. Needs cosign on PATH and
+# id-token: write in release.yml; verifiable with `cosign verify-blob`.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    output: true
+    certificate: '${artifact}.pem'
+    args:
+      - sign-blob
+      - '--output-certificate=${certificate}'
+      - '--output-signature=${signature}'
+      - '${artifact}'
+      - '--yes'
 
 changelog:
   sort: asc

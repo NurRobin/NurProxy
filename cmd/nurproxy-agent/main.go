@@ -65,6 +65,9 @@ func main() {
 		case "install":
 			cmdInstall(os.Args[2:])
 			return
+		case "setup":
+			cmdSetup(os.Args[2:])
+			return
 		case "uninstall":
 			cmdUninstall(os.Args[2:])
 			return

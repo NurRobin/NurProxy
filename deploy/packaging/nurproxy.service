@@ -1,0 +1,22 @@
+[Unit]
+Description=NurProxy orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/nurproxy/nurproxy.env
+ExecStart=/usr/bin/nurproxy
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/nurproxy
+
+[Install]
+WantedBy=multi-user.target
