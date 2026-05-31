@@ -2,19 +2,24 @@
 
 Reverse proxy and DNS management for people who run servers in more than one place.
 
-If you have a homelab, a VPS or two, and a handful of domains, you know the pain: every time you spin up a new service, you log into your DNS provider, create a record, SSH into the right server, edit the proxy config, request a certificate, and hope you didn't fat-finger anything. Multiply that by a few servers across different networks and it gets old fast.
+If you have a homelab, a VPS or two, and a handful of domains, you know the drill: every time you spin up a new service, you log into your DNS provider, create a record, SSH into the right server, edit the proxy config, request a certificate, and hope you didn't fat-finger anything. Multiply that by a few servers across different networks and it gets old fast.
 
-NurProxy puts all of that into one dashboard. You tell it which DNS provider you use, point it at your servers, and from then on, creating a new subdomain is one click. DNS record, reverse proxy route, TLS certificate, done. No more jumping between Cloudflare tabs and SSH sessions.
+NurProxy puts all of that into one dashboard. You tell it which DNS provider you use, point it at your servers, and from then on, creating a new subdomain is one click. DNS record, reverse proxy route, TLS certificate, done.
 
 ## How it works
 
 NurProxy has two parts:
 
-**The Orchestrator** is where you log in. It runs the dashboard, stores your configuration in a local SQLite database, talks to your DNS provider, and tells your agents what to do. It is a single binary with the web UI baked in. No Node.js runtime, no external database, no dependencies.
+**The Orchestrator** is where you log in. It runs the dashboard, stores your configuration in a local SQLite database, talks to your DNS provider, issues TLS certificates centrally via DNS-01, and tells your agents what to do. Single binary with the web UI baked in, no runtime dependencies, no external database.
 
-**Agents** run on each server that should act as a reverse proxy. An agent is a lightweight binary that manages a local Caddy instance. You start it, point it at your orchestrator, and adopt it through the dashboard. Once adopted, the orchestrator pushes routes to it and the agent takes care of TLS certificates automatically.
+**Agents** run on each server that should act as a reverse proxy. An agent has two modes:
 
-The split is intentional. Your DNS credentials never leave the orchestrator. Agents don't need API keys for anything. They just receive routes and serve traffic.
+- **Built-in** (default): The agent runs its own bundled **Caddy** instance. Nothing else to install. It owns the proxy process end to end.
+- **Existing**: The agent manages an **already-installed nginx or Apache** on the host. It writes that proxy's config files and reloads the service, but leaves the process under your control. Your existing vhosts stay untouched.
+
+You start an agent, point it at your orchestrator, and adopt it through the dashboard. Once adopted, the orchestrator pushes routes and TLS certificates to it, and the agent configures whichever proxy backend it uses.
+
+The split is intentional. Your DNS credentials never leave the orchestrator. Agents don't need API keys for anything. They receive routes and serve traffic.
 
 ```
                      Internet
@@ -25,7 +30,7 @@ The split is intentional. Your DNS credentials never leave the orchestrator. Age
         +-----------+   +-----------+
         |  Agent A  |   |  Agent B  |
         |  (VPS)    |   |  (Home)   |
-        |  Caddy    |   |  Caddy    |
+        |  Caddy    |   |  nginx    |
         +-----+-----+   +--+----+--+
               |             |    |
          localhost:3000   LAN   LAN
@@ -36,41 +41,94 @@ The split is intentional. Your DNS credentials never leave the orchestrator. Age
         |   Orchestrator    |
         |   Dashboard + API |
         |   SQLite + DNS    |
+        |   TLS issuance    |
         +-------------------+
 ```
 
-Each agent gets an A record at your DNS provider (pointing to the server's public IP). All subdomains that run through that agent get a CNAME pointing to the agent's FQDN. That way, if a server's IP changes (common with home connections), only one A record needs updating and all subdomains follow automatically. The agent can handle this itself with built-in DDNS support.
+Each agent gets an A record at your DNS provider (pointing to the server's public IP). All subdomains that run through that agent get a CNAME pointing to the agent's FQDN. If a server's IP changes (common with home connections), only one A record needs updating and all subdomains follow automatically. The agent can handle this itself with built-in DDNS support.
+
+## Already have nginx or Apache?
+
+NurProxy **manages your existing proxy directly**. You do not need to replace it, remove it, or put another proxy in front of it. If the agent detects nginx or Apache on the host, the dashboard offers a guided "Manage existing proxy" flow:
+
+1. The dashboard shows what it found (proxy type, config directory, test/reload commands).
+2. You confirm and get a one-time confirmation code.
+3. On the host, you run `nurproxy-agent apply <CODE>`. The agent switches from its bundled Caddy to your installed proxy live, without a restart.
+
+From that point on, the agent writes `nurproxy-*.conf` files into your proxy's config directory (e.g. `/etc/nginx/sites-available/`) and reloads the service when routes change. Your hand-written vhosts are left alone. If you edit a NurProxy-generated config on disk, the dashboard detects the drift and lets you accept or revert the change.
+
+The agent needs exactly two permissions: write access to the config directory (via group ownership) and a scoped sudoers entry for the test + reload commands. It tells you which grants are missing and prints the commands to fix them. See [Managing existing proxies](wiki/existing-proxies.md) for the full guide.
+
+```
+Internet :80/:443
+       |
+   nginx / Apache (your existing install, managed by NurProxy agent)
+       |
+   your services
+```
+
+There is no extra proxy layer, no port conflict, and no TLS delegation chain. The agent drives your existing proxy the same way you would, just centrally managed.
 
 ## The typical flow
 
-1. **Setup**: You install the orchestrator, open the dashboard, and run through the setup wizard. You enter your DNS provider credentials (Cloudflare to start, more planned), and it auto-detects your zones.
+1. **Setup**: Install the orchestrator, open the dashboard, and run through the setup wizard. Enter your DNS provider credentials (Cloudflare to start, more planned), and it auto-detects your zones. Optionally set a Let's Encrypt contact email for central TLS issuance.
 
-2. **Add an agent**: On a server that should proxy traffic, you install the agent binary and point it at the orchestrator. It shows up in the dashboard as "pending". You adopt it, give it a name, and assign which DNS zones it should handle.
+2. **Add an agent**: On a server that should proxy traffic, install the agent binary and point it at the orchestrator. It shows up in the dashboard as "pending". Adopt it, give it a name, and assign which DNS zones it should handle. If the agent detects an existing nginx or Apache, the dashboard offers to switch to managing it; otherwise it uses its bundled Caddy.
 
-3. **Add servers**: You tell the agent which backend servers it can reach. For a homelab, that might be a Proxmox host and a few VMs. You enter the IP addresses as they are reachable from the agent's perspective (this matters when your agent is in the same LAN as the backends, but you are accessing the dashboard through Tailscale or a VPN).
+3. **Add servers**: Tell the agent which backend servers it can reach. For a homelab, that might be a Proxmox host and a few VMs. Enter the IP addresses as they are reachable from the agent's perspective (this matters when your agent is in the same LAN as the backends, but you access the dashboard through Tailscale or a VPN).
 
-4. **Create a domain**: You click "New Domain", pick a zone like `example.com`, type a subdomain like `jellyfin`, pick the target server and port. Optionally you toggle WebSocket support, set a max body size, or add custom headers. Hit save. The orchestrator creates a CNAME record at your DNS provider, pushes the route to the agent, and Caddy grabs a TLS certificate. The subdomain is live within seconds.
+4. **Create a domain**: Click "New Domain", pick a zone like `example.com`, type a subdomain like `jellyfin`, pick the target server and port. Optionally toggle WebSocket support, basic auth, max body size, or custom headers. Hit save. The orchestrator creates a CNAME record at your DNS provider, issues a TLS certificate, pushes the route and cert to the agent, and the agent configures the proxy. The subdomain is live within seconds.
 
-5. **Edit anytime**: Every route is fully editable through the dashboard. Simple settings like WebSocket and body size have their own toggles. For advanced use cases, you can edit the raw Caddy JSON directly. If you customize the config manually, NurProxy marks it as manually configured and won't overwrite it during sync.
+5. **Edit anytime**: Every route is fully editable through the dashboard. Simple settings like WebSocket and body size have their own toggles. For advanced use cases, you can edit the raw config directly in the proxy's native format (Caddy JSON, nginx config, or Apache VirtualHost, depending on what the agent runs). If you customize the config manually, NurProxy marks it as manually configured and won't overwrite it during sync.
 
 ## Features
 
-- **One dashboard for everything**: See all your agents, servers, and domains in one place. Create, edit, and delete from the UI.
+### Core
+
+- **One dashboard for everything**: All agents, servers, and domains in one place. Create, edit, and delete from the UI.
 - **DNS provider integration**: Cloudflare ships first. The provider system is pluggable, so adding Hetzner DNS, deSEC, Route53, or others is straightforward.
-- **Automatic TLS**: Agents run Caddy, which handles Let's Encrypt certificates through HTTP-01 challenges. No certificate management on your end.
 - **DDNS built in**: Agents behind dynamic IPs can automatically keep their DNS A record up to date. Configurable interval per agent.
 - **CNAME chain architecture**: Subdomains point to agent FQDNs via CNAME, agents publish their own A records. One IP change updates one record, all subdomains follow.
-- **Full route control**: Toggle common settings through simple UI controls or drop into raw Caddy JSON for full flexibility.
-- **Reconciler**: A background sync loop ensures that what the dashboard says matches what is actually configured on agents and at the DNS provider. Drift gets corrected automatically.
+- **Full route control**: Toggle common settings through simple UI controls, or drop into the proxy's native config format for full flexibility. The dashboard greys out options the backend can't handle.
+- **Basic auth**: Per-route username/password protection, managed from the dashboard.
+- **MCP server (opt-in)**: Exposes an MCP endpoint so AI tools like Claude can create and manage domains programmatically. Disabled by default.
+- **Headless + CLI**: Run the orchestrator without the dashboard and manage everything via the built-in CLI client. Every command supports `--json` for scripting.
+- **Minimal footprint**: The orchestrator is a single binary (~20 MB) serving its own dashboard. Agents weigh ~30-50 MB with Caddy built in. Neither has runtime dependencies.
+
+### Proxy management
+
+- **Multi-backend support**: Agents support three proxy backends: **Caddy** (built-in, zero config), **nginx**, and **Apache**. Each agent reports its backend and capabilities; the dashboard adapts the UI accordingly.
+- **Existing proxy management**: An agent can manage an already-installed nginx or Apache instead of running its own Caddy. Existing vhosts are adopted into the central store (versioned, visible in the dashboard) but never modified unless you say so. See [Managing existing proxies](wiki/existing-proxies.md).
+- **Port-conflict detection**: On Linux, the agent detects when another process holds `:80`/`:443`, identifies it by name, and offers to switch to managing it instead of fighting for the ports.
+- **Guided setup**: `nurproxy-agent setup` prompts for the orchestrator URL and FQDN, probes connectivity, writes the env file, and starts the service. One command after package install.
+
+### TLS
+
+- **Central TLS issuance**: The orchestrator issues Let's Encrypt certificates via DNS-01, using the DNS provider credentials it already has. Certificates are stored encrypted at rest and pushed to agents, so you don't need port-80 challenge traffic.
+- **Automatic renewal**: A background loop renews certificates before expiry and re-pushes them to the serving agent.
+- **Backend-aware**: Built-in Caddy agents can also use self-managed ACME as fallback. Existing nginx/Apache agents receive centrally issued certificates with paths that match their config conventions.
+- **ACME email setup**: Configurable in the setup wizard or settings. Issuance stays inactive until an email is set, and the dashboard warns when central-TLS domains exist without one.
+
+### Config lifecycle
+
+- **Version history**: Every config artifact (generated and adopted) is versioned. The dashboard shows the full history with diffs.
+- **Drift detection**: The agent checksums on-disk config each heartbeat. If someone edits a file outside the dashboard, the change appears as drift with the actual diff.
+- **Drift review**: Accept an on-disk edit (it becomes the new baseline), reject it (the agent reverts to the last known-good version), or roll back to any previous version.
+- **Reconciler**: A background sync loop ensures that what the dashboard says matches what is actually configured on agents and at the DNS provider. Generated config that drifts is corrected automatically; manually edited config is left alone.
 - **Audit log**: Every change is logged with who did what and when.
-- **MCP server (opt-in)**: Expose an MCP endpoint so AI tools like Claude can create and manage domains programmatically. Disabled by default, enable it in settings when you want it.
-- **Minimal footprint**: The orchestrator is a single binary (~20 MB) serving its own dashboard. Agents are a single binary (~30-50 MB) with Caddy. No runtime dependencies.
+
+### Observability
+
+- **Permission self-test**: Existing-mode agents probe their permissions each heartbeat and report a structured result: can it write config? Can it reload the service? The dashboard shows which grant is missing and the commands to fix it.
+- **Degraded state**: An agent that can read config but not reload the service is marked "degraded". It stays connected and visible, but the dashboard makes clear it can't push changes live yet.
+- **Agent capabilities**: Each agent reports what its proxy backend supports (WebSocket, headers, body size, etc.). The dashboard disables controls the backend can't handle.
+- **Log tailing**: On-demand log streaming from the orchestrator in the dashboard.
 
 ## Installation
 
 The fastest path on Linux, macOS, and FreeBSD is the one-line installer. It
 downloads the right binary for your OS and architecture, installs it, and
-registers a hardened service (systemd, OpenRC, launchd, or rc.d — auto-detected)
+registers a hardened service (systemd, OpenRC, launchd, or rc.d, auto-detected)
 in one step.
 
 **Orchestrator** (on the host you log into):
@@ -162,20 +220,20 @@ extract it, and run `./nurproxy --port 8080` or
 | OS | amd64 | arm64 | armv7 | Notes |
 |---|:---:|:---:|:---:|---|
 | Linux | ✅ | ✅ | ✅ | full support; `.deb`/`.rpm` for systemd distros, OpenRC on Alpine |
-| macOS (darwin) | ✅ | ✅ | — | launchd; agent is experimental (see below) |
-| FreeBSD | ✅ | ✅ | — | rc.d (incl. OPNsense/pfSense/TrueNAS); agent is experimental |
+| macOS (darwin) | ✅ | ✅ | - | launchd; agent is experimental (see below) |
+| FreeBSD | ✅ | ✅ | - | rc.d (incl. OPNsense/pfSense/TrueNAS); agent is experimental |
 
-> Windows isn't supported: production reverse proxies don't run on bare Windows
-> — use WSL2, a Linux VM, or Docker. The orchestrator runs fully on every
+> Windows is not supported. Production reverse proxies don't run on bare Windows;
+> use WSL2, a Linux VM, or Docker instead. The orchestrator runs on every
 > platform above; the **agent** is Linux-first because a few host probes
 > (port-conflict detection, existing-proxy discovery) are Linux-only and degrade
 > gracefully elsewhere, so macOS/FreeBSD agents are experimental for now.
 
-> **A note on IP addresses and URLs**: When setting up an agent, the orchestrator URL must be reachable from the agent's machine, not from your browser. If you access the dashboard through Tailscale but the agent is in the same LAN as the orchestrator, use the LAN address. The same applies when adding backend servers to an agent: enter IP addresses as the agent sees them.
+> **IP addresses and URLs**: When setting up an agent, the orchestrator URL must be reachable from the agent's machine, not from your browser. If you access the dashboard through Tailscale but the agent is in the same LAN as the orchestrator, use the LAN address. The same applies when adding backend servers to an agent: enter IP addresses as the agent sees them.
 
 ## Headless & CLI
 
-For servers and CI you can run a **headless orchestrator** — the same API, no embedded dashboard:
+For servers and CI you can run a **headless orchestrator**, the same API without the embedded dashboard:
 
 ```bash
 make build-headless    # produces ./nurproxy-headless (no embedded web/dist)
@@ -206,9 +264,10 @@ Auth comes from `NP_API_KEY` (Bearer) or `NP_API_PASSWORD` (the CLI logs in for 
 
 - **Backend**: Go, SQLite (embedded, no CGo), single binary
 - **Frontend**: React, TypeScript, Tailwind CSS, built with Vite, embedded via `go:embed`
-- **Proxy**: Caddy (managed by agents, runtime config via Admin API)
+- **Proxy backends**: Caddy (built-in), nginx, Apache, pluggable via the `proxy.Proxy` interface
+- **TLS**: Central DNS-01 issuance via [lego](https://github.com/go-acme/lego), encrypted cert store; Caddy self-ACME as fallback
 - **DNS**: Provider plugin system (Cloudflare implemented)
-- **Builds**: Multi-arch (amd64, arm64, armv7) via GoReleaser
+- **Builds**: Multi-arch (amd64, arm64, armv7) via GoReleaser; signed releases with SBOMs
 
 ## Project structure
 
@@ -216,7 +275,8 @@ Auth comes from `NP_API_KEY` (Bearer) or `NP_API_PASSWORD` (the CLI logs in for 
 cmd/nurproxy/          Orchestrator entry point
 cmd/nurproxy-agent/    Agent entry point
 internal/orchestrator/ Orchestrator logic (API, database, reconciler)
-internal/agent/        Agent logic (Caddy management, adoption, heartbeat)
+internal/agent/        Agent logic (proxy management, adoption, heartbeat)
+internal/proxy/        Proxy backend interface + Caddy, nginx, Apache implementations
 internal/provider/     DNS provider plugin system
 internal/shared/       Shared code (models, auth, crypto, route generation)
 web/                   Dashboard (Vite + React + Tailwind)
@@ -224,7 +284,7 @@ web/                   Dashboard (Vite + React + Tailwind)
 
 ## Contributing
 
-NurProxy is open source and contributions are welcome. The DNS provider interface and notification system are designed as plugin points where new implementations can be added without touching core logic.
+NurProxy is open source and contributions are welcome. The DNS provider interface, proxy backend interface, and notification system are designed as plugin points where new implementations can be added without touching core logic.
 
 See [CLAUDE.md](CLAUDE.md) for development setup, build commands, and conventions.
 
