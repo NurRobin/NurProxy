@@ -427,6 +427,15 @@ var migrations = []string{
 	`
 	ALTER TABLE agents ADD COLUMN detected_networks TEXT NOT NULL DEFAULT '';
 	`,
+
+	// Migration 17: IPv6 support. public_ip6 holds the agent's detected public
+	// IPv6 address; dns_record_id6 tracks the provider ID of its AAAA record,
+	// separate from the A record's dns_record_id so each family updates
+	// independently under DDNS. Empty for IPv4-only hosts.
+	`
+	ALTER TABLE agents ADD COLUMN public_ip6     TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN dns_record_id6 TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

@@ -220,15 +220,23 @@ type RemediationStep struct {
 
 // Agent represents a registered proxy agent.
 type Agent struct {
-	ID           string      `json:"id"`
-	Name         string      `json:"name"`
-	FQDN         string      `json:"fqdn"`
-	APIURL       string      `json:"api_url"`
-	TokenHash    string      `json:"-"`
-	DNSMode      DNSMode     `json:"dns_mode"`
-	DDNSInterval int         `json:"ddns_interval"`
-	PublicIP     string      `json:"public_ip,omitempty"`
-	DNSRecordID  string      `json:"dns_record_id,omitempty"`
+	ID           string  `json:"id"`
+	Name         string  `json:"name"`
+	FQDN         string  `json:"fqdn"`
+	APIURL       string  `json:"api_url"`
+	TokenHash    string  `json:"-"`
+	DNSMode      DNSMode `json:"dns_mode"`
+	DDNSInterval int     `json:"ddns_interval"`
+	PublicIP     string  `json:"public_ip,omitempty"`
+	// PublicIP6 is the agent's detected public IPv6 address, used to publish an
+	// AAAA record for its anchor FQDN alongside the A record. Empty when the agent
+	// has no routable IPv6 (IPv4-only host); in that case no AAAA record is made.
+	PublicIP6   string `json:"public_ip6,omitempty"`
+	DNSRecordID string `json:"dns_record_id,omitempty"`
+	// DNSRecordID6 is the provider record ID of the agent's AAAA record, tracked
+	// separately from the A record's DNSRecordID so DDNS can update each address
+	// family independently. Empty until an AAAA record is created/adopted.
+	DNSRecordID6 string      `json:"dns_record_id6,omitempty"`
 	Status       AgentStatus `json:"status"`
 	LastSeen     *time.Time  `json:"last_seen,omitempty"`
 	Version      string      `json:"version,omitempty"`

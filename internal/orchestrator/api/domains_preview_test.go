@@ -28,7 +28,7 @@ func makePreviewDomain(t *testing.T, srv *Server, proxyMode, detectedKind string
 	// proxy_mode is owned by the heartbeat (CreateAgent defaults it to built-in),
 	// so set it explicitly to model an agent running in existing mode.
 	if proxyMode != "" {
-		if err := d.UpdateAgentHealth("a1", "", "", false, proxyMode); err != nil {
+		if err := d.UpdateAgentHealth("a1", "", "", "", false, proxyMode); err != nil {
 			t.Fatalf("UpdateAgentHealth: %v", err)
 		}
 	}

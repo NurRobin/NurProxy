@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/google/uuid"
@@ -33,12 +34,13 @@ type Manager struct {
 
 // registerRequest is the JSON body for POST /api/v1/agents/register.
 type registerRequest struct {
-	ID       string `json:"id"`
-	FQDN     string `json:"fqdn"`
-	Token    string `json:"token"`
-	APIURL   string `json:"api_url"`
-	PublicIP string `json:"public_ip"`
-	Version  string `json:"version"`
+	ID        string `json:"id"`
+	FQDN      string `json:"fqdn"`
+	Token     string `json:"token"`
+	APIURL    string `json:"api_url"`
+	PublicIP  string `json:"public_ip"`
+	PublicIP6 string `json:"public_ip6,omitempty"`
+	Version   string `json:"version"`
 	// ProxyDetection is the agent's read-only Phase-0 detection (§13.0/§2.1/§9):
 	// installed proxy + version + paths + bind-conflict holder. The agent dials
 	// out and carries it here so the orchestrator can store it on the agent row.
@@ -117,6 +119,9 @@ func (m *Manager) AgentID() string {
 // Register sends a registration request to the orchestrator.
 func (m *Manager) Register(ctx context.Context) error {
 	publicIP, _ := detectPublicIPSimple(ctx)
+	// IPv6 is best-effort and never gates registration; a v6-less host just omits
+	// it. The heartbeat re-reports both families every beat regardless.
+	publicIP6, _ := ddns.DetectPublicIP6(ctx)
 
 	apiURL := fmt.Sprintf("http://%s:%d", m.fqdn, m.apiPort)
 	if publicIP != "" {
@@ -129,6 +134,7 @@ func (m *Manager) Register(ctx context.Context) error {
 		Token:             m.token,
 		APIURL:            apiURL,
 		PublicIP:          publicIP,
+		PublicIP6:         publicIP6,
 		Version:           m.version,
 		ProxyDetection:    m.detection,
 		ProxyCapabilities: m.capabilities,
