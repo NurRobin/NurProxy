@@ -3,7 +3,16 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 )
+
+// ErrRecordNotFound signals that a record a caller tried to read or delete does
+// not exist at the provider. Providers should wrap it (errors.Is-detectable)
+// only for the specific "record does not exist" API response — NOT for transient
+// or auth errors — so callers can treat a delete of an already-absent record as
+// success (idempotent teardown) without masking real failures. For Cloudflare
+// this is HTTP 404 with API error code 81044.
+var ErrRecordNotFound = errors.New("provider: dns record not found")
 
 type Provider interface {
 	Info() ProviderInfo

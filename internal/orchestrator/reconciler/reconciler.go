@@ -6,6 +6,7 @@ package reconciler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -1031,17 +1032,34 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 			affectedAgents[srv.AgentID] = true
 		}
 
-		// Best-effort DNS record cleanup.
+		// DNS record cleanup. A record that is already gone at the provider
+		// (provider.ErrRecordNotFound) counts as success — teardown is idempotent —
+		// but any OTHER error (transient/auth/config) keeps the domain around to
+		// retry, rather than masking a real failure. On success or already-absent we
+		// CLEAR the stored record id immediately, so if a later step (row delete)
+		// fails this cycle, the next cycle does not re-attempt a delete against an
+		// id that no longer exists (which previously wedged the domain in
+		// "deleting" forever once the record was gone).
 		if dom.DNSRecordID != "" {
 			if zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID); ok {
 				provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
-				if dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID); dErr != nil {
+				dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID)
+				switch {
+				case dErr == nil:
+					r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+				case errors.Is(dErr, provider.ErrRecordNotFound):
+					// Already removed at the provider — proceed with the rest of teardown.
+					r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_skipped", fmt.Sprintf("record %s already absent", dom.DNSRecordID))
+				default:
 					log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
 					r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
 					// Keep the domain around so we retry next cycle.
 					continue
 				}
-				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+				if uErr := r.db.UpdateDomainDNSRecord(dom.ID, ""); uErr != nil {
+					log.Printf("reconciler: failed to clear DNS record id for domain %d: %v", dom.ID, uErr)
+				}
+				dom.DNSRecordID = ""
 			}
 		}
 
