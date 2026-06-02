@@ -27,6 +27,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
+	"github.com/NurRobin/NurProxy/internal/shared/logging"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -59,6 +60,11 @@ var (
 )
 
 func main() {
+	// Configure structured logging first so every log line (including the legacy
+	// log.Printf calls, which slog.SetDefault bridges) honors NP_LOG_LEVEL /
+	// NP_LOG_FORMAT.
+	logging.Setup("agent")
+
 	// Subcommands are dispatched before flag parsing so they can own their flags.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
