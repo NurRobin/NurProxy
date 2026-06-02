@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
@@ -12,6 +13,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
 )
 
 // sessionSecretSetting is the settings key under which the persistent HMAC
@@ -45,6 +47,9 @@ type Server struct {
 	pusher   RoutePusher
 	issuer   CertIssuer
 	logs     *logbroker.Broker
+	// loginLimiter blunts online password guessing: too many failed logins from
+	// one IP trip a temporary lockout.
+	loginLimiter *ratelimit.Limiter
 }
 
 // SetAgentHub wires the live agent connection hub and the route pusher into the
@@ -71,6 +76,8 @@ func NewServer(database *db.DB, version string) *Server {
 		mux:      http.NewServeMux(),
 		sessions: auth.NewSessionManager(loadOrCreateSessionKey(database)),
 		logs:     logbroker.New(),
+		// 5 failed logins per IP within 15 min → locked out for 15 min.
+		loginLimiter: ratelimit.New(5, 15*time.Minute, 15*time.Minute),
 	}
 
 	s.registerRoutes()

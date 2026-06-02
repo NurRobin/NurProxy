@@ -13,11 +13,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
 )
 
 // protocolVersion is the MCP revision this server speaks.
@@ -27,11 +30,18 @@ const protocolVersion = "2024-11-05"
 type Handler struct {
 	db      *db.DB
 	version string
+	// limiter blunts brute-forcing the admin API key against this endpoint.
+	limiter *ratelimit.Limiter
 }
 
 // New creates an MCP handler backed by the given database.
 func New(database *db.DB, version string) *Handler {
-	return &Handler{db: database, version: version}
+	return &Handler{
+		db:      database,
+		version: version,
+		// 10 failed auth attempts per IP within 15 min → locked out for 15 min.
+		limiter: ratelimit.New(10, 15*time.Minute, 15*time.Minute),
+	}
 }
 
 // enabled reports whether the operator turned MCP on.
@@ -56,6 +66,15 @@ func (h *Handler) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(token), []byte(key)) == 1
 }
 
+// mcpClientIP returns the peer IP for rate-limiting. Like the REST side it keys
+// on RemoteAddr, not the spoofable X-Forwarded-For header.
+func mcpClientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Disabled → behave as if the endpoint doesn't exist.
 	if !h.enabled() {
@@ -67,11 +86,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	ip := mcpClientIP(r)
+	if ok, retryAfter := h.limiter.Allow(ip); !ok {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())+1))
+		http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
+		return
+	}
 	if !h.authorized(r) {
+		h.limiter.Fail(ip)
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	h.limiter.Reset(ip)
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
