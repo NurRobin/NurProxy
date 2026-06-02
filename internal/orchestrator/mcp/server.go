@@ -9,6 +9,7 @@
 package mcp
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,7 +52,8 @@ func (h *Handler) authorized(r *http.Request) bool {
 	if !strings.HasPrefix(authz, prefix) {
 		return false
 	}
-	return strings.TrimSpace(authz[len(prefix):]) == key
+	token := strings.TrimSpace(authz[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(token), []byte(key)) == 1
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
