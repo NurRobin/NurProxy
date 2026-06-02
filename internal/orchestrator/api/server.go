@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"log"
 	"net/http"
 
@@ -9,8 +10,14 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// sessionSecretSetting is the settings key under which the persistent HMAC
+// secret used to sign session cookies is stored (base64 of 32 random bytes).
+// It is masked from the settings API (see system.go) so it never leaves the box.
+const sessionSecretSetting = "session_secret"
 
 // RoutePusher computes an agent's desired routes and delivers them over its live
 // stream. The reconciler implements it; API handlers call it to push config the
@@ -62,12 +69,39 @@ func NewServer(database *db.DB, version string) *Server {
 		db:       database,
 		version:  version,
 		mux:      http.NewServeMux(),
-		sessions: auth.NewSessionManager([]byte("nurproxy-session-key-" + version)),
+		sessions: auth.NewSessionManager(loadOrCreateSessionKey(database)),
 		logs:     logbroker.New(),
 	}
 
 	s.registerRoutes()
 	return s
+}
+
+// loadOrCreateSessionKey returns the persistent HMAC key used to sign session
+// cookies. It is generated once (32 cryptographically random bytes) and stored
+// in the settings table so it survives restarts AND is unique per install.
+// This replaces a key derived from a public constant plus the (publicly
+// readable) version string, which let anyone who knew the version forge a valid
+// session cookie and bypass login entirely. If the secret cannot be persisted,
+// an ephemeral random key is used: still unforgeable, but sessions reset on the
+// next restart.
+func loadOrCreateSessionKey(database *db.DB) []byte {
+	if v, err := database.GetSetting(sessionSecretSetting); err == nil && v != "" {
+		if key, derr := base64.StdEncoding.DecodeString(v); derr == nil && len(key) == 32 {
+			return key
+		}
+		log.Printf("warning: stored session secret is malformed; regenerating (existing sessions will be invalidated)")
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		// crypto/rand is broken — unrecoverable for a security-sensitive key.
+		log.Fatalf("failed to generate session secret: %v", err)
+	}
+	if err := database.SetSetting(sessionSecretSetting, base64.StdEncoding.EncodeToString(key)); err != nil {
+		log.Printf("warning: could not persist session secret, sessions will reset on restart: %v", err)
+	}
+	return key
 }
 
 // Handler returns the mux wrapped with middleware.
