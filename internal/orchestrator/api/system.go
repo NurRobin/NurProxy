@@ -1,18 +1,33 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
 
-// GET /api/v1/health
+// GET /api/v1/health — liveness + a real database check. Returns 503 (not 200)
+// when the DB is unreachable, so a load balancer or monitor can detect a wedged
+// orchestrator instead of seeing a hollow "ok".
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	resp := map[string]any{
 		"status":  "ok",
 		"version": s.version,
-	})
+		"checks":  map[string]string{"database": "ok"},
+	}
+	if err := s.db.Ping(ctx); err != nil {
+		resp["status"] = "degraded"
+		resp["checks"] = map[string]string{"database": "error: " + err.Error()}
+		writeJSON(w, http.StatusServiceUnavailable, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // GET /api/v1/audit-log — supports ?limit=&offset= pagination.

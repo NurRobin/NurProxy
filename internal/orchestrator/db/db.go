@@ -2,6 +2,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 
@@ -57,4 +58,12 @@ func Open(dbPath string, cryptoKey []byte) (*DB, error) {
 // Close closes the underlying database connection.
 func (d *DB) Close() error {
 	return d.sql.Close()
+}
+
+// Ping verifies the database is reachable and responsive by running a trivial
+// query (not just a pool check), so a wedged or corrupted database surfaces in
+// the health endpoint instead of being reported healthy.
+func (d *DB) Ping(ctx context.Context) error {
+	var n int
+	return d.sql.QueryRowContext(ctx, "SELECT 1").Scan(&n)
 }
