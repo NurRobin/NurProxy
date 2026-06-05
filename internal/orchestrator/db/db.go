@@ -18,27 +18,32 @@ type DB struct {
 // pragmas, and runs any pending schema migrations. cryptoKey is the AES-256
 // key used to encrypt/decrypt provider configurations at rest.
 func Open(dbPath string, cryptoKey []byte) (*DB, error) {
-	sqlDB, err := sql.Open("sqlite", dbPath)
+	// Pragmas must ride the DSN so EVERY pooled connection gets them. busy_timeout
+	// and foreign_keys are per-connection settings: running them once via Exec only
+	// configures whichever connection happened to serve that statement, leaving the
+	// rest of the pool with busy_timeout=0 — so any concurrent writer that doesn't
+	// win the lock immediately returns SQLITE_BUSY ("database is locked") instead of
+	// waiting. That surfaced as spurious 500s on domain create under load.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", dbPath)
+	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
-	// Enable WAL mode for better concurrent read performance.
+	// SQLite allows only one writer at a time. Capping the pool at a single
+	// connection serializes all access through it, which (combined with the DSN
+	// pragmas above) removes write contention entirely — the orchestrator's load is
+	// modest and correctness/latency-stability matters more than read parallelism
+	// here. Without this, concurrent writers (API insert + reconciler status updates
+	// + N cert-issuance goroutines) race on the WAL writer lock and intermittently
+	// fail.
+	sqlDB.SetMaxOpenConns(1)
+
+	// Belt-and-suspenders: re-assert WAL on the (single) connection. journal_mode is
+	// a persistent database property, so this is effectively idempotent.
 	if _, err := sqlDB.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("enabling WAL: %w", err)
-	}
-
-	// Enforce foreign key constraints.
-	if _, err := sqlDB.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("enabling foreign keys: %w", err)
-	}
-
-	// Set a busy timeout to avoid "database is locked" under contention.
-	if _, err := sqlDB.Exec("PRAGMA busy_timeout=5000"); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("setting busy timeout: %w", err)
 	}
 
 	d := &DB{
