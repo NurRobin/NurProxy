@@ -345,17 +345,17 @@ type ProxyConfig struct {
 
 // Domain represents a proxied subdomain.
 type Domain struct {
-	ID           int64        `json:"id"`
-	Subdomain    string       `json:"subdomain"`
-	ZoneID       string       `json:"zone_id"`
-	ServerID     string       `json:"server_id"`
-	Port         int          `json:"port"`
-	ProxyConfig  ProxyConfig  `json:"proxy_config"`
-	ManualConfig bool         `json:"manual_config"`
-	WebSocket    bool         `json:"websocket"`
-	ForceHTTPS   bool         `json:"force_https"`
-	SSLMode      SSLMode      `json:"ssl_mode"`
-	DNSRecordID  string       `json:"dns_record_id,omitempty"`
+	ID           int64       `json:"id"`
+	Subdomain    string      `json:"subdomain"`
+	ZoneID       string      `json:"zone_id"`
+	ServerID     string      `json:"server_id"`
+	Port         int         `json:"port"`
+	ProxyConfig  ProxyConfig `json:"proxy_config"`
+	ManualConfig bool        `json:"manual_config"`
+	WebSocket    bool        `json:"websocket"`
+	ForceHTTPS   bool        `json:"force_https"`
+	SSLMode      SSLMode     `json:"ssl_mode"`
+	DNSRecordID  string      `json:"dns_record_id,omitempty"`
 	// DNSManaged reports whether NurProxy created this domain's DNS record (true)
 	// or adopted a matching pre-existing one (false). On delete, only created
 	// records are removed from the provider — an adopted record predates NurProxy
@@ -363,9 +363,9 @@ type Domain struct {
 	DNSManaged bool         `json:"dns_managed"`
 	Status     DomainStatus `json:"status"`
 	ErrorMsg   string       `json:"error_msg,omitempty"`
-	LastSynced   *time.Time   `json:"last_synced,omitempty"`
-	CreatedAt    time.Time    `json:"created_at"`
-	UpdatedAt    time.Time    `json:"updated_at"`
+	LastSynced *time.Time   `json:"last_synced,omitempty"`
+	CreatedAt  time.Time    `json:"created_at"`
+	UpdatedAt  time.Time    `json:"updated_at"`
 }
 
 // FQDN returns the full domain name (subdomain + zone).
