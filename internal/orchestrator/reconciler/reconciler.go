@@ -725,8 +725,9 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 
 	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
 		// Identical record already exists — adopt it instead of creating a duplicate
-		// ("it's the record we'd set anyway, just skip").
-		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID); dErr != nil {
+		// ("it's the record we'd set anyway, just skip"). managed=false: we did NOT
+		// create this record, so teardown must never delete it (§79).
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, false); dErr != nil {
 			log.Printf("reconciler: failed to store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
 		}
 		// Clear any stale DNS error; the proxy apply sets the real status next.
@@ -759,7 +760,8 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
 		return
 	}
-	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
+	// managed=true: NurProxy created this record, so teardown may delete it (§79).
+	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
 		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
 	}
 	r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
@@ -1031,8 +1033,12 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 			affectedAgents[srv.AgentID] = true
 		}
 
-		// Best-effort DNS record cleanup.
-		if dom.DNSRecordID != "" {
+		// Best-effort DNS record cleanup — but ONLY for records NurProxy created.
+		// An adopted record (DNSManaged == false) predates NurProxy and must never
+		// be deleted: doing so would destroy the operator's own DNS. Skipping the
+		// delete for adopted records also avoids the failure path below stranding
+		// the domain in "deleting" forever (§79).
+		if dom.DNSRecordID != "" && dom.DNSManaged {
 			if zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID); ok {
 				provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
 				if dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID); dErr != nil {
@@ -1043,6 +1049,9 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 				}
 				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
 			}
+		} else if dom.DNSRecordID != "" && !dom.DNSManaged {
+			log.Printf("reconciler: leaving adopted DNS record %s for domain %d in place (NurProxy did not create it)", dom.DNSRecordID, dom.ID)
+			r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_left_adopted", fmt.Sprintf("kept operator-owned record %s", dom.DNSRecordID))
 		}
 
 		// Route cleanup on the host rides the dial-out stream (the re-push after this

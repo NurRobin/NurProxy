@@ -356,8 +356,13 @@ type Domain struct {
 	ForceHTTPS   bool         `json:"force_https"`
 	SSLMode      SSLMode      `json:"ssl_mode"`
 	DNSRecordID  string       `json:"dns_record_id,omitempty"`
-	Status       DomainStatus `json:"status"`
-	ErrorMsg     string       `json:"error_msg,omitempty"`
+	// DNSManaged reports whether NurProxy created this domain's DNS record (true)
+	// or adopted a matching pre-existing one (false). On delete, only created
+	// records are removed from the provider — an adopted record predates NurProxy
+	// and must not be destroyed.
+	DNSManaged bool         `json:"dns_managed"`
+	Status     DomainStatus `json:"status"`
+	ErrorMsg   string       `json:"error_msg,omitempty"`
 	LastSynced   *time.Time   `json:"last_synced,omitempty"`
 	CreatedAt    time.Time    `json:"created_at"`
 	UpdatedAt    time.Time    `json:"updated_at"`
