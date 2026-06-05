@@ -398,6 +398,11 @@ func registerMockProvider(t *testing.T) *mockDNSProvider {
 func TestReconcileRoutes_PushMissing(t *testing.T) {
 	d := testDB(t)
 	_, _, agent, _, dom := setupScenario(t, d)
+	// A cert exists for the host, so a successful apply marks the domain active
+	// (a central-TLS domain WITHOUT a cert would correctly be "degraded", §78).
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -1121,6 +1126,10 @@ func TestRunOnce_FullCycle(t *testing.T) {
 	d := testDB(t)
 	mp := registerMockProvider(t)
 	_, _, agent, _, dom := setupScenario(t, d)
+	// Cert present so the fully-synced domain ends "active" (no cert => "degraded", §78).
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)

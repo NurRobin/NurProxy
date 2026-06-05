@@ -23,6 +23,12 @@ const (
 	DomainStatusActive   DomainStatus = "active"
 	DomainStatusError    DomainStatus = "error"
 	DomainStatusDeleting DomainStatus = "deleting"
+	// DomainStatusDegraded means the route is applied and serving, but not as the
+	// operator intended: a central-TLS domain is being served over plaintext HTTP
+	// because no certificate has been issued yet (TLS + force_https were dropped).
+	// Distinct from "active" so the dashboard never implies HTTPS is enforced when
+	// it is not (§78).
+	DomainStatusDegraded DomainStatus = "degraded"
 )
 
 // DNSMode indicates whether DNS records are static or use dynamic DNS.
