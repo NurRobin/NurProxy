@@ -45,7 +45,23 @@ func (s *providerSolver) Present(ctx context.Context, fqdn, value string) error 
 		TTL:     120,
 	})
 	if err != nil {
-		return fmt.Errorf("tls: creating challenge TXT %s: %w", name, err)
+		// Idempotency: a prior issuance attempt that died before CleanUp ran (CA
+		// unreachable, context deadline, process restart) can leave an identical
+		// _acme-challenge TXT behind. The provider then rejects the re-create as a
+		// duplicate (e.g. Cloudflare error 81058), which would permanently wedge
+		// issuance for this host. Adopt the existing identical record instead of
+		// failing — it carries exactly the challenge value we need.
+		if existingID, found := s.findExistingChallenge(ctx, name, value); found {
+			id = existingID
+			if s.logger != nil {
+				s.logger.WarnContext(ctx, "adopted pre-existing DNS-01 challenge record (prior attempt likely left it behind)",
+					slog.String("fqdn", name),
+					slog.String("record_id", id),
+				)
+			}
+		} else {
+			return fmt.Errorf("tls: creating challenge TXT %s: %w", name, err)
+		}
 	}
 
 	s.mu.Lock()
@@ -92,6 +108,24 @@ func (s *providerSolver) legoPresent(domain, _, keyAuth string) error {
 func (s *providerSolver) legoCleanUp(domain, _, keyAuth string) error {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	return s.CleanUp(context.Background(), info.FQDN, info.Value)
+}
+
+// findExistingChallenge looks up an already-present TXT record at name whose
+// content equals value (the exact challenge token), returning its provider ID so
+// Present can adopt it. Used only on the create-duplicate path. A provider that
+// cannot list records, or a lookup error, yields (._, false) so the caller
+// surfaces the original create error rather than masking it.
+func (s *providerSolver) findExistingChallenge(ctx context.Context, name, value string) (string, bool) {
+	recs, err := s.provider.ListRecords(ctx, s.config, name, "TXT")
+	if err != nil {
+		return "", false
+	}
+	for _, r := range recs {
+		if r.Content == value && r.ID != "" {
+			return r.ID, true
+		}
+	}
+	return "", false
 }
 
 func challengeKey(fqdn, value string) string {
