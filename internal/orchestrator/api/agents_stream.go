@@ -206,15 +206,6 @@ func (s *Server) storeArtifactReport(r *http.Request, agentID string, rep *proxy
 		return
 	}
 
-	// Invariant #4: the backend dropped one or more unsupported options rather
-	// than failing the render. The agent logged each locally; record them in the
-	// central audit log too (source agent + actor agent) so the operator can see
-	// exactly what was silently dropped. This runs regardless of apply success.
-	for _, w := range rep.Warnings {
-		s.auditAs(r, models.AuditSourceAgent, "config_artifact", rep.ArtifactID, "option_dropped",
-			fmt.Sprintf("%s (%s)", w, rep.Host))
-	}
-
 	existing, err := s.db.GetConfigArtifact(rep.ArtifactID)
 	notFound := err != nil
 
@@ -225,6 +216,18 @@ func (s *Server) storeArtifactReport(r *http.Request, agentID string, rep *proxy
 	if !notFound && existing.AgentID != agentID {
 		log.Printf("ack: agent %s attempted to write artifact %s owned by agent %s; refusing", agentID, rep.ArtifactID, existing.AgentID)
 		return
+	}
+
+	// Invariant #4: record the options the backend silently dropped (e.g.
+	// force_https / TLS dropped because no certificate is available yet). Audit
+	// them ONLY when this is a new artifact or its content changed — never on an
+	// unchanged heartbeat re-ACK — so a route that stays persistently degraded (a
+	// cert still pending or rate-limited) does not spam the activity feed with an
+	// identical option_dropped line every few seconds. Gated on the content
+	// checksum, independent of the store write below, so the drop is still recorded
+	// even if persistence later fails.
+	if notFound || existing.Content != rep.Content {
+		s.auditDroppedOptions(r, rep)
 	}
 
 	// A per-artifact apply failure: flag the stored artifact (if any) as
@@ -273,6 +276,20 @@ func (s *Server) storeArtifactReport(r *http.Request, agentID string, rep *proxy
 	// is not a config change worth an audit line.
 	if ver != nil && ver.Version != prevVersion {
 		s.audit(r, "config_artifact", rep.ArtifactID, "apply", fmt.Sprintf("applied version %d (%s)", ver.Version, rep.Host))
+	}
+}
+
+// auditDroppedOptions records the backend's silently-dropped options (invariant
+// #4 — e.g. force_https or TLS dropped because no certificate is available yet)
+// to the central audit log so the operator can see what was degraded. It is
+// called ONLY when the artifact is first stored or its content genuinely changes
+// — never on an unchanged re-ACK — so a route that stays persistently degraded
+// (a cert still pending / rate-limited) does not spam the activity feed with an
+// identical option_dropped line on every heartbeat.
+func (s *Server) auditDroppedOptions(r *http.Request, rep *proxymodel.ArtifactReport) {
+	for _, w := range rep.Warnings {
+		s.auditAs(r, models.AuditSourceAgent, "config_artifact", rep.ArtifactID, "option_dropped",
+			fmt.Sprintf("%s (%s)", w, rep.Host))
 	}
 }
 
