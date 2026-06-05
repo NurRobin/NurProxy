@@ -1072,7 +1072,7 @@ func TestDomain_UpdateDNSRecord(t *testing.T) {
 	s := createTestServer(t, d, a.ID)
 	dom := createTestDomain(t, d, z.ID, s.ID)
 
-	if err := d.UpdateDomainDNSRecord(dom.ID, "rec-xyz"); err != nil {
+	if err := d.UpdateDomainDNSRecord(dom.ID, "rec-xyz", true); err != nil {
 		t.Fatal(err)
 	}
 
