@@ -23,6 +23,21 @@ const DefaultRenewWindow = 30 * 24 * time.Hour
 // scan cadence does not need to be tight; once a day is ample and cheap.
 const DefaultRenewInterval = 12 * time.Hour
 
+// Issuance retry policy. A single attempt is fragile: DNS-01 issuance crosses the
+// public internet to the ACME CA, and a transient blip (TLS handshake timeout,
+// packet loss, "no route to host" on a flaky uplink) fails the whole attempt —
+// after which the on-create fast path would otherwise wait up to a full
+// DefaultRenewInterval before trying again. Retrying a few times with exponential
+// backoff turns an intermittently-reachable CA (observed ~50% success on a lossy
+// link) into reliable issuance. Rate-limit and not-configured errors are NOT
+// retried (they will not clear within this window; retrying only burns quota).
+// vars (not consts) so tests can shrink the backoff; production never mutates them.
+var (
+	issueMaxAttempts = 4
+	issueBaseBackoff = 2 * time.Second
+	issueMaxBackoff  = 30 * time.Second
+)
+
 // RenewTarget is one certificate the renewer should re-issue: the host (primary
 // FQDN), the full name set the existing cert covers, whether it is a wildcard,
 // and the DNS provider plus decrypted config to drive DNS-01 against. The
@@ -232,6 +247,56 @@ func (r *Renewer) EnsureCertForHost(ctx context.Context, host string) error {
 	return nil
 }
 
+// issueWithRetry obtains a certificate, retrying transient failures with
+// exponential backoff (issueMaxAttempts / issueBaseBackoff / issueMaxBackoff).
+// It does NOT retry a CA rate limit (it will not clear within the backoff window
+// and retrying burns quota) nor ErrACMENotConfigured (nothing to retry until the
+// operator configures the contact email); both are returned immediately. The
+// context bounds total time, so a caller-imposed deadline still caps the work.
+func (r *Renewer) issueWithRetry(ctx context.Context, req IssueRequest, p provider.Provider, config json.RawMessage) (*CertResult, error) {
+	var lastErr error
+	for attempt := 1; attempt <= issueMaxAttempts; attempt++ {
+		res, err := r.issuer.Issue(ctx, req, p, config)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+
+		// Permanent / expected conditions: do not retry.
+		if errors.Is(err, ErrACMENotConfigured) {
+			return nil, err
+		}
+		var rl *RateLimitError
+		if asRateLimit(err, &rl) {
+			return nil, err
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		if attempt == issueMaxAttempts {
+			break
+		}
+
+		backoff := issueBaseBackoff << (attempt - 1)
+		if backoff > issueMaxBackoff {
+			backoff = issueMaxBackoff
+		}
+		r.logger.WarnContext(ctx, "tls: issuance attempt failed, retrying",
+			slog.String("host", req.Host),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", issueMaxAttempts),
+			slog.Duration("backoff", backoff),
+			slog.Any("error", err),
+		)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	return nil, lastErr
+}
+
 // renewOne re-issues, saves, and re-pushes a single certificate. The re-issue
 // reuses the exact name set and wildcard flag of the existing cert so scope never
 // drifts. A reload-push failure is non-fatal: the new bundle is already stored
@@ -246,7 +311,7 @@ func (r *Renewer) renewOne(ctx context.Context, t RenewTarget) error {
 	// so the renewed cert covers exactly what the old one did.
 	req.SANs = sansFromNames(t.Host, t.IsWildcard, t.Names)
 
-	res, err := r.issuer.Issue(ctx, req, t.Provider, t.Config)
+	res, err := r.issueWithRetry(ctx, req, t.Provider, t.Config)
 	if err != nil {
 		return fmt.Errorf("re-issuing %s: %w", t.Host, err)
 	}
