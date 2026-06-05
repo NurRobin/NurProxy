@@ -555,8 +555,8 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 				continue
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_pushed", "pushed missing route to agent")
-			if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
-				log.Printf("reconciler: failed to mark domain synced: %v", dErr)
+			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
 		}
@@ -565,8 +565,8 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if routesMatch(desired.route, actual) {
 			// All good — keep last_synced fresh so the dashboard reflects the
 			// most recent successful reconciliation.
-			if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
-				log.Printf("reconciler: failed to mark domain synced: %v", dErr)
+			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
 		}

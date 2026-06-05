@@ -266,6 +266,34 @@ func (d *DB) MarkDomainSynced(id int64) error {
 	return nil
 }
 
+// MarkDomainApplied records a successful route apply. For a domain that wants a
+// central-TLS certificate (wantsCentralTLS), it first checks whether one has
+// actually been issued for fqdn: if not, the agent is serving the route over
+// plaintext HTTP (TLS and any force_https redirect were dropped), so the domain
+// is marked "degraded" with an explanatory error rather than a bare "active"
+// that would hide the downgrade (§78). Otherwise the domain is marked active.
+func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) error {
+	if wantsCentralTLS {
+		if _, err := d.GetCertificate(fqdn); err != nil {
+			now := time.Now().UTC().Format(time.RFC3339)
+			res, xErr := d.sql.Exec(`
+				UPDATE domains SET status = ?, error_msg = ?, last_synced = ?, updated_at = ? WHERE id = ?`,
+				string(models.DomainStatusDegraded),
+				"served over plaintext HTTP — no TLS certificate issued yet; force_https not enforced",
+				now, now, id,
+			)
+			if xErr != nil {
+				return fmt.Errorf("marking domain degraded: %w", xErr)
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return fmt.Errorf("domain not found: %d", id)
+			}
+			return nil
+		}
+	}
+	return d.MarkDomainSynced(id)
+}
+
 // UpdateDomainDNSRecord stores the provider record id for a domain and records
 // whether NurProxy created that record (managed=true) or adopted a pre-existing
 // matching one (managed=false). Only created records are deleted on teardown.

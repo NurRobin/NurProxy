@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
+	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -183,8 +184,8 @@ func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if applied[fqdn] {
-			if err := s.db.MarkDomainSynced(dom.ID); err != nil {
-				log.Printf("ack: failed to mark domain %d synced: %v", dom.ID, err)
+			if err := s.db.MarkDomainApplied(dom.ID, fqdn, caddygen.TLSPolicyForDomain(*dom) == proxymodel.TLSPolicyCentral); err != nil {
+				log.Printf("ack: failed to mark domain %d applied: %v", dom.ID, err)
 			}
 		}
 	}
