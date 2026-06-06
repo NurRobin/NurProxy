@@ -50,6 +50,12 @@ func main() {
 		case "version":
 			fmt.Printf("nurproxy %s\n", version)
 			return
+		case "backup":
+			cmdBackup(os.Args[2:])
+			return
+		case "restore":
+			cmdRestore(os.Args[2:])
+			return
 		default:
 			// Management CLI subcommands (provider/zone/agent/server/domain/...).
 			// If handled, we're done; otherwise fall through to running the server.
