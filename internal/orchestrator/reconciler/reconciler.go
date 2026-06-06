@@ -6,6 +6,7 @@ package reconciler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -1059,21 +1060,37 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 			affectedAgents[srv.AgentID] = true
 		}
 
-		// Best-effort DNS record cleanup — but ONLY for records NurProxy created.
-		// An adopted record (DNSManaged == false) predates NurProxy and must never
-		// be deleted: doing so would destroy the operator's own DNS. Skipping the
-		// delete for adopted records also avoids the failure path below stranding
-		// the domain in "deleting" forever (§79).
+		// DNS record cleanup, deleting ONLY records NurProxy created (DNSManaged):
+		// an adopted record predates NurProxy and must never be removed, or we would
+		// destroy the operator's own DNS. Deletion is idempotent — a record already
+		// gone at the provider (provider.ErrRecordNotFound) counts as success, so
+		// teardown is never wedged in "deleting" forever — while any OTHER error
+		// keeps the domain around to retry rather than masking a real failure. On
+		// success or already-absent we CLEAR the stored record id immediately, so a
+		// later-step failure this cycle does not re-attempt a delete against an id
+		// that no longer exists.
 		if dom.DNSRecordID != "" && dom.DNSManaged {
 			if zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID); ok {
 				provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
-				if dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID); dErr != nil {
+				dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID)
+				switch {
+				case dErr == nil:
+					r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+				case errors.Is(dErr, provider.ErrRecordNotFound):
+					// Already removed at the provider — proceed with the rest of teardown.
+					r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_skipped", fmt.Sprintf("record %s already absent", dom.DNSRecordID))
+				default:
 					log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
 					r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
 					// Keep the domain around so we retry next cycle.
 					continue
 				}
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+				// Record gone: clear its id and the managed flag so a later-step
+				// failure this cycle does not re-attempt a delete against a dead id.
+				if uErr := r.db.UpdateDomainDNSRecord(dom.ID, "", false); uErr != nil {
+					log.Printf("reconciler: failed to clear DNS record id for domain %d: %v", dom.ID, uErr)
+				}
+				dom.DNSRecordID = ""
 			}
 		} else if dom.DNSRecordID != "" && !dom.DNSManaged {
 			log.Printf("reconciler: leaving adopted DNS record %s for domain %d in place (NurProxy did not create it)", dom.DNSRecordID, dom.ID)

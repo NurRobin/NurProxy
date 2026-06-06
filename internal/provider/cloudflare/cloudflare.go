@@ -391,13 +391,30 @@ func (p *CloudflareProvider) doRequest(ctx context.Context, token, method, path 
 	return &cfResp, nil
 }
 
-func formatCFErrors(errors []cfError) error {
-	if len(errors) == 0 {
+// cfErrCodeRecordNotFound is Cloudflare's API error code for "Record does not
+// exist", returned (with HTTP 404) when deleting or editing a record that isn't
+// there. We map ONLY this code to provider.ErrRecordNotFound so an idempotent
+// delete can treat it as already-done; every other code stays a plain error so
+// transient/auth/config failures are not masked.
+const cfErrCodeRecordNotFound = 81044
+
+func formatCFErrors(errs []cfError) error {
+	if len(errs) == 0 {
 		return fmt.Errorf("cloudflare: unknown API error")
 	}
-	msgs := make([]string, 0, len(errors))
-	for _, e := range errors {
+	msgs := make([]string, 0, len(errs))
+	notFound := false
+	for _, e := range errs {
 		msgs = append(msgs, fmt.Sprintf("[%d] %s", e.Code, e.Message))
+		if e.Code == cfErrCodeRecordNotFound {
+			notFound = true
+		}
 	}
-	return fmt.Errorf("cloudflare API error: %s", strings.Join(msgs, "; "))
+	detail := strings.Join(msgs, "; ")
+	if notFound {
+		// Wrap the sentinel so errors.Is(err, provider.ErrRecordNotFound) holds,
+		// while keeping the human-readable detail.
+		return fmt.Errorf("%w: cloudflare API error: %s", provider.ErrRecordNotFound, detail)
+	}
+	return fmt.Errorf("cloudflare API error: %s", detail)
 }
