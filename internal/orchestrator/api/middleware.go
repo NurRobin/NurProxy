@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"log"
 	"net/http"
 	"strings"
@@ -36,7 +37,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		// 2) Bearer token — admin API key → REST API
 		if token := bearerToken(r); token != "" {
 			apiKey, err := s.db.GetSetting("admin_api_key")
-			if err == nil && apiKey != "" && apiKey == token {
+			if err == nil && apiKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(token)) == 1 {
 				ctx := context.WithValue(r.Context(), ctxActor, "api_key")
 				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -93,13 +94,18 @@ func (s *Server) requireAgentAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// corsMiddleware adds CORS headers.
+// corsMiddleware adds CORS headers. It allows any origin for header-based
+// (Bearer API key) access but deliberately does NOT set
+// Access-Control-Allow-Credentials: a wildcard origin combined with credentials
+// is rejected by browsers anyway, and the dashboard is served from the same
+// origin as the API, so its session cookie never needs a cross-origin grant.
+// Keeping the two consistent removes the misconfiguration without losing any
+// supported access path.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
