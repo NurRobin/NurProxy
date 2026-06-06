@@ -37,6 +37,7 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		if zones == nil {
 			zones = []models.Zone{}
 		}
+		a.VersionStatus = s.agentVersionStatus(a.Version)
 		resp[i] = agentResponse{
 			Agent: a,
 			Zones: zones,
@@ -287,6 +288,7 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 		"last_seen":          agent.LastSeen,
 		"public_ip":          agent.PublicIP,
 		"version":            agent.Version,
+		"version_status":     s.agentVersionStatus(agent.Version),
 		"caddy_running":      agent.CaddyRunning,
 		"proxy_mode":         agent.ProxyMode,
 		"last_error":         agent.LastError,

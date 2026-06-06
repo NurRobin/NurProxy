@@ -205,6 +205,57 @@ func TestAuditPaths_DroppedOptions_auditedSourceAgent(t *testing.T) {
 	}
 }
 
+// TestAuditPaths_DroppedOptions_notReauditedOnUnchangedReack checks that a route
+// which stays persistently degraded (same dropped options on every heartbeat,
+// e.g. force_https dropped while a cert is still pending or rate-limited) does
+// NOT re-write its option_dropped lines on each identical re-ACK — otherwise the
+// activity feed gets spammed. The drop is audited on first apply and on genuine
+// content changes only.
+func TestAuditPaths_DroppedOptions_notReauditedOnUnchangedReack(t *testing.T) {
+	srv, database := testServer(t)
+	token := makeAgent(t, database, "agent-1", "edge1.example.com", models.AgentStatusAdopted, nil)
+
+	// A non-"dom-" artifact id keeps domain_id NULL so the artifact persists in
+	// the test DB without seeding a full domain row; the dedup logic (gated on
+	// stored content) is identical regardless.
+	ack := proxymodel.ApplyAck{Reports: []proxymodel.ArtifactReport{{
+		ArtifactID: "adopted-app.example.com",
+		Host:       "app.example.com",
+		Backend:    "nginx",
+		TargetKind: "file",
+		TargetPath: "/etc/nginx/sites-available/nurproxy-app.example.com.conf",
+		Content:    "server {}",
+		Checksum:   db.ChecksumContent("server {}"),
+		Enabled:    true,
+		Warnings: []string{
+			"force_https: no TLS certificate available for this route; HTTP→HTTPS redirect dropped",
+			"tls: no provided certificate available; route served over plaintext HTTP",
+		},
+	}}}
+
+	// Three identical ACKs (simulating heartbeats while the cert is still pending).
+	for i := 0; i < 3; i++ {
+		if w := doRequestWithAuth(t, srv.Handler(), "POST", "/api/v1/agents/agent-1/routes/ack", ack, token); w.Code != 200 {
+			t.Fatalf("ack %d: %d %s", i, w.Code, w.Body.String())
+		}
+	}
+
+	entries, _, err := database.ListAuditLogFiltered(models.AuditSourceAgent, 500, 0)
+	if err != nil {
+		t.Fatalf("ListAuditLogFiltered: %v", err)
+	}
+	dropped := 0
+	for _, e := range entries {
+		if e.EntityType == "config_artifact" && e.EntityID == "adopted-app.example.com" && e.Action == "option_dropped" {
+			dropped++
+		}
+	}
+	// Only the FIRST apply audits the two drops; the two identical re-ACKs add none.
+	if dropped != 2 {
+		t.Fatalf("expected 2 option_dropped entries after 3 identical ACKs (no re-audit spam), got %d", dropped)
+	}
+}
+
 func assertUIAdmin(t *testing.T, e models.AuditLogEntry) {
 	t.Helper()
 	if e.Source != models.AuditSourceUI {

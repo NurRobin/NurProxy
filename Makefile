@@ -1,4 +1,4 @@
-.PHONY: build build-agent build-headless build-all test test-integration test-e2e lint clean dev help
+.PHONY: build build-agent build-headless build-all test test-integration test-e2e test-sandbox lint clean dev dev-sandbox help
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -25,6 +25,9 @@ test-integration: ## Run integration tests
 test-e2e: ## Run E2E tests
 	go test -race -count=1 -tags=e2e ./...
 
+test-sandbox: build-headless build-agent ## Run the dry-run sandbox e2e test (full stack, no external deps)
+	go test -count=1 -tags=sandbox -timeout=180s ./test/sandbox/...
+
 test-cover: ## Run tests with coverage
 	go test -race -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
@@ -35,6 +38,10 @@ lint: ## Run linters
 
 lint-fix: ## Run linters with auto-fix
 	golangci-lint run --fix ./...
+
+## Sandbox
+dev-sandbox: build build-agent ## Bring up a full dry-run stack (orchestrator + agents) and seed it
+	ORCH_BIN=./nurproxy AGENT_BIN=./nurproxy-agent ./scripts/dev-sandbox.sh
 
 ## Frontend
 dev: ## Run dashboard dev server

@@ -143,6 +143,12 @@ export interface Agent {
   status: 'pending' | 'adopted' | 'offline' | 'error';
   last_seen?: string;
   version?: string;
+  /**
+   * Computed server-side: how the agent's version compares to the orchestrator's
+   * ('current' | 'outdated' | 'ahead'). 'unknown' when either side is missing or
+   * a non-release (dev) build.
+   */
+  version_status?: 'current' | 'outdated' | 'ahead' | 'unknown';
   caddy_running?: boolean;
   /**
    * The agent's CURRENT live reverse-proxy mode (§19): 'built-in' (bundled Caddy)

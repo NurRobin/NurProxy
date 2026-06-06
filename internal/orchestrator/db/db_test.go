@@ -1072,7 +1072,7 @@ func TestDomain_UpdateDNSRecord(t *testing.T) {
 	s := createTestServer(t, d, a.ID)
 	dom := createTestDomain(t, d, z.ID, s.ID)
 
-	if err := d.UpdateDomainDNSRecord(dom.ID, "rec-xyz"); err != nil {
+	if err := d.UpdateDomainDNSRecord(dom.ID, "rec-xyz", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1345,5 +1345,55 @@ func TestDomain_LastSyncedRoundtrip(t *testing.T) {
 	}
 	if got.LastSynced == nil {
 		t.Fatal("expected LastSynced to be set")
+	}
+}
+
+// TestMarkDomainApplied_reflectsCertPresence proves the #78 fix: a successful
+// apply marks a central-TLS domain "degraded" (with a message) while it has no
+// certificate (served plaintext), "active" once a cert exists, and "active"
+// regardless when the domain does not want central TLS.
+func TestMarkDomainApplied_reflectsCertPresence(t *testing.T) {
+	d := testDB(t)
+	p := createTestProvider(t, d)
+	z := createTestZone(t, d, p.ID)
+	a := createTestAgent(t, d)
+	s := createTestServer(t, d, a.ID)
+	dom := createTestDomain(t, d, z.ID, s.ID)
+	const host = "svc.example.com"
+
+	// central TLS wanted, no cert -> degraded with an explanatory message.
+	if err := d.MarkDomainApplied(dom.ID, host, true); err != nil {
+		t.Fatalf("MarkDomainApplied: %v", err)
+	}
+	got, _ := d.GetDomain(dom.ID)
+	if got.Status != models.DomainStatusDegraded {
+		t.Errorf("no-cert central-TLS: status = %q, want degraded", got.Status)
+	}
+	if got.ErrorMsg == "" {
+		t.Error("degraded domain should carry an explanatory error_msg")
+	}
+
+	// not central TLS -> active even without a cert.
+	if err := d.MarkDomainApplied(dom.ID, host, false); err != nil {
+		t.Fatalf("MarkDomainApplied: %v", err)
+	}
+	got, _ = d.GetDomain(dom.ID)
+	if got.Status != models.DomainStatusActive {
+		t.Errorf("non-central-TLS: status = %q, want active", got.Status)
+	}
+
+	// central TLS + cert present -> active, error cleared.
+	if err := d.UpsertCertificate(&models.Certificate{ID: "c1", Host: host, Names: []string{host}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+	if err := d.MarkDomainApplied(dom.ID, host, true); err != nil {
+		t.Fatalf("MarkDomainApplied: %v", err)
+	}
+	got, _ = d.GetDomain(dom.ID)
+	if got.Status != models.DomainStatusActive {
+		t.Errorf("cert present: status = %q, want active", got.Status)
+	}
+	if got.ErrorMsg != "" {
+		t.Errorf("active domain should have empty error_msg, got %q", got.ErrorMsg)
 	}
 }

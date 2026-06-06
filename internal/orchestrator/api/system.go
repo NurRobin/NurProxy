@@ -17,9 +17,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	resp := map[string]any{
-		"status":  "ok",
-		"version": s.version,
-		"checks":  map[string]string{"database": "ok"},
+		"status":       "ok",
+		"version":      s.version,
+		"checks":       map[string]string{"database": "ok"},
+		"dry_run":      s.dnsDryRun || s.acmeDryRun,
+		"dns_dry_run":  s.dnsDryRun,
+		"acme_dry_run": s.acmeDryRun,
 	}
 	if err := s.db.Ping(ctx); err != nil {
 		resp["status"] = "degraded"
