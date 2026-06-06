@@ -238,6 +238,12 @@ type Agent struct {
 	Status       AgentStatus `json:"status"`
 	LastSeen     *time.Time  `json:"last_seen,omitempty"`
 	Version      string      `json:"version,omitempty"`
+	// VersionStatus is a COMPUTED, non-persisted comparison of the agent's version
+	// against the orchestrator's, set by the API when listing/showing an agent so
+	// the dashboard can flag skew: "current" | "outdated" | "ahead" | "unknown"
+	// (unknown when either version is missing or non-semver, e.g. a dev build). It
+	// is never stored — it has no DB column and is recomputed per response.
+	VersionStatus string `json:"version_status,omitempty"`
 	// CaddyRunning reports whether the agent's embedded Caddy is serving
 	// traffic. It can be false (e.g. ports 80/443 are taken by another service)
 	// while the agent itself is perfectly healthy and connected.

@@ -180,6 +180,12 @@
     "zones": "Zones",
     "ip": "IP",
     "version": "Version",
+    "versionStatus": {
+      "outdated": "outdated",
+      "ahead": "ahead",
+      "outdatedHint": "This agent is older than the orchestrator — consider upgrading it.",
+      "aheadHint": "This agent is newer than the orchestrator."
+    },
     "lastSeen": "Last seen",
     "id": "ID",
     "manageInServers": "Manage in Servers →",
