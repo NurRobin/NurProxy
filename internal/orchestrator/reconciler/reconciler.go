@@ -15,6 +15,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/provider"
+	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -50,6 +51,12 @@ type Reconciler struct {
 	mu          sync.Mutex
 	cancel      context.CancelFunc
 	running     bool
+
+	// dnsDryRun routes every DNS provider operation through the in-memory sandbox
+	// instead of a real provider (#93). auditSource is "dryrun" while it is on so
+	// the audit trail can never be mistaken for real DNS changes.
+	dnsDryRun   bool
+	auditSource models.AuditSource
 }
 
 // New creates a Reconciler.
@@ -58,7 +65,29 @@ func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reco
 		db:          database,
 		agentClient: agentClient,
 		interval:    interval,
+		auditSource: models.AuditSourceSystem,
 	}
+}
+
+// SetDryRunDNS toggles DNS sandbox mode. When on, the reconciler wraps every
+// resolved DNS provider with the dry-run decorator (no real API calls) and tags
+// its audit entries with the dry-run source so they are clearly synthetic.
+func (r *Reconciler) SetDryRunDNS(on bool) {
+	r.dnsDryRun = on
+	if on {
+		r.auditSource = models.AuditSourceDryRun
+	} else {
+		r.auditSource = models.AuditSourceSystem
+	}
+}
+
+// wrapDNS returns p unchanged, or its dry-run sandbox decorator when DNS dry-run
+// mode is active. Applied at every point the reconciler resolves a DNS provider.
+func (r *Reconciler) wrapDNS(p provider.Provider) provider.Provider {
+	if r.dnsDryRun {
+		return dryrun.Wrap(p, nil)
+	}
+	return p
 }
 
 // SetHub attaches the agent connection hub so the reconciler can push routes to
@@ -642,6 +671,7 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 			log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, pErr)
 			continue
 		}
+		dnsProvider = r.wrapDNS(dnsProvider)
 
 		// Merge zone's external ID into provider config for DNS API calls.
 		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
@@ -879,6 +909,7 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 			log.Printf("reconciler: provider %s not registered: %v", prov.Type, gErr)
 			continue
 		}
+		dnsProvider = r.wrapDNS(dnsProvider)
 		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
 
 		rec := provider.Record{Type: "A", Name: a.FQDN, Content: a.PublicIP, TTL: 0}
@@ -1110,7 +1141,7 @@ func (r *Reconciler) resolveDNS(zoneID string) (*models.Zone, *models.Provider, 
 		log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, err)
 		return nil, nil, nil, false
 	}
-	return zone, prov, dnsProvider, true
+	return zone, prov, r.wrapDNS(dnsProvider), true
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,12 +1213,16 @@ func routesMatch(a, b json.RawMessage) bool {
 // audit is a convenience wrapper that logs to both the audit table and stderr.
 func (r *Reconciler) audit(entityType, entityID, action, details string) {
 	log.Printf("reconciler: audit %s/%s %s: %s", entityType, entityID, action, details)
+	source := r.auditSource
+	if source == "" {
+		source = models.AuditSourceSystem
+	}
 	entry := &models.AuditLogEntry{
 		EntityType: entityType,
 		EntityID:   entityID,
 		Action:     action,
 		Actor:      "reconciler",
-		Source:     models.AuditSourceSystem,
+		Source:     source,
 		Details:    details,
 	}
 	if err := r.db.InsertAuditLog(entry); err != nil {
