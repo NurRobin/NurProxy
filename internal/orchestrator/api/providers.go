@@ -8,8 +8,20 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
+	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// dnsProvider wraps a resolved provider in the dry-run sandbox decorator when the
+// orchestrator runs in DNS sandbox mode, so provider setup (validate + list
+// zones) works against the in-memory mock instead of needing live credentials
+// (#93). Returns p unchanged on a normal instance.
+func (s *Server) dnsProvider(p provider.Provider) provider.Provider {
+	if s.dnsDryRun {
+		return dryrun.Wrap(p, nil)
+	}
+	return p
+}
 
 // GET /api/v1/providers
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +81,7 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider type: "+req.Type)
 		return
 	}
+	prov = s.dnsProvider(prov)
 	if err := prov.ValidateConfig(context.Background(), req.Config); err != nil {
 		writeError(w, http.StatusBadRequest, "config validation failed: "+err.Error())
 		return
@@ -136,6 +149,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "unknown provider type")
 			return
 		}
+		prov = s.dnsProvider(prov)
 		if err := prov.ValidateConfig(context.Background(), *req.Config); err != nil {
 			writeError(w, http.StatusBadRequest, "config validation failed: "+err.Error())
 			return
@@ -188,6 +202,7 @@ func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider type: "+req.Type)
 		return
 	}
+	prov = s.dnsProvider(prov)
 
 	if err := prov.ValidateConfig(context.Background(), req.Config); err != nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{

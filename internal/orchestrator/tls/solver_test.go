@@ -3,6 +3,7 @@ package tls
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -17,6 +18,9 @@ import (
 type recordingProvider struct {
 	records map[string]provider.Record // id -> record
 	next    int
+	// rejectIdenticalTXT makes CreateRecord fail with a duplicate error when a TXT
+	// with the same name+content already exists, mimicking Cloudflare error 81058.
+	rejectIdenticalTXT bool
 }
 
 func newRecordingProvider() *recordingProvider {
@@ -41,6 +45,13 @@ func (p *recordingProvider) ListZones(context.Context, json.RawMessage) ([]provi
 	return nil, nil
 }
 func (p *recordingProvider) CreateRecord(_ context.Context, _ json.RawMessage, r provider.Record) (string, error) {
+	if p.rejectIdenticalTXT && r.Type == "TXT" {
+		for _, ex := range p.records {
+			if ex.Type == "TXT" && strings.EqualFold(ex.Name, r.Name) && ex.Content == r.Content {
+				return "", errors.New("provider: [81058] An identical record already exists")
+			}
+		}
+	}
 	p.next++
 	id := "rec-" + string(rune('A'+p.next))
 	p.records[id] = r
@@ -162,4 +173,55 @@ func TestProviderSolver_dns01_challengeOwnerIsAcmeChallenge_notCNAME(t *testing.
 			t.Errorf("CleanUp left a challenge TXT behind: %+v", r)
 		}
 	}
+}
+
+// TestProviderSolver_Present_idempotentOnDuplicate proves the #82 fix: when a
+// prior attempt left an identical _acme-challenge TXT behind (so the provider
+// rejects the re-create as a duplicate), Present adopts the existing record
+// instead of failing — and CleanUp then removes it, leaving no leak.
+func TestProviderSolver_Present_idempotentOnDuplicate(t *testing.T) {
+	p := newRecordingProvider()
+	p.rejectIdenticalTXT = true
+	const fqdn = "_acme-challenge.app.example.com."
+	const value = "tok-abc123"
+	// Seed a leftover identical challenge TXT from a "prior failed attempt".
+	leakedID := p.seed(provider.Record{Type: "TXT", Name: strings.TrimSuffix(fqdn, "."), Content: value})
+
+	s := &providerSolver{provider: p, createdID: map[string]string{}}
+
+	if err := s.Present(context.Background(), fqdn, value); err != nil {
+		t.Fatalf("Present should adopt the existing duplicate, got error: %v", err)
+	}
+	// The adopted record id must be tracked so CleanUp can remove it.
+	if got := s.createdID[challengeKey(fqdn, value)]; got != leakedID {
+		t.Fatalf("adopted record id = %q, want the leaked record %q", got, leakedID)
+	}
+	if err := s.CleanUp(context.Background(), fqdn, value); err != nil {
+		t.Fatalf("CleanUp: %v", err)
+	}
+	// No challenge TXT must remain.
+	recs, _ := p.ListRecords(context.Background(), nil, strings.TrimSuffix(fqdn, "."), "TXT")
+	if len(recs) != 0 {
+		t.Fatalf("challenge TXT leaked after CleanUp: %+v", recs)
+	}
+}
+
+// TestProviderSolver_Present_surfacesNonDuplicateErrors proves Present does not
+// swallow a genuine create failure (no adoptable record exists).
+func TestProviderSolver_Present_surfacesNonDuplicateErrors(t *testing.T) {
+	p := newRecordingProvider()
+	p.rejectIdenticalTXT = true // will only reject if an identical exists — none does here
+	// Force a hard create error unrelated to duplicates by making the provider
+	// reject everything via a wrapper.
+	fp := &alwaysFailCreate{recordingProvider: p}
+	s := &providerSolver{provider: fp, createdID: map[string]string{}}
+	if err := s.Present(context.Background(), "_acme-challenge.x.example.com.", "v"); err == nil {
+		t.Fatal("expected Present to surface a non-duplicate create error")
+	}
+}
+
+type alwaysFailCreate struct{ *recordingProvider }
+
+func (a *alwaysFailCreate) CreateRecord(context.Context, json.RawMessage, provider.Record) (string, error) {
+	return "", errors.New("provider: boom")
 }

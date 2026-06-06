@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -392,5 +393,48 @@ func TestParseLogPaths(t *testing.T) {
 				t.Errorf("parseLogPaths(%q) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadDryRunDataDir(t *testing.T) {
+	tmp := os.TempDir()
+
+	// Dry-run via flag with no data-dir override → relocated to a writable,
+	// per-FQDN temp dir (never the privileged default), so it runs unprivileged.
+	cfg, err := Load(Flags{Orchestrator: "http://orch:8080", FQDN: "edge1.example.com", DryRun: true})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.DryRun {
+		t.Fatal("DryRun not set")
+	}
+	if cfg.DataDir == defaults().DataDir {
+		t.Fatalf("dry-run data dir was not relocated off the privileged default: %s", cfg.DataDir)
+	}
+	if filepath.Dir(cfg.DataDir) != filepath.Clean(tmp) {
+		t.Fatalf("dry-run data dir not under temp: %s", cfg.DataDir)
+	}
+	if !strings.Contains(cfg.DataDir, "edge1.example.com") {
+		t.Fatalf("dry-run data dir not scoped by FQDN: %s", cfg.DataDir)
+	}
+
+	// A second FQDN must get a distinct dir so multiple dry-run agents on one host
+	// don't share identity/cert files.
+	cfg2, err := Load(Flags{Orchestrator: "http://orch:8080", FQDN: "edge2.example.com", DryRun: true})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DataDir == cfg2.DataDir {
+		t.Fatalf("two dry-run agents collided on the same data dir: %s", cfg.DataDir)
+	}
+
+	// An explicit data-dir is always respected, even in dry-run.
+	dir := t.TempDir()
+	cfg3, err := Load(Flags{Orchestrator: "http://orch:8080", FQDN: "edge3.example.com", DryRun: true, DataDir: dir})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg3.DataDir != dir {
+		t.Fatalf("explicit data dir not respected in dry-run: got %s want %s", cfg3.DataDir, dir)
 	}
 }

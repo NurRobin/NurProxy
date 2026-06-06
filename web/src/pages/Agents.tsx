@@ -289,7 +289,28 @@ export default function Agents() {
                         {selected.dns_mode === 'ddns' && <Row label={t('agents.ddnsInterval')} value={`${selected.ddns_interval}s`} />}
                         {selected.zones && selected.zones.length > 0 && <Row label={t('agents.zones')} value={selected.zones.map((z) => z.name).join(', ')} />}
                         {selected.public_ip && <Row label={t('agents.ip')} value={selected.public_ip} />}
-                        {selected.version && <Row label={t('agents.version')} value={selected.version} />}
+                        {selected.version && (
+                          <Row
+                            label={t('agents.version')}
+                            value={
+                              <span className="flex items-center gap-2">
+                                {selected.version}
+                                {(selected.version_status === 'outdated' || selected.version_status === 'ahead') && (
+                                  <span
+                                    className={`rounded px-1.5 py-0.5 text-xs font-medium ${
+                                      selected.version_status === 'outdated'
+                                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                                        : 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300'
+                                    }`}
+                                    title={t(`agents.versionStatus.${selected.version_status}Hint`)}
+                                  >
+                                    {t(`agents.versionStatus.${selected.version_status}`)}
+                                  </span>
+                                )}
+                              </span>
+                            }
+                          />
+                        )}
                         <Row
                           label={t('agents.proxyMode')}
                           value={

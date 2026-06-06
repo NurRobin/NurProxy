@@ -9,6 +9,7 @@ import ClassicShell from './shells/Classic';
 import WorkbenchShell from './shells/Workbench';
 import WallboardShell from './shells/Wallboard';
 import SpreadsheetShell from './shells/Spreadsheet';
+import DryRunBanner from './components/DryRunBanner';
 
 const SHELLS = {
   classic: ClassicShell,
@@ -94,7 +95,12 @@ function App() {
   }
 
   const Shell = SHELLS[variant] ?? ClassicShell;
-  return <Shell onLogout={handleLogout} />;
+  return (
+    <>
+      <DryRunBanner />
+      <Shell onLogout={handleLogout} />
+    </>
+  );
 }
 
 export default App;
