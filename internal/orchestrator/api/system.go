@@ -9,9 +9,12 @@ import (
 
 // GET /api/v1/health
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "ok",
-		"version": s.version,
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "ok",
+		"version":      s.version,
+		"dry_run":      s.dnsDryRun || s.acmeDryRun,
+		"dns_dry_run":  s.dnsDryRun,
+		"acme_dry_run": s.acmeDryRun,
 	})
 }
 

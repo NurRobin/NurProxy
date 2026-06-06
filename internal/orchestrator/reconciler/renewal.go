@@ -10,6 +10,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/provider"
+	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -23,12 +24,19 @@ import (
 // exactly the provider DNS-01 must drive to renew it.
 type CertRenewalStore struct {
 	db *db.DB
+	// dnsDryRun wraps the resolved DNS provider in the sandbox decorator so the
+	// renewer's DNS-01 challenge runs against the in-memory store (#93).
+	dnsDryRun bool
 }
 
 // NewCertRenewalStore builds the store adapter over the given DB.
 func NewCertRenewalStore(database *db.DB) *CertRenewalStore {
 	return &CertRenewalStore{db: database}
 }
+
+// SetDryRunDNS toggles DNS sandbox mode for resolved providers, matching the
+// reconciler so the renewer never performs real DNS calls in dry-run.
+func (s *CertRenewalStore) SetDryRunDNS(on bool) { s.dnsDryRun = on }
 
 // DueForRenewal returns the issuance work for one scan: existing certificates
 // within window of expiry (renewal) PLUS central-TLS domains that have no cert
@@ -146,6 +154,9 @@ func (s *CertRenewalStore) resolveTarget(host string, names []string, isWildcard
 	dnsProvider, gErr := provider.Get(prov.Type)
 	if gErr != nil {
 		return tls.RenewTarget{}, false
+	}
+	if s.dnsDryRun {
+		dnsProvider = dryrun.Wrap(dnsProvider, nil)
 	}
 	return tls.RenewTarget{
 		Host:       host,

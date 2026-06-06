@@ -50,6 +50,18 @@ type Server struct {
 	// loginLimiter blunts online password guessing: too many failed logins from
 	// one IP trip a temporary lockout.
 	loginLimiter *ratelimit.Limiter
+
+	// dnsDryRun / acmeDryRun reflect sandbox mode so the health endpoint can tell
+	// the dashboard to show a "dry-run — no external calls" banner (#93).
+	dnsDryRun  bool
+	acmeDryRun bool
+}
+
+// SetDryRun records whether the orchestrator is running in DNS/ACME sandbox mode
+// so the health endpoint can surface it to the dashboard banner.
+func (s *Server) SetDryRun(dns, acme bool) {
+	s.dnsDryRun = dns
+	s.acmeDryRun = acme
 }
 
 // SetAgentHub wires the live agent connection hub and the route pusher into the
