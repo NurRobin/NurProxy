@@ -14,6 +14,8 @@ package dryrun
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -24,24 +26,44 @@ import (
 	"github.com/NurRobin/NurProxy/internal/provider"
 )
 
+// entry is a stored record plus the zone bucket it belongs to. The bucket is
+// derived from the provider config (which carries the zone id), so ListRecords
+// only ever returns records for the zone it is queried against — matching the
+// real provider contract, where config scopes operations to one zone.
+type entry struct {
+	rec  provider.Record
+	zone string
+}
+
 // store is the shared in-memory record set backing every dry-run wrapper in the
 // process. It is queryable so ListRecords/GetRecord reflect prior CreateRecord
 // calls, which is what lets the reconciler's adopt-or-create state machine and
 // the ACME challenge present/cleanup loop progress normally.
 type store struct {
 	mu      sync.Mutex
-	records map[string]provider.Record // keyed by synthetic ID
+	records map[string]entry // keyed by synthetic ID
 	seq     atomic.Uint64
 }
 
-var shared = &store{records: make(map[string]provider.Record)}
+var shared = &store{records: make(map[string]entry)}
 
 // Reset clears the shared store. Intended for tests; harmless in production
 // (dry-run is never on there).
 func Reset() {
 	shared.mu.Lock()
 	defer shared.mu.Unlock()
-	shared.records = make(map[string]provider.Record)
+	shared.records = make(map[string]entry)
+}
+
+// zoneKey derives a stable per-zone bucket from the provider config bytes. The
+// reconciler merges the zone's external id into the config before each call, so
+// identical config => same zone. Empty config maps to a shared "default" bucket.
+func zoneKey(config json.RawMessage) string {
+	if len(config) == 0 {
+		return "default"
+	}
+	sum := sha256.Sum256(config)
+	return hex.EncodeToString(sum[:8])
 }
 
 func (s *store) nextID() string {
@@ -90,29 +112,32 @@ func (d *dryProvider) ListZones(_ context.Context, _ json.RawMessage) ([]provide
 	return []provider.Zone{{ID: "dryrun-zone", Name: "dryrun.invalid"}}, nil
 }
 
-func (d *dryProvider) CreateRecord(ctx context.Context, _ json.RawMessage, record provider.Record) (string, error) {
+func (d *dryProvider) CreateRecord(ctx context.Context, config json.RawMessage, record provider.Record) (string, error) {
 	if err := validateRecord(record); err != nil {
 		return "", err
 	}
 	id := shared.nextID()
 	record.ID = id
 	record.Name = canonicalName(record.Name)
+	zk := zoneKey(config)
 	shared.mu.Lock()
-	shared.records[id] = record
+	shared.records[id] = entry{rec: record, zone: zk}
 	shared.mu.Unlock()
 
 	d.logger.InfoContext(ctx, "dryrun DNS: would create record",
 		slog.String("op", "CreateRecord"),
 		slog.String("id", id),
+		slog.String("zone", zk),
 		slog.String("type", record.Type),
 		slog.String("name", record.Name),
 		slog.String("content", record.Content),
 		slog.Int("ttl", record.TTL),
+		slog.Bool("proxied", record.Proxied),
 	)
 	return id, nil
 }
 
-func (d *dryProvider) UpdateRecord(ctx context.Context, _ json.RawMessage, recordID string, record provider.Record) error {
+func (d *dryProvider) UpdateRecord(ctx context.Context, config json.RawMessage, recordID string, record provider.Record) error {
 	if recordID == "" {
 		return fmt.Errorf("dryrun: UpdateRecord requires a record ID")
 	}
@@ -120,11 +145,12 @@ func (d *dryProvider) UpdateRecord(ctx context.Context, _ json.RawMessage, recor
 		return err
 	}
 	shared.mu.Lock()
-	_, ok := shared.records[recordID]
+	existing, ok := shared.records[recordID]
 	if ok {
 		record.ID = recordID
 		record.Name = canonicalName(record.Name)
-		shared.records[recordID] = record
+		// Preserve the record's zone bucket across an update.
+		shared.records[recordID] = entry{rec: record, zone: existing.zone}
 	}
 	shared.mu.Unlock()
 	if !ok {
@@ -134,9 +160,12 @@ func (d *dryProvider) UpdateRecord(ctx context.Context, _ json.RawMessage, recor
 	d.logger.InfoContext(ctx, "dryrun DNS: would update record",
 		slog.String("op", "UpdateRecord"),
 		slog.String("id", recordID),
+		slog.String("zone", zoneKey(config)),
 		slog.String("type", record.Type),
 		slog.String("name", record.Name),
 		slog.String("content", record.Content),
+		slog.Int("ttl", record.TTL),
+		slog.Bool("proxied", record.Proxied),
 	)
 	return nil
 }
@@ -163,32 +192,38 @@ func (d *dryProvider) DeleteRecord(ctx context.Context, _ json.RawMessage, recor
 
 func (d *dryProvider) GetRecord(ctx context.Context, _ json.RawMessage, recordID string) (*provider.Record, error) {
 	shared.mu.Lock()
-	rec, ok := shared.records[recordID]
+	e, ok := shared.records[recordID]
 	shared.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("dryrun: record %q not found", recordID)
 	}
 	d.logger.DebugContext(ctx, "dryrun DNS: get record", slog.String("id", recordID))
-	out := rec
+	out := e.rec
 	return &out, nil
 }
 
-func (d *dryProvider) ListRecords(ctx context.Context, _ json.RawMessage, name, recordType string) ([]provider.Record, error) {
+func (d *dryProvider) ListRecords(ctx context.Context, config json.RawMessage, name, recordType string) ([]provider.Record, error) {
 	want := canonicalName(name)
+	zk := zoneKey(config)
 	shared.mu.Lock()
 	var out []provider.Record
-	for _, rec := range shared.records {
-		if want != "" && rec.Name != want {
+	for _, e := range shared.records {
+		// Scope to the queried zone so a lookup never returns a same-named record
+		// that was created against a different zone/provider.
+		if e.zone != zk {
 			continue
 		}
-		if recordType != "" && !strings.EqualFold(rec.Type, recordType) {
+		if want != "" && e.rec.Name != want {
 			continue
 		}
-		out = append(out, rec)
+		if recordType != "" && !strings.EqualFold(e.rec.Type, recordType) {
+			continue
+		}
+		out = append(out, e.rec)
 	}
 	shared.mu.Unlock()
 	d.logger.DebugContext(ctx, "dryrun DNS: list records",
-		slog.String("name", want), slog.String("type", recordType), slog.Int("matches", len(out)))
+		slog.String("name", want), slog.String("zone", zk), slog.String("type", recordType), slog.Int("matches", len(out)))
 	return out, nil
 }
 
