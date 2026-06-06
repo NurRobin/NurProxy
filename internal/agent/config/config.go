@@ -98,17 +98,27 @@ func Load(f Flags) (*Config, error) {
 	cfg := defaults()
 
 	// Determine data dir early so we can find the config file.
-	// We need data dir from flags first, then env, then keep default.
+	// Priority: flag > env > default.
 	dataDir := cfg.DataDir
-	if f.DataDir != "" {
-		dataDir = f.DataDir
-	}
 	if v := os.Getenv("NP_DATA_DIR"); v != "" {
 		dataDir = v
 	}
-	// Flag still takes priority over env; re-apply if flag was set.
 	if f.DataDir != "" {
 		dataDir = f.DataDir
+	}
+	explicitDataDir := f.DataDir != "" || os.Getenv("NP_DATA_DIR") != ""
+
+	// Dry-run ergonomics: the default data dir is a privileged system path
+	// (/var/lib/...). When sandbox mode is requested via flag or env and the
+	// operator did not pin a data dir, relocate to a writable, per-agent temp dir
+	// *before* the config file is read — so an unreadable /var/lib never blocks an
+	// unprivileged run, and multiple dry-run agents on one host don't collide on
+	// shared identity/cert files. (Activation only via the config file in the
+	// privileged default dir is a contradiction — writing it there needs the same
+	// access — so resolving from flag/env here is sufficient.) An explicit
+	// data-dir is always respected.
+	if (f.DryRun || envBool("NP_DRY_RUN")) && !explicitDataDir {
+		dataDir = dryRunDataDir(firstNonEmpty(f.FQDN, os.Getenv("NP_FQDN")))
 	}
 
 	// Load config file if it exists.
@@ -129,12 +139,10 @@ func Load(f Flags) (*Config, error) {
 	// Layer 3: flags over everything.
 	mergeFlags(&cfg, f)
 
-	// Dry-run ergonomics: the default data dir is a privileged system path
-	// (/var/lib/...). In sandbox mode, when the operator did not override it,
-	// relocate to a writable temp dir so `nurproxy-agent -dry-run` runs unprivileged
-	// with zero setup. An explicit data-dir (flag/env/file) is always respected.
-	if cfg.DryRun && cfg.DataDir == defaults().DataDir {
-		cfg.DataDir = filepath.Join(os.TempDir(), "nurproxy-agent-dry")
+	// Pin the resolved data dir: in the relocated dry-run case nothing above
+	// should drag it back to the privileged default.
+	if !explicitDataDir && (cfg.DryRun || f.DryRun) && cfg.DataDir == defaults().DataDir {
+		cfg.DataDir = dataDir
 	}
 
 	// Validate required fields.
@@ -253,6 +261,43 @@ func mergeEnv(cfg *Config) {
 	if envBool("NP_DRY_RUN") {
 		cfg.DryRun = true
 	}
+}
+
+// dryRunDataDir returns a writable, per-agent temp data dir for sandbox mode.
+// Including the FQDN keeps multiple dry-run agents on one host isolated (separate
+// token / identity / cert store) while staying stable across restarts of the
+// same agent. An empty FQDN falls back to a shared name.
+func dryRunDataDir(fqdn string) string {
+	name := "nurproxy-agent-dry"
+	if s := sanitizeForPath(fqdn); s != "" {
+		name += "-" + s
+	}
+	return filepath.Join(os.TempDir(), name)
+}
+
+// sanitizeForPath reduces a string to a safe path segment (alphanumerics, dash,
+// dot), so an FQDN can be embedded in a directory name.
+func sanitizeForPath(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+// firstNonEmpty returns the first non-empty argument, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // envBool reports whether an env var is set to a truthy value (1/true/yes/on).

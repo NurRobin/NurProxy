@@ -291,6 +291,9 @@ func mustGetJSON(t *testing.T, cli *http.Client, url string, out any) {
 		t.Fatalf("GET %s: %v", url, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		t.Fatalf("GET %s: status %d", url, resp.StatusCode)
+	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		t.Fatalf("decode %s: %v", url, err)
 	}
@@ -298,7 +301,10 @@ func mustGetJSON(t *testing.T, cli *http.Client, url string, out any) {
 
 func postJSON(t *testing.T, cli *http.Client, url string, body, out any) {
 	t.Helper()
-	raw, _ := json.Marshal(body)
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal %s body: %v", url, err)
+	}
 	resp, err := cli.Post(url, "application/json", bytes.NewReader(raw))
 	if err != nil {
 		t.Fatalf("POST %s: %v", url, err)
@@ -325,12 +331,18 @@ func (c *apiClient) do(method, path string, body, out any) {
 	c.t.Helper()
 	var rdr *bytes.Reader
 	if body != nil {
-		raw, _ := json.Marshal(body)
+		raw, err := json.Marshal(body)
+		if err != nil {
+			c.t.Fatalf("marshal %s %s body: %v", method, path, err)
+		}
 		rdr = bytes.NewReader(raw)
 	} else {
 		rdr = bytes.NewReader(nil)
 	}
-	req, _ := http.NewRequest(method, c.base+path, rdr)
+	req, err := http.NewRequest(method, c.base+path, rdr)
+	if err != nil {
+		c.t.Fatalf("new request %s %s: %v", method, path, err)
+	}
 	req.Header.Set("Authorization", "Bearer "+c.key)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
