@@ -25,6 +25,7 @@ import (
 	orchtls "github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
+	"github.com/NurRobin/NurProxy/internal/shared/logging"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/web"
 )
@@ -32,6 +33,11 @@ import (
 var version = "dev"
 
 func main() {
+	// Configure structured logging first so every log line (including the legacy
+	// log.Printf calls, which slog.SetDefault bridges) honors NP_LOG_LEVEL /
+	// NP_LOG_FORMAT.
+	logging.Setup("orchestrator")
+
 	// Subcommands are dispatched before flag parsing so they can own their flags.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
