@@ -31,7 +31,8 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 
 	_, err := d.sql.Exec(`
 		INSERT INTO agents (id, name, fqdn, api_url, token_hash, dns_mode,
-			ddns_interval, public_ip, dns_record_id, status, last_seen, version,
+			ddns_interval, public_ip, public_ip6, dns_record_id, dns_record_id6,
+			status, last_seen, version,
 			caddy_running, last_error, dns_error,
 			detected_proxy_kind, detected_proxy_version, detected_binary_path,
 			detected_config_dir, detected_log_paths, detected_port_conflicts,
@@ -39,9 +40,9 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 			detected_installed, detected_at, detected_capabilities,
 			auto_reconcile_config,
 			created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
-		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
+		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.PublicIP6, a.DNSRecordID, a.DNSRecordID6,
 		string(a.Status), lastSeen, a.Version,
 		boolToInt(a.CaddyRunning), a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
@@ -218,7 +219,7 @@ func scanAgent(sc interface {
 
 	err := sc.Scan(
 		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
-		&a.DNSMode, &a.DDNSInterval, &a.PublicIP, &a.DNSRecordID,
+		&a.DNSMode, &a.DDNSInterval, &a.PublicIP, &a.PublicIP6, &a.DNSRecordID, &a.DNSRecordID6,
 		&a.Status, &lastSeen, &a.Version, &caddyRunning, &a.LastError,
 		&a.DNSError,
 		&det.kind, &det.version, &det.binaryPath, &det.configDir,
@@ -248,7 +249,7 @@ func scanAgent(sc interface {
 }
 
 const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
-	ddns_interval, public_ip, dns_record_id, status, last_seen, version,
+	ddns_interval, public_ip, public_ip6, dns_record_id, dns_record_id6, status, last_seen, version,
 	caddy_running, last_error, dns_error,
 	detected_proxy_kind, detected_proxy_version, detected_binary_path,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
@@ -337,7 +338,8 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 	res, err := d.sql.Exec(`
 		UPDATE agents
 		SET name = ?, fqdn = ?, api_url = ?, token_hash = ?,
-			dns_mode = ?, ddns_interval = ?, public_ip = ?, dns_record_id = ?,
+			dns_mode = ?, ddns_interval = ?, public_ip = ?, public_ip6 = ?,
+			dns_record_id = ?, dns_record_id6 = ?,
 			status = ?, last_seen = ?, version = ?, caddy_running = ?,
 			last_error = ?, dns_error = ?,
 			detected_proxy_kind = ?, detected_proxy_version = ?,
@@ -349,7 +351,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 			updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.FQDN, a.APIURL, a.TokenHash,
-		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.DNSRecordID,
+		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.PublicIP6, a.DNSRecordID, a.DNSRecordID6,
 		string(a.Status), lastSeen, a.Version, boolToInt(a.CaddyRunning),
 		a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
@@ -421,6 +423,26 @@ func (d *DB) UpdateAgentDNSRecord(id string, recordID string) error {
 	return nil
 }
 
+// UpdateAgentDNSRecord6 sets only the dns_record_id6 (AAAA) for an agent. Like
+// UpdateAgentDNSRecord, it is a narrow update so it doesn't clobber fields that
+// concurrent heartbeats write (public_ip/public_ip6/last_seen).
+func (d *DB) UpdateAgentDNSRecord6(id string, recordID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET dns_record_id6 = ?, updated_at = ? WHERE id = ?`,
+		recordID, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent AAAA record: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
 // UpdateAgentHeartbeat updates the last_seen timestamp and public IP. A blank
 // IP leaves the stored value untouched (so a transient detection failure on the
 // agent doesn't erase a known-good address).
@@ -445,21 +467,23 @@ func (d *DB) UpdateAgentHeartbeat(id string, ip string) error {
 }
 
 // UpdateAgentHealth records a full heartbeat from the agent: it refreshes
-// last_seen, the public IP, and the agent's self-reported Caddy state, last
-// error, and current live proxy mode (§19). It is a narrow update so it doesn't
-// clobber fields (name, fqdn, zones, dns_record_id) owned by the orchestrator. A
-// blank IP is ignored; a blank proxyMode leaves the stored mode untouched (so an
-// older agent that doesn't report it doesn't reset the row to built-in).
-func (d *DB) UpdateAgentHealth(id, ip, lastError string, caddyRunning bool, proxyMode string) error {
+// last_seen, the public IPv4/IPv6, and the agent's self-reported Caddy state,
+// last error, and current live proxy mode (§19). It is a narrow update so it
+// doesn't clobber fields (name, fqdn, zones, dns_record_id) owned by the
+// orchestrator. A blank ip/ip6 is ignored (so a transient detection failure
+// doesn't erase a known-good address); a blank proxyMode leaves the stored mode
+// untouched (so an older agent that doesn't report it doesn't reset to built-in).
+func (d *DB) UpdateAgentHealth(id, ip, ip6, lastError string, caddyRunning bool, proxyMode string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
 		UPDATE agents
 		SET last_seen = ?, public_ip = CASE WHEN ? != '' THEN ? ELSE public_ip END,
+			public_ip6 = CASE WHEN ? != '' THEN ? ELSE public_ip6 END,
 			caddy_running = ?, last_error = ?,
 			proxy_mode = CASE WHEN ? != '' THEN ? ELSE proxy_mode END,
 			updated_at = ?
 		WHERE id = ?`,
-		now, ip, ip, boolToInt(caddyRunning), lastError, proxyMode, proxyMode, now, id,
+		now, ip, ip, ip6, ip6, boolToInt(caddyRunning), lastError, proxyMode, proxyMode, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent health: %w", err)

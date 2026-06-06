@@ -55,6 +55,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		Token             string                    `json:"token"`
 		APIURL            string                    `json:"api_url"`
 		PublicIP          string                    `json:"public_ip"`
+		PublicIP6         string                    `json:"public_ip6"`
 		Version           string                    `json:"version"`
 		ProxyDetection    *models.ProxyDetection    `json:"proxy_detection"`
 		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
@@ -85,6 +86,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		APIURL:    req.APIURL,
 		TokenHash: tokenHash,
 		PublicIP:  req.PublicIP,
+		PublicIP6: req.PublicIP6,
 		Status:    models.AgentStatusPending,
 		Version:   req.Version,
 		// Assume healthy until the agent reports otherwise via heartbeat, so a
@@ -369,8 +371,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		PublicIP string `json:"public_ip"`
-		Version  string `json:"version"`
+		PublicIP  string `json:"public_ip"`
+		PublicIP6 string `json:"public_ip6"`
+		Version   string `json:"version"`
 		// CaddyRunning and LastError are the agent's self-report. CaddyRunning is
 		// a pointer so an older agent that omits it doesn't get read as "down".
 		CaddyRunning *bool  `json:"caddy_running"`
@@ -413,7 +416,7 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		caddyRunning = *req.CaddyRunning
 	}
 
-	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning, req.ProxyMode); err != nil {
+	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.PublicIP6, req.LastError, caddyRunning, req.ProxyMode); err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
 	}
