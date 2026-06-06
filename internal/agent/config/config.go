@@ -50,6 +50,12 @@ type Config struct {
 	// ProxyService is the service unit (systemd/openrc/launchd) used for reloads
 	// (§9).
 	ProxyService string `yaml:"proxy_service"`
+
+	// DryRun runs the agent in sandbox mode (#93): the reverse proxy is simulated
+	// entirely in-memory — no Caddy subprocess, no :80/:443 binding, no privileged
+	// file ops — while registration, heartbeat, the stream, and route rendering all
+	// run for real. Lets the full orchestrator↔agent loop run unprivileged anywhere.
+	DryRun bool `yaml:"dry_run"`
 }
 
 // Flags carries the command-line flag values into Load. Each field mirrors a
@@ -70,6 +76,10 @@ type Flags struct {
 	ProxyTestCmd   string
 	ProxyLogPaths  string // comma-separated
 	ProxyService   string
+
+	// DryRun mirrors the -dry-run flag (sandbox mode). Only ever set to true; a
+	// false value means "flag not set" so env/file can still enable it.
+	DryRun bool
 }
 
 // defaults returns a Config with default values applied.
@@ -118,6 +128,14 @@ func Load(f Flags) (*Config, error) {
 
 	// Layer 3: flags over everything.
 	mergeFlags(&cfg, f)
+
+	// Dry-run ergonomics: the default data dir is a privileged system path
+	// (/var/lib/...). In sandbox mode, when the operator did not override it,
+	// relocate to a writable temp dir so `nurproxy-agent -dry-run` runs unprivileged
+	// with zero setup. An explicit data-dir (flag/env/file) is always respected.
+	if cfg.DryRun && cfg.DataDir == defaults().DataDir {
+		cfg.DataDir = filepath.Join(os.TempDir(), "nurproxy-agent-dry")
+	}
 
 	// Validate required fields.
 	if cfg.OrchestratorURL == "" {
@@ -188,6 +206,9 @@ func mergeFile(dst *Config, src *Config) {
 	if src.ProxyService != "" {
 		dst.ProxyService = src.ProxyService
 	}
+	if src.DryRun {
+		dst.DryRun = true
+	}
 }
 
 func mergeEnv(cfg *Config) {
@@ -228,6 +249,19 @@ func mergeEnv(cfg *Config) {
 	}
 	if v := os.Getenv("NP_PROXY_SERVICE"); v != "" {
 		cfg.ProxyService = v
+	}
+	if envBool("NP_DRY_RUN") {
+		cfg.DryRun = true
+	}
+}
+
+// envBool reports whether an env var is set to a truthy value (1/true/yes/on).
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -270,6 +304,9 @@ func mergeFlags(cfg *Config, f Flags) {
 	}
 	if f.ProxyService != "" {
 		cfg.ProxyService = f.ProxyService
+	}
+	if f.DryRun {
+		cfg.DryRun = true
 	}
 }
 
