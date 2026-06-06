@@ -75,7 +75,7 @@ func backupDataDir(dataDir, outPath string) error {
 	if err != nil {
 		return fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.RemoveAll(snapDir)
+	defer func() { _ = os.RemoveAll(snapDir) }()
 	snapPath := filepath.Join(snapDir, dbFileName)
 	if err := db.SnapshotTo(dbPath, snapPath); err != nil {
 		return err
