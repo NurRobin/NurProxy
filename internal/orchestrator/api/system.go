@@ -118,7 +118,7 @@ func (s *Server) handleListSettings(w http.ResponseWriter, r *http.Request) {
 	// Filter out sensitive settings
 	filtered := make([]map[string]interface{}, 0, len(settings))
 	for _, setting := range settings {
-		if setting.Key == "admin_password_hash" || setting.Key == "admin_api_key" {
+		if setting.Key == "admin_password_hash" || setting.Key == "admin_api_key" || setting.Key == sessionSecretSetting {
 			continue
 		}
 		filtered = append(filtered, map[string]interface{}{
@@ -146,6 +146,10 @@ func (s *Server) handleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 	}
 	if key == "admin_api_key" {
 		writeError(w, http.StatusForbidden, "use the /api/v1/api-key endpoint to manage the API key")
+		return
+	}
+	if key == sessionSecretSetting {
+		writeError(w, http.StatusForbidden, "the session secret is managed internally and cannot be set")
 		return
 	}
 

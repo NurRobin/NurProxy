@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -196,6 +197,9 @@ type mockDNSProvider struct {
 	mu      sync.Mutex
 	records map[string]provider.Record // recordID -> record
 	nextID  int
+	// deleteErr, when set, is returned by DeleteRecord instead of deleting — used
+	// to simulate provider failures (transient errors, ErrRecordNotFound).
+	deleteErr error
 }
 
 func newMockDNSProvider() *mockDNSProvider {
@@ -247,6 +251,9 @@ func (p *mockDNSProvider) UpdateRecord(_ context.Context, _ json.RawMessage, rec
 func (p *mockDNSProvider) DeleteRecord(_ context.Context, _ json.RawMessage, recordID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.deleteErr != nil {
+		return p.deleteErr
+	}
 	delete(p.records, recordID)
 	return nil
 }
@@ -942,6 +949,61 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	}
 }
 
+// A record already absent at the provider (ErrRecordNotFound) must NOT wedge the
+// teardown: deletion is idempotent, so the domain row is still removed.
+func TestReconcileDeletions_recordAlreadyGone_completesTeardown(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, _, _, _, dom := setupScenario(t, d)
+
+	if err := d.UpdateDomainDNSRecord(dom.ID, "rec-gone", true); err != nil {
+		t.Fatalf("UpdateDomainDNSRecord: %v", err)
+	}
+	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatalf("UpdateDomainStatus: %v", err)
+	}
+	mp.deleteErr = provider.ErrRecordNotFound
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.reconcileDeletions(context.Background()); err != nil {
+		t.Fatalf("reconcileDeletions: %v", err)
+	}
+	if _, err := d.GetDomain(dom.ID); err == nil {
+		t.Error("domain should be torn down even when the DNS record was already gone")
+	}
+}
+
+// A transient (non-not-found) delete error must keep the domain for retry rather
+// than tearing it down — otherwise a real record could be orphaned.
+func TestReconcileDeletions_transientError_keepsDomainForRetry(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, _, _, _, dom := setupScenario(t, d)
+
+	if err := d.UpdateDomainDNSRecord(dom.ID, "rec-x", true); err != nil {
+		t.Fatalf("UpdateDomainDNSRecord: %v", err)
+	}
+	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatalf("UpdateDomainStatus: %v", err)
+	}
+	mp.deleteErr = errors.New("cloudflare API error: [1001] dns resolution timed out")
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.reconcileDeletions(context.Background()); err != nil {
+		t.Fatalf("reconcileDeletions: %v", err)
+	}
+	got, err := d.GetDomain(dom.ID)
+	if err != nil {
+		t.Fatal("domain must survive a transient DNS-delete error for retry")
+	}
+	if got.Status != models.DomainStatusDeleting {
+		t.Errorf("status = %q, want still deleting", got.Status)
+	}
+	if got.DNSRecordID != "rec-x" {
+		t.Errorf("DNS record id should be retained for retry, got %q", got.DNSRecordID)
+	}
+}
+
 func TestReconcileAgentDNS_CreateAndDDNSUpdate(t *testing.T) {
 	d := testDB(t)
 	mp := registerMockProvider(t)
@@ -995,6 +1057,60 @@ func TestReconcileAgentDNS_CreateAndDDNSUpdate(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected ddns_updated audit entry")
+	}
+}
+
+// An agent reporting a public IPv6 gets an AAAA record alongside its A record,
+// each tracked by its own provider record ID. DDNS then updates each family
+// independently.
+func TestReconcileAgentDNS_CreatesAAAAForIPv6(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, zone, agent, _, _ := setupScenario(t, d)
+
+	agent.DNSMode = models.DNSModeDDNS
+	agent.PublicIP = "203.0.113.10"
+	agent.PublicIP6 = "2001:db8::10"
+	if err := d.UpdateAgent(agent); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	if err := d.AddAgentZone(agent.ID, zone.ID); err != nil {
+		t.Fatalf("AddAgentZone: %v", err)
+	}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.reconcileAgentDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileAgentDNS: %v", err)
+	}
+
+	got, _ := d.GetAgent(agent.ID)
+	if got.DNSRecordID == "" || got.DNSRecordID6 == "" {
+		t.Fatalf("expected both A and AAAA record ids, got A=%q AAAA=%q", got.DNSRecordID, got.DNSRecordID6)
+	}
+	if got.DNSRecordID == got.DNSRecordID6 {
+		t.Fatal("A and AAAA must be distinct records")
+	}
+
+	a4, _ := mp.getRecord(got.DNSRecordID)
+	if a4.Type != "A" || a4.Content != "203.0.113.10" {
+		t.Errorf("A record: %+v", a4)
+	}
+	a6, ok := mp.getRecord(got.DNSRecordID6)
+	if !ok || a6.Type != "AAAA" || a6.Content != "2001:db8::10" || a6.Name != "agent1.example.com" {
+		t.Fatalf("AAAA record: %+v (ok=%v)", a6, ok)
+	}
+
+	// A v6 change updates only the AAAA record.
+	got.PublicIP6 = "2001:db8::99"
+	if err := d.UpdateAgent(got); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	if err := r.reconcileAgentDNS(context.Background()); err != nil {
+		t.Fatalf("reconcileAgentDNS (v6 update): %v", err)
+	}
+	a6, _ = mp.getRecord(got.DNSRecordID6)
+	if a6.Content != "2001:db8::99" {
+		t.Errorf("DDNS did not update AAAA: got %q, want 2001:db8::99", a6.Content)
 	}
 }
 

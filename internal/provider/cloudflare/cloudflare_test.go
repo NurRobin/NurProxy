@@ -3,6 +3,7 @@ package cloudflare
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,6 +26,43 @@ func makeConfig(token, zoneID string) json.RawMessage {
 	}
 	b, _ := json.Marshal(cfg)
 	return b
+}
+
+// Deleting a record Cloudflare reports as nonexistent (HTTP 404, API code 81044)
+// must surface as provider.ErrRecordNotFound so callers can treat it as an
+// idempotent no-op — while other error codes stay plain errors.
+func TestDeleteRecord_notFound_mapsToErrRecordNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"success":false,"errors":[{"code":81044,"message":"Record does not exist."}],"result":null}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	err := p.DeleteRecord(context.Background(), makeConfig("tok", "zone1"), "rec-123")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, provider.ErrRecordNotFound) {
+		t.Fatalf("error should wrap provider.ErrRecordNotFound, got %v", err)
+	}
+}
+
+func TestDeleteRecord_otherError_isNotNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"success":false,"errors":[{"code":9109,"message":"Unauthorized"}],"result":null}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	err := p.DeleteRecord(context.Background(), makeConfig("tok", "zone1"), "rec-123")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if errors.Is(err, provider.ErrRecordNotFound) {
+		t.Fatal("a non-81044 error must NOT be treated as record-not-found")
+	}
 }
 
 func TestInfo(t *testing.T) {

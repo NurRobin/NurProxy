@@ -464,7 +464,7 @@ func TestAgent_HealthPersistsProxyMode(t *testing.T) {
 	}
 
 	// A heartbeat reporting a §19 hot-switch persists the new live mode.
-	if err := d.UpdateAgentHealth(a.ID, "", "", true, "existing"); err != nil {
+	if err := d.UpdateAgentHealth(a.ID, "", "", "", true, "existing"); err != nil {
 		t.Fatalf("UpdateAgentHealth(existing): %v", err)
 	}
 	got, _ = d.GetAgent(a.ID)
@@ -474,7 +474,7 @@ func TestAgent_HealthPersistsProxyMode(t *testing.T) {
 
 	// A subsequent beat that omits the mode (empty) must NOT reset it to built-in:
 	// an older agent that doesn't report mode shouldn't erase a known-good value.
-	if err := d.UpdateAgentHealth(a.ID, "", "", true, ""); err != nil {
+	if err := d.UpdateAgentHealth(a.ID, "", "", "", true, ""); err != nil {
 		t.Fatalf("UpdateAgentHealth(empty): %v", err)
 	}
 	got, _ = d.GetAgent(a.ID)

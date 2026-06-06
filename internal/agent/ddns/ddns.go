@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -36,8 +37,12 @@ type Heartbeat struct {
 
 // heartbeatPayload is the JSON body sent to the orchestrator.
 type heartbeatPayload struct {
-	AgentID      string `json:"agent_id"`
-	PublicIP     string `json:"public_ip"`
+	AgentID  string `json:"agent_id"`
+	PublicIP string `json:"public_ip"`
+	// PublicIP6 is the agent's detected public IPv6 address, used by the
+	// orchestrator to publish an AAAA record for the anchor FQDN. Omitted when the
+	// host has no routable IPv6 (the orchestrator then keeps the last known value).
+	PublicIP6    string `json:"public_ip6,omitempty"`
 	Version      string `json:"version"`
 	CaddyRunning bool   `json:"caddy_running"`
 	LastError    string `json:"last_error"`
@@ -168,6 +173,14 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		ip = ""
 	}
 
+	// IPv6 is best-effort: most hosts have no routable IPv6, and a failure here
+	// must never affect the IPv4 heartbeat. A blank ip6 leaves the orchestrator's
+	// stored value (and any AAAA record) untouched.
+	ip6, err6 := DetectPublicIP6(ctx)
+	if err6 != nil {
+		ip6 = ""
+	}
+
 	var mode string
 	if h.modeFn != nil {
 		mode = h.modeFn()
@@ -196,6 +209,7 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 	payload := heartbeatPayload{
 		AgentID:           h.agentID,
 		PublicIP:          ip,
+		PublicIP6:         ip6,
 		Version:           h.version,
 		CaddyRunning:      caddyRunning,
 		LastError:         lastError,
@@ -233,47 +247,103 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		return
 	}
 
-	log.Printf("Heartbeat sent (IP: %s)", ip)
+	if ip6 != "" {
+		log.Printf("Heartbeat sent (IPv4: %s, IPv6: %s)", ip, ip6)
+	} else {
+		log.Printf("Heartbeat sent (IP: %s)", ip)
+	}
 }
 
-// defaultServices is the list of public IP detection services.
+// defaultServices is the list of public IPv4 detection services. The v4-only
+// hostnames force an A lookup so a dual-stack agent reports its IPv4 here (and
+// its IPv6 via defaultServices6) rather than whichever the resolver happened to
+// pick.
 var defaultServices = []string{
 	"https://api.ipify.org",
 	"https://ifconfig.me/ip",
 	"https://icanhazip.com",
 }
 
-// DetectPublicIP tries multiple services to determine the agent's public IP.
-func DetectPublicIP(ctx context.Context) (string, error) {
-	return detectPublicIPFromServices(ctx, defaultServices)
+// defaultServices6 is the list of IPv6-only public IP detection services. They
+// resolve over AAAA only, so a request succeeds exactly when the host has
+// working outbound IPv6 — which is the precondition for publishing an AAAA
+// record at all.
+var defaultServices6 = []string{
+	"https://api6.ipify.org",
+	"https://v6.ident.me",
+	"https://ipv6.icanhazip.com",
 }
 
-// detectPublicIPFromServices queries the given services in order and returns
-// the first successfully detected IP.
-func detectPublicIPFromServices(ctx context.Context, services []string) (string, error) {
+// DetectPublicIP tries multiple services to determine the agent's public IPv4.
+func DetectPublicIP(ctx context.Context) (string, error) {
+	return detectPublicIPFromServices(ctx, defaultServices, wantIPv4)
+}
+
+// DetectPublicIP6 tries IPv6-only services to determine the agent's public
+// IPv6. It returns an error (not a v4 fallback) when the host has no routable
+// IPv6, so the caller simply omits the AAAA update.
+func DetectPublicIP6(ctx context.Context) (string, error) {
+	return detectPublicIPFromServices(ctx, defaultServices6, wantIPv6)
+}
+
+type ipFamily int
+
+const (
+	wantIPv4 ipFamily = iota
+	wantIPv6
+)
+
+// detectPublicIPFromServices queries the given services in order and returns the
+// first response that parses as an IP of the requested family. Validating the
+// family guards against a detection service returning garbage, an error page, or
+// the wrong family (e.g. a v4 address from a dual-stack endpoint) — which would
+// otherwise be published verbatim as a DNS record.
+func detectPublicIPFromServices(ctx context.Context, services []string, family ipFamily) (string, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	for _, svc := range services {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, svc, nil)
-		if err != nil {
-			continue
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
-
-		var buf [64]byte
-		n, _ := resp.Body.Read(buf[:])
-		if n > 0 {
-			return strings.TrimSpace(string(buf[:n])), nil
+		if ip := queryIPService(ctx, client, svc, family); ip != "" {
+			return ip, nil
 		}
 	}
 
 	return "", fmt.Errorf("all IP detection services failed")
+}
+
+// queryIPService fetches one detection service and returns the response if it
+// parses as an IP of the requested family, or "" on any failure.
+func queryIPService(ctx context.Context, client *http.Client, svc string, family ipFamily) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, svc, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var buf [64]byte
+	n, _ := resp.Body.Read(buf[:])
+	candidate := strings.TrimSpace(string(buf[:n]))
+	if !isValidIPForFamily(candidate, family) {
+		return ""
+	}
+	return candidate
+}
+
+// isValidIPForFamily reports whether s is a valid IP of the requested family.
+func isValidIPForFamily(s string, family ipFamily) bool {
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return false
+	}
+	switch family {
+	case wantIPv6:
+		return addr.Is6() && !addr.Is4In6()
+	default:
+		return addr.Is4()
+	}
 }

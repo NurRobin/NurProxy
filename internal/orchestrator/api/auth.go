@@ -91,8 +91,17 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "setup complete"})
 }
 
-// POST /api/v1/auth/login — admin login.
+// POST /api/v1/auth/login — admin login. Failed attempts are rate-limited per
+// client IP to blunt online password guessing (bcrypt slows each attempt, but
+// the lockout caps the total).
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if ok, retryAfter := s.loginLimiter.Allow(ip); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many failed login attempts; try again later")
+		return
+	}
+
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -107,15 +116,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	hash, err := s.db.GetSetting("admin_password_hash")
 	if err != nil {
+		s.loginLimiter.Fail(ip)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 
 	if err := auth.CheckPassword(hash, req.Password); err != nil {
+		s.loginLimiter.Fail(ip)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 
+	s.loginLimiter.Reset(ip)
 	s.setSessionCookie(w)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged in"})
