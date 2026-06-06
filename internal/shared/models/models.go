@@ -388,6 +388,7 @@ const (
 	AuditSourceMCP    AuditSource = "mcp"    // MCP tool call
 	AuditSourceAgent  AuditSource = "agent"  // an agent (token auth)
 	AuditSourceSystem AuditSource = "system" // orchestrator itself (reconciler)
+	AuditSourceDryRun AuditSource = "dryrun" // sandbox mode — DNS/ACME calls were simulated, not real (#93)
 )
 
 // AuditLogEntry records a single change event for audit purposes.

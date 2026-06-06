@@ -260,6 +260,24 @@ nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port
 
 Auth comes from `NP_API_KEY` (Bearer) or `NP_API_PASSWORD` (the CLI logs in for you). Add `--json` to any command for script-friendly output. See [wiki/cli.md](wiki/cli.md) for the full command reference.
 
+## Sandbox / dry-run mode
+
+For local development and CI you can run the orchestrator in **dry-run mode**: it runs the full control plane — reconciler, DNS state machine, certificate issuance and renewal — but **simulates every DNS and ACME call instead of executing it**. No live Cloudflare zone, no Let's Encrypt round trips, and no rate-limit risk. DNS mutations land in an in-memory store that reads back correctly (so `create CNAME → present TXT challenge → clean up TXT` sequences behave realistically), and ACME issuance returns a self-signed certificate with a 90-day validity.
+
+```bash
+# Mock everything (DNS + ACME):
+NP_DRY_RUN=true ./nurproxy
+
+# Or per subsystem, for partial testing:
+NP_DNS_DRY_RUN=true ./nurproxy     # mock DNS, real ACME
+NP_ACME_DRY_RUN=true ./nurproxy    # real DNS, mock ACME
+
+# Exercise issuance error paths without waiting for a real failure:
+NP_ACME_DRY_RUN=true NP_DRY_RUN_FAIL=ratelimit ./nurproxy   # ratelimit | challenge | propagation
+```
+
+The `-dry-run` CLI flag is equivalent to `NP_DRY_RUN=true`. Every simulated call is logged and tagged in the audit log with `source: dryrun`, the dashboard shows a persistent **"Dry-run mode"** banner, and `/api/v1/health` reports `dry_run`, `dns_dry_run`, and `acme_dry_run` so there's no confusion with a live instance. Provider setup (validate + list zones) is mocked too, so you can wire up a Cloudflare provider with a dummy token and run the whole flow end-to-end without provisioning anything.
+
 ## Tech stack
 
 - **Backend**: Go, SQLite (embedded, no CGo), single binary
