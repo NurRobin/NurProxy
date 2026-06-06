@@ -148,11 +148,14 @@ func selfSignedCert(names []string) (certPEM, keyPEM []byte, err error) {
 	}
 	now := time.Now()
 	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: names[0], Organization: []string{"NurProxy dry-run"}},
-		NotBefore:             now.Add(-1 * time.Hour),
-		NotAfter:              now.Add(dryRunCertValidity),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: names[0], Organization: []string{"NurProxy dry-run"}},
+		NotBefore:    now.Add(-1 * time.Hour),
+		NotAfter:     now.Add(dryRunCertValidity),
+		// ECDSA leaf for TLS server auth: DigitalSignature is the correct (and
+		// sufficient) key-usage bit. KeyEncipherment is an RSA-key-transport bit and
+		// does not apply to ECDSA.
+		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		DNSNames:              names,

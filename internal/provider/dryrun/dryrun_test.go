@@ -161,3 +161,33 @@ func TestValidateConfig(t *testing.T) {
 		t.Fatal("invalid JSON config should be rejected")
 	}
 }
+
+func TestZoneIsolation(t *testing.T) {
+	ctx := context.Background()
+	d := newWrapped()
+	cfgA := json.RawMessage(`{"zone_id":"zoneA"}`)
+	cfgB := json.RawMessage(`{"zone_id":"zoneB"}`)
+
+	// Same record name created under two different zones (configs).
+	idA, err := d.CreateRecord(ctx, cfgA, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "a.edge", TTL: 0})
+	if err != nil {
+		t.Fatalf("create A: %v", err)
+	}
+	if _, err := d.CreateRecord(ctx, cfgB, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "b.edge", TTL: 0}); err != nil {
+		t.Fatalf("create B: %v", err)
+	}
+
+	// A lookup scoped to zone A must see only zone A's record, not zone B's.
+	recsA, err := d.ListRecords(ctx, cfgA, "app.example.com", "CNAME")
+	if err != nil {
+		t.Fatalf("list A: %v", err)
+	}
+	if len(recsA) != 1 || recsA[0].ID != idA || recsA[0].Content != "a.edge" {
+		t.Fatalf("zone A lookup leaked across zones: %+v", recsA)
+	}
+
+	recsB, _ := d.ListRecords(ctx, cfgB, "app.example.com", "CNAME")
+	if len(recsB) != 1 || recsB[0].Content != "b.edge" {
+		t.Fatalf("zone B lookup wrong: %+v", recsB)
+	}
+}
