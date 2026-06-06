@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"log/slog"
 	"strings"
@@ -42,10 +43,10 @@ func TestSetup_returnsLoggerAndSetsDefault(t *testing.T) {
 		t.Fatal("slog.Default() is nil after Setup")
 	}
 	// Level gating: debug must be below the configured warn threshold.
-	if slog.Default().Enabled(nil, slog.LevelDebug) {
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		t.Error("debug should be disabled when NP_LOG_LEVEL=warn")
 	}
-	if !slog.Default().Enabled(nil, slog.LevelError) {
+	if !slog.Default().Enabled(context.Background(), slog.LevelError) {
 		t.Error("error should be enabled when NP_LOG_LEVEL=warn")
 	}
 }
