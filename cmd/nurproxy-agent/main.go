@@ -44,6 +44,7 @@ var (
 	apiPort         = flag.Int("api-port", 8780, "Agent API port")
 	caddyAdminPort  = flag.Int("caddy-admin-port", 2019, "Caddy admin API port (localhost)")
 	showVersion     = flag.Bool("version", false, "Print version and exit")
+	dryRun          = flag.Bool("dry-run", false, "Sandbox mode: simulate the proxy in-memory (no Caddy process, no :80/:443, unprivileged)")
 
 	// Proxy backend config (§9). Empty = autodetect / OS default; proxy-mode
 	// defaults to built-in (bundled Caddy). These are also settable via env
@@ -99,6 +100,7 @@ func main() {
 		ProxyTestCmd:   *proxyTestCmd,
 		ProxyLogPaths:  *proxyLogPaths,
 		ProxyService:   *proxyService,
+		DryRun:         *dryRun,
 	})
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
@@ -111,6 +113,9 @@ func main() {
 	log.Printf("  API port:     %d", cfg.APIPort)
 	log.Printf("  Caddy admin:  %d", cfg.CaddyAdminPort)
 	log.Printf("  Proxy mode:   %s", cfg.ProxyMode)
+	if cfg.DryRun {
+		log.Printf("  DRY-RUN:      proxy simulated in-memory — no Caddy process, no :80/:443, no privileged file ops")
+	}
 
 	// Set up context with graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -195,9 +200,12 @@ func main() {
 	existingMode := cfg.ProxyMode == agentconfig.ProxyModeExisting
 
 	// Step 2: Start Caddy subprocess (built-in mode only). Failures are reported,
-	// not fatal.
+	// not fatal. Dry-run skips it entirely: the proxy is simulated in-memory, so no
+	// subprocess is spawned and :80/:443 are never bound (runs unprivileged).
 	caddyProc := caddy.NewProcess(cfg.CaddyAdminPort)
-	if existingMode {
+	if cfg.DryRun {
+		log.Printf("Dry-run: not starting the bundled Caddy (proxy simulated in-memory)")
+	} else if existingMode {
 		log.Printf("Existing mode: not starting the bundled Caddy (the host proxy owns :80/:443)")
 	} else if err := caddyProc.Start(ctx); err != nil {
 		log.Printf("WARNING: failed to start Caddy: %v (continuing — agent stays connected)", err)
@@ -205,12 +213,17 @@ func main() {
 		hs.SetError(fmt.Sprintf("failed to start Caddy: %v", err))
 	}
 
-	// Create Caddy client. Fall back to the in-memory mock whenever there is no
-	// live Caddy process to talk to (binary missing, or Start failed above).
+	// Create Caddy client. Use the in-memory mock in dry-run (intentional sandbox),
+	// or whenever there is no live Caddy process to talk to (binary missing, or
+	// Start failed above). The mock records routes/config in memory; Render still
+	// runs for real, so the rendered artifacts match production built-in Caddy.
 	var caddyClient *caddy.Client
-	if caddyProc.IsMock() || !caddyProc.Running() {
+	if cfg.DryRun || caddyProc.IsMock() || !caddyProc.Running() {
 		caddyClient = caddy.NewMockClient()
-		if caddyProc.IsMock() {
+		if cfg.DryRun {
+			hs.SetCaddyRunning(false)
+			hs.SetError("")
+		} else if caddyProc.IsMock() {
 			hs.SetCaddyRunning(false)
 			hs.SetError("Caddy binary not found — no local reverse proxy (install caddy on this host)")
 		}
@@ -283,7 +296,12 @@ func main() {
 	// here is the classic "ports 80/443 already in use" case — report it clearly
 	// and keep running. In existing mode the bundled Caddy is dormant, so binding
 	// the ports would only fail against the host proxy; skip it entirely.
-	if existingMode {
+	if cfg.DryRun {
+		// Dry-run: nothing binds. The mock backend ensures its virtual server when
+		// the stream applies routes; report a clean (non-erroring) state.
+		hs.SetCaddyRunning(false)
+		hs.SetError("")
+	} else if existingMode {
 		hs.SetCaddyRunning(false)
 	} else if err := caddyBackend.EnsureServer(ctx); err != nil {
 		log.Printf("WARNING: Caddy could not start its HTTP server: %v", err)

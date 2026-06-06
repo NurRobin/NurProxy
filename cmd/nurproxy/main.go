@@ -55,6 +55,7 @@ func main() {
 
 	port := flag.Int("port", 8080, "HTTP port")
 	dataDir := flag.String("data-dir", "./data", "Data directory")
+	dryRunFlag := flag.Bool("dry-run", false, "Sandbox mode: simulate all DNS and ACME calls (no external requests)")
 	flag.Parse()
 
 	// Check env vars
@@ -65,6 +66,18 @@ func main() {
 	}
 	if envDataDir := os.Getenv("NP_DATA_DIR"); envDataDir != "" {
 		*dataDir = envDataDir
+	}
+
+	// Dry-run / sandbox mode (#93). NP_DRY_RUN (or -dry-run) turns on both the DNS
+	// and ACME sandboxes; the per-subsystem vars override it for partial testing
+	// (e.g. mock DNS but real ACME, or vice versa). NP_DRY_RUN_FAIL injects an ACME
+	// failure mode (ratelimit|challenge|propagation) so error paths can be exercised.
+	dryRunAll := *dryRunFlag || envBool("NP_DRY_RUN")
+	dnsDryRun := envBoolDefault("NP_DNS_DRY_RUN", dryRunAll)
+	acmeDryRun := envBoolDefault("NP_ACME_DRY_RUN", dryRunAll)
+	acmeFailMode := os.Getenv("NP_DRY_RUN_FAIL")
+	if dnsDryRun || acmeDryRun {
+		log.Printf("DRY-RUN MODE: dns=%v acme=%v fail=%q — no external DNS/ACME calls will be made", dnsDryRun, acmeDryRun, acmeFailMode)
 	}
 
 	// Ensure data dir exists
@@ -97,6 +110,7 @@ func main() {
 	// actual state on agents (routes) and at DNS providers (records).
 	rec := reconciler.New(database, agentclient.New(), reconcilerInterval(database))
 	rec.SetHub(hub)
+	rec.SetDryRunDNS(dnsDryRun)
 	rec.Start(rootCtx)
 	defer rec.Stop()
 
@@ -106,12 +120,14 @@ func main() {
 	// inbound; certs ride the agent-initiated stream (§7). Started only when an
 	// ACME account can be constructed; failures here are non-fatal (the built-in
 	// Caddy self-ACME fallback keeps hosts served).
-	renewer := startRenewer(rootCtx, database, rec, *dataDir)
+	renewer := startRenewer(rootCtx, database, rec, *dataDir, dryRunConfig{dns: dnsDryRun, acme: acmeDryRun, failMode: acmeFailMode})
 
 	// Create API server, wiring in the hub + reconciler so the stream endpoint
 	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
 	srv.SetAgentHub(hub, rec)
+	// Surface sandbox state so the dashboard can show a "dry-run" banner (#93).
+	srv.SetDryRun(dnsDryRun, acmeDryRun)
 	// Wire the on-demand cert issuer so creating a central-TLS domain kicks
 	// first-issuance immediately (§7). Nil when ACME could not be set up; the
 	// periodic renewal scan remains the backstop.
@@ -195,23 +211,45 @@ func main() {
 // settings. Any setup failure is logged and renewal is simply skipped — it must
 // never block orchestrator startup, and hosts still serve via stored certs or
 // the Caddy self-ACME fallback.
-func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, dataDir string) *orchtls.Renewer {
+// dryRunConfig carries the sandbox flags resolved from env/CLI into the renewer
+// wiring (#93): dns mocks the DNS provider, acme mocks the CA (self-signed
+// issuance), and failMode optionally injects an ACME failure path.
+type dryRunConfig struct {
+	dns      bool
+	acme     bool
+	failMode string
+}
+
+func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, dataDir string, dry dryRunConfig) *orchtls.Renewer {
 	accountKey, err := orchtls.LoadOrGenerateAccountKey(filepath.Join(dataDir, "acme-account.key"))
 	if err != nil {
 		log.Printf("tls: renewal disabled: %v", err)
 		return nil
 	}
 
-	// The ACME client reads the contact email + directory from settings at issuance
-	// time (not boot), so configuring them in the setup wizard / Settings takes
-	// effect WITHOUT an orchestrator restart. Until an email is set, issuance is a
-	// quiet no-op (the dashboard surfaces a warning) rather than a hard-disabled loop.
-	acmeClient := &settingsACMEClient{db: database, accountKey: accountKey}
+	// In ACME sandbox mode the CA is never contacted: a dry-run client mints a
+	// self-signed bundle (and can inject failures) so the full issuance/renewal
+	// loop runs with no LE rate-limit risk and no contact email required. Otherwise
+	// the real lego-backed client reads the contact email + directory from settings
+	// at issuance time, so configuring them post-boot takes effect without a restart.
+	var acmeClient orchtls.ACMEClient
+	if dry.acme {
+		acmeClient = orchtls.NewDryRunACMEClient(nil, dry.failMode)
+	} else {
+		acmeClient = &settingsACMEClient{db: database, accountKey: accountKey}
+	}
 	issuer := orchtls.NewIssuer(acmeClient, nil)
 	store := reconciler.NewCertRenewalStore(database)
+	store.SetDryRunDNS(dry.dns)
+	// A sandbox issuance is audited as "dryrun" so its events are never mistaken
+	// for real certificate changes.
+	auditSource := models.AuditSourceSystem
+	if dry.acme {
+		auditSource = models.AuditSourceDryRun
+	}
 	renewer := orchtls.NewRenewer(store, issuer, orchtls.RenewerConfig{
 		Reloader: rec,
-		Audit:    &dbAuditSink{db: database},
+		Audit:    &dbAuditSink{db: database, source: auditSource},
 	})
 
 	go renewer.Start(ctx)
@@ -250,22 +288,55 @@ func (c *settingsACMEClient) ObtainViaDNS01(ctx context.Context, names []string,
 	return client.ObtainViaDNS01(ctx, names, solver)
 }
 
-// dbAuditSink writes renewal audit events to the orchestrator audit log with
-// the system source, satisfying tls.AuditSink (invariant #5: every config change
-// — including cert renewal — is audited with source + actor).
-type dbAuditSink struct{ db *db.DB }
+// dbAuditSink writes renewal audit events to the orchestrator audit log,
+// satisfying tls.AuditSink (invariant #5: every config change — including cert
+// renewal — is audited with source + actor). source is "system" for real
+// issuance and "dryrun" in ACME sandbox mode. A zero source falls back to system.
+type dbAuditSink struct {
+	db     *db.DB
+	source models.AuditSource
+}
 
 func (s *dbAuditSink) Audit(entityType, entityID, action, details string) {
+	source := s.source
+	if source == "" {
+		source = models.AuditSourceSystem
+	}
 	entry := &models.AuditLogEntry{
 		EntityType: entityType,
 		EntityID:   entityID,
 		Action:     action,
 		Actor:      "renewer",
-		Source:     models.AuditSourceSystem,
+		Source:     source,
 		Details:    details,
 	}
 	if err := s.db.InsertAuditLog(entry); err != nil {
 		log.Printf("tls: failed to insert renewal audit log: %v", err)
+	}
+}
+
+// envBool reports whether an env var is set to a truthy value (1/true/yes/on).
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// envBoolDefault returns the env var's boolean value, or def when it is unset.
+// Used for the per-subsystem dry-run overrides, which default to the global flag.
+func envBoolDefault(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -327,6 +328,9 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	}
 	if in.Subdomain == "" || in.ZoneID == "" || in.ServerID == "" {
 		return nil, fmt.Errorf("subdomain, zone_id, and server_id are required")
+	}
+	if err := dnsname.ValidateSubdomain(in.Subdomain); err != nil {
+		return nil, err
 	}
 	if in.Port <= 0 || in.Port > 65535 {
 		return nil, fmt.Errorf("port must be between 1 and 65535")

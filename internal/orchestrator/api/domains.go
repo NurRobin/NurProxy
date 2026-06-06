@@ -12,6 +12,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
+	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -55,6 +56,10 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 
 	if req.Subdomain == "" || req.ZoneID == "" || req.ServerID == "" {
 		writeError(w, http.StatusBadRequest, "subdomain, zone_id, and server_id are required")
+		return
+	}
+	if err := dnsname.ValidateSubdomain(req.Subdomain); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.Port <= 0 || req.Port > 65535 {
@@ -189,6 +194,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Subdomain != nil {
+		if err := dnsname.ValidateSubdomain(*req.Subdomain); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		dom.Subdomain = *req.Subdomain
 	}
 	if req.ZoneID != nil {

@@ -180,6 +180,12 @@
     "zones": "Zonen",
     "ip": "IP",
     "version": "Version",
+    "versionStatus": {
+      "outdated": "veraltet",
+      "ahead": "neuer",
+      "outdatedHint": "Dieser Agent ist älter als der Orchestrator — ein Upgrade wird empfohlen.",
+      "aheadHint": "Dieser Agent ist neuer als der Orchestrator."
+    },
     "lastSeen": "Zuletzt gesehen",
     "id": "ID",
     "manageInServers": "In Server verwalten →",

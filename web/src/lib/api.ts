@@ -32,6 +32,9 @@ export interface AuditLogResponse {
 export interface HealthResponse {
   status: string;
   version: string;
+  dry_run?: boolean;
+  dns_dry_run?: boolean;
+  acme_dry_run?: boolean;
 }
 
 export interface TestProviderZone {

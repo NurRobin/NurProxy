@@ -295,3 +295,66 @@ func containsEvent(events []string, want string) bool {
 	}
 	return false
 }
+
+// flakyACME fails its first failBefore Obtain calls with err, then returns result.
+type flakyACME struct {
+	failBefore int
+	calls      int
+	err        error
+	result     *CertResult
+}
+
+func (f *flakyACME) ObtainViaDNS01(_ context.Context, _ []string, _ DNSSolver) (*CertResult, error) {
+	f.calls++
+	if f.calls <= f.failBefore {
+		return nil, f.err
+	}
+	return f.result, nil
+}
+
+// withFastBackoff shrinks the issuance backoff for the duration of a test and
+// restores it afterwards, so retry tests run in milliseconds.
+func withFastBackoff(t *testing.T) {
+	t.Helper()
+	base, max := issueBaseBackoff, issueMaxBackoff
+	issueBaseBackoff, issueMaxBackoff = time.Millisecond, 2*time.Millisecond
+	t.Cleanup(func() { issueBaseBackoff, issueMaxBackoff = base, max })
+}
+
+func TestRenewer_issueWithRetry_succeedsAfterTransientFailures(t *testing.T) {
+	withFastBackoff(t)
+	fp := newFakeProvider("TXT")
+	store := &fakeStore{forHost: map[string]*RenewTarget{
+		"flaky.example.com": {Host: "flaky.example.com", Names: []string{"flaky.example.com"}, Provider: fp},
+	}}
+	acme := &flakyACME{failBefore: 2, err: errors.New("dial tcp 172.65.32.248:443: i/o timeout"),
+		result: &CertResult{CertPEM: []byte("OK"), KeyPEM: []byte("K")}}
+	r := newRenewer(store, acme, &fakeReloader{}, &fakeAudit{})
+
+	if err := r.EnsureCertForHost(context.Background(), "flaky.example.com"); err != nil {
+		t.Fatalf("expected success after transient retries, got %v", err)
+	}
+	if acme.calls != 3 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 3 (2 transient failures + 1 success)", acme.calls)
+	}
+	if len(store.saved) != 1 || string(store.saved[0].CertPEM) != "OK" {
+		t.Fatalf("cert not saved after retry: %+v", store.saved)
+	}
+}
+
+func TestRenewer_issueWithRetry_doesNotRetryRateLimit(t *testing.T) {
+	withFastBackoff(t)
+	fp := newFakeProvider("TXT")
+	store := &fakeStore{forHost: map[string]*RenewTarget{
+		"rl.example.com": {Host: "rl.example.com", Names: []string{"rl.example.com"}, Provider: fp},
+	}}
+	acme := &flakyACME{failBefore: 99, err: &RateLimitError{Detail: "too many certificates"}}
+	r := newRenewer(store, acme, &fakeReloader{}, &fakeAudit{})
+
+	if err := r.EnsureCertForHost(context.Background(), "rl.example.com"); err == nil {
+		t.Fatal("expected rate-limit error to surface")
+	}
+	if acme.calls != 1 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 1 (rate limit must not be retried)", acme.calls)
+	}
+}

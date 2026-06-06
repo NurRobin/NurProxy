@@ -398,6 +398,11 @@ func registerMockProvider(t *testing.T) *mockDNSProvider {
 func TestReconcileRoutes_PushMissing(t *testing.T) {
 	d := testDB(t)
 	_, _, agent, _, dom := setupScenario(t, d)
+	// A cert exists for the host, so a successful apply marks the domain active
+	// (a central-TLS domain WITHOUT a cert would correctly be "degraded", §78).
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -835,7 +840,7 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 	mp.mu.Unlock()
 
 	// Store the record ID on the domain.
-	if err := d.UpdateDomainDNSRecord(dom.ID, recordID); err != nil {
+	if err := d.UpdateDomainDNSRecord(dom.ID, recordID, true); err != nil {
 		t.Fatalf("UpdateDomainDNSRecord: %v", err)
 	}
 
@@ -881,7 +886,7 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateRecord: %v", err)
 	}
-	if err := d.UpdateDomainDNSRecord(dom.ID, recID); err != nil {
+	if err := d.UpdateDomainDNSRecord(dom.ID, recID, true); err != nil {
 		t.Fatalf("UpdateDomainDNSRecord: %v", err)
 	}
 	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
@@ -1175,6 +1180,10 @@ func TestRunOnce_FullCycle(t *testing.T) {
 	d := testDB(t)
 	mp := registerMockProvider(t)
 	_, _, agent, _, dom := setupScenario(t, d)
+	// Cert present so the fully-synced domain ends "active" (no cert => "degraded", §78).
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -1425,5 +1434,49 @@ func TestReconcileDNS_conflictOnDifferentExistingRecord(t *testing.T) {
 	}
 	if !strings.Contains(got.ErrorMsg, "already exists") || !strings.Contains(got.ErrorMsg, "203.0.113.99") {
 		t.Errorf("conflict error should state current vs desired, got %q", got.ErrorMsg)
+	}
+}
+
+// TestReconcileDeletions_KeepsAdoptedRecord proves the #79 fix: when a domain's
+// DNS record was ADOPTED (managed=false) rather than created by NurProxy,
+// teardown must NOT delete it (that record predates NurProxy and is the
+// operator's), yet the domain row must still be removed (no stranding in
+// "deleting").
+func TestReconcileDeletions_KeepsAdoptedRecord(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	recID, err := mp.CreateRecord(context.Background(), nil, provider.Record{
+		Type: "CNAME", Name: "app.example.com", Content: "agent1.example.com",
+	})
+	if err != nil {
+		t.Fatalf("CreateRecord: %v", err)
+	}
+	// Adopted, not created by NurProxy.
+	if err := d.UpdateDomainDNSRecord(dom.ID, recID, false); err != nil {
+		t.Fatalf("UpdateDomainDNSRecord: %v", err)
+	}
+	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatalf("UpdateDomainStatus: %v", err)
+	}
+
+	mc := newMockAgentClient()
+	mc.setHealthy(agent.APIURL, true)
+	r := New(d, mc, time.Minute)
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+	r.SetHub(hub)
+	if err := r.reconcileDeletions(context.Background()); err != nil {
+		t.Fatalf("reconcileDeletions: %v", err)
+	}
+
+	// The adopted DNS record MUST survive.
+	if _, ok := mp.getRecord(recID); !ok {
+		t.Error("adopted DNS record was deleted; teardown must only delete records NurProxy created (#79)")
+	}
+	// The domain row is still removed — no stranding in "deleting".
+	if _, err := d.GetDomain(dom.ID); err == nil {
+		t.Error("expected domain row to be removed even though the adopted record was kept")
 	}
 }

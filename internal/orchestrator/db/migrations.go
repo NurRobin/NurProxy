@@ -428,7 +428,17 @@ var migrations = []string{
 	ALTER TABLE agents ADD COLUMN detected_networks TEXT NOT NULL DEFAULT '';
 	`,
 
-	// Migration 17: IPv6 support. public_ip6 holds the agent's detected public
+	// Migration 17: track whether NurProxy CREATED a domain's DNS record or merely
+	// ADOPTED a matching pre-existing one. On teardown we must only delete records
+	// we created — deleting an adopted record would destroy DNS the operator owned
+	// before NurProxy ever touched it. Default 0 (not managed) is the safe value
+	// for existing rows: a record whose provenance we don't know is treated as
+	// adopted and never auto-deleted.
+	`
+	ALTER TABLE domains ADD COLUMN dns_managed INTEGER NOT NULL DEFAULT 0;
+	`,
+
+	// Migration 18: IPv6 support. public_ip6 holds the agent's detected public
 	// IPv6 address; dns_record_id6 tracks the provider ID of its AAAA record,
 	// separate from the A record's dns_record_id so each family updates
 	// independently under DDNS. Empty for IPv4-only hosts.

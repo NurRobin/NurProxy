@@ -15,6 +15,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/provider"
+	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -50,6 +51,13 @@ type Reconciler struct {
 	mu          sync.Mutex
 	cancel      context.CancelFunc
 	running     bool
+
+	// dnsDryRun routes every DNS provider operation through the in-memory sandbox
+	// instead of a real provider (#93). It also flips the source of DNS-specific
+	// audit entries to "dryrun" so simulated record changes are unmistakable —
+	// while non-DNS reconciler events (route push, drift, agent status) stay
+	// "system", since those are not simulated by DNS sandbox mode.
+	dnsDryRun bool
 }
 
 // New creates a Reconciler.
@@ -59,6 +67,22 @@ func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reco
 		agentClient: agentClient,
 		interval:    interval,
 	}
+}
+
+// SetDryRunDNS toggles DNS sandbox mode. When on, the reconciler wraps every
+// resolved DNS provider with the dry-run decorator (no real API calls) and tags
+// its DNS audit entries with the dry-run source so they are clearly synthetic.
+func (r *Reconciler) SetDryRunDNS(on bool) {
+	r.dnsDryRun = on
+}
+
+// wrapDNS returns p unchanged, or its dry-run sandbox decorator when DNS dry-run
+// mode is active. Applied at every point the reconciler resolves a DNS provider.
+func (r *Reconciler) wrapDNS(p provider.Provider) provider.Provider {
+	if r.dnsDryRun {
+		return dryrun.Wrap(p, nil)
+	}
+	return p
 }
 
 // SetHub attaches the agent connection hub so the reconciler can push routes to
@@ -555,8 +579,8 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 				continue
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_pushed", "pushed missing route to agent")
-			if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
-				log.Printf("reconciler: failed to mark domain synced: %v", dErr)
+			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
 		}
@@ -565,8 +589,8 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if routesMatch(desired.route, actual) {
 			// All good — keep last_synced fresh so the dashboard reflects the
 			// most recent successful reconciliation.
-			if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
-				log.Printf("reconciler: failed to mark domain synced: %v", dErr)
+			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
 		}
@@ -642,6 +666,7 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 			log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, pErr)
 			continue
 		}
+		dnsProvider = r.wrapDNS(dnsProvider)
 
 		// Merge zone's external ID into provider config for DNS API calls.
 		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
@@ -694,10 +719,10 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", uErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
 				}
-				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", uErr.Error())
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", uErr.Error())
 				continue
 			}
-			r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_updated", fmt.Sprintf("updated CNAME %s: %s -> %s", fqdn, rec.Content, expectedTarget))
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_updated", fmt.Sprintf("updated CNAME %s: %s -> %s", fqdn, rec.Content, expectedTarget))
 		}
 	}
 
@@ -725,15 +750,16 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 
 	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
 		// Identical record already exists — adopt it instead of creating a duplicate
-		// ("it's the record we'd set anyway, just skip").
-		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID); dErr != nil {
+		// ("it's the record we'd set anyway, just skip"). managed=false: we did NOT
+		// create this record, so teardown must never delete it (§79).
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, false); dErr != nil {
 			log.Printf("reconciler: failed to store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
 		}
 		// Clear any stale DNS error; the proxy apply sets the real status next.
 		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
 			log.Printf("reconciler: failed to clear domain status: %v", dErr)
 		}
-		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s", fqdn, target))
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s", fqdn, target))
 		return
 	}
 
@@ -745,7 +771,7 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, msg); dErr != nil {
 			log.Printf("reconciler: failed to update domain status: %v", dErr)
 		}
-		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_conflict", msg)
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_conflict", msg)
 		return
 	}
 
@@ -756,13 +782,14 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS create failed: %v", cErr)); dErr != nil {
 			log.Printf("reconciler: failed to update domain status: %v", dErr)
 		}
-		r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
 		return
 	}
-	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID); dErr != nil {
+	// managed=true: NurProxy created this record, so teardown may delete it (§79).
+	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
 		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
 	}
-	r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
+	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
 }
 
 // lookupRecordsByName returns the provider's records whose name equals fqdn
@@ -877,6 +904,7 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 			log.Printf("reconciler: provider %s not registered: %v", prov.Type, gErr)
 			continue
 		}
+		dnsProvider = r.wrapDNS(dnsProvider)
 		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
 
 		// Always ensure the IPv4 A record. Also ensure an IPv6 AAAA record when the
@@ -925,12 +953,12 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 			// correct its IP if it drifted (e.g. adopted from a prior run).
 			persist(adopt.ID)
 			if sameRecordContent(adopt.Content, ip) {
-				r.audit("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted existing %s %s -> %s", recordType, a.FQDN, ip))
+				r.auditDNS("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted existing %s %s -> %s", recordType, a.FQDN, ip))
 			} else if uErr := dnsProvider.UpdateRecord(ctx, provConfig, adopt.ID, rec); uErr != nil {
 				log.Printf("reconciler: failed to correct adopted %s record for agent %s: %v", recordType, a.ID, uErr)
-				r.audit("agent", a.ID, action+"_update_failed", uErr.Error())
+				r.auditDNS("agent", a.ID, action+"_update_failed", uErr.Error())
 			} else {
-				r.audit("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted + corrected %s %s -> %s (was %s)", recordType, a.FQDN, ip, adopt.Content))
+				r.auditDNS("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted + corrected %s %s -> %s (was %s)", recordType, a.FQDN, ip, adopt.Content))
 			}
 			return
 		}
@@ -939,17 +967,17 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 			msg := fmt.Sprintf("cannot create the %s record for %s: a CNAME already exists there (%s). An address record can't coexist with a CNAME — remove it or pick a different FQDN.", recordType, a.FQDN, describeRecords([]provider.Record{*cname}))
 			log.Printf("reconciler: %s record conflict for agent %s: %s", recordType, a.ID, msg)
 			r.setAgentDNSError(a, msg)
-			r.audit("agent", a.ID, action+"_conflict", msg)
+			r.auditDNS("agent", a.ID, action+"_conflict", msg)
 			return
 		}
 		newID, cErr := dnsProvider.CreateRecord(ctx, provConfig, rec)
 		if cErr != nil {
 			log.Printf("reconciler: failed to create %s record for agent %s: %v", recordType, a.ID, cErr)
-			r.audit("agent", a.ID, action+"_create_failed", cErr.Error())
+			r.auditDNS("agent", a.ID, action+"_create_failed", cErr.Error())
 			return
 		}
 		persist(newID)
-		r.audit("agent", a.ID, action+"_created", fmt.Sprintf("created %s %s -> %s", recordType, a.FQDN, ip))
+		r.auditDNS("agent", a.ID, action+"_created", fmt.Sprintf("created %s %s -> %s", recordType, a.FQDN, ip))
 		return
 	}
 
@@ -972,10 +1000,10 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 	}
 	if uErr := dnsProvider.UpdateRecord(ctx, provConfig, recordID, rec); uErr != nil {
 		log.Printf("reconciler: failed to update %s record for agent %s: %v", recordType, a.ID, uErr)
-		r.audit("agent", a.ID, action+"_update_failed", uErr.Error())
+		r.auditDNS("agent", a.ID, action+"_update_failed", uErr.Error())
 		return
 	}
-	r.audit("agent", a.ID, "ddns_updated", fmt.Sprintf("updated %s %s: %s -> %s", recordType, a.FQDN, existing.Content, ip))
+	r.auditDNS("agent", a.ID, "ddns_updated", fmt.Sprintf("updated %s %s: %s -> %s", recordType, a.FQDN, existing.Content, ip))
 }
 
 // setAgentDNSError persists an orchestrator-side DNS error for the agent, but
@@ -992,9 +1020,9 @@ func (r *Reconciler) setAgentDNSError(a *models.Agent, msg string) {
 	}
 	a.DNSError = msg
 	if msg != "" {
-		r.audit("agent", a.ID, "dns_error", msg)
+		r.auditDNS("agent", a.ID, "dns_error", msg)
 	} else {
-		r.audit("agent", a.ID, "dns_error_cleared", "FQDN now resolves to an assigned zone")
+		r.auditDNS("agent", a.ID, "dns_error_cleared", "FQDN now resolves to an assigned zone")
 	}
 }
 
@@ -1049,18 +1077,25 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 			affectedAgents[srv.AgentID] = true
 		}
 
-		// Best-effort DNS record cleanup.
-		if dom.DNSRecordID != "" {
+		// Best-effort DNS record cleanup — but ONLY for records NurProxy created.
+		// An adopted record (DNSManaged == false) predates NurProxy and must never
+		// be deleted: doing so would destroy the operator's own DNS. Skipping the
+		// delete for adopted records also avoids the failure path below stranding
+		// the domain in "deleting" forever (§79).
+		if dom.DNSRecordID != "" && dom.DNSManaged {
 			if zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID); ok {
 				provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
 				if dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID); dErr != nil {
 					log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
-					r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
+					r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
 					// Keep the domain around so we retry next cycle.
 					continue
 				}
-				r.audit("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
 			}
+		} else if dom.DNSRecordID != "" && !dom.DNSManaged {
+			log.Printf("reconciler: leaving adopted DNS record %s for domain %d in place (NurProxy did not create it)", dom.DNSRecordID, dom.ID)
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_left_adopted", fmt.Sprintf("kept operator-owned record %s", dom.DNSRecordID))
 		}
 
 		// Route cleanup on the host rides the dial-out stream (the re-push after this
@@ -1119,7 +1154,7 @@ func (r *Reconciler) resolveDNS(zoneID string) (*models.Zone, *models.Provider, 
 		log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, err)
 		return nil, nil, nil, false
 	}
-	return zone, prov, dnsProvider, true
+	return zone, prov, r.wrapDNS(dnsProvider), true
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,15 +1223,34 @@ func routesMatch(a, b json.RawMessage) bool {
 	return caddyeq.Equal(string(a), string(b))
 }
 
-// audit is a convenience wrapper that logs to both the audit table and stderr.
+// audit records a reconciler event with the system source (the reconciler is the
+// orchestrator acting on its own).
 func (r *Reconciler) audit(entityType, entityID, action, details string) {
+	r.auditWithSource(models.AuditSourceSystem, entityType, entityID, action, details)
+}
+
+// auditDNS records a DNS-record event. In DNS sandbox mode its source is
+// "dryrun" — so a simulated CNAME/A/TXT change can never be mistaken for a real
+// one — otherwise it is the normal system source. Only record-mutation events
+// use this; route/drift/agent events stay on audit() (system), because DNS
+// sandbox mode does not simulate those.
+func (r *Reconciler) auditDNS(entityType, entityID, action, details string) {
+	source := models.AuditSourceSystem
+	if r.dnsDryRun {
+		source = models.AuditSourceDryRun
+	}
+	r.auditWithSource(source, entityType, entityID, action, details)
+}
+
+// auditWithSource is the shared writer: it logs to stderr and the audit table.
+func (r *Reconciler) auditWithSource(source models.AuditSource, entityType, entityID, action, details string) {
 	log.Printf("reconciler: audit %s/%s %s: %s", entityType, entityID, action, details)
 	entry := &models.AuditLogEntry{
 		EntityType: entityType,
 		EntityID:   entityID,
 		Action:     action,
 		Actor:      "reconciler",
-		Source:     models.AuditSourceSystem,
+		Source:     source,
 		Details:    details,
 	}
 	if err := r.db.InsertAuditLog(entry); err != nil {
