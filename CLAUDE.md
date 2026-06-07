@@ -100,3 +100,12 @@ created with a dummy token works end-to-end.
 - Interface: `internal/provider/provider.go`
 - Add new: implement interface, register in `init()`
 - Cloudflare ships first: `internal/provider/cloudflare/`
+
+## Releasing
+- Full runbook: [RELEASING.md](RELEASING.md).
+- Branch model: `dev` (integration) → `release/X.Y.Z` (freeze + RCs) → `main`
+  (released code only, always == latest tag).
+- Tag-driven: any `v*` tag runs `release.yml`. A `-rc`/`-beta` suffix builds a
+  GitHub pre-release + versioned GHCR image + signed binaries for real testing,
+  while `:latest`, Homebrew, AUR and the apt/yum repo stay on the last final tag.
+- Final release: merge `release/X.Y.Z → main`, then tag `vX.Y.Z` (no suffix).

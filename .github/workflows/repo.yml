@@ -73,8 +73,10 @@ jobs:
             done
             [ "$n" -gt 0 ] || { echo "::error::no .deb/.rpm assets on $TAG after waiting 5m"; exit 1; }
           fi
-          # Rebuild the repo from every release's packages so it stays complete.
-          for tag in $(gh release list --limit 200 --json tagName --jq '.[].tagName'); do
+          # Rebuild the repo from every STABLE release's packages so it stays
+          # complete. Pre-releases (-rc/-beta) are excluded — an RC's .deb/.rpm
+          # must never enter the stable apt/yum repo; only final tags ship here.
+          for tag in $(gh release list --limit 200 --exclude-pre-releases --json tagName --jq '.[].tagName'); do
             gh release download "$tag" -D packages -p '*.deb' -p '*.rpm' --clobber || true
           done
           count=$(find packages -name '*.deb' -o -name '*.rpm' | wc -l)
