@@ -69,8 +69,10 @@ api() { # api METHOD PATH [JSON]
 jget() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
 
 wait_for() { # wait_for URL DESC
+  # A fresh-DB cold boot runs every migration before /health answers; on a slow
+  # disk that is tens of seconds, so wait up to ~60s (300 * 0.2s) rather than 10s.
   local url=$1 desc=$2 i
-  for i in $(seq 1 50); do curl -fsS "$url" >/dev/null 2>&1 && return 0; sleep 0.2; done
+  for i in $(seq 1 300); do curl -fsS "$url" >/dev/null 2>&1 && return 0; sleep 0.2; done
   echo "error: timed out waiting for $desc ($url)" >&2; return 1
 }
 
@@ -81,7 +83,15 @@ PIDS+=($!)
 wait_for "${BASE}/api/v1/health" "orchestrator"
 
 export NP_API_URL="$BASE"
-"$ORCH_BIN" auth setup --password "$PASSWORD" >/dev/null 2>&1 || true
+# The workdir is wiped on every run, so the DB is always fresh — auth setup
+# must succeed. Capture its output and surface it on failure instead of masking
+# the real error behind an eventual empty API_KEY.
+if ! setup_out=$("$ORCH_BIN" auth setup --password "$PASSWORD" 2>&1); then
+  echo "error: auth setup failed:" >&2
+  echo "$setup_out" >&2
+  cat "$WORKDIR/orch.log" >&2
+  exit 1
+fi
 API_KEY=$("$ORCH_BIN" apikey create --password "$PASSWORD" 2>&1 | grep -oE 'np_ak_[a-f0-9]+' | head -1)
 [[ -n "$API_KEY" ]] || { echo "error: could not create API key" >&2; cat "$WORKDIR/orch.log" >&2; exit 1; }
 export API_KEY
