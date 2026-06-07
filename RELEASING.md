@@ -58,8 +58,9 @@ dev ──cut──▶ release/X.Y.Z ──tag rc──▶ test ──fix──�
 2. **Review** the full `main..dev` diff — correctness and security:
    ```bash
    git diff origin/main...release/0.3.0     # what ships
-   /code-review                              # correctness + cleanup
-   /security-review                          # security pass
+   # then, in Claude Code, run the review skills over that diff:
+   #   /code-review       — correctness + cleanup
+   #   /security-review   — security pass
    ```
    Pay special attention to anything auth/crypto/network-facing and to new env
    defaults (e.g. dry-run must never be on in prod).
