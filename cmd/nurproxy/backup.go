@@ -58,6 +58,7 @@ func cmdBackup(args []string) {
 		fatalf("backup: %v", err)
 	}
 	fmt.Printf("Backup written to %s\n", outPath)
+	fmt.Fprintf(os.Stderr, "backup: WARNING: %s contains the plaintext %s — store it as a secret (anyone with it can decrypt every provider config and TLS key in the DB)\n", outPath, encryptionKeyName)
 }
 
 // backupDataDir writes a gzipped tar of a consistent DB snapshot plus the key
@@ -143,6 +144,13 @@ func cmdRestore(args []string) {
 // into dataDir, returning the number of files restored. It refuses to clobber an
 // existing database unless force is set, and ignores any entry that isn't one of
 // the known flat filenames (rejecting path traversal and stray content).
+//
+// The restore is ATOMIC with respect to the existing data dir: every entry is
+// first extracted to a temp file alongside its destination, the whole archive is
+// read to completion (so gzip's CRC validates the full stream and a truncated or
+// corrupt archive is caught) and only then are the temp files renamed into place.
+// On any error before the commit, the temp files are removed and the existing
+// data dir is left byte-for-byte untouched.
 func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	if _, err := os.Stat(filepath.Join(dataDir, dbFileName)); err == nil && !force {
 		return 0, fmt.Errorf("%s already has a %s — refusing to overwrite (pass --force to replace it)", dataDir, dbFileName)
@@ -165,7 +173,20 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	}
 
 	allowed := map[string]bool{dbFileName: true, encryptionKeyName: true, acmeAccountKeyName: true}
-	restored := 0
+
+	// staged maps the final filename to the temp file it has been extracted to.
+	// Until the whole archive verifies we touch nothing in dataDir but these
+	// temps, which are removed on any failure path.
+	staged := map[string]string{}
+	committed := false
+	defer func() {
+		if !committed {
+			for _, tmp := range staged {
+				_ = os.Remove(tmp)
+			}
+		}
+	}()
+
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
@@ -173,7 +194,9 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 			break
 		}
 		if err != nil {
-			return restored, fmt.Errorf("reading archive: %w", err)
+			// A truncated/corrupt archive surfaces here (incl. gzip CRC). The
+			// defer wipes the staged temps; dataDir is untouched.
+			return 0, fmt.Errorf("reading archive: %w", err)
 		}
 		// Only known, flat filenames are honored — this rejects path traversal
 		// (../, absolute paths) and any unexpected entries outright.
@@ -182,16 +205,86 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 			fmt.Fprintf(os.Stderr, "restore: skipping unexpected entry %q\n", hdr.Name)
 			continue
 		}
-		if err := writeFileFromTar(filepath.Join(dataDir, name), tr); err != nil {
-			return restored, fmt.Errorf("writing %s: %w", name, err)
+		tmp, err := extractToTemp(dataDir, name, tr)
+		if err != nil {
+			return 0, fmt.Errorf("staging %s: %w", name, err)
 		}
-		restored++
+		staged[name] = tmp
 	}
 
-	if restored == 0 {
+	if len(staged) == 0 {
 		return 0, fmt.Errorf("archive contained no recognizable NurProxy files")
 	}
+
+	// The archive read cleanly. Before installing the new DB, guard against a key
+	// mismatch: if the archive omits encryption.key but the target already has one,
+	// the restored DB would be decrypted with a stale key. Refuse rather than
+	// silently leave a DB that cannot read its own secrets.
+	if _, bringsKey := staged[encryptionKeyName]; !bringsKey {
+		if _, bringsDB := staged[dbFileName]; bringsDB {
+			existingKey := filepath.Join(dataDir, encryptionKeyName)
+			if _, err := os.Stat(existingKey); err == nil {
+				return 0, fmt.Errorf("archive has no %s but %s already exists — the existing key may not match the restored %s; restore from a backup that includes the key, or remove the stale key deliberately first", encryptionKeyName, existingKey, dbFileName)
+			}
+		}
+	}
+
+	// Commit: rename each staged temp over its destination. The DB is installed
+	// first; once it lands we clear any stale -wal/-shm so SQLite can't replay a
+	// journal that belonged to the previous database.
+	restored := 0
+	commit := func(name string) error {
+		dest := filepath.Join(dataDir, name)
+		if err := os.Rename(staged[name], dest); err != nil {
+			return fmt.Errorf("installing %s: %w", name, err)
+		}
+		delete(staged, name)
+		restored++
+		return nil
+	}
+	if _, ok := staged[dbFileName]; ok {
+		if err := commit(dbFileName); err != nil {
+			return restored, err
+		}
+		for _, sidecar := range []string{dbFileName + "-wal", dbFileName + "-shm"} {
+			if err := os.Remove(filepath.Join(dataDir, sidecar)); err != nil && !os.IsNotExist(err) {
+				return restored, fmt.Errorf("removing stale %s: %w", sidecar, err)
+			}
+		}
+	}
+	for name := range staged {
+		if err := commit(name); err != nil {
+			return restored, err
+		}
+	}
+
+	committed = true
 	return restored, nil
+}
+
+// extractToTemp writes the current tar entry to a temp file in dataDir (same
+// filesystem as the destination, so the later rename is atomic) and returns its
+// path. The temp is named after the target so a crash leaves it obviously stray.
+func extractToTemp(dataDir, name string, tr io.Reader) (string, error) {
+	tmp, err := os.CreateTemp(dataDir, "."+name+".restore-*")
+	if err != nil {
+		return "", err
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	if _, err := io.Copy(tmp, tr); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	return tmp.Name(), nil
 }
 
 // addFileToTar writes the file at srcPath into the tar under name with mode 0600.
@@ -215,17 +308,5 @@ func addFileToTar(tw *tar.Writer, srcPath, name string) error {
 		return err
 	}
 	_, err = io.Copy(tw, in)
-	return err
-}
-
-// writeFileFromTar writes the current tar entry to dest with mode 0600 (secrets
-// and the DB must not be world-readable).
-func writeFileFromTar(dest string, tr io.Reader) error {
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, tr)
 	return err
 }
