@@ -20,8 +20,17 @@ const (
 	ctxSource  contextKey = "source"
 )
 
-// requireAuth wraps a handler to require authentication.
-// Checks: 1) session cookie, 2) Bearer token (admin API key), 3) agent token.
+// requireAuth wraps an operator-only (admin) handler. It accepts EXACTLY two
+// credentials: 1) a valid admin session cookie (dashboard) or 2) the admin API
+// key as a Bearer token (REST API).
+//
+// It deliberately does NOT accept agent bearer tokens. Every route guarded by
+// requireAuth is operator-only (providers, zones, domains, servers, settings,
+// api-key, audit, agent management). Agent self-endpoints (register, heartbeat,
+// stream, routes/ack, artifact/log/admin-op reporting) use requireAgentAuth
+// instead, which scopes each agent to its own resources. Honoring an agent
+// token here would let any leaked agent credential drive the whole control
+// plane — a privilege escalation to full admin (H1).
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1) Session cookie → dashboard (UI)
@@ -34,7 +43,9 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		// 2) Bearer token — admin API key → REST API
+		// 2) Bearer token — admin API key only → REST API. An agent token is NOT
+		// a substitute here (see the doc comment above); it is rejected so a
+		// leaked agent credential cannot reach admin routes.
 		if token := bearerToken(r); token != "" {
 			apiKey, err := s.db.GetSetting("admin_api_key")
 			if err == nil && apiKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(token)) == 1 {
@@ -42,21 +53,6 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
-			}
-
-			// 3) Agent token
-			agents, err := s.db.ListAgents()
-			if err == nil {
-				tokenHash := auth.HashToken(token)
-				for _, a := range agents {
-					if a.TokenHash == tokenHash {
-						ctx := context.WithValue(r.Context(), ctxActor, "agent:"+a.ID)
-						ctx = context.WithValue(ctx, ctxAgentID, a.ID)
-						ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAgent)
-						next.ServeHTTP(w, r.WithContext(ctx))
-						return
-					}
-				}
 			}
 		}
 

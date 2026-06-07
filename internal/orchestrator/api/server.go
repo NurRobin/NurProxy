@@ -92,6 +92,19 @@ func NewServer(database *db.DB, version string) *Server {
 		loginLimiter: ratelimit.New(5, 15*time.Minute, 15*time.Minute),
 	}
 
+	// Wire the session TTL and the server-side revocation-version provider ONCE,
+	// at construction, before any handler can run. This makes token expiry and
+	// revocation enforced from the very first request after a process restart.
+	// Previously these were wired only lazily inside the auth handlers, so until
+	// an auth handler happened to run, sm.version was nil and currentVersion()
+	// returned 0 — which let a REVOKED cookie (version >= 1) pass the
+	// "ver < currentVersion()" check on every protected route. Wiring here closes
+	// that window. Doing it once (rather than on every auth call) also removes the
+	// concurrent unsynchronized writes to sm.ttl/sm.version that raced with the
+	// requireAuth Verify reads.
+	s.sessions.WithTTLFunc(s.sessionDuration)
+	s.sessions.WithVersion(func() int { return s.currentSessionVersion() })
+
 	s.registerRoutes()
 	return s
 }
@@ -164,7 +177,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/adopt", s.requireAuth(s.handleAdoptAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/reject", s.requireAuth(s.handleRejectAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/auto-reconcile", s.requireAuth(s.handleSetAutoReconcile))
-	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAuth(s.handleAgentStatus))
+	// Adoption/status poll: the agent dials out to confirm its own adoption
+	// state (agent auth, scoped to itself). Not an admin route — honoring an
+	// agent token here does not re-open the H1 escalation because the handler
+	// rejects any id that is not the caller's own.
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAgentAuth(s.handleAgentStatus))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", s.requireAgentAuth(s.handleAgentHeartbeat))
 	// Live push channel: the agent dials out and holds this open; the
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
