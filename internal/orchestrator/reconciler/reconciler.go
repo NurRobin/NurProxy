@@ -615,8 +615,11 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 			continue
 		}
 		r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "drift_fixed", "pushed corrected route to agent")
-		if dErr := r.db.MarkDomainSynced(desired.domain.ID); dErr != nil {
-			log.Printf("reconciler: failed to mark domain synced: %v", dErr)
+		// Route the drift-fix through the same applied path as the push/match cases so
+		// it honors the §78 degraded check (a central-TLS domain with no issued cert
+		// is marked "degraded", not a bare "active" that hides the plaintext downgrade).
+		if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+			log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 		}
 	}
 
@@ -699,10 +702,18 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 		// Record exists — verify content.
 		rec, gErr := dnsProvider.GetRecord(ctx, provConfig, dom.DNSRecordID)
 		if gErr != nil {
-			// The stored record ID no longer resolves (deleted at the provider, or a
-			// transient read error). Re-resolve by name: adopt the live record if it
-			// still exists, else create — never blind-create into "already exists".
-			log.Printf("reconciler: DNS record %s for domain %d did not resolve, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
+			// Only a genuine not-found (the record was deleted at the provider) means
+			// we should re-resolve by name — adopt the live record if it still exists,
+			// else create — never blind-create into "already exists". A transient read
+			// error (network/auth/rate-limit) is NOT a miss: re-resolving would adopt a
+			// still-managed record as managed=false, flipping it to "adopted" and
+			// defeating teardown cleanup (#66/§79). Preserve the stored dns_managed flag
+			// and the record id, and retry next cycle.
+			if !errors.Is(gErr, provider.ErrRecordNotFound) {
+				log.Printf("reconciler: transient read of DNS record %s for domain %d, preserving managed state and retrying next cycle: %v", dom.DNSRecordID, dom.ID, gErr)
+				continue
+			}
+			log.Printf("reconciler: DNS record %s for domain %d no longer exists, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
 			r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
 			continue
 		}
@@ -950,17 +961,22 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 			return
 		}
 		if adopt := firstRecordOfType(existing, recordType); adopt != nil {
-			// The agent owns its anchor FQDN's record. Adopt the existing one and
-			// correct its IP if it drifted (e.g. adopted from a prior run).
-			persist(adopt.ID)
-			if sameRecordContent(adopt.Content, ip) {
-				r.auditDNS("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted existing %s %s -> %s", recordType, a.FQDN, ip))
-			} else if uErr := dnsProvider.UpdateRecord(ctx, provConfig, adopt.ID, rec); uErr != nil {
-				log.Printf("reconciler: failed to correct adopted %s record for agent %s: %v", recordType, a.ID, uErr)
-				r.auditDNS("agent", a.ID, action+"_update_failed", uErr.Error())
-			} else {
-				r.auditDNS("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted + corrected %s %s -> %s (was %s)", recordType, a.FQDN, ip, adopt.Content))
+			// Only adopt a record whose content ALREADY matches the agent IP — "it's the
+			// record we'd set anyway". A record of the same type but a different IP is one
+			// NurProxy did not create (an operator's own A/AAAA at this name); never
+			// UpdateRecord over it — that would silently clobber a record we don't own,
+			// unlike the safe domain-CNAME path. Raise an explicit, actionable conflict
+			// instead (mirrors the CNAME-conflict handling below).
+			if !sameRecordContent(adopt.Content, ip) {
+				msg := fmt.Sprintf("a %s record for %s already exists with a different address (%s, want %s). NurProxy won't overwrite a record it didn't create — point it at %s or remove it at your DNS provider.", recordType, a.FQDN, adopt.Content, ip, ip)
+				log.Printf("reconciler: %s record conflict for agent %s: %s", recordType, a.ID, msg)
+				r.setAgentDNSError(a, msg)
+				r.auditDNS("agent", a.ID, action+"_conflict", msg)
+				return
 			}
+			// Content matches what we'd set: adopt it (record its ID).
+			persist(adopt.ID)
+			r.auditDNS("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted existing %s %s -> %s", recordType, a.FQDN, ip))
 			return
 		}
 		if cname := firstRecordOfType(existing, "CNAME"); cname != nil {

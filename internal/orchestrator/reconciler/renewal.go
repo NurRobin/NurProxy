@@ -108,6 +108,7 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 			log.Printf("reconciler: first-issuance: cannot resolve zone/provider for %q, skipping", fqdn)
 			continue
 		}
+		t.FirstIssue = true // re-checked under the per-host lock so a concurrent on-create issuance isn't double-driven
 		targets = append(targets, t)
 		seen[fqdn] = true
 	}
