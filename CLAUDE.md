@@ -91,6 +91,13 @@ created with a dummy token works end-to-end.
 - Error handling: return errors, don't panic in library code
 - Context as first parameter where applicable
 
+## Commit attribution
+- Commits and PRs are authored **solely under the repository owner**. An AI
+  assistant is a tool, not an author or co-owner — it gets no attribution.
+- Never add `Co-Authored-By:`, `Co-developed-by:`, `Assisted-by:` or
+  `Signed-off-by:` trailers for any AI assistant, and no "Generated with …"
+  footer in PR descriptions. The human author takes full responsibility.
+
 ## Database
 - SQLite via `modernc.org/sqlite` (pure Go, no CGo)
 - Migrations in `internal/orchestrator/db/migrations.go`
