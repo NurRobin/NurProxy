@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
 )
@@ -351,5 +352,51 @@ func TestInvalidConfigJSON(t *testing.T) {
 	err := p.ValidateConfig(context.Background(), json.RawMessage(`not json`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
+	}
+}
+
+func TestGetClient(t *testing.T) {
+	configured := &http.Client{Timeout: 5 * time.Second}
+
+	tests := []struct {
+		name        string
+		client      *http.Client
+		wantSame    bool
+		wantTimeout time.Duration
+	}{
+		{
+			name:        "nil client falls back to a client with a non-zero timeout",
+			client:      nil,
+			wantSame:    false,
+			wantTimeout: 30 * time.Second,
+		},
+		{
+			name:        "explicit client is returned unchanged",
+			client:      configured,
+			wantSame:    true,
+			wantTimeout: 5 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &CloudflareProvider{client: tt.client}
+			got := p.getClient()
+			if got == nil {
+				t.Fatal("getClient returned nil")
+			}
+			if tt.wantSame && got != tt.client {
+				t.Errorf("expected the configured client to be returned unchanged")
+			}
+			if !tt.wantSame && got == http.DefaultClient {
+				t.Errorf("expected fallback client, got http.DefaultClient")
+			}
+			if got.Timeout != tt.wantTimeout {
+				t.Errorf("Timeout = %v, want %v", got.Timeout, tt.wantTimeout)
+			}
+			if got.Timeout == 0 {
+				t.Errorf("Timeout must be non-zero to avoid hanging on a black-holing endpoint")
+			}
+		})
 	}
 }

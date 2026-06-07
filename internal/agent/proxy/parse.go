@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -125,11 +126,18 @@ var gatherNginxConfig = func(configDir string) string {
 			return
 		}
 		seen[real] = struct{}{}
-		data, err := os.ReadFile(path)
+		f, err := os.Open(path)
 		if err != nil {
 			return
 		}
-		b.Write(data)
+		defer f.Close()
+		// Bound this file's contribution to the remaining budget so a single
+		// huge config can never blow up memory — the cap holds across files and
+		// within any one file.
+		remaining := maxConfigBytes - b.Len()
+		if _, err := io.Copy(&b, io.LimitReader(f, int64(remaining))); err != nil {
+			return
+		}
 		b.WriteByte('\n')
 	}
 

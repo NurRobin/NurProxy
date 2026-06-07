@@ -431,12 +431,36 @@ func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {
 	if auth := strings.TrimSuffix(target.Path, confSuffix) + htpasswdSuffix; auth != target.Path {
 		_ = os.Remove(auth)
 	}
+	// Scrub the host's centrally-issued cert/key artifacts (incl. any decrypted
+	// .key.plain) so a removed domain leaves no private key on disk.
+	b.removeCerts(ctx, target.Path)
 	if b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
 			return fmt.Errorf("nginx -s reload after remove failed: %w", err)
 		}
 	}
 	return nil
+}
+
+// removeCerts deletes the cert store artifacts for the host a managed config
+// path belongs to. Managed files are named nurproxy-<base>.conf where <base> is
+// the cert store's sanitized host; an operator-authored config (no nurproxy-
+// prefix) has no NurProxy-issued cert, so it is skipped. A nil cert store (no
+// CertDir configured) is a no-op. Errors are logged, not fatal: failing to
+// scrub a stale key must not block the domain removal/reload.
+func (b *Backend) removeCerts(ctx context.Context, configPath string) {
+	if b.certs == nil {
+		return
+	}
+	name := filepath.Base(configPath)
+	if !IsManagedFile(name) {
+		return
+	}
+	base := strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix)
+	if err := b.certs.Remove(base); err != nil {
+		slog.WarnContext(ctx, "nginx: could not remove cert artifacts for removed vhost",
+			slog.String("config", configPath), slog.Any("err", err))
+	}
 }
 
 // Prune removes every NurProxy-generated vhost (the nurproxy- prefix) in
@@ -484,6 +508,9 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 		}
 		// Drop the orphaned vhost's htpasswd sidecar too, if any.
 		_ = os.Remove(strings.TrimSuffix(path, confSuffix) + htpasswdSuffix)
+		// Scrub the orphaned vhost's centrally-issued cert/key artifacts so a
+		// deleted domain leaves no decrypted private key behind.
+		b.removeCerts(ctx, path)
 		removed++
 	}
 	if removed > 0 && b.runner != nil {

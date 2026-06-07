@@ -40,18 +40,30 @@ const (
 	EventLogTailStop = "log_tail_stop"
 )
 
+// maxStreamsPerAgent caps how many concurrent SSE streams a single agent may
+// hold open. A legitimate agent keeps exactly one stream; the small surplus
+// tolerates a reconnect racing a stale connection's teardown. Without a cap, a
+// misbehaving or hostile agent could open unbounded streams, each costing a
+// goroutine, a connection and fan-out work on every publish. When a new stream
+// would exceed the cap, the oldest stream for that agent is evicted (its channel
+// closed) so at most maxStreamsPerAgent remain.
+const maxStreamsPerAgent = 2
+
 // subscriber is one live connection for an agent.
 type subscriber struct {
-	ch chan Event
+	ch  chan Event
+	seq uint64 // monotonic registration order; lower == older
 }
 
 // Hub tracks live agent connections and fans events out to them. It is safe for
 // concurrent use. An agent may briefly have more than one connection (e.g. a
 // reconnect racing a stale connection's teardown), so subscribers are tracked
-// as a set per agent and every one receives each event.
+// as a set per agent and every one receives each event — up to a per-agent cap
+// (maxStreamsPerAgent) that evicts the oldest stream to bound resource use.
 type Hub struct {
-	mu   sync.RWMutex
-	subs map[string]map[*subscriber]struct{} // agentID -> set of subscribers
+	mu      sync.RWMutex
+	subs    map[string]map[*subscriber]struct{} // agentID -> set of subscribers
+	nextSeq uint64                              // monotonic counter for subscriber ordering
 }
 
 // New creates an empty Hub.
@@ -71,21 +83,45 @@ func (h *Hub) Subscribe(agentID string) (<-chan Event, func()) {
 	if h.subs[agentID] == nil {
 		h.subs[agentID] = make(map[*subscriber]struct{})
 	}
-	h.subs[agentID][sub] = struct{}{}
+	sub.seq = h.nextSeq
+	h.nextSeq++
+	set := h.subs[agentID]
+	// Cap concurrent streams per agent: evict the oldest until adding this one
+	// leaves at most maxStreamsPerAgent. Eviction closes the stale channel so its
+	// handler tears down; legitimate single-stream agents are never affected, and
+	// a reconnect racing a not-yet-torn-down stale stream still fits.
+	for len(set) >= maxStreamsPerAgent {
+		var oldest *subscriber
+		for s := range set {
+			if oldest == nil || s.seq < oldest.seq {
+				oldest = s
+			}
+		}
+		delete(set, oldest)
+		close(oldest.ch)
+	}
+	set[sub] = struct{}{}
 	h.mu.Unlock()
 
 	var once sync.Once
 	unsubscribe := func() {
 		once.Do(func() {
 			h.mu.Lock()
-			if set, ok := h.subs[agentID]; ok {
+			set, ok := h.subs[agentID]
+			_, stillMember := set[sub]
+			if ok && stillMember {
 				delete(set, sub)
 				if len(set) == 0 {
 					delete(h.subs, agentID)
 				}
 			}
 			h.mu.Unlock()
-			close(sub.ch)
+			// If we were evicted (no longer a member), the eviction path already
+			// closed our channel — closing again would panic. Only close when we
+			// removed ourselves.
+			if stillMember {
+				close(sub.ch)
+			}
 		})
 	}
 

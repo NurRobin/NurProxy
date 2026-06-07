@@ -700,3 +700,130 @@ func TestResolvedCommands_default_andOverride(t *testing.T) {
 		t.Fatalf("empty-binary fallback = %q / %q", test, reload)
 	}
 }
+
+// newBackendWithCerts builds a backend whose cert store points at a temp dir, so
+// Remove/Prune cert-scrubbing can be exercised. Returns the backend, its layout
+// and the cert directory.
+func newBackendWithCerts(t *testing.T, r Runner) (*Backend, Layout, string) {
+	t.Helper()
+	dir := t.TempDir()
+	certDir := filepath.Join(dir, "certs")
+	b := New(proxy.Config{Type: "nginx", ConfigDir: filepath.Join(dir, "sites-available"), CertDir: certDir})
+	b.WithRunner(r)
+	if b.certs == nil {
+		t.Fatal("expected cert store to be configured")
+	}
+	return b, b.layout, certDir
+}
+
+// installCertArtifacts writes the cert plus a stray .key.plain for a host into
+// certDir, mirroring what Install + CertPaths leave on disk so the test can
+// assert Remove/Prune scrub them.
+func installCertArtifacts(t *testing.T, b *Backend, host string) []string {
+	t.Helper()
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n")
+	if err := b.InstallCerts(context.Background(), []proxy.CertBundle{{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}}); err != nil {
+		t.Fatalf("InstallCerts: %v", err)
+	}
+	base := filepath.Join(b.certs.Dir(), host)
+	// Materialize a decrypted plaintext key as CertPaths would on the encrypted
+	// path — the file whose lingering presence the fix targets.
+	plain := base + ".key.plain"
+	if err := os.WriteFile(plain, keyPEM, 0o600); err != nil {
+		t.Fatalf("seed .key.plain: %v", err)
+	}
+	return []string{base + ".crt", base + ".key", plain}
+}
+
+func assertGone(t *testing.T, paths []string) {
+	t.Helper()
+	for _, p := range paths {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("cert artifact %q still present (stat err=%v)", p, err)
+		}
+	}
+}
+
+// TestRemove_scrubsCertArtifacts proves a removed managed vhost's centrally
+// issued cert/key files (including the decrypted .key.plain) are deleted, while
+// an operator-authored config never triggers a cert scrub.
+func TestRemove_scrubsCertArtifacts(t *testing.T) {
+	t.Run("managed vhost scrubs certs", func(t *testing.T) {
+		b, layout, _ := newBackendWithCerts(t, &fakeRunner{})
+		host := "app.example.com"
+		artifacts := installCertArtifacts(t, b, host)
+		// A managed config file at the layout's path; Remove targets it.
+		confPath := layout.AvailablePath(host)
+		if err := os.MkdirAll(layout.Available, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(confPath, []byte("server {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Remove(context.Background(), proxy.Target{Kind: proxy.TargetKindFile, Path: confPath}); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		assertGone(t, artifacts)
+	})
+
+	t.Run("operator config leaves certs untouched", func(t *testing.T) {
+		b, layout, certDir := newBackendWithCerts(t, &fakeRunner{})
+		// An unrelated host's cert artifacts in the store.
+		host := "app.example.com"
+		artifacts := installCertArtifacts(t, b, host)
+		// Remove an operator-authored config (no nurproxy- prefix): no cert scrub.
+		opPath := filepath.Join(layout.Available, "operator-site.conf")
+		if err := os.MkdirAll(layout.Available, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(opPath, []byte("server {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Remove(context.Background(), proxy.Target{Kind: proxy.TargetKindFile, Path: opPath}); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		for _, p := range artifacts {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("unrelated cert artifact %q was wrongly removed: %v", p, err)
+			}
+		}
+		_ = certDir
+	})
+}
+
+// TestPrune_scrubsCertArtifacts proves a pruned orphan vhost's cert/key files
+// are deleted while a kept vhost's stay.
+func TestPrune_scrubsCertArtifacts(t *testing.T) {
+	b, layout, _ := newBackendWithCerts(t, &fakeRunner{})
+	if err := os.MkdirAll(layout.Available, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orphanHost := "orphan.example.com"
+	keepHost := "keep.example.com"
+	orphanArts := installCertArtifacts(t, b, orphanHost)
+	keepArts := installCertArtifacts(t, b, keepHost)
+
+	orphanConf := layout.AvailablePath(orphanHost)
+	keepConf := layout.AvailablePath(keepHost)
+	for _, p := range []string{orphanConf, keepConf} {
+		if err := os.WriteFile(p, []byte("server {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := b.Prune(context.Background(), []proxy.Target{{Kind: proxy.TargetKindFile, Path: keepConf}})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Prune removed %d, want 1", n)
+	}
+	assertGone(t, orphanArts)
+	for _, p := range keepArts {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("kept host cert artifact %q was wrongly removed: %v", p, err)
+		}
+	}
+}

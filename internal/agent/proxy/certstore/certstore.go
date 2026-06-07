@@ -33,6 +33,11 @@ const (
 	keySuffix = ".key.enc"
 	// keyPlainSuffix is used when no at-rest key is configured: a plaintext PEM key.
 	keyPlainSuffix = ".key"
+	// keyMaterializedSuffix is the decrypted plaintext key CertPaths materializes
+	// next to the ciphertext so a proxy can read it (see CertPaths). It must be
+	// deleted alongside the other artifacts on Remove — a lingering decrypted key
+	// negates the at-rest encryption.
+	keyMaterializedSuffix = ".key.plain"
 
 	// dirMode is the cert directory's mode: owner-only (keys live here).
 	dirMode = 0o700
@@ -200,11 +205,39 @@ func (s *Store) CertPaths(host string) (ProxyPaths, error) {
 	if err != nil {
 		return ProxyPaths{}, err
 	}
-	plainPath := filepath.Join(s.dir, base+".key.plain")
+	plainPath := filepath.Join(s.dir, base+keyMaterializedSuffix)
 	if err := writeAtomic(plainPath, plain, keyMode); err != nil {
 		return ProxyPaths{}, fmt.Errorf("certstore: materializing plaintext key for %q: %w", host, err)
 	}
 	return ProxyPaths{CertPath: certPath, KeyPath: plainPath}, nil
+}
+
+// Remove deletes every on-disk artifact for a host: the public leaf+chain
+// (.crt), the at-rest-encrypted key (.key.enc), the plaintext key written when
+// no at-rest key is configured (.key), and the decrypted key CertPaths
+// materializes for the proxy (.key.plain). It is the inverse of Install plus
+// CertPaths, called when a domain/route is removed so a decrypted private key
+// never outlives its cert (a lingering .key.plain would negate the at-rest
+// encryption). A missing file is not an error — Remove is a no-op when nothing
+// was ever installed and is safe to call repeatedly (idempotent). Any
+// unexpected unlink error is returned (after attempting the rest) so the caller
+// can surface a key that could not be scrubbed.
+func (s *Store) Remove(host string) error {
+	if host == "" {
+		return fmt.Errorf("certstore: empty host")
+	}
+	if s.dir == "" {
+		return nil
+	}
+	base := SanitizeHost(host)
+	var firstErr error
+	for _, suffix := range []string{certSuffix, keySuffix, keyPlainSuffix, keyMaterializedSuffix} {
+		path := filepath.Join(s.dir, base+suffix)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = fmt.Errorf("certstore: removing %q: %w", path, err)
+		}
+	}
+	return firstErr
 }
 
 // SanitizeHost turns an FQDN into a safe file-name base, mapping a leading
