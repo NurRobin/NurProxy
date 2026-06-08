@@ -279,30 +279,132 @@ func (b *Backend) GetConfig(ctx context.Context) (json.RawMessage, error) {
 }
 
 // RemoveRoute deletes a single live route by its admin-API @id. Exposed for the
-// agent's per-domain route deletion endpoint.
+// agent's per-domain route deletion endpoint. Before deleting the route it
+// resolves the route's public host from the live config and scrubs that host's
+// centrally-issued cert/key artifacts (incl. any decrypted .key.plain) so a
+// removed domain leaves no private key on disk — mirroring the nginx/apache
+// backends. The cert scrub runs first (while the route is still readable, so the
+// host can be recovered); failing to scrub a key is logged, not fatal, and never
+// blocks the route deletion.
 func (b *Backend) RemoveRoute(ctx context.Context, routeID string) error {
+	b.scrubCertsForRoute(ctx, routeID)
 	return b.client.RemoveRoute(ctx, routeID)
 }
 
-// Prune is a no-op for the admin-API Caddy: applyIntents calls ClearRoutes before
-// re-adding the desired set, so a route absent from the set is already gone — there
-// is no orphaned on-disk vhost to remove (unlike the file backends). It satisfies
-// the proxy.Proxy interface uniformly.
-func (b *Backend) Prune(_ context.Context, _ []proxy.Target) (int, error) {
-	return 0, nil
+// Prune scrubs the cert store for hosts whose routes are no longer in the desired
+// set. The live route set itself is reconciled by Apply (ClearRoutes then re-add),
+// so there is no orphaned on-disk vhost to delete (unlike the file backends) — but
+// the centrally-issued cert/key artifacts (incl. any decrypted .key.plain) for a
+// removed domain would otherwise linger on disk, negating the at-rest encryption.
+// So Prune lists the live routes, and for every route whose target handle is NOT in
+// keep it scrubs that host's cert material, mirroring how the nginx/apache backends
+// scrub orphaned vhosts. It returns the count of hosts scrubbed. With no cert store
+// configured there is nothing to scrub and it is a no-op.
+func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
+	if b.certs == nil {
+		return 0, nil
+	}
+	wanted := make(map[string]bool, len(keep))
+	for _, t := range keep {
+		if id := routeIDFromTarget(t.Path); id != "" {
+			wanted[id] = true
+		}
+	}
+	routes, err := b.client.ListRoutes(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("caddy prune: reading managed routes: %w", err)
+	}
+	scrubbed := 0
+	for _, raw := range routes {
+		id := routeID(raw)
+		if id == "" || wanted[id] {
+			continue
+		}
+		host := hostFromRoute(raw)
+		if host == "" {
+			continue
+		}
+		if err := b.certs.Remove(host); err != nil {
+			slog.WarnContext(ctx, "caddy: could not remove cert artifacts for orphaned route",
+				slog.String("route_id", id), slog.String("host", host), slog.Any("err", err))
+			continue
+		}
+		scrubbed++
+	}
+	return scrubbed, nil
 }
 
 // Remove deletes a single route from the live config by its admin-API @id,
-// derived from the target handle (§3, no ghost routes).
+// derived from the target handle (§3, no ghost routes). Before deleting it scrubs
+// the route's host cert/key artifacts (incl. any decrypted .key.plain) from the
+// cert store so a removed domain leaves no private key on disk, mirroring the
+// nginx/apache backends. The scrub is best-effort (logged, not fatal) and must not
+// block the route removal.
 func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {
 	id := routeIDFromTarget(target.Path)
 	if id == "" {
 		return fmt.Errorf("caddy remove: invalid target %q", target.Path)
 	}
+	b.scrubCertsForRoute(ctx, id)
 	if err := b.client.RemoveRoute(ctx, id); err != nil {
 		return fmt.Errorf("removing caddy route %q: %w", id, err)
 	}
 	return nil
+}
+
+// scrubCertsForRoute removes the cert store artifacts for the public host served
+// by the live route with the given admin-API @id. The host is recovered from the
+// route's host matcher in the live config (the @id is a slug, not the FQDN, so it
+// cannot be reversed; reading the live route is the reliable source). A nil cert
+// store (no CertDir configured) is a no-op. A route that cannot be read or carries
+// no host matcher is skipped. Any unlink error is logged, not fatal: failing to
+// scrub a stale key must not block the route removal.
+func (b *Backend) scrubCertsForRoute(ctx context.Context, id string) {
+	if b.certs == nil || id == "" {
+		return
+	}
+	routes, err := b.client.ListRoutes(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "caddy: could not read routes to scrub cert artifacts",
+			slog.String("route_id", id), slog.Any("err", err))
+		return
+	}
+	for _, raw := range routes {
+		if routeID(raw) != id {
+			continue
+		}
+		host := hostFromRoute(raw)
+		if host == "" {
+			return
+		}
+		if err := b.certs.Remove(host); err != nil {
+			slog.WarnContext(ctx, "caddy: could not remove cert artifacts for removed route",
+				slog.String("route_id", id), slog.String("host", host), slog.Any("err", err))
+		}
+		return
+	}
+}
+
+// hostFromRoute extracts the first public host from a Caddy route's host matcher
+// (match[].host[]). Rendered NurProxy routes carry exactly one host (see caddygen),
+// so the first entry is the route's FQDN. Returns empty when the route has no host
+// matcher (e.g. a non-NurProxy or malformed route), in which case there is no
+// associated cert to scrub.
+func hostFromRoute(raw json.RawMessage) string {
+	var partial struct {
+		Match []struct {
+			Host []string `json:"host"`
+		} `json:"match"`
+	}
+	if err := json.Unmarshal(raw, &partial); err != nil {
+		return ""
+	}
+	for _, m := range partial.Match {
+		if len(m.Host) > 0 {
+			return m.Host[0]
+		}
+	}
+	return ""
 }
 
 // Validate checks the live config by reading it back through the admin API. A

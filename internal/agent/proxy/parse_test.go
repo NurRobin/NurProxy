@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/shared/netdiscover"
@@ -235,5 +238,78 @@ func stubFS(dirs, files map[string]bool) func() {
 		fileExists = origFile
 		gatherNginxConfig = origGather
 		collectNetworks = origNet
+	}
+}
+
+func TestGatherNginxConfig_capsTotalBytes(t *testing.T) {
+	tests := []struct {
+		name      string
+		files     map[string]int // filename in configDir -> byte size
+		wantMaxOK bool           // result length must be <= maxConfigBytes (+ newlines)
+	}{
+		{
+			name: "single oversized file is bounded at the cap",
+			// One file larger than the cap; before the fix it was read in full,
+			// blowing past maxConfigBytes.
+			files:     map[string]int{"huge.conf": maxConfigBytes + (4 << 20)},
+			wantMaxOK: true,
+		},
+		{
+			name: "normal multi-file gathering is unchanged",
+			files: map[string]int{
+				"a.conf": 1024,
+				"b.conf": 2048,
+			},
+			wantMaxOK: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var totalWritten int
+			for name, size := range tt.files {
+				if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+				totalWritten += size
+			}
+
+			got := gatherNginxConfig(dir)
+
+			// The accumulated bytes from files this test owns must never exceed
+			// the cap. gatherNginxConfig may also append the host's real
+			// /etc/nginx files, but it stops adding once the builder reaches the
+			// cap, and any single file is itself bounded by the remaining budget,
+			// so the configDir-sourced bytes can't exceed maxConfigBytes.
+			if len(got) > maxConfigBytes+(8<<20) {
+				t.Fatalf("gathered config = %d bytes, unbounded (cap %d)", len(got), maxConfigBytes)
+			}
+
+			// For the oversized single-file case, the file alone exceeds the cap,
+			// so the result must be strictly smaller than the file we wrote —
+			// proving it was truncated rather than read in full.
+			if size, big := tt.files["huge.conf"]; big && size > maxConfigBytes {
+				if len(got) > maxConfigBytes+(1<<20) {
+					t.Fatalf("oversized file not capped: got %d bytes from a %d-byte file (cap %d)", len(got), size, maxConfigBytes)
+				}
+				if len(got) >= size {
+					t.Fatalf("oversized file read in full: got %d bytes, file is %d", len(got), size)
+				}
+			}
+
+			// For the normal case, all small files fit under the cap, so every
+			// byte we wrote should be present (no truncation of normal configs).
+			if !tt.wantMaxOK {
+				return
+			}
+			if _, big := tt.files["huge.conf"]; !big {
+				// Sum of file sizes plus one newline per file must be fully present.
+				wantMin := totalWritten
+				if strings.Count(got, "\x00") < wantMin {
+					t.Fatalf("normal multi-file gathering truncated: got %d NUL bytes, want >= %d", strings.Count(got, "\x00"), wantMin)
+				}
+			}
+		})
 	}
 }

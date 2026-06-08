@@ -25,6 +25,12 @@ func testServer(t *testing.T) (*Server, *db.DB) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { database.Close() })
+	// registerLimiter is a package-global shared across all tests in this package.
+	// The register tests all use the httptest default RemoteAddr (192.0.2.1), so
+	// cumulative Fail() calls from earlier tests can otherwise trip the lockout and
+	// make later registrations 429 — order-dependent under `go test -shuffle`.
+	// Reset that key so every test starts from a clean limiter.
+	registerLimiter.Reset("192.0.2.1")
 	srv := NewServer(database, "test")
 	return srv, database
 }
@@ -366,10 +372,19 @@ func TestAgentRegistrationAndAdoption(t *testing.T) {
 		t.Fatalf("re-adopt: expected 400, got %d", w.Code)
 	}
 
-	// Get agent status
-	w = doRequest(t, handler, "GET", "/api/v1/agents/agent-1/status", nil, cookie)
+	// Get agent status — agent self-poll (adoption loop) with its own token.
+	// This is the credential the agent actually uses; it must succeed.
+	w = doRequestWithAuth(t, handler, "GET", "/api/v1/agents/agent-1/status", nil, agentToken)
 	if w.Code != http.StatusOK {
-		t.Fatalf("agent status: expected 200, got %d", w.Code)
+		t.Fatalf("agent status (self token): expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// The status route is agent-scoped, not an admin route: an admin session
+	// cookie carries no agent identity and is rejected (H1: agent self-endpoints
+	// do not honor admin creds, and admin creds do not impersonate an agent).
+	w = doRequest(t, handler, "GET", "/api/v1/agents/agent-1/status", nil, cookie)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("agent status (admin cookie): expected 401, got %d", w.Code)
 	}
 
 	// Heartbeat with agent token
@@ -962,10 +977,12 @@ func TestAgentAuth(t *testing.T) {
 		t.Fatalf("agent heartbeat: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Agent token should also work as general auth
+	// An agent token must NOT work as general admin auth: requireAuth-guarded
+	// routes are operator-only and rejecting agent tokens prevents a leaked agent
+	// credential from driving the control plane (H1).
 	w = doRequestWithAuth(t, handler, "GET", "/api/v1/agents", nil, token)
-	if w.Code != http.StatusOK {
-		t.Fatalf("agent list via agent token: expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("agent list via agent token: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 
 	// Invalid token should fail
@@ -984,5 +1001,153 @@ func TestAgentAuth(t *testing.T) {
 		map[string]string{"public_ip": "1.2.3.4"}, token)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("cross-agent heartbeat: expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Admin authorization boundary (H1): an agent token must never reach an
+// operator-only route, while a session cookie and the admin API key both must.
+// ---------------------------------------------------------------------------
+
+func TestAdminRoutes_RejectAgentToken(t *testing.T) {
+	const agentToken = "np_ag_adminboundary123456789012345678901234567890"
+	const apiKey = "admin-api-key-abc123"
+
+	// seed builds a fresh server with an admin password, an admin API key and one
+	// adopted agent whose token is agentToken. A fresh instance per credential
+	// check keeps mutating routes (delete agent, rotate api-key) from
+	// contaminating sibling subtests.
+	seed := func(t *testing.T) (http.Handler, *http.Cookie) {
+		t.Helper()
+		srv, database := testServer(t)
+		handler := srv.Handler()
+		cookie := setupAdmin(t, handler)
+		if err := database.SetSetting("admin_api_key", apiKey); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.CreateAgent(&models.Agent{
+			ID: "agent-1", Name: "Agent", FQDN: "edge1.example.com",
+			TokenHash: auth.HashToken(agentToken),
+			DNSMode:   models.DNSModeStatic, Status: models.AgentStatusAdopted,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return handler, cookie
+	}
+
+	// Every operator-only route. An agent token must be rejected (401), while the
+	// session cookie and the admin API key must both pass auth (the handler may
+	// still return a validation 4xx, but never 401/403).
+	adminRoutes := []struct {
+		name   string
+		method string
+		path   string
+		body   interface{}
+	}{
+		{"create provider", "POST", "/api/v1/providers", map[string]string{"type": "cloudflare", "name": "x", "config": "{}"}},
+		{"delete agent", "DELETE", "/api/v1/agents/agent-1", nil},
+		{"create zone", "POST", "/api/v1/zones", map[string]string{"provider_id": "p", "external_id": "e", "name": "example.com"}},
+		{"create domain", "POST", "/api/v1/domains", map[string]interface{}{"subdomain": "x", "zone_id": "z", "server_id": "s", "port": 80}},
+		{"update setting", "PUT", "/api/v1/settings/mcp_enabled", map[string]string{"value": "true"}},
+		{"generate api key", "POST", "/api/v1/api-key", nil},
+		{"list providers", "GET", "/api/v1/providers", nil},
+		{"list audit log", "GET", "/api/v1/audit-log", nil},
+	}
+
+	for _, rt := range adminRoutes {
+		t.Run(rt.name+"/agent-token-rejected", func(t *testing.T) {
+			handler, _ := seed(t)
+			w := doRequestWithAuth(t, handler, rt.method, rt.path, rt.body, agentToken)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("agent token on %s %s: expected 401, got %d: %s",
+					rt.method, rt.path, w.Code, w.Body.String())
+			}
+		})
+
+		t.Run(rt.name+"/session-cookie-accepted", func(t *testing.T) {
+			handler, cookie := seed(t)
+			w := doRequest(t, handler, rt.method, rt.path, rt.body, cookie)
+			if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+				t.Fatalf("session cookie on %s %s: expected auth to pass, got %d: %s",
+					rt.method, rt.path, w.Code, w.Body.String())
+			}
+		})
+
+		t.Run(rt.name+"/api-key-accepted", func(t *testing.T) {
+			handler, _ := seed(t)
+			w := doRequestWithAuth(t, handler, rt.method, rt.path, rt.body, apiKey)
+			if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+				t.Fatalf("admin api key on %s %s: expected auth to pass, got %d: %s",
+					rt.method, rt.path, w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// The agent token STILL works on its own self-endpoints — proving the H1 fix
+	// did not break legitimate agent traffic.
+	t.Run("agent-self-heartbeat-still-works", func(t *testing.T) {
+		handler, _ := seed(t)
+		w := doRequestWithAuth(t, handler, "POST", "/api/v1/agents/agent-1/heartbeat",
+			map[string]string{"public_ip": "1.2.3.4"}, agentToken)
+		if w.Code != http.StatusOK {
+			t.Fatalf("agent heartbeat: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("agent-self-routes-ack-still-works", func(t *testing.T) {
+		handler, _ := seed(t)
+		w := doRequestWithAuth(t, handler, "POST", "/api/v1/agents/agent-1/routes/ack",
+			map[string]interface{}{}, agentToken)
+		if w.Code != http.StatusOK {
+			t.Fatalf("agent routes ack: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("agent-self-stream-authenticates", func(t *testing.T) {
+		handler, _ := seed(t)
+		// No hub is wired in tests, so the stream handler returns 503 (streaming
+		// not enabled) — but crucially NOT 401/403, proving the agent token
+		// authenticated and was scoped to its own stream.
+		w := doRequestWithAuth(t, handler, "GET", "/api/v1/agents/agent-1/stream", nil, agentToken)
+		if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+			t.Fatalf("agent stream auth: expected auth to pass, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestRequireAuth_RejectsRevokedTokenOnFreshServer guards the session-revocation
+// wiring gap: the version provider must be active from construction, so a token
+// minted at an older version is rejected on a protected route even when NO auth
+// handler has run since the process started.
+func TestRequireAuth_RejectsRevokedTokenOnFreshServer(t *testing.T) {
+	srv, database := testServer(t)
+
+	// Mint a cookie at the current (version 0) state, exactly as setSessionCookie
+	// would. We sign directly so that NO auth handler runs first — this is the
+	// post-restart scenario the MED fix targets.
+	rawToken, err := auth.GenerateSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := srv.sessions.Sign(rawToken)
+	cookie := &http.Cookie{Name: "nurproxy_session", Value: signed}
+
+	// Sanity: before any revocation the token is accepted.
+	handler := srv.Handler()
+	if w := doRequest(t, handler, "GET", "/api/v1/providers", nil, cookie); w.Code != http.StatusOK {
+		t.Fatalf("pre-revocation: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Revoke every outstanding session by bumping the server-side version, as
+	// logout / change-password do — but WITHOUT calling an auth handler.
+	if err := database.SetSetting(sessionVersionSetting, "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The version provider was wired in NewServer, so the now-stale (version 0)
+	// cookie must be rejected. With the old lazy-wiring bug, sm.version was still
+	// nil here and the revoked cookie would have been accepted.
+	if w := doRequest(t, handler, "GET", "/api/v1/providers", nil, cookie); w.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked token on fresh server: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 }

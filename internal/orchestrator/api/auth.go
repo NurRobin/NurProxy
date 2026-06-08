@@ -2,6 +2,7 @@ package api
 
 import (
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -9,6 +10,43 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// sessionVersionSetting holds a monotonically increasing server-side session
+// version. Bumping it (logout / password change) invalidates every outstanding
+// session cookie, because each signed token carries the version it was minted
+// under and Verify rejects anything older. Stored in the settings table.
+const sessionVersionSetting = "session_version"
+
+// secureCookiesSetting gates the Secure attribute on the session cookie. When
+// set to "true"/"1" Secure is forced on; "false"/"0" forces it off. When unset
+// the cookie is Secure for any non-localhost request and plain for localhost, so
+// HTTPS deployments behind a TLS-terminating proxy get Secure without breaking
+// local http dev.
+const secureCookiesSetting = "secure_cookies"
+
+// currentSessionVersion reads the server-side session version (0 when unset).
+func (s *Server) currentSessionVersion() int {
+	v, err := s.db.GetSetting(sessionVersionSetting)
+	if err != nil || v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// bumpSessionVersion increments the server-side session version, immediately
+// invalidating every outstanding cookie. Used by logout and change-password so
+// those actions take effect for live tokens rather than only nudging the
+// client-side cookie.
+func (s *Server) bumpSessionVersion() {
+	next := s.currentSessionVersion() + 1
+	if err := s.db.SetSetting(sessionVersionSetting, strconv.Itoa(next)); err != nil {
+		log.Printf("failed to bump session version: %v", err)
+	}
+}
 
 // GET /api/v1/auth/status — returns authentication state.
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -74,7 +112,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create session
-	s.setSessionCookie(w)
+	s.setSessionCookie(w, r)
 
 	// Audit log — bootstrap happens through the dashboard, so source is ui.
 	if err := s.db.InsertAuditLog(&models.AuditLogEntry{
@@ -128,7 +166,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.loginLimiter.Reset(ip)
-	s.setSessionCookie(w)
+	s.setSessionCookie(w, r)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged in"})
 }
@@ -173,24 +211,33 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Invalidate every outstanding session so a changed password forces re-login
+	// everywhere (e.g. after a suspected credential compromise).
+	s.bumpSessionVersion()
+
 	s.audit(r, "system", "admin", "change_password", "admin password changed")
 	writeJSON(w, http.StatusOK, map[string]string{"message": "password changed"})
 }
 
-// POST /api/v1/auth/logout — clears session cookie.
+// POST /api/v1/auth/logout — clears the session cookie and invalidates every
+// outstanding session server-side. Clearing the cookie alone only logs out the
+// calling browser; bumping the session version makes any copy of the token
+// (including ones already exfiltrated) fail Verify immediately.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.bumpSessionVersion()
 	http.SetCookie(w, &http.Cookie{
 		Name:     "nurproxy_session",
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   s.useSecureCookies(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out"})
 }
 
-func (s *Server) setSessionCookie(w http.ResponseWriter) {
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request) {
 	token, _ := auth.GenerateSessionToken()
 	signed := s.sessions.Sign(token)
 	d := s.sessionDuration()
@@ -200,9 +247,42 @@ func (s *Server) setSessionCookie(w http.ResponseWriter) {
 		Path:     "/",
 		MaxAge:   int(d.Seconds()),
 		HttpOnly: true,
+		Secure:   s.useSecureCookies(r),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Now().Add(d),
 	})
+}
+
+// useSecureCookies decides whether the session cookie carries the Secure
+// attribute. An explicit secure_cookies setting wins; otherwise Secure is on for
+// any non-localhost request (the production case: HTTPS terminated at a proxy)
+// and off for localhost so plain-http local development keeps working.
+func (s *Server) useSecureCookies(r *http.Request) bool {
+	if v, err := s.db.GetSetting(secureCookiesSetting); err == nil && v != "" {
+		switch v {
+		case "true", "1":
+			return true
+		case "false", "0":
+			return false
+		}
+	}
+	return !requestIsLocalhost(r)
+}
+
+// requestIsLocalhost reports whether the request targets a loopback host, used
+// to default Secure cookies off only for local development.
+func requestIsLocalhost(r *http.Request) bool {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // sessionDuration returns the configured session lifetime, read from the

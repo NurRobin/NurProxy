@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
 )
@@ -340,7 +341,7 @@ func (p *CloudflareProvider) getClient() *http.Client {
 	if p.client != nil {
 		return p.client
 	}
-	return http.DefaultClient
+	return &http.Client{Timeout: 30 * time.Second}
 }
 
 // doRawRequest makes an HTTP request to the Cloudflare API and returns the raw response body.

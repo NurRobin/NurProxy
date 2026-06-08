@@ -196,35 +196,66 @@ func stripPath(s string) string {
 	return s
 }
 
-// parseHostPort parses "host" or "host:port" into an Upstream. An empty or
-// bracketed-IPv6 form without a clean port is taken as host-only.
+// parseHostPort parses "host" or "host:port" into an Upstream. A port must be a
+// valid TCP port (1..65535); anything out of range, negative, or non-numeric is
+// rejected (ok=false) rather than surfaced as a malformed suggestion. A bare host
+// with no port is kept as host-only. The scanner must never emit a value it could
+// not actually parse.
 func parseHostPort(s string) (Upstream, bool) {
 	if s == "" {
 		return Upstream{}, false
 	}
-	// IPv6 in brackets: [::1]:8080
+	// IPv6 in brackets: [::1]:8080 (the host itself contains colons).
 	if strings.HasPrefix(s, "[") {
 		end := strings.Index(s, "]")
 		if end < 0 {
 			return Upstream{}, false
 		}
 		host := s[1:end]
-		rest := s[end+1:]
-		u := Upstream{Host: host}
-		if strings.HasPrefix(rest, ":") {
-			if p, err := strconv.Atoi(rest[1:]); err == nil {
-				u.Port = p
-			}
+		if host == "" {
+			return Upstream{}, false
 		}
-		return u, true
+		rest := s[end+1:]
+		if rest == "" {
+			return Upstream{Host: host}, true
+		}
+		if !strings.HasPrefix(rest, ":") {
+			return Upstream{}, false // junk after the bracket, e.g. "[::1]x"
+		}
+		port, ok := parsePort(rest[1:])
+		if !ok {
+			return Upstream{}, false
+		}
+		return Upstream{Host: host, Port: port}, true
 	}
 	if i := strings.LastIndex(s, ":"); i >= 0 {
 		host := s[:i]
-		if p, err := strconv.Atoi(s[i+1:]); err == nil && host != "" {
-			return Upstream{Host: host, Port: p}, true
+		port, ok := parsePort(s[i+1:])
+		if !ok {
+			// Non-numeric/out-of-range port. Keep the token as a host only if it
+			// has no colon left in it; otherwise it is unparseable junk and is
+			// dropped rather than glued back together as a host.
+			if host == "" || strings.Contains(host, ":") {
+				return Upstream{}, false
+			}
+			return Upstream{Host: host}, false
 		}
+		if host == "" {
+			return Upstream{}, false
+		}
+		return Upstream{Host: host, Port: port}, true
 	}
 	return Upstream{Host: s}, true
+}
+
+// parsePort parses a TCP port string, accepting only 1..65535. Leading-plus,
+// whitespace, or overflow all fail.
+func parsePort(s string) (int, bool) {
+	p, err := strconv.Atoi(s)
+	if err != nil || p < 1 || p > 65535 {
+		return 0, false
+	}
+	return p, true
 }
 
 // cleanNames drops wildcard/regex/underscore server_name tokens that are not a

@@ -44,7 +44,11 @@ func TestSandboxEndToEnd(t *testing.T) {
 	}, "NP_DRY_RUN=true")
 	defer orch.stop()
 
-	waitFor(t, 10*time.Second, func() bool { return httpOK(base + "/api/v1/health") })
+	// A fresh-DB cold boot must run every migration and a single WAL fsync
+	// before the API serves /health; on slow/loaded CI disks that can take tens
+	// of seconds, so allow a generous readiness window (the convergence wait
+	// below uses 75s for a full reconciler cycle).
+	waitFor(t, 60*time.Second, func() bool { return httpOK(base + "/api/v1/health") })
 
 	// Health must advertise the sandbox so the dashboard banner lights up.
 	var health map[string]any

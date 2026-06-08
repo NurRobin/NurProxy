@@ -123,6 +123,68 @@ func TestDiscover_hostOnlyNoPort(t *testing.T) {
 	}
 }
 
+func TestParseHostPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		in       string
+		wantOK   bool
+		wantHost string
+		wantPort int
+	}{
+		{"valid host:port", "10.0.0.1:8080", true, "10.0.0.1", 8080},
+		{"host only", "backend.internal", true, "backend.internal", 0},
+		{"port 65535 ok", "h:65535", true, "h", 65535},
+		{"port 1 ok", "h:1", true, "h", 1},
+		{"overflow port", "10.0.0.1:99999", false, "", 0},
+		{"way overflow port", "h:4294967296", false, "", 0},
+		{"negative port", "10.0.0.1:-1", false, "", 0},
+		{"zero port", "h:0", false, "", 0},
+		{"non-numeric suffix dropped", "host:garbage", false, "", 0},
+		{"empty host with port", ":8080", false, "", 0},
+		{"empty string", "", false, "", 0},
+		{"ipv6 bracket with port", "[::1]:8080", true, "::1", 8080},
+		{"ipv6 bracket no port", "[fe80::1]", true, "fe80::1", 0},
+		{"ipv6 bracket overflow port", "[::1]:99999", false, "", 0},
+		{"ipv6 bracket non-numeric port", "[::1]:abc", false, "", 0},
+		{"ipv6 bracket empty host", "[]:80", false, "", 0},
+		{"ipv6 bracket junk after", "[::1]x", false, "", 0},
+		{"ipv6 unterminated bracket", "[::1", false, "", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, ok := parseHostPort(tt.in)
+			if ok != tt.wantOK {
+				t.Fatalf("parseHostPort(%q) ok = %v, want %v (u=%+v)", tt.in, ok, tt.wantOK, u)
+			}
+			if !ok {
+				return
+			}
+			if u.Host != tt.wantHost || u.Port != tt.wantPort {
+				t.Errorf("parseHostPort(%q) = {Host:%q Port:%d}, want {Host:%q Port:%d}",
+					tt.in, u.Host, u.Port, tt.wantHost, tt.wantPort)
+			}
+		})
+	}
+}
+
+func TestDiscover_rejectsMalformedPorts(t *testing.T) {
+	// A proxy_pass to an out-of-range/garbage port must never surface as a
+	// suggestion — the scanner only emits values it could actually parse.
+	cfg := `
+server {
+    server_name x.com;
+    location /a { proxy_pass http://10.0.0.1:99999; }
+    location /b { proxy_pass http://10.0.0.2:-5; }
+    location /c { proxy_pass http://10.0.0.3:garbage; }
+    location /d { proxy_pass http://10.0.0.4:0; }
+    location /e { proxy_pass http://10.0.0.5:8080; }
+}`
+	got := Discover(cfg)
+	if len(got) != 1 || got[0].Addr() != "10.0.0.5:8080" {
+		t.Fatalf("only the valid host:port should survive, got %+v", got)
+	}
+}
+
 func TestDiscover_empty(t *testing.T) {
 	if got := Discover(""); len(got) != 0 {
 		t.Errorf("empty config should yield nothing, got %+v", got)

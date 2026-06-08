@@ -130,6 +130,15 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// Cancel ctx on the first SIGINT/SIGTERM, BEFORE the adoption wait. Without this
+	// goroutine nothing cancels ctx during WaitForAdoption (which can block
+	// indefinitely until the operator adopts the agent), so a Ctrl+C there would be
+	// ignored and the "shutdown requested during adoption wait" branch below would be
+	// unreachable. Starting the watcher here makes signals unblock the wait — and
+	// every other ctx-bound operation — at any point in startup. The bottom of main
+	// then simply waits on <-ctx.Done().
+	go watchSignals(sigCh, cancel)
+
 	// Step 1: Adoption flow.
 	mgr, err := adoption.New(cfg.OrchestratorURL, cfg.FQDN, cfg.DataDir, cfg.APIPort)
 	if err != nil {
@@ -446,10 +455,11 @@ func main() {
 
 	log.Printf("Agent is running. Press Ctrl+C to stop.")
 
-	// Wait for shutdown signal.
-	<-sigCh
+	// Wait for shutdown. The signal watcher started above cancels ctx on
+	// SIGINT/SIGTERM; we also reach here (with ctx already canceled) if a signal
+	// arrived during the adoption wait and the shutdown branch did not exit.
+	<-ctx.Done()
 	log.Printf("Shutting down...")
-	cancel()
 
 	// Graceful shutdown with timeout.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -466,6 +476,17 @@ func main() {
 	}
 
 	log.Printf("Agent stopped.")
+}
+
+// watchSignals blocks until a signal arrives on sigCh, then calls cancel to begin
+// graceful shutdown. It returns after the first signal (one cancel is enough —
+// ctx is idempotently cancellable and the rest of shutdown is driven off
+// ctx.Done()). Factored out of main so the signal→cancel wiring is unit-testable
+// without spawning a process.
+func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
+	if _, ok := <-sigCh; ok {
+		cancel()
+	}
 }
 
 // detectProxy runs read-only proxy detection and converts it to the shared wire

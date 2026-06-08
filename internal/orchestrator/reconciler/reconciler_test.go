@@ -200,6 +200,9 @@ type mockDNSProvider struct {
 	// deleteErr, when set, is returned by DeleteRecord instead of deleting — used
 	// to simulate provider failures (transient errors, ErrRecordNotFound).
 	deleteErr error
+	// getErr, when set, is returned by GetRecord instead of the stored record —
+	// used to simulate a transient read failure vs. a genuine ErrRecordNotFound.
+	getErr error
 }
 
 func newMockDNSProvider() *mockDNSProvider {
@@ -261,6 +264,9 @@ func (p *mockDNSProvider) DeleteRecord(_ context.Context, _ json.RawMessage, rec
 func (p *mockDNSProvider) GetRecord(_ context.Context, _ json.RawMessage, recordID string) (*provider.Record, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.getErr != nil {
+		return nil, p.getErr
+	}
 	rec, ok := p.records[recordID]
 	if !ok {
 		return nil, fmt.Errorf("record not found: %s", recordID)
@@ -702,6 +708,13 @@ func TestReconcileRoutes_IgnoreUnmanaged(t *testing.T) {
 func TestReconcileRoutes_FixDrift(t *testing.T) {
 	d := testDB(t)
 	_, _, agent, _, dom := setupScenario(t, d)
+	// A cert exists for the host, so the drift-fix marks the domain active. The
+	// drift-fix path now goes through MarkDomainApplied (not MarkDomainSynced), so
+	// it honors the §78 degraded check — a central-TLS domain WITHOUT a cert would
+	// correctly be "degraded" instead of a bare "active".
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -738,6 +751,30 @@ func TestReconcileRoutes_FixDrift(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected audit entry with action drift_fixed")
+	}
+}
+
+// The drift-fix path routes through MarkDomainApplied, so a central-TLS domain
+// with NO issued certificate is marked "degraded" (served over plaintext), not a
+// bare "active". Under the old MarkDomainSynced this §78 check was bypassed and
+// the domain wrongly showed "active".
+func TestReconcileRoutes_FixDriftDegradedWhenNoCert(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d) // SSLModeAuto -> central TLS, no cert seeded
+
+	mc := newMockAgentClient()
+	mc.setHealthy(agent.APIURL, true)
+	staleRoute := json.RawMessage(`{"@id":"domain-app-example-com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"subroute"}],"terminal":true}`)
+	mc.setRoutes(agent.APIURL, []json.RawMessage{staleRoute})
+
+	r := New(d, mc, time.Minute)
+	if err := r.reconcileRoutes(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileRoutes: %v", err)
+	}
+
+	got, _ := d.GetDomain(dom.ID)
+	if got.Status != models.DomainStatusDegraded {
+		t.Errorf("expected status %q (no cert, §78), got %q", models.DomainStatusDegraded, got.Status)
 	}
 }
 
@@ -878,6 +915,161 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected audit entry with action dns_updated")
+	}
+}
+
+// A transient GetRecord failure (network/auth/rate-limit — NOT ErrRecordNotFound)
+// for a NurProxy-managed CNAME must preserve the stored record id and the
+// dns_managed=true flag, NOT re-resolve by name and adopt the record as
+// managed=false (which would flip it to "adopted" and defeat teardown, #66/§79).
+// A genuine ErrRecordNotFound, by contrast, IS treated as a real miss and the
+// record is re-resolved/re-created.
+func TestReconcileDNS_TransientGetRecordPreservesManaged(t *testing.T) {
+	tests := []struct {
+		name        string
+		getErr      error
+		wantManaged bool
+		wantSameID  bool
+	}{
+		{
+			name:        "transient error preserves managed and id",
+			getErr:      errors.New("dial tcp: i/o timeout"),
+			wantManaged: true,
+			wantSameID:  true,
+		},
+		{
+			name:        "record-not-found re-resolves and adopts",
+			getErr:      provider.ErrRecordNotFound,
+			wantManaged: false, // re-resolved by name, the live record is adopted
+			wantSameID:  true,  // same record id (re-found by name)
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			mp := registerMockProvider(t)
+			_, _, _, _, dom := setupScenario(t, d)
+
+			// Seed a correct, NurProxy-created CNAME and record it as managed=true.
+			recordID := mp.seedRecord(provider.Record{
+				Type:    "CNAME",
+				Name:    "app.example.com",
+				Content: "agent1.example.com",
+			})
+			if err := d.UpdateDomainDNSRecord(dom.ID, recordID, true); err != nil {
+				t.Fatalf("UpdateDomainDNSRecord: %v", err)
+			}
+
+			// GetRecord fails this cycle; ListRecords (used by the re-resolve path)
+			// still returns the live record, so a wrongful re-resolve WOULD adopt it
+			// as managed=false — the regression we guard against.
+			mp.getErr = tc.getErr
+
+			r := New(d, newMockAgentClient(), time.Minute)
+			if err := r.reconcileDNS(context.Background()); err != nil {
+				t.Fatalf("reconcileDNS: %v", err)
+			}
+
+			got, err := d.GetDomain(dom.ID)
+			if err != nil {
+				t.Fatalf("GetDomain: %v", err)
+			}
+			if got.DNSManaged != tc.wantManaged {
+				t.Errorf("dns_managed = %v, want %v", got.DNSManaged, tc.wantManaged)
+			}
+			if tc.wantSameID && got.DNSRecordID != recordID {
+				t.Errorf("dns_record_id = %q, want preserved %q", got.DNSRecordID, recordID)
+			}
+		})
+	}
+}
+
+// reconcileAgentDNS must only adopt an existing A/AAAA whose content already
+// matches the agent IP. A same-type record with a DIFFERENT IP is one NurProxy
+// did not create; it must raise an explicit conflict (dns_error + audit) rather
+// than UpdateRecord-ing over a record it doesn't own.
+func TestReconcileAgentDNS_AddressContentMismatchConflict(t *testing.T) {
+	tests := []struct {
+		name       string
+		recordType string
+		seedIP     string
+		agentIP    string
+		ip6        bool
+	}{
+		{name: "A mismatch", recordType: "A", seedIP: "198.51.100.5", agentIP: "203.0.113.10"},
+		{name: "AAAA mismatch", recordType: "AAAA", seedIP: "2001:db8::5", agentIP: "2001:db8::10", ip6: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			mp := registerMockProvider(t)
+			_, zone, agent, _, _ := setupScenario(t, d)
+
+			agent.DNSMode = models.DNSModeDDNS
+			if tc.ip6 {
+				agent.PublicIP = "203.0.113.10" // A is fine; only AAAA conflicts
+				agent.PublicIP6 = tc.agentIP
+			} else {
+				agent.PublicIP = tc.agentIP
+			}
+			if err := d.UpdateAgent(agent); err != nil {
+				t.Fatalf("UpdateAgent: %v", err)
+			}
+			if err := d.AddAgentZone(agent.ID, zone.ID); err != nil {
+				t.Fatalf("AddAgentZone: %v", err)
+			}
+
+			// An operator-owned record of the same type, different IP, sits at the
+			// anchor FQDN. NurProxy has no stored id for it (record id "").
+			conflictID := mp.seedRecord(provider.Record{
+				Type:    tc.recordType,
+				Name:    agent.FQDN,
+				Content: tc.seedIP,
+			})
+
+			r := New(d, newMockAgentClient(), time.Minute)
+			if err := r.reconcileAgentDNS(context.Background()); err != nil {
+				t.Fatalf("reconcileAgentDNS: %v", err)
+			}
+
+			// The pre-existing record must be left UNTOUCHED (no overwrite).
+			rec, ok := mp.getRecord(conflictID)
+			if !ok {
+				t.Fatalf("seeded record %s disappeared", conflictID)
+			}
+			if rec.Content != tc.seedIP {
+				t.Errorf("seeded record was overwritten: content = %q, want %q (NurProxy must not touch a record it didn't create)", rec.Content, tc.seedIP)
+			}
+
+			// The agent must carry a DNS conflict error and NOT have adopted the
+			// foreign record's id for this family.
+			got, _ := d.GetAgent(agent.ID)
+			if got.DNSError == "" {
+				t.Error("expected a dns_error conflict to be set on the agent")
+			}
+			gotID := got.DNSRecordID
+			if tc.ip6 {
+				gotID = got.DNSRecordID6
+			}
+			if gotID == conflictID {
+				t.Errorf("agent adopted the foreign %s record id %q — it must not own a record it didn't create", tc.recordType, conflictID)
+			}
+
+			entries, _, _ := d.ListAuditLog(20, 0)
+			wantAction := strings.ToLower(tc.recordType) + "_record_conflict"
+			found := false
+			for _, e := range entries {
+				if e.Action == wantAction {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected audit entry with action %q", wantAction)
+			}
+		})
 	}
 }
 
@@ -1412,6 +1604,11 @@ func TestCertRenewalStore_firstIssuesCentralDomains(t *testing.T) {
 	}
 	if targets[0].Provider == nil {
 		t.Error("first-issue target must carry a resolved DNS provider")
+	}
+	// The target must be flagged FirstIssue so the per-host lock in renewOne
+	// re-checks for a concurrently-issued cert instead of double-driving ACME.
+	if !targets[0].FirstIssue {
+		t.Error("first-issuance target must carry FirstIssue=true so renewOne re-checks under the lock")
 	}
 
 	// TargetForHost resolves the same host on demand.

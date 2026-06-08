@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -25,8 +26,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"acme_dry_run": s.acmeDryRun,
 	}
 	if err := s.db.Ping(ctx); err != nil {
+		// Log the raw error for operators, but never reflect the database
+		// error string to unauthenticated callers — it can leak internal
+		// detail (paths, driver internals). Return a generic message.
+		log.Printf("health: database ping failed: %v", err)
 		resp["status"] = "degraded"
-		resp["checks"] = map[string]string{"database": "error: " + err.Error()}
+		resp["checks"] = map[string]string{"database": "database unavailable"}
 		writeJSON(w, http.StatusServiceUnavailable, resp)
 		return
 	}
