@@ -441,6 +441,12 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		reportIdx int
 	}
 	var fileArts []fileArtifact
+	// caddyKept collects the targets of successfully-applied built-in-Caddy routes so
+	// the post-apply Prune retains their cert material. Without it a pure-Caddy agent's
+	// keep set holds only file targets; Prune's route-ID match then finds nothing
+	// wanted and scrubs the provided cert of every live route, breaking central-TLS
+	// (the cert is written on the issuing apply, then deleted on the next one).
+	var caddyKept []proxy.Target
 
 	for _, in := range intents {
 		host := in.Route.Host
@@ -491,6 +497,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 			continue
 		}
 		applied++
+		caddyKept = append(caddyKept, art.Target)
 		reports = append(reports, report)
 		// Track the successfully-applied artifact for the heartbeat drift check.
 		if in.ArtifactID != "" {
@@ -556,6 +563,9 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		for _, p := range set.Keep {
 			keep = append(keep, proxy.Target{Kind: proxy.TargetKindFile, Path: p})
 		}
+		// Built-in-Caddy routes applied above are admin-API targets, not files; include
+		// them so Prune retains their (still-wanted) cert material instead of scrubbing it.
+		keep = append(keep, caddyKept...)
 		if n, err := c.caddy.Prune(ctx, keep); err != nil {
 			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
 		} else if n > 0 {

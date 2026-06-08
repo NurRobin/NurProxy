@@ -79,6 +79,11 @@ health endpoint that actually checks the database.
   tear them down, orphaning their DNS records and certificates at the provider
   with no audit trail. Delete the domains first (each routes through the proper
   teardown), then the parent.
+- **Built-in-Caddy agents no longer scrub the provided certificate of an active
+  route.** The post-apply cert prune was fed only file-backend targets, so on a
+  Caddy agent its keep set never matched any live route and it deleted every
+  route's central-TLS cert on the apply after issuance — leaving `:443` unable to
+  serve. The keep set now includes the applied Caddy route targets.
 
 ## Upgrade notes
 
