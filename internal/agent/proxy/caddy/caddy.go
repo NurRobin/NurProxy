@@ -483,6 +483,14 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 // every host falls back to whatever policy GenerateServerTLS yields from paths
 // left empty (no load_files), and Caddy self-ACME covers TLS.
 func (b *Backend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error {
+	// srv0 must exist (with its routes array) before ApplyTLS PUTs automatic_https
+	// into it. A cert push can arrive before the first route apply, and ApplyTLS
+	// assumes EnsureServer already ran; without this, srv0 ends up created with only
+	// automatic_https and no routes, and the later AddRoute writes an object Caddy
+	// rejects as a RouteList.
+	if err := b.client.EnsureServer(ctx); err != nil {
+		return fmt.Errorf("ensuring server before tls strategy: %w", err)
+	}
 	hosts := make([]caddygen.TLSHost, 0, len(intents))
 	for _, in := range intents {
 		h := caddygen.TLSHost{Host: in.Host, Policy: in.Policy}
@@ -522,7 +530,13 @@ func (b *Backend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent
 	if err != nil {
 		return fmt.Errorf("marshaling automatic_https: %w", err)
 	}
-	if err := b.client.ApplyTLS(ctx, loadFiles, autoHTTPS); err != nil {
+	var connPolicies json.RawMessage
+	if len(strategy.ConnectionPolicies) > 0 {
+		if connPolicies, err = json.Marshal(strategy.ConnectionPolicies); err != nil {
+			return fmt.Errorf("marshaling tls_connection_policies: %w", err)
+		}
+	}
+	if err := b.client.ApplyTLS(ctx, loadFiles, autoHTTPS, connPolicies); err != nil {
 		return fmt.Errorf("applying caddy tls strategy: %w", err)
 	}
 	slog.InfoContext(ctx, "caddy: applied tls strategy",

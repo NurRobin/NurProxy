@@ -29,7 +29,8 @@ func TestGenerateServerTLS(t *testing.T) {
 				LoadFiles: []LoadFile{
 					{Certificate: "/c/app.crt", Key: "/c/app.key"},
 				},
-				AutomaticHTTPS: AutomaticHTTPS{Disable: true},
+				AutomaticHTTPS:     AutomaticHTTPS{Disable: true},
+				ConnectionPolicies: []ConnectionPolicy{{}},
 			},
 		},
 		{
@@ -41,7 +42,8 @@ func TestGenerateServerTLS(t *testing.T) {
 				LoadFiles: []LoadFile{
 					{Certificate: "/c/app.crt", Key: "/c/app.key"},
 				},
-				AutomaticHTTPS: AutomaticHTTPS{Disable: true},
+				AutomaticHTTPS:     AutomaticHTTPS{Disable: true},
+				ConnectionPolicies: []ConnectionPolicy{{}},
 			},
 		},
 		{
@@ -55,7 +57,8 @@ func TestGenerateServerTLS(t *testing.T) {
 					{Certificate: "/c/a.crt", Key: "/c/a.key"},
 					{Certificate: "/c/b.crt", Key: "/c/b.key"},
 				},
-				AutomaticHTTPS: AutomaticHTTPS{Disable: true},
+				AutomaticHTTPS:     AutomaticHTTPS{Disable: true},
+				ConnectionPolicies: []ConnectionPolicy{{}},
 			},
 		},
 		{

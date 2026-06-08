@@ -190,8 +190,21 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
-	// Already present? Nothing to do.
-	if _, err := c.doRequest(ctx, http.MethodGet, "/config/apps/http/servers/srv0", nil); err == nil {
+	// Already present? Ensure it still has a routes array before returning: a TLS
+	// strategy apply (ApplyTLS) may have created srv0 with only automatic_https and
+	// no routes, in which case a later AddRoute POST writes an object Caddy cannot
+	// load as a RouteList. Seed an empty routes array when it is missing.
+	if body, err := c.doRequest(ctx, http.MethodGet, "/config/apps/http/servers/srv0", nil); err == nil {
+		var existing struct {
+			Routes json.RawMessage `json:"routes"`
+		}
+		_ = json.Unmarshal(body, &existing)
+		if len(existing.Routes) == 0 {
+			empty, _ := json.Marshal([]json.RawMessage{})
+			if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http/servers/srv0/routes", empty); err != nil {
+				return fmt.Errorf("seeding routes array on existing srv0: %w", err)
+			}
+		}
 		return nil
 	}
 
@@ -266,11 +279,12 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 // never clobbers sibling config — the same conservative approach EnsureServer
 // uses. A nil/empty load_files set still writes automatic_https (e.g. disable for
 // a pure-provided fleet or a managed self-ACME server with no loaded files).
-func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automaticHTTPS json.RawMessage) error {
+func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automaticHTTPS json.RawMessage, connPolicies json.RawMessage) error {
 	c.mu.Lock()
 	if c.mock {
 		c.mockConfig["tls_load_files"] = loadFiles
 		c.mockConfig["automatic_https"] = automaticHTTPS
+		c.mockConfig["tls_connection_policies"] = connPolicies
 		c.mu.Unlock()
 		return nil
 	}
@@ -281,6 +295,15 @@ func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automa
 	if len(automaticHTTPS) > 0 {
 		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http/servers/srv0/automatic_https", automaticHTTPS); err != nil {
 			return fmt.Errorf("setting automatic_https: %w", err)
+		}
+	}
+
+	// With automatic_https disabled, Caddy creates no TLS connection policy, so
+	// without this srv0 serves plaintext on :443. PUT the default policy so it
+	// terminates TLS using the provided certs loaded below (matched by SNI).
+	if len(connPolicies) > 0 {
+		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http/servers/srv0/tls_connection_policies", connPolicies); err != nil {
+			return fmt.Errorf("setting tls_connection_policies: %w", err)
 		}
 	}
 

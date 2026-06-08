@@ -84,6 +84,15 @@ health endpoint that actually checks the database.
   Caddy agent its keep set never matched any live route and it deleted every
   route's central-TLS cert on the apply after issuance — leaving `:443` unable to
   serve. The keep set now includes the applied Caddy route targets.
+- **Built-in Caddy now actually serves HTTPS on central TLS** (#106). Three gaps
+  on the real-Caddy path (which the dry/sandbox harness never exercises) stopped
+  the default agent mode from terminating TLS: a TLS-strategy apply could create
+  `srv0` with no `routes` array, so the route's `POST` was rejected as a
+  `RouteList`; and with `automatic_https` disabled Caddy adds no TLS connection
+  policy, so `srv0` served plaintext on `:443`. EnsureServer now seeds the routes
+  array (and runs before the TLS strategy), and the strategy now sets a default
+  `tls_connection_policies` so Caddy serves the provided cert by SNI. A built-in
+  Caddy agent with central TLS now serves real HTTPS end to end.
 
 ## Upgrade notes
 

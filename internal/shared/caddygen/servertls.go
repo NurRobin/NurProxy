@@ -50,7 +50,19 @@ type ServerTLS struct {
 	// provided-cert hosts so Caddy does not also try to ACME them (§7 fallback
 	// coexistence).
 	AutomaticHTTPS AutomaticHTTPS
+	// ConnectionPolicies is srv0's tls_connection_policies. Caddy only auto-creates
+	// these while automatic_https is enabled; with every host on provided certs
+	// (Disable=true) it adds none, so srv0 would terminate plaintext on :443. We
+	// then add one default (catch-all) policy so Caddy serves the loaded provided
+	// certs by SNI. Empty in the mixed/self-ACME case (automatic_https creates the
+	// policies) and when no host actually provides a cert.
+	ConnectionPolicies []ConnectionPolicy
 }
+
+// ConnectionPolicy is one entry in Caddy's http server `tls_connection_policies`.
+// The empty policy {} is a catch-all that serves the best-matching loaded (or
+// managed) certificate for the connection's SNI.
+type ConnectionPolicy struct{}
 
 // LoadFile is one entry in Caddy's tls app `certificates.load_files`: a cert and
 // key file pair Caddy loads at startup and serves for the matching SNI host.
@@ -131,6 +143,12 @@ func GenerateServerTLS(hosts []TLSHost) ServerTLS {
 	} else {
 		// Every host runs on provided certs (or off): disable Caddy ACME entirely.
 		out.AutomaticHTTPS = AutomaticHTTPS{Disable: true}
+		// With automatic_https disabled Caddy adds no TLS connection policy, so srv0
+		// would serve plaintext on :443. Add a default policy when there is actually
+		// a provided cert to serve, so Caddy terminates TLS with the loaded certs.
+		if len(out.LoadFiles) > 0 {
+			out.ConnectionPolicies = []ConnectionPolicy{{}}
+		}
 	}
 	return out
 }
