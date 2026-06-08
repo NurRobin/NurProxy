@@ -480,7 +480,9 @@ func (c *fakeCaddyBackend) Render(ctx context.Context, route proxymodel.Route) (
 		Enabled: true,
 	}, nil
 }
-func (c *fakeCaddyBackend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) error { return nil }
+func (c *fakeCaddyBackend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) error {
+	return nil
+}
 func (c *fakeCaddyBackend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error {
 	return nil
 }
