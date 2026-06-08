@@ -4,10 +4,6 @@ How we cut a release: branch model, the release-candidate flow, and what each
 tag publishes. The pipeline is tag-driven — `release.yml` fires on any `v*` tag
 and runs GoReleaser (`.goreleaser.yml`); `repo.yml` rebuilds the apt/yum repo.
 
-Before tagging a final release, work through the
-[Release QA / Acceptance Book](docs/RELEASE-QA.md): the dry suite per RC, the
-real-run suite before the final tag, and the condensed acceptance checklist.
-
 ## Branch model
 
 | Branch | Role |
