@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -318,6 +319,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/v1/agents/{id}
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
+
+	// Refuse while domains still reference this agent's servers: the ON DELETE
+	// CASCADE (agent -> servers -> domains) would orphan their DNS records/certs
+	// ahead of the reconciler teardown (see guardChildDomains).
+	if s.guardChildDomains(w, "agent", db.DomainFilter{AgentID: id}) {
+		return
+	}
 
 	if err := s.db.DeleteAgent(id); err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")

@@ -13,6 +13,7 @@ import (
 type DomainFilter struct {
 	AgentID  string
 	ServerID string
+	ZoneID   string
 	Status   string
 }
 
@@ -131,6 +132,10 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 	if filter.ServerID != "" {
 		conditions = append(conditions, "server_id = ?")
 		args = append(args, filter.ServerID)
+	}
+	if filter.ZoneID != "" {
+		conditions = append(conditions, "zone_id = ?")
+		args = append(args, filter.ZoneID)
 	}
 	if filter.Status != "" {
 		conditions = append(conditions, "status = ?")

@@ -73,6 +73,12 @@ health endpoint that actually checks the database.
 ### Fixed
 
 - Audit log no longer re-logs `option_dropped` on every unchanged ACK.
+- Deleting a server, agent, or zone that still has domains is now refused with
+  `409` (the response lists the blocking domains). Previously the database's
+  `ON DELETE CASCADE` hard-removed those domain rows before the reconciler could
+  tear them down, orphaning their DNS records and certificates at the provider
+  with no audit trail. Delete the domains first (each routes through the proper
+  teardown), then the parent.
 
 ## Upgrade notes
 
