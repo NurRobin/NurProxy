@@ -2,9 +2,9 @@ package api
 
 import (
 	"log"
-	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
@@ -19,9 +19,10 @@ const sessionVersionSetting = "session_version"
 
 // secureCookiesSetting gates the Secure attribute on the session cookie. When
 // set to "true"/"1" Secure is forced on; "false"/"0" forces it off. When unset
-// the cookie is Secure for any non-localhost request and plain for localhost, so
-// HTTPS deployments behind a TLS-terminating proxy get Secure without breaking
-// local http dev.
+// the cookie is Secure exactly when the request arrived over HTTPS (directly or
+// through a TLS-terminating proxy), so HTTPS deployments get Secure automatically
+// while a plain-http deployment reached over its IP keeps working instead of
+// locking the operator out.
 const secureCookiesSetting = "secure_cookies"
 
 // currentSessionVersion reads the server-side session version (0 when unset).
@@ -254,9 +255,13 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request) {
 }
 
 // useSecureCookies decides whether the session cookie carries the Secure
-// attribute. An explicit secure_cookies setting wins; otherwise Secure is on for
-// any non-localhost request (the production case: HTTPS terminated at a proxy)
-// and off for localhost so plain-http local development keeps working.
+// attribute. An explicit secure_cookies setting wins; otherwise Secure tracks
+// whether the request itself arrived over HTTPS. Tying it to the actual scheme
+// (rather than to "non-localhost") means a plain-http deployment reached over
+// its LAN IP still receives a usable cookie, while any HTTPS request, direct or
+// proxied, gets Secure. Trusting X-Forwarded-Proto here is safe: a forged
+// "https" over plain http only marks the cookie Secure, which the same plain-http
+// client then declines to send back, so it can never weaken a real session.
 func (s *Server) useSecureCookies(r *http.Request) bool {
 	if v, err := s.db.GetSetting(secureCookiesSetting); err == nil && v != "" {
 		switch v {
@@ -266,23 +271,17 @@ func (s *Server) useSecureCookies(r *http.Request) bool {
 			return false
 		}
 	}
-	return !requestIsLocalhost(r)
+	return requestIsHTTPS(r)
 }
 
-// requestIsLocalhost reports whether the request targets a loopback host, used
-// to default Secure cookies off only for local development.
-func requestIsLocalhost(r *http.Request) bool {
-	host := r.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	if host == "localhost" {
+// requestIsHTTPS reports whether the request reached the server over TLS, either
+// on a direct connection or via a TLS-terminating proxy that sets
+// X-Forwarded-Proto.
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
 		return true
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // sessionDuration returns the configured session lifetime, read from the

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -73,9 +74,10 @@ func TestChangePassword_InvalidatesLiveToken(t *testing.T) {
 	}
 }
 
-// setupOnHost runs first-time setup against a specific Host header and returns
-// the resulting session cookie (with whatever Secure attribute the server set).
-func setupOnHost(t *testing.T, handler http.Handler, host string) *http.Cookie {
+// runSetup runs first-time setup, applying mutate to the request so a test can
+// pick the Host, scheme, or forwarding headers, and returns the session cookie
+// (with whatever Secure attribute the server set).
+func runSetup(t *testing.T, handler http.Handler, mutate func(*http.Request)) *http.Cookie {
 	t.Helper()
 	b, err := json.Marshal(map[string]string{"password": "testpassword123"})
 	if err != nil {
@@ -83,33 +85,46 @@ func setupOnHost(t *testing.T, handler http.Handler, host string) *http.Cookie {
 	}
 	req := httptest.NewRequest("POST", "/api/v1/auth/setup", bytes.NewBuffer(b))
 	req.Header.Set("Content-Type", "application/json")
-	req.Host = host
+	if mutate != nil {
+		mutate(req)
+	}
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("setup on host %q: got %d: %s", host, w.Code, w.Body.String())
+		t.Fatalf("setup: got %d: %s", w.Code, w.Body.String())
 	}
 	c := sessionCookie(w.Result())
 	if c == nil {
-		t.Fatalf("no session cookie from setup on host %q", host)
+		t.Fatal("no session cookie from setup")
 	}
 	return c
 }
 
-// The Secure attribute defaults on for non-localhost requests, off for
-// localhost, and is overridable by the secure_cookies setting.
+// The Secure attribute defaults to tracking the request scheme: on for HTTPS
+// (direct TLS or X-Forwarded-Proto=https), off for plain http regardless of
+// host, and overridable either way by the secure_cookies setting.
 func TestSessionCookie_SecureFlag(t *testing.T) {
 	tests := []struct {
 		name       string
-		host       string
 		setting    string // "" = unset
+		mutate     func(*http.Request)
 		wantSecure bool
 	}{
-		{name: "non-localhost default secure", host: "proxy.example.com", wantSecure: true},
-		{name: "localhost default insecure", host: "localhost:8080", wantSecure: false},
-		{name: "loopback ip default insecure", host: "127.0.0.1:8080", wantSecure: false},
-		{name: "explicit true forces secure on localhost", host: "localhost:8080", setting: "true", wantSecure: true},
-		{name: "explicit false forces insecure on remote", host: "proxy.example.com", setting: "false", wantSecure: false},
+		{name: "plain http remote default insecure", mutate: func(r *http.Request) { r.Host = "proxy.example.com" }, wantSecure: false},
+		{name: "plain http localhost default insecure", mutate: func(r *http.Request) { r.Host = "localhost:8080" }, wantSecure: false},
+		{name: "direct tls default secure", mutate: func(r *http.Request) {
+			r.Host = "proxy.example.com"
+			r.TLS = &tls.ConnectionState{}
+		}, wantSecure: true},
+		{name: "forwarded https default secure", mutate: func(r *http.Request) {
+			r.Host = "proxy.example.com"
+			r.Header.Set("X-Forwarded-Proto", "https")
+		}, wantSecure: true},
+		{name: "explicit true forces secure on plain http", setting: "true", mutate: func(r *http.Request) { r.Host = "localhost:8080" }, wantSecure: true},
+		{name: "explicit false forces insecure over https", setting: "false", mutate: func(r *http.Request) {
+			r.Host = "proxy.example.com"
+			r.Header.Set("X-Forwarded-Proto", "https")
+		}, wantSecure: false},
 	}
 
 	for _, tt := range tests {
@@ -120,7 +135,7 @@ func TestSessionCookie_SecureFlag(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			cookie := setupOnHost(t, srv.Handler(), tt.host)
+			cookie := runSetup(t, srv.Handler(), tt.mutate)
 			if cookie.Secure != tt.wantSecure {
 				t.Fatalf("Secure = %v, want %v", cookie.Secure, tt.wantSecure)
 			}

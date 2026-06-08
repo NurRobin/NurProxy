@@ -53,11 +53,11 @@ health endpoint that actually checks the database.
 
 - TLS issuance retries transient failures with exponential backoff and parses an
   ACME rate-limit "retry after" instant into a typed `RateLimitError`.
-- **Session cookies are now marked `Secure` by default** for any request not
-  served over localhost, so the session cookie is only sent back over HTTPS.
-  Deployments fronted by plain HTTP will see the cookie dropped by the browser;
-  set the `secure_cookies` setting to override and force the previous behavior
-  when TLS is terminated upstream.
+- **Session cookies are marked `Secure` when the request arrives over HTTPS**
+  (direct TLS or `X-Forwarded-Proto: https` from a TLS-terminating proxy), so the
+  cookie is only sent back over HTTPS where that applies. A plain-HTTP deployment
+  reached over its IP keeps working and is not locked out. The `secure_cookies`
+  setting still forces the attribute on or off explicitly.
 - **Logout and password change now force a global re-login.** Both perform
   server-side session revocation, so every existing session — across all
   browsers and devices — is invalidated, not just the current one.
@@ -76,9 +76,10 @@ health endpoint that actually checks the database.
 
 ## Upgrade notes
 
-- **Back up before upgrading.** Run `nurproxy backup` against your current
-  orchestrator data directory before installing 0.3.0, so you can roll back if
-  needed.
+- **Back up before upgrading.** `nurproxy backup` ships *in* 0.3.0, so it is not
+  available on the version you are upgrading from. Stop the orchestrator and copy
+  its data directory (default `/var/lib/nurproxy`) before installing 0.3.0, so you
+  can roll back if needed. From 0.3.0 onward, `nurproxy backup` does this for you.
 - **Pre-0.3.0 DNS records are treated as adopted, not auto-deleted.** DNS records
   created by NurProxy before this release are now treated as *adopted* records.
   On teardown (deleting a domain or agent) they are left in place at your DNS
@@ -89,12 +90,12 @@ health endpoint that actually checks the database.
 
 ### Security defaults that may require operator action
 
-- **Secure session cookies break plain-HTTP deployments.** Session cookies are
-  now `Secure` by default for non-localhost requests, so a browser will not send
-  the cookie back over plain HTTP and login will appear to fail. If your
-  deployment is fronted by plain HTTP (or terminates TLS at an upstream proxy
-  without forwarding it correctly), set the `secure_cookies` setting so the
-  cookie is issued as before. Serving the dashboard over HTTPS needs no change.
+- **Secure session cookies now follow the request scheme.** The cookie is marked
+  `Secure` only when the request reaches the orchestrator over HTTPS (direct TLS
+  or `X-Forwarded-Proto: https`). Reaching the dashboard over plain HTTP, for
+  example by IP, keeps working. If you terminate TLS at an upstream proxy, make
+  sure it forwards `X-Forwarded-Proto`, or set the `secure_cookies` setting to
+  `true` to force the attribute on.
 - **All sessions are invalidated on logout and password change.** Both now
   perform server-side revocation, forcing a global re-login. After upgrading and
   on any logout or password change, every active session across all devices is
