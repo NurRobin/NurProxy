@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,12 @@ const (
 	maxBackoff = 30 * time.Second
 	// maxLine bounds a single SSE data line; route snapshots can be large.
 	maxLine = 4 << 20 // 4 MiB
+	// suppressionTTL bounds how long an unchanged push may skip the apply phase.
+	// Suppression works off the agent's in-memory record of its last clean apply,
+	// so out-of-band divergence it cannot see (a proxy restarted empty, a managed
+	// file removed without the heartbeat catching it yet) must self-heal: at most
+	// this much time passes before a full re-apply runs regardless.
+	suppressionTTL = 10 * time.Minute
 )
 
 // caddyBackend is the subset of the bundled-Caddy proxy backend the stream
@@ -100,6 +107,17 @@ type Client struct {
 	// targetPath (see ManagedChecksums).
 	managedMu sync.RWMutex
 	managed   map[string]managedArtifact
+
+	// applyStateMu guards the change-suppression record of the last apply. A push
+	// whose rendered set (artifacts + certs + keep + TLS policies) fingerprints
+	// identically to the last CLEAN apply within suppressionTTL skips the apply
+	// phase entirely — the periodic reconcile tick re-pushes the same set every
+	// interval, and without this every tick costs a validate + reload on file
+	// backends and a clear/re-add window on the admin-API path.
+	applyStateMu   sync.Mutex
+	lastApplyFP    string
+	lastApplyClean bool
+	lastFullApply  time.Time
 
 	// logPaths is the operator-configured proxy_log_paths allowlist (§9). An
 	// on-demand tail (§15) is refused unless its path is within this set, so a
@@ -393,7 +411,7 @@ func (c *Client) sendLogChunk(ctx context.Context, sessionID, path string, ch lo
 // (which can self-ACME as a fallback, §7); file backends that hard-require the
 // cert will fail their own validate, attributed per-artifact.
 func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
-	c.installCerts(ctx, set.Certs)
+	certsOK := c.installCerts(ctx, set.Certs)
 
 	intents := set.Intents
 	reports := make([]proxymodel.ArtifactReport, 0, len(intents))
@@ -404,34 +422,6 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	managed := make(map[string]managedArtifact, len(intents))
 	applied := 0
 
-	// Ensure the server exists first (creates the config path), then clear, then
-	// add — so clearing doesn't hit a not-yet-created path on a fresh Caddy. These
-	// admin-API primitives are safe no-ops on a file backend (the Holder forwards
-	// them only when the current backend implements them).
-	if err := c.caddy.EnsureServer(ctx); err != nil {
-		log.Printf("Stream: failed to ensure server: %v", err)
-		if c.health != nil {
-			c.health.SetCaddyRunning(false)
-			c.health.SetError(fmt.Sprintf("Caddy could not start its HTTP server (ports 80/443 in use?): %v", err))
-		}
-	} else if c.health != nil {
-		// Server is up — clear any prior bind error.
-		c.health.SetCaddyRunning(true)
-		c.health.SetError("")
-	}
-	if err := c.caddy.ClearRoutes(ctx); err != nil {
-		log.Printf("Stream: failed to clear routes: %v", err)
-	}
-
-	// Configure the server's TLS strategy from each host's policy (§7): central
-	// provided certs run with automatic_https disabled and the installed bundle
-	// fed in; self-ACME hosts keep Caddy's own ACME (the explicit fallback). This
-	// runs after the certs are installed and the server exists, before routes are
-	// applied. A failure is logged + surfaced via health but never aborts the
-	// apply (invariant #1: the running Caddy path keeps serving; self-ACME still
-	// covers TLS).
-	c.applyServerTLS(ctx, intents)
-
 	// fileArtifact ties a file-backed render to its slot in reports, so the batch
 	// Apply below can attribute the outcome back per artifact. reportIdx is stable:
 	// reports is fully built by the render loop and never appended to afterwards.
@@ -441,13 +431,19 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		reportIdx int
 	}
 	var fileArts []fileArtifact
-	// caddyKept collects the targets of successfully-applied built-in-Caddy routes so
-	// the post-apply Prune retains their cert material. Without it a pure-Caddy agent's
-	// keep set holds only file targets; Prune's route-ID match then finds nothing
-	// wanted and scrubs the provided cert of every live route, breaking central-TLS
-	// (the cert is written on the issuing apply, then deleted on the next one).
-	var caddyKept []proxy.Target
+	// caddyArts are the admin-API built-in-Caddy renders, applied via AddRoute in
+	// the apply phase below (after the suppression gate).
+	type caddyArtifact struct {
+		intent    proxymodel.RouteIntent
+		art       proxy.Artifact
+		reportIdx int
+	}
+	var caddyArts []caddyArtifact
 
+	// Render every intent first. Rendering is read-only with respect to the live
+	// proxy (it produces the artifact bytes), so it can run before any mutation —
+	// which lets the suppression gate below compare the fully-rendered set against
+	// the last apply without touching the proxy at all.
 	for _, in := range intents {
 		host := in.Route.Host
 
@@ -478,33 +474,113 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 			// each one (invariant #4: dropped, logged, and audited).
 			Warnings: art.Warnings,
 		}
+		reports = append(reports, report)
 
 		// Dispatch by target kind. A file-backed artifact (nginx/apache/external
-		// caddy) is deferred to the atomic batch Apply below — AddRoute is a no-op
-		// for those backends, so applying through it would ACK success without ever
+		// caddy) goes to the atomic batch Apply below — AddRoute is a no-op for
+		// those backends, so applying through it would ACK success without ever
 		// writing the file or reloading the proxy (§10). The admin-API built-in
-		// Caddy applies its route directly here.
+		// Caddy applies its route via AddRoute.
 		if art.Target.Kind == proxy.TargetKindFile {
-			reports = append(reports, report)
 			fileArts = append(fileArts, fileArtifact{intent: in, art: art, reportIdx: len(reports) - 1})
-			continue
+		} else {
+			caddyArts = append(caddyArts, caddyArtifact{intent: in, art: art, reportIdx: len(reports) - 1})
 		}
+	}
 
-		if err := c.caddy.AddRoute(ctx, json.RawMessage(art.Content)); err != nil {
-			log.Printf("Stream: failed to apply route for %s: %v", host, err)
-			report.Error = err.Error()
-			reports = append(reports, report)
+	// Change suppression: the periodic reconcile tick re-pushes the same desired
+	// set every interval. If the rendered set — artifacts, cert material, keep
+	// paths, TLS policies — is identical to what the last clean apply put live,
+	// re-applying buys nothing and costs a validate + reload on file backends and
+	// a clear/re-add window on the admin-API path. Skip straight to the ACK (the
+	// orchestrator's version store is equality-gated, so identical content never
+	// churns versions, while domain status still refreshes). Bounded by
+	// suppressionTTL, and only after a CLEAN apply — any apply-phase error forces
+	// a retry on the next push.
+	fp := setFingerprint(reports, set)
+	c.applyStateMu.Lock()
+	suppress := certsOK && c.lastApplyClean && fp == c.lastApplyFP && time.Since(c.lastFullApply) < suppressionTTL
+	c.applyStateMu.Unlock()
+	if suppress {
+		for _, ca := range caddyArts {
+			if ca.intent.ArtifactID != "" {
+				rep := reports[ca.reportIdx]
+				managed[ca.intent.ArtifactID] = managedArtifact{targetKind: rep.TargetKind, targetPath: rep.TargetPath, checksum: rep.Checksum}
+			}
+		}
+		for _, fa := range fileArts {
+			if fa.intent.ArtifactID != "" {
+				rep := reports[fa.reportIdx]
+				managed[fa.intent.ArtifactID] = managedArtifact{targetKind: rep.TargetKind, targetPath: rep.TargetPath, checksum: rep.Checksum}
+			}
+		}
+		c.carryKeepManaged(set.Keep, managed)
+		c.setManaged(managed)
+		log.Printf("Stream: set unchanged since last apply, suppressed re-apply of %d intent(s)", len(intents))
+		c.sendAck(ctx, reports)
+		return
+	}
+
+	// clean tracks whether every apply-phase mutation succeeded (cert install
+	// included); only a clean apply may seed the suppression gate (a failed one
+	// must retry on the next push, even an identical one).
+	clean := certsOK
+
+	// Ensure the server exists first (creates the config path), then clear, then
+	// add — so clearing doesn't hit a not-yet-created path on a fresh Caddy. These
+	// admin-API primitives are safe no-ops on a file backend (the Holder forwards
+	// them only when the current backend implements them).
+	if err := c.caddy.EnsureServer(ctx); err != nil {
+		log.Printf("Stream: failed to ensure server: %v", err)
+		clean = false
+		if c.health != nil {
+			c.health.SetCaddyRunning(false)
+			c.health.SetError(fmt.Sprintf("Caddy could not start its HTTP server (ports 80/443 in use?): %v", err))
+		}
+	} else if c.health != nil {
+		// Server is up — clear any prior bind error.
+		c.health.SetCaddyRunning(true)
+		c.health.SetError("")
+	}
+	if err := c.caddy.ClearRoutes(ctx); err != nil {
+		log.Printf("Stream: failed to clear routes: %v", err)
+		clean = false
+	}
+
+	// Configure the server's TLS strategy from each host's policy (§7): central
+	// provided certs run with automatic_https disabled and the installed bundle
+	// fed in; self-ACME hosts keep Caddy's own ACME (the explicit fallback). This
+	// runs after the certs are installed and the server exists, before routes are
+	// applied. A failure is logged + surfaced via health but never aborts the
+	// apply (invariant #1: the running Caddy path keeps serving; self-ACME still
+	// covers TLS).
+	if !c.applyServerTLS(ctx, intents) {
+		clean = false
+	}
+
+	// caddyKept collects the targets of successfully-applied built-in-Caddy routes so
+	// the post-apply Prune retains their cert material. Without it a pure-Caddy agent's
+	// keep set holds only file targets; Prune's route-ID match then finds nothing
+	// wanted and scrubs the provided cert of every live route, breaking central-TLS
+	// (the cert is written on the issuing apply, then deleted on the next one).
+	var caddyKept []proxy.Target
+
+	for _, ca := range caddyArts {
+		if err := c.caddy.AddRoute(ctx, json.RawMessage(ca.art.Content)); err != nil {
+			log.Printf("Stream: failed to apply route for %s: %v", ca.intent.Route.Host, err)
+			reports[ca.reportIdx].Error = err.Error()
+			clean = false
 			continue
 		}
 		applied++
-		caddyKept = append(caddyKept, art.Target)
-		reports = append(reports, report)
+		caddyKept = append(caddyKept, ca.art.Target)
 		// Track the successfully-applied artifact for the heartbeat drift check.
-		if in.ArtifactID != "" {
-			managed[in.ArtifactID] = managedArtifact{
-				targetKind: report.TargetKind,
-				targetPath: report.TargetPath,
-				checksum:   report.Checksum,
+		if ca.intent.ArtifactID != "" {
+			rep := reports[ca.reportIdx]
+			managed[ca.intent.ArtifactID] = managedArtifact{
+				targetKind: rep.TargetKind,
+				targetPath: rep.TargetPath,
+				checksum:   rep.Checksum,
 			}
 		}
 	}
@@ -521,6 +597,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		}
 		if err := c.caddy.Apply(ctx, arts); err != nil {
 			fileApplyOK = false
+			clean = false
 			log.Printf("Stream: failed to apply %d file artifact(s): %v", len(arts), err)
 			if c.health != nil {
 				c.health.SetError(fmt.Sprintf("failed to apply proxy config: %v", err))
@@ -568,37 +645,81 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		keep = append(keep, caddyKept...)
 		if n, err := c.caddy.Prune(ctx, keep); err != nil {
 			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
+			clean = false
 		} else if n > 0 {
 			log.Printf("Stream: pruned %d orphaned vhost(s)", n)
 		}
 	}
 
-	// Carry forward the managed entries for Keep'd paths (drifted artifacts the
-	// orchestrator retained but did not re-push). Keeping them in the managed set
-	// means the heartbeat keeps reporting their checksum, so the drift auto-clears
-	// when the operator reverts the file and drift_content refreshes on a re-edit
-	// (§11). Their last-applied checksum is the accepted baseline the orchestrator
-	// compares against, so this never masks a genuine divergence.
-	if len(set.Keep) > 0 {
-		keepPaths := make(map[string]bool, len(set.Keep))
-		for _, p := range set.Keep {
-			keepPaths[p] = true
-		}
-		c.managedMu.RLock()
-		for id, m := range c.managed {
-			if _, alreadyApplied := managed[id]; !alreadyApplied && keepPaths[m.targetPath] {
-				managed[id] = m
-			}
-		}
-		c.managedMu.RUnlock()
-	}
+	c.carryKeepManaged(set.Keep, managed)
 
 	// Replace the managed snapshot so the heartbeat reports exactly what is live
 	// now (additions and removals both reflected).
 	c.setManaged(managed)
 
+	// Seed the suppression gate: an identical push within suppressionTTL may now
+	// skip its apply phase — but only because this one completed cleanly.
+	c.applyStateMu.Lock()
+	c.lastApplyFP = fp
+	c.lastApplyClean = clean
+	c.lastFullApply = time.Now()
+	c.applyStateMu.Unlock()
+
 	log.Printf("Stream: applied %d/%d intents", applied, len(intents))
 	c.sendAck(ctx, reports)
+}
+
+// carryKeepManaged carries forward the managed entries for Keep'd paths (drifted
+// artifacts the orchestrator retained but did not re-push). Keeping them in the
+// managed set means the heartbeat keeps reporting their checksum, so the drift
+// auto-clears when the operator reverts the file and drift_content refreshes on a
+// re-edit (§11). Their last-applied checksum is the accepted baseline the
+// orchestrator compares against, so this never masks a genuine divergence.
+func (c *Client) carryKeepManaged(keep []string, managed map[string]managedArtifact) {
+	if len(keep) == 0 {
+		return
+	}
+	keepPaths := make(map[string]bool, len(keep))
+	for _, p := range keep {
+		keepPaths[p] = true
+	}
+	c.managedMu.RLock()
+	for id, m := range c.managed {
+		if _, alreadyApplied := managed[id]; !alreadyApplied && keepPaths[m.targetPath] {
+			managed[id] = m
+		}
+	}
+	c.managedMu.RUnlock()
+}
+
+// setFingerprint condenses everything a push would make live — the rendered
+// artifacts (content checksums and per-artifact render errors), the pushed cert
+// material, the keep paths, and each host's TLS policy — into one hash for the
+// change-suppression gate. Components are sorted first: intents arrive in map
+// order from the orchestrator, so the same set must fingerprint identically
+// regardless of ordering.
+func setFingerprint(reports []proxymodel.ArtifactReport, set proxymodel.IntentSet) string {
+	lines := make([]string, 0, len(reports)+len(set.Certs)+len(set.Keep)+len(set.Intents))
+	for _, r := range reports {
+		lines = append(lines, fmt.Sprintf("art|%s|%s|%s|%s|%s|%s|%t|%s",
+			r.ArtifactID, r.Host, r.Backend, r.TargetKind, r.TargetPath, r.Checksum, r.Enabled, r.Error))
+	}
+	for _, cb := range set.Certs {
+		lines = append(lines, "cert|"+cb.Host+"|"+checksum(cb.CertPEM)+"|"+checksum(cb.KeyPEM))
+	}
+	for _, p := range set.Keep {
+		lines = append(lines, "keep|"+p)
+	}
+	// TLS policies feed EnsureServerTLS but not the rendered route content, so
+	// they need their own component (a policy flip must defeat suppression).
+	for _, in := range set.Intents {
+		if in.Route.IsRaw() || in.Route.Host == "" {
+			continue
+		}
+		lines = append(lines, "tls|"+in.Route.Host+"|"+string(in.Route.TLS.Policy))
+	}
+	sort.Strings(lines)
+	return checksum(strings.Join(lines, "\n"))
 }
 
 // installCerts runs the preflight cert install for a push (§5/§7): it converts the
@@ -607,10 +728,12 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 // applies any referencing config. An install error is logged and surfaced via
 // health but never aborts the apply: the built-in Caddy can self-ACME as a fallback
 // (§7), and per-artifact validation still attributes a genuinely missing cert. A
-// nil/empty slice is a no-op (no TLS material in this push).
-func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle) {
+// nil/empty slice is a no-op (no TLS material in this push). The returned ok
+// feeds the suppression gate: after a failed install the on-disk cert material
+// may be stale, so an otherwise-identical push must re-run in full.
+func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle) bool {
 	if len(certs) == 0 {
-		return
+		return true
 	}
 	bundles := make([]proxy.CertBundle, 0, len(certs))
 	for _, cb := range certs {
@@ -625,9 +748,10 @@ func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle
 		if c.health != nil {
 			c.health.SetError(fmt.Sprintf("failed to install TLS certificates: %v", err))
 		}
-		return
+		return false
 	}
 	log.Printf("Stream: installed %d cert bundle(s) before apply", len(bundles))
+	return true
 }
 
 // applyServerTLS derives each host's TLS policy from its pushed intent and asks
@@ -639,8 +763,9 @@ func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle
 //
 // A failure is logged and surfaced via health but never aborts the apply: the
 // already-running Caddy keeps serving and self-ACME still covers TLS, preserving
-// invariant #1.
-func (c *Client) applyServerTLS(ctx context.Context, intents []proxymodel.RouteIntent) {
+// invariant #1. The returned ok feeds the suppression gate — a failed TLS
+// configure must not count as a clean apply.
+func (c *Client) applyServerTLS(ctx context.Context, intents []proxymodel.RouteIntent) bool {
 	tlsIntents := make([]proxy.TLSIntent, 0, len(intents))
 	for _, in := range intents {
 		if in.Route.IsRaw() || in.Route.Host == "" {
@@ -657,7 +782,9 @@ func (c *Client) applyServerTLS(ctx context.Context, intents []proxymodel.RouteI
 		if c.health != nil {
 			c.health.SetError(fmt.Sprintf("failed to configure TLS strategy: %v", err))
 		}
+		return false
 	}
+	return true
 }
 
 // checksum returns the hex-encoded SHA-256 of the rendered content. It matches

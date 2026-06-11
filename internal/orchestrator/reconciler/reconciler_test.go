@@ -1739,3 +1739,75 @@ func TestReconcileDeletions_KeepsAdoptedRecord(t *testing.T) {
 		t.Error("expected domain row to be removed even though the adopted record was kept")
 	}
 }
+
+// TestBuildDesiredRoutes_manualDomainWithoutArtifact pins the nil-guard on the
+// Caddy-JSON fallback: a manual config on the domain row (PUT /config) renders a
+// raw intent via ConfigFromDomain, and when no dom-<id> artifact exists yet (the
+// domain was never ACK'd) the fallback used to dereference the nil stored
+// artifact and panic the reconcile loop.
+func TestBuildDesiredRoutes_manualDomainWithoutArtifact(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	dom.ManualConfig = true
+	dom.ProxyConfig.RawConfig = models.RawConfig{Backend: "nginx", Content: "server { listen 80; }"}
+	if err := d.UpdateDomain(dom); err != nil {
+		t.Fatalf("UpdateDomain: %v", err)
+	}
+	agent.ProxyMode = "existing"
+	agent.ProxyDetection = &models.ProxyDetection{Installed: true, Kind: "nginx"}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	desired, _, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes: %v", err)
+	}
+	dr, ok := desired["app.example.com"]
+	if !ok {
+		t.Fatal("expected the manual domain in the desired set")
+	}
+	if !dr.intent.IsRaw() {
+		t.Error("expected a raw intent for the manual-config domain")
+	}
+	if string(dr.route) != "server { listen 80; }" {
+		t.Errorf("fallback route = %q, want the raw content", string(dr.route))
+	}
+}
+
+// TestReconcileRoutes_tickIncludesCerts verifies the periodic tick's stream push
+// carries the cert bundles exactly like the instant push (§5/§7 preflight
+// ordering) — without them an agent that missed the instant push keeps receiving
+// TLS configs it can never validate.
+func TestReconcileRoutes_tickIncludesCerts(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, _, _ := setupScenario(t, d)
+
+	if err := d.UpsertCertificate(&models.Certificate{
+		ID:      "cert-1",
+		Host:    "app.example.com",
+		Names:   []string{"app.example.com"},
+		CertPEM: "LEAFCHAIN",
+		KeyPEM:  "PRIVATEKEY",
+	}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+
+	hub := newMockHub()
+	hub.setConnected(agent.ID, true)
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.SetHub(hub)
+
+	if err := r.reconcileRoutes(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileRoutes: %v", err)
+	}
+	set, ok := hub.lastSet(agent.ID)
+	if !ok {
+		t.Fatal("expected an intent set to be published")
+	}
+	if len(set.Certs) != 1 {
+		t.Fatalf("expected 1 cert bundle in the tick push, got %d", len(set.Certs))
+	}
+	if set.Certs[0].Host != "app.example.com" || set.Certs[0].CertPEM != "LEAFCHAIN" {
+		t.Errorf("cert bundle = %+v, want the stored leaf for app.example.com", set.Certs[0])
+	}
+}
