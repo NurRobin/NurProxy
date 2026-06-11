@@ -56,7 +56,25 @@ if [[ -z "$ORCH_BIN" ]]; then
 fi
 [[ -x "$AGENT_BIN" ]] || { echo "error: agent binary $AGENT_BIN missing (build with 'make build-agent')" >&2; exit 1; }
 
+# Guard the rm -rf: WORKDIR is env-overridable, so refuse to wipe anything that
+# doesn't look like a sandbox dir — either its basename starts with .dev-sandbox
+# (the default) or it carries the marker file a previous run left behind.
+MARKER=".nurproxy-dev-sandbox"
+if [[ -e "$WORKDIR" ]]; then
+  case "$(basename "$WORKDIR")" in
+    .dev-sandbox*) : ;;
+    *)
+      if [[ ! -e "$WORKDIR/$MARKER" ]]; then
+        echo "error: refusing to rm -rf $WORKDIR — not a sandbox directory" >&2
+        echo "       (expected a basename starting with .dev-sandbox, or a $MARKER marker file from a previous run)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR/orch"
+touch "$WORKDIR/$MARKER"
 echo "==> NurProxy dev sandbox (dry-run) — orchestrator=$ORCH_BIN agent=$AGENT_BIN"
 
 api() { # api METHOD PATH [JSON]

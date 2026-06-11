@@ -83,6 +83,15 @@ esac
 command -v curl >/dev/null 2>&1 || err "curl is required"
 command -v tar  >/dev/null 2>&1 || err "tar is required"
 
+# sha256 verifier: sha256sum on Linux, shasum (perl, ships with macOS) elsewhere.
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256="shasum -a 256"
+else
+  err "sha256sum (or shasum) is required to verify downloads"
+fi
+
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$os" in
   linux|darwin|freebsd) : ;;
@@ -122,7 +131,29 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# install_binary <comp-asset-name> — downloads and installs that binary.
+# fetch_checksums — downloads the release's checksums.txt into $tmp (once).
+fetch_checksums() {
+  [ -f "${tmp}/checksums.txt" ] && return 0
+  sums_url="$(printf '%s' "$release_json" \
+    | grep -o '"browser_download_url": *"[^"]*"' \
+    | sed -E 's/.*"(https[^"]*)".*/\1/' \
+    | grep -E '/checksums\.txt$' \
+    | head -n1)"
+  [ -n "$sums_url" ] || err "release ${VERSION} publishes no checksums.txt — cannot verify downloads"
+  curl -fsSL "$sums_url" -o "${tmp}/checksums.txt" || err "could not download checksums.txt"
+}
+
+# verify_checksum <asset-filename> — checks the downloaded asset in $tmp against
+# checksums.txt. Fails hard on a mismatch or a missing checksum entry.
+verify_checksum() {
+  asset="$1"
+  fetch_checksums
+  info "verifying checksum for ${asset}"
+  ( cd "$tmp" && grep " ${asset}\$" checksums.txt | $SHA256 -c - >/dev/null 2>&1 ) \
+    || err "checksum verification FAILED for ${asset} — aborting (corrupt or tampered download?)"
+}
+
+# install_binary <comp-asset-name> — downloads, verifies, and installs that binary.
 install_binary() {
   comp="$1"
   url="$(printf '%s' "$release_json" \
@@ -131,10 +162,12 @@ install_binary() {
     | grep -E "/${comp}_[^/]*_${os}_${arch}\.tar\.gz$" \
     | head -n1)"
   [ -n "$url" ] || err "no ${comp} asset for ${os}/${arch} in release ${VERSION}"
+  asset="${url##*/}"
 
   info "downloading ${comp} (${os}/${arch})"
-  curl -fsSL "$url" -o "${tmp}/${comp}.tar.gz" || err "download failed: $url"
-  tar -xzf "${tmp}/${comp}.tar.gz" -C "$tmp" "$comp" || err "could not extract ${comp}"
+  curl -fsSL "$url" -o "${tmp}/${asset}" || err "download failed: $url"
+  verify_checksum "$asset"
+  tar -xzf "${tmp}/${asset}" -C "$tmp" "$comp" || err "could not extract ${comp}"
 
   info "installing ${comp} -> ${INSTALL_DIR}/${comp}"
   $SUDO install -m 0755 "${tmp}/${comp}" "${INSTALL_DIR}/${comp}"

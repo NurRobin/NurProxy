@@ -15,9 +15,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Gate: a tag must never ship untested commits. The release job only runs
+  # once the full test suite passes on the tagged commit.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - name: Run tests
+        run: go test ./...
+
   release:
     name: Release
     runs-on: ubuntu-latest
+    needs: test
     steps:
       - uses: actions/checkout@v6
         with:

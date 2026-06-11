@@ -90,7 +90,7 @@ There is no extra proxy layer, no port conflict, and no TLS delegation chain. Th
 - **DDNS built in**: Agents behind dynamic IPs can automatically keep their DNS A record up to date. Configurable interval per agent.
 - **CNAME chain architecture**: Subdomains point to agent FQDNs via CNAME, agents publish their own A records. One IP change updates one record, all subdomains follow.
 - **Full route control**: Toggle common settings through simple UI controls, or drop into the proxy's native config format for full flexibility. The dashboard greys out options the backend can't handle.
-- **Basic auth**: Per-route username/password protection, managed from the dashboard.
+- **Basic auth**: Per-route username/password protection in the route model and API. The dashboard currently only shows whether it is enabled; editing credentials from the UI is not wired up yet.
 - **MCP server (opt-in)**: Exposes an MCP endpoint so AI tools like Claude can create and manage domains programmatically. Disabled by default.
 - **Headless + CLI**: Run the orchestrator without the dashboard and manage everything via the built-in CLI client. Every command supports `--json` for scripting.
 - **Minimal footprint**: The orchestrator is a single binary (~20 MB) serving its own dashboard. Agents weigh ~30-50 MB with Caddy built in. Neither has runtime dependencies.
@@ -260,6 +260,19 @@ nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port
 
 Auth comes from `NP_API_KEY` (Bearer) or `NP_API_PASSWORD` (the CLI logs in for you). Add `--json` to any command for script-friendly output. See [wiki/cli.md](wiki/cli.md) for the full command reference.
 
+## Backup & restore
+
+`nurproxy backup` archives everything the orchestrator needs to come back up: a consistent snapshot of the SQLite database (safe to take while the orchestrator is running) plus `encryption.key` and `acme-account.key`.
+
+```bash
+nurproxy backup [--data-dir DIR] [-o OUTFILE]        # default output: nurproxy-backup-<timestamp>.tar.gz
+nurproxy restore [--data-dir DIR] [--force] ARCHIVE
+```
+
+`--data-dir` defaults to `$NP_DATA_DIR` or `./data`, matching the server's own resolution order. Restore refuses to overwrite an existing database unless `--force` is given, and clears stale SQLite `-wal`/`-shm` sidecars so an old journal can't replay over the restored snapshot. If the orchestrator is running, stop it before restoring into its data dir.
+
+The archive contains the plaintext `encryption.key` — store it as a secret. Anyone holding it can decrypt every provider config and TLS private key in the database.
+
 ## Sandbox / dry-run mode
 
 For local development and CI you can run the orchestrator in **dry-run mode**: it runs the full control plane — reconciler, DNS state machine, certificate issuance and renewal — but **simulates every DNS and ACME call instead of executing it**. No live Cloudflare zone, no Let's Encrypt round trips, and no rate-limit risk. DNS mutations land in an in-memory store that reads back correctly (so `create CNAME → present TXT challenge → clean up TXT` sequences behave realistically), and ACME issuance returns a self-signed certificate with a 90-day validity.
@@ -310,7 +323,7 @@ cmd/nurproxy/          Orchestrator entry point
 cmd/nurproxy-agent/    Agent entry point
 internal/orchestrator/ Orchestrator logic (API, database, reconciler)
 internal/agent/        Agent logic (proxy management, adoption, heartbeat)
-internal/proxy/        Proxy backend interface + Caddy, nginx, Apache implementations
+internal/agent/proxy/  Proxy backend interface + Caddy, nginx, Apache implementations
 internal/provider/     DNS provider plugin system
 internal/shared/       Shared code (models, auth, crypto, route generation)
 web/                   Dashboard (Vite + React + Tailwind)

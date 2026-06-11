@@ -132,6 +132,15 @@ func cmdRestore(args []string) {
 	}
 	dir := resolveDataDir(*dataDir)
 
+	// A live orchestrator holds the DB open in WAL mode; replacing the file
+	// underneath it corrupts the restored state. Warn whenever --force is about
+	// to overwrite an existing database.
+	if *force {
+		if _, err := os.Stat(filepath.Join(dir, dbFileName)); err == nil {
+			fmt.Fprintln(os.Stderr, "restore: WARNING: overwriting the existing database — if the orchestrator is running, stop it before restoring")
+		}
+	}
+
 	restored, err := restoreArchive(fs.Arg(0), dir, *force)
 	if err != nil {
 		fatalf("restore: %v", err)
