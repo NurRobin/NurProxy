@@ -269,12 +269,14 @@ For local development and CI you can run the orchestrator in **dry-run mode**: i
 NP_DRY_RUN=true ./nurproxy
 
 # Or per subsystem, for partial testing:
-NP_DNS_DRY_RUN=true ./nurproxy     # mock DNS, real ACME
+NP_DNS_DRY_RUN=true ./nurproxy     # mock DNS, real ACME (DNS-01 cannot complete — see note)
 NP_ACME_DRY_RUN=true ./nurproxy    # real DNS, mock ACME
 
 # Exercise issuance error paths without waiting for a real failure:
 NP_ACME_DRY_RUN=true NP_DRY_RUN_FAIL=ratelimit ./nurproxy   # ratelimit | challenge | propagation
 ```
+
+Note that `NP_DNS_DRY_RUN` (mock DNS) combined with **real** ACME cannot complete a DNS-01 challenge: the challenge TXT record only lands in the in-memory DNS store and is never published to a resolvable zone, so Let's Encrypt can't validate it. Use that combination for non-issuance DNS testing only; for full TLS flows use `NP_DRY_RUN` (mock both) or `NP_ACME_DRY_RUN` (real DNS, mock ACME).
 
 The `-dry-run` CLI flag is equivalent to `NP_DRY_RUN=true`. Every simulated call is logged and tagged in the audit log with `source: dryrun`, the dashboard shows a persistent **"Dry-run mode"** banner, and `/api/v1/health` reports `dry_run`, `dns_dry_run`, and `acme_dry_run` so there's no confusion with a live instance. Provider setup (validate + list zones) is mocked too, so you can wire up a Cloudflare provider with a dummy token and run the whole flow end-to-end without provisioning anything.
 

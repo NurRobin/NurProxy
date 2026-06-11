@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
@@ -52,6 +53,15 @@ type RenewTarget struct {
 	// IsWildcard echoes the stored cert's wildcard flag so the re-issue keeps the
 	// same scope (and the same shared-key trade-off the operator opted into).
 	IsWildcard bool
+	// FirstIssue marks a target the scan resolved because the host had NO cert yet
+	// (the first-issuance pass), as opposed to a renewal of an in-window cert. It
+	// gates the under-lock re-check in renewOne: a first-issuance target whose cert
+	// now exists (the on-create EnsureCertForHost won the race and already issued)
+	// must NO-OP rather than re-drive ACME against the stale target. A renewal
+	// target (FirstIssue=false, the safe default) always proceeds — its on-file
+	// cert is due/in-window and the whole point of the scan is to re-issue it, so
+	// it must never be collapsed by a "cert exists" check.
+	FirstIssue bool
 	// Provider is the DNS provider plugin for this host's zone.
 	Provider provider.Provider
 	// Config is the decrypted provider config (with the zone id merged in) used to
@@ -119,6 +129,23 @@ type Renewer struct {
 
 	window   time.Duration
 	interval time.Duration
+
+	// hostLocks serializes issuance per host. The on-create fast path
+	// (EnsureCertForHost) and the periodic scan (RunOnce → renewOne) can target
+	// the same FQDN at the same time; without a per-host guard both would drive
+	// ACME, double-issuing and burning the CA rate-limit budget. Each host gets
+	// its own mutex so different hosts still issue concurrently. Stored as
+	// *sync.Mutex values (created once per host) so the critical section can be
+	// held across the full issue→save sequence.
+	hostLocks sync.Map // map[string]*sync.Mutex
+}
+
+// hostLock returns the per-host issuance mutex, creating it on first use. The
+// lock guards the whole check-then-issue critical section so two callers for the
+// same host can never both drive ACME.
+func (r *Renewer) hostLock(host string) *sync.Mutex {
+	m, _ := r.hostLocks.LoadOrStore(host, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 // RenewerConfig configures a Renewer. Zero values fall back to the defaults
@@ -226,6 +253,15 @@ func (r *Renewer) EnsureCertForHost(ctx context.Context, host string) error {
 	if host == "" {
 		return nil
 	}
+	// Hold the per-host lock across the whole check-then-issue so a concurrent
+	// EnsureCertForHost or renewal scan for the same host cannot also issue. The
+	// resolve is done INSIDE the lock so the GetCertificate check (in
+	// TargetForHost) and the ACME drive are a single atomic winner: the second
+	// caller resolves to nil (a cert now exists) and no-ops.
+	lk := r.hostLock(host)
+	lk.Lock()
+	defer lk.Unlock()
+
 	target, err := r.store.TargetForHost(ctx, host)
 	if err != nil {
 		return fmt.Errorf("tls: resolving issue target for %s: %w", host, err)
@@ -234,7 +270,7 @@ func (r *Renewer) EnsureCertForHost(ctx context.Context, host string) error {
 		return nil // nothing to issue (no central cert needed / already have one)
 	}
 	r.logger.InfoContext(ctx, "tls: issuing certificate on demand", slog.String("host", host))
-	if err := r.renewOne(ctx, *target); err != nil {
+	if err := r.issueAndSave(ctx, *target); err != nil {
 		// Not configured yet: a no-op, not a failure — the periodic scan retries
 		// once the operator sets the contact email.
 		if errors.Is(err, ErrACMENotConfigured) {
@@ -297,11 +333,59 @@ func (r *Renewer) issueWithRetry(ctx context.Context, req IssueRequest, p provid
 	return nil, lastErr
 }
 
-// renewOne re-issues, saves, and re-pushes a single certificate. The re-issue
-// reuses the exact name set and wildcard flag of the existing cert so scope never
-// drifts. A reload-push failure is non-fatal: the new bundle is already stored
-// and an offline agent picks it up on reconnect.
+// renewOne re-issues, saves, and re-pushes a single certificate for the periodic
+// scan. It takes the per-host issuance lock so a concurrent on-create
+// EnsureCertForHost for the same host cannot also drive ACME (different hosts
+// keep their own locks and proceed concurrently), then runs the issue→save→push
+// critical section. EnsureCertForHost holds the same lock itself and calls
+// issueAndSave directly, so the lock is never taken twice for one caller.
+//
+// The target was resolved by DueForRenewal BEFORE any lock was held, so for a
+// first-issuance target the host may have been issued by a concurrent
+// EnsureCertForHost in the meantime (it issues+saves+unlocks before this call
+// takes the freed lock). To avoid double-driving ACME against that stale target —
+// burning the CA duplicate-cert rate-limit budget — a first-issuance target
+// re-verifies cert state INSIDE the lock via TargetForHost (the same nil-means-
+// "cert now on file" guard EnsureCertForHost uses) and no-ops if the cert now
+// exists. The check-then-act is thereby collapsed under the lock on both paths.
+// Renewal targets (FirstIssue=false) skip this guard: their cert is on file by
+// definition and is precisely what the scan exists to re-issue.
 func (r *Renewer) renewOne(ctx context.Context, t RenewTarget) error {
+	if t.Host == "" {
+		return errors.New("tls: renew target has no host")
+	}
+	lk := r.hostLock(t.Host)
+	lk.Lock()
+	defer lk.Unlock()
+
+	if t.FirstIssue {
+		// Re-resolve under the lock. A nil target means a current cert is now on
+		// file (a concurrent EnsureCertForHost won the race and issued it), so
+		// re-issuing would only double-drive ACME — no-op instead.
+		fresh, err := r.store.TargetForHost(ctx, t.Host)
+		if err != nil {
+			return fmt.Errorf("tls: re-checking issue target for %s: %w", t.Host, err)
+		}
+		if fresh == nil {
+			r.logger.InfoContext(ctx, "tls: first-issuance superseded — cert already on file, skipping",
+				slog.String("host", t.Host))
+			return nil
+		}
+		// Issue the freshly re-resolved target: its provider/config/name set reflect
+		// current state rather than the pre-lock snapshot.
+		return r.issueAndSave(ctx, *fresh)
+	}
+
+	return r.issueAndSave(ctx, t)
+}
+
+// issueAndSave is the issuance critical section: re-issue, save, and re-push a
+// single certificate. The re-issue reuses the exact name set and wildcard flag of
+// the existing cert so scope never drifts. A reload-push failure is non-fatal:
+// the new bundle is already stored and an offline agent picks it up on reconnect.
+// Callers MUST hold the per-host lock for t.Host (renewOne takes it; the on-create
+// fast path holds it across its check-then-issue).
+func (r *Renewer) issueAndSave(ctx context.Context, t RenewTarget) error {
 	if t.Host == "" {
 		return errors.New("tls: renew target has no host")
 	}

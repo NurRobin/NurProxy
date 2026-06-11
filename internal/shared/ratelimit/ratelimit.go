@@ -34,9 +34,11 @@ type entry struct {
 }
 
 // New returns a Limiter that locks a key out for lockout once it accumulates max
-// failures within window. maxKeys bounds memory under a distributed flood; once
-// reached, brand-new keys are not tracked (fail-open) rather than evicting
-// active lockouts.
+// failures within window. maxKeys bounds memory under a distributed flood: when
+// the map is full, expired entries are pruned first, and if that frees nothing
+// the oldest entry is evicted to make room. Enforcement is never skipped, so a
+// flooding key is still tracked and locked out (fail-closed) rather than slipping
+// past the check.
 func New(max int, window, lockout time.Duration) *Limiter {
 	return &Limiter{
 		entries: make(map[string]*entry),
@@ -77,7 +79,15 @@ func (l *Limiter) Fail(key string) {
 			l.pruneLocked(now)
 		}
 		if len(l.entries) >= l.maxKeys {
-			return // still full: don't track new keys (fail-open under flood)
+			// Pruning expired entries freed nothing (every tracked key is still
+			// active). Evict the oldest UNLOCKED entry to make room rather than
+			// skipping the check: a flooding key must still be tracked and lockable
+			// (fail-closed). If every entry is locked out, that is itself an active
+			// attack: keep the lockouts (a distinct-key flood must not be able to
+			// free a locked victim) and decline the new key instead.
+			if !l.evictOldestUnlockedLocked(now) {
+				return
+			}
 		}
 		e = &entry{windowStart: now}
 		l.entries[key] = e
@@ -117,4 +127,34 @@ func (l *Limiter) pruneLocked(now time.Time) {
 		}
 		delete(l.entries, k)
 	}
+}
+
+// evictOldestUnlockedLocked removes the entry with the earliest windowStart
+// among entries that are NOT currently locked out, freeing a slot when the map
+// is full and nothing is prunable. It returns true if an entry was evicted.
+//
+// Actively locked-out entries are skipped on purpose: under the distributed-flood
+// threat model this limiter targets, an attacker spraying many distinct keys must
+// not be able to evict a legitimately locked-out victim and thereby clear the
+// victim's lockout. If every entry is locked (an active attack), nothing is
+// evicted and false is returned, so the caller declines the new key (fail-closed)
+// rather than freeing a locked victim. Caller must hold l.mu.
+func (l *Limiter) evictOldestUnlockedLocked(now time.Time) bool {
+	var oldestKey string
+	var oldest time.Time
+	found := false
+	for k, e := range l.entries {
+		if e.lockedUntil.After(now) {
+			continue // never evict an active lockout
+		}
+		if !found || e.windowStart.Before(oldest) {
+			oldestKey = k
+			oldest = e.windowStart
+			found = true
+		}
+	}
+	if found {
+		delete(l.entries, oldestKey)
+	}
+	return found
 }

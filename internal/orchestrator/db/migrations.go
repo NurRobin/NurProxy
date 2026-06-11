@@ -450,6 +450,16 @@ var migrations = []string{
 
 // migrate applies any outstanding migrations. It uses a simple
 // schema_version table to track which migrations have already run.
+//
+// All pending migrations are applied inside a SINGLE transaction: begin once,
+// apply every version > current and record its schema_version row, then commit
+// once. This is both faster on a fresh database (one WAL fsync instead of one
+// per migration — a cold boot of N migrations no longer pays N fsyncs, which
+// previously pushed first-boot readiness past the sandbox health-wait) and
+// strictly all-or-nothing: any failure rolls the whole batch back, so the
+// schema is never left at a partially-migrated version. Idempotency is
+// preserved — only versions strictly greater than the recorded maximum are
+// applied, so a second call with nothing pending opens no transaction at all.
 func (d *DB) migrate() error {
 	// Ensure the version tracking table exists.
 	if _, err := d.sql.Exec(`
@@ -466,12 +476,17 @@ func (d *DB) migrate() error {
 		return fmt.Errorf("reading schema version: %w", err)
 	}
 
-	for i := current; i < len(migrations); i++ {
-		tx, err := d.sql.Begin()
-		if err != nil {
-			return fmt.Errorf("beginning migration %d: %w", i+1, err)
-		}
+	// Nothing pending — no transaction, no work.
+	if current >= len(migrations) {
+		return nil
+	}
 
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning migrations: %w", err)
+	}
+
+	for i := current; i < len(migrations); i++ {
 		if _, err := tx.Exec(migrations[i]); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("executing migration %d: %w", i+1, err)
@@ -481,10 +496,10 @@ func (d *DB) migrate() error {
 			tx.Rollback()
 			return fmt.Errorf("recording migration %d: %w", i+1, err)
 		}
+	}
 
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("committing migration %d: %w", i+1, err)
-		}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing migrations: %w", err)
 	}
 
 	return nil

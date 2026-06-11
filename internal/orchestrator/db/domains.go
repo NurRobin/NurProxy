@@ -13,6 +13,7 @@ import (
 type DomainFilter struct {
 	AgentID  string
 	ServerID string
+	ZoneID   string
 	Status   string
 }
 
@@ -131,6 +132,10 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 	if filter.ServerID != "" {
 		conditions = append(conditions, "server_id = ?")
 		args = append(args, filter.ServerID)
+	}
+	if filter.ZoneID != "" {
+		conditions = append(conditions, "zone_id = ?")
+		args = append(args, filter.ZoneID)
 	}
 	if filter.Status != "" {
 		conditions = append(conditions, "status = ?")
@@ -274,7 +279,17 @@ func (d *DB) MarkDomainSynced(id int64) error {
 // that would hide the downgrade (§78). Otherwise the domain is marked active.
 func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) error {
 	if wantsCentralTLS {
-		if _, err := d.GetCertificate(fqdn); err != nil {
+		// Distinguish a genuinely absent certificate (degrade — the route is
+		// served plaintext) from a transient DB read error (propagate — do not
+		// mislabel a healthy domain as degraded). A bare existence probe avoids
+		// the key decryption that GetCertificate performs and lets sql.ErrNoRows
+		// cleanly signal not-found.
+		var dummy int
+		err := d.sql.QueryRow(
+			"SELECT 1 FROM certificates WHERE host = ?", fqdn,
+		).Scan(&dummy)
+		switch {
+		case err == sql.ErrNoRows:
 			now := time.Now().UTC().Format(time.RFC3339)
 			res, xErr := d.sql.Exec(`
 				UPDATE domains SET status = ?, error_msg = ?, last_synced = ?, updated_at = ? WHERE id = ?`,
@@ -289,6 +304,8 @@ func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) erro
 				return fmt.Errorf("domain not found: %d", id)
 			}
 			return nil
+		case err != nil:
+			return fmt.Errorf("checking central-TLS certificate for %s: %w", fqdn, err)
 		}
 	}
 	return d.MarkDomainSynced(id)

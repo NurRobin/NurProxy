@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -115,6 +116,13 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/v1/servers/{id}
 func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
+
+	// Refuse while domains still reference this server: the ON DELETE CASCADE would
+	// orphan their DNS records/certs ahead of the reconciler teardown (see
+	// guardChildDomains).
+	if s.guardChildDomains(w, "server", db.DomainFilter{ServerID: id}) {
+		return
+	}
 
 	if err := s.db.DeleteServer(id); err != nil {
 		writeError(w, http.StatusNotFound, "server not found")

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -305,6 +306,35 @@ func artifactIDForDomainID(domainID int64) string {
 }
 
 // DELETE /api/v1/domains/{id}
+// guardChildDomains refuses to delete a parent (server, agent, or zone) while
+// domains still reference it. It writes a 409 listing the blocking subdomains and
+// returns true when deletion must abort. Without this guard the DB's ON DELETE
+// CASCADE hard-removes those domain rows the instant the parent is deleted, which
+// runs BEFORE the reconciler's teardown (reconcileDeletions) and so never deletes
+// their managed DNS records or certificates — they leak at the provider with no
+// audit. Domains must be deleted first, individually, so each routes through the
+// reconciler teardown. The 409 body carries the domain list so a UI/CLI can offer
+// an explicit cascade (delete the domains first, then retry) rather than guessing.
+func (s *Server) guardChildDomains(w http.ResponseWriter, parent string, filter db.DomainFilter) bool {
+	doms, err := s.db.ListDomains(filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check for dependent domains")
+		return true
+	}
+	if len(doms) == 0 {
+		return false
+	}
+	names := make([]string, 0, len(doms))
+	for _, d := range doms {
+		names = append(names, d.Subdomain)
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"error":   fmt.Sprintf("%s still has %d domain(s); delete them first", parent, len(names)),
+		"domains": names,
+	})
+	return true
+}
+
 func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
 	if err != nil {

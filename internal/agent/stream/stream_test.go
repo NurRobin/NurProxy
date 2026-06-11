@@ -458,6 +458,74 @@ func TestApplyIntents_fileBackendWritesViaApply(t *testing.T) {
 	}
 }
 
+// fakeCaddyBackend renders a built-in-Caddy admin-API route target, exercising the
+// AddRoute path (not the file Apply path) and recording the Prune keep set.
+type fakeCaddyBackend struct {
+	addRoutes int
+	pruneHit  bool
+	pruneKeep []proxy.Target
+}
+
+func (c *fakeCaddyBackend) EnsureServer(ctx context.Context) error { return nil }
+func (c *fakeCaddyBackend) ClearRoutes(ctx context.Context) error  { return nil }
+func (c *fakeCaddyBackend) AddRoute(ctx context.Context, route json.RawMessage) error {
+	c.addRoutes++
+	return nil
+}
+func (c *fakeCaddyBackend) Apply(ctx context.Context, arts []proxy.Artifact) error { return nil }
+func (c *fakeCaddyBackend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
+	return proxy.Artifact{
+		Target:  proxy.Target{Kind: proxy.TargetKindCaddyRoute, Path: "caddy:route:" + route.Host},
+		Content: `{"@id":"caddy:route:` + route.Host + `"}`,
+		Enabled: true,
+	}, nil
+}
+func (c *fakeCaddyBackend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) error {
+	return nil
+}
+func (c *fakeCaddyBackend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent) error {
+	return nil
+}
+func (c *fakeCaddyBackend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
+	c.pruneHit = true
+	c.pruneKeep = keep
+	return 0, nil
+}
+
+// A live built-in-Caddy route's target must be in the keep set passed to Prune, so
+// Prune does not scrub the provided cert material of a still-active route. Regression
+// for the bug where keep was built only from file targets: a pure-Caddy agent's keep
+// held no route targets, so Prune scrubbed every live route's central-TLS cert (the
+// cert was written on the issuing apply, then deleted on the next).
+func TestApplyIntents_caddyRouteRetainedInPruneKeep(t *testing.T) {
+	be := &fakeCaddyBackend{}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "caddy",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+	})
+
+	if be.addRoutes != 1 {
+		t.Fatalf("caddy route must apply via AddRoute, got %d AddRoute call(s)", be.addRoutes)
+	}
+	if !be.pruneHit {
+		t.Fatal("applyIntents must call Prune")
+	}
+	want := "caddy:route:app.example.com"
+	found := false
+	for _, k := range be.pruneKeep {
+		if k.Path == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Prune keep set %+v missing the live caddy route target %q — it would be scrubbed", be.pruneKeep, want)
+	}
+}
+
 // TestApplyIntents_keepRetainsDriftedArtifactInManaged proves the §11 drift
 // auto-clear fix: when a later push omits an artifact but lists its path in Keep
 // (the orchestrator skipped a drifted artifact awaiting review), the agent carries

@@ -195,11 +195,12 @@ func main() {
 		})
 	}
 
-	// Start HTTP server
-	httpSrv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", *port),
-		Handler: mux,
-	}
+	// Start HTTP server. Timeouts harden the internet-facing listener against
+	// Slowloris / idle-connection exhaustion: ReadHeaderTimeout caps how long a
+	// client may dribble request headers, IdleTimeout reaps idle keep-alive conns,
+	// and MaxHeaderBytes bounds header size. WriteTimeout is deliberately left
+	// unset — the agent SSE stream and on-demand log-tail responses are long-lived.
+	httpSrv := newHTTPServer(fmt.Sprintf(":%d", *port), mux)
 
 	// Graceful shutdown
 	go func() {
@@ -208,12 +209,30 @@ func main() {
 		<-sig
 		log.Println("shutting down...")
 		rootCancel()
-		httpSrv.Shutdown(context.Background())
+		// Bound shutdown so a stuck long-lived stream can't hang `systemctl stop`.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
 	log.Printf("NurProxy %s listening on :%d", version, *port)
 	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("HTTP server error: %v", err)
+	}
+}
+
+// newHTTPServer builds the orchestrator's HTTP server with hardened timeouts.
+// ReadHeaderTimeout and IdleTimeout defend the internet-facing listener against
+// Slowloris and idle-connection exhaustion, and MaxHeaderBytes caps header size.
+// WriteTimeout is intentionally omitted: the agent SSE stream and on-demand
+// log-tail are long-lived responses that a write deadline would sever.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 }
 

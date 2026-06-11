@@ -561,3 +561,188 @@ func TestBackend_EnsureServerTLS_certMissing(t *testing.T) {
 		t.Errorf("a lone central host must still disable ACME, got %+v", auto)
 	}
 }
+
+// installAndMaterialize installs a central cert bundle for host and then calls
+// CertPaths to decrypt the at-rest key into a sibling .key.plain, so every
+// artifact (.crt, .key.enc, .key.plain) exists on disk and the cert-scrub paths
+// have something to remove. It returns the absolute paths that must be gone after
+// a Remove/RemoveRoute/Prune.
+func installAndMaterialize(t *testing.T, b *Backend, dir, host string) []string {
+	t.Helper()
+	keyPEM := []byte("-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n")
+	if err := b.InstallCerts(context.Background(), []proxy.CertBundle{{
+		Host:    host,
+		CertPEM: []byte("CERTDATA"),
+		KeyPEM:  keyPEM,
+	}}); err != nil {
+		t.Fatalf("InstallCerts: %v", err)
+	}
+	// Materialize the decrypted plaintext key (.key.plain) the proxy would read.
+	if _, err := b.certs.CertPaths(host); err != nil {
+		t.Fatalf("CertPaths: %v", err)
+	}
+	base := certstore.SanitizeHost(host)
+	want := []string{
+		filepath.Join(dir, base+".crt"),
+		filepath.Join(dir, base+".key.enc"),
+		filepath.Join(dir, base+".key.plain"),
+	}
+	for _, p := range want {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("setup: expected artifact %q to exist: %v", p, err)
+		}
+	}
+	return want
+}
+
+// assertArtifactsGone fails if any of the given cert-store paths still exist.
+func assertArtifactsGone(t *testing.T, paths []string) {
+	t.Helper()
+	for _, p := range paths {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("cert artifact %q must be gone after removal, stat err = %v", p, err)
+		}
+	}
+}
+
+// TestBackend_Remove_scrubsCertArtifacts proves the regression: removing a Caddy
+// route via Remove also scrubs the host's centrally-issued cert/key material
+// (incl. the decrypted .key.plain) so a removed domain leaves no private key on
+// disk. Before round 1 the Caddy backend only touched the admin API and leaked
+// these files.
+func TestBackend_Remove_scrubsCertArtifacts(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, key))
+
+	art, _ := b.Render(ctx, sampleRoute())
+	if err := b.Apply(ctx, []proxy.Artifact{art}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	artifacts := installAndMaterialize(t, b, dir, sampleRoute().Host)
+
+	if err := b.Remove(ctx, art.Target); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	assertArtifactsGone(t, artifacts)
+
+	// Route itself is gone too (existing behavior must hold).
+	managed, err := b.ReadManaged(ctx)
+	if err != nil {
+		t.Fatalf("ReadManaged: %v", err)
+	}
+	if len(managed) != 0 {
+		t.Fatalf("after Remove, ReadManaged returned %d artifacts, want 0", len(managed))
+	}
+}
+
+// TestBackend_RemoveRoute_scrubsCertArtifacts proves the per-domain admin-API
+// route-delete endpoint also scrubs the route's host cert/key material.
+func TestBackend_RemoveRoute_scrubsCertArtifacts(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, key))
+
+	art, _ := b.Render(ctx, sampleRoute())
+	if err := b.Apply(ctx, []proxy.Artifact{art}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	artifacts := installAndMaterialize(t, b, dir, sampleRoute().Host)
+
+	if err := b.RemoveRoute(ctx, routeIDFromTarget(art.Target.Path)); err != nil {
+		t.Fatalf("RemoveRoute: %v", err)
+	}
+	assertArtifactsGone(t, artifacts)
+}
+
+// TestBackend_Prune_scrubsOrphanedCertArtifacts proves Prune scrubs the cert
+// material of a host whose route is no longer in the desired (keep) set, while
+// leaving a kept host's artifacts intact.
+func TestBackend_Prune_scrubsOrphanedCertArtifacts(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, key))
+
+	keepRoute := sampleRoute()
+	keepRoute.Host = "keep.example.com"
+	keepArt, _ := b.Render(ctx, keepRoute)
+
+	orphanRoute := sampleRoute()
+	orphanRoute.Host = "orphan.example.com"
+	orphanArt, _ := b.Render(ctx, orphanRoute)
+
+	if err := b.Apply(ctx, []proxy.Artifact{keepArt, orphanArt}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	keepArtifacts := installAndMaterialize(t, b, dir, keepRoute.Host)
+	orphanArtifacts := installAndMaterialize(t, b, dir, orphanRoute.Host)
+
+	// Keep only the keep route; the orphan's host cert material must be scrubbed.
+	n, err := b.Prune(ctx, []proxy.Target{keepArt.Target})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Prune scrubbed %d hosts, want 1", n)
+	}
+	assertArtifactsGone(t, orphanArtifacts)
+	for _, p := range keepArtifacts {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("kept host artifact %q must survive prune: %v", p, err)
+		}
+	}
+}
+
+// TestBackend_Remove_noCertStore_stillRemovesRoute verifies the scrub is a safe
+// no-op when no cert store is configured (Remove must still delete the route).
+func TestBackend_Remove_noCertStore_stillRemovesRoute(t *testing.T) {
+	ctx := context.Background()
+	b := New(agentcaddy.NewMockClient())
+
+	art, _ := b.Render(ctx, sampleRoute())
+	if err := b.Apply(ctx, []proxy.Artifact{art}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := b.Remove(ctx, art.Target); err != nil {
+		t.Fatalf("Remove with no cert store: %v", err)
+	}
+	managed, _ := b.ReadManaged(ctx)
+	if len(managed) != 0 {
+		t.Fatalf("after Remove, ReadManaged returned %d artifacts, want 0", len(managed))
+	}
+}
+
+// TestHostFromRoute is a table test for the host-matcher extraction helper that
+// recovers a route's FQDN (the cert-store key) from its live JSON.
+func TestHostFromRoute(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"single host", `{"@id":"domain-app","match":[{"host":["app.example.com"]}]}`, "app.example.com"},
+		{"first of many", `{"match":[{"host":["a.example.com","b.example.com"]}]}`, "a.example.com"},
+		{"no match", `{"@id":"x"}`, ""},
+		{"empty host list", `{"match":[{"host":[]}]}`, ""},
+		{"malformed json", `{not json`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostFromRoute(json.RawMessage(tt.raw)); got != tt.want {
+				t.Errorf("hostFromRoute(%s) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}

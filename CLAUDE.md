@@ -46,7 +46,7 @@ a fully populated, "live"-looking environment. Launcher: `scripts/dev-sandbox.sh
 ```bash
 # Orchestrator — both subsystems, or per-subsystem for partial testing:
 NP_DRY_RUN=true ./nurproxy                 # mock DNS + ACME   (or: ./nurproxy -dry-run)
-NP_DNS_DRY_RUN=true ./nurproxy             # mock DNS, real ACME
+NP_DNS_DRY_RUN=true ./nurproxy             # mock DNS, real ACME (see caveat below)
 NP_ACME_DRY_RUN=true ./nurproxy            # real DNS, mock ACME
 NP_ACME_DRY_RUN=true NP_DRY_RUN_FAIL=ratelimit ./nurproxy   # inject ACME failure:
                                            #   ratelimit | challenge | propagation
@@ -59,6 +59,13 @@ NP_DRY_RUN=true ./nurproxy-agent -orchestrator http://localhost:8080 -fqdn edge1
 Provider setup (validate + list-zones) is mocked too, so a Cloudflare provider
 created with a dummy token works end-to-end.
 
+> **Caveat — `NP_DNS_DRY_RUN` + real ACME always fails DNS-01.** Mock DNS keeps
+> the challenge TXT record in the in-memory store only; it is never published to
+> a resolvable zone. A real Let's Encrypt validation server therefore cannot see
+> the `_acme-challenge` TXT and the DNS-01 order fails. Use this combination only
+> to exercise non-issuance DNS paths; for end-to-end TLS testing run full dry-run
+> (`NP_DRY_RUN`) or `NP_ACME_DRY_RUN` (real DNS, mock ACME) instead.
+
 ### How to use it when building a feature
 1. Bring the stack up (`make dev-sandbox`), or boot the binaries dry by hand.
 2. Drive it via the dashboard, the management CLI, or the REST API and watch the
@@ -70,7 +77,8 @@ created with a dummy token works end-to-end.
    and each would-be provider call is logged with its full record shape.
 4. Add an end-to-end assertion to `test/sandbox` (build tag `sandbox`) and run
    `make test-sandbox` — it boots the whole dry stack and asserts convergence
-   with zero external deps. It also runs in CI on every push/PR.
+   with zero external deps. It also runs in CI on every push/PR targeting
+   `main`, `dev`, or a `release/**` branch.
 
 ### What it covers vs. what it doesn't
 - **Covered (develop exactly like prod):** orchestrator/API/CLI/dashboard, the DNS
@@ -84,7 +92,7 @@ created with a dummy token works end-to-end.
   for the optional live-traffic harness.
 
 ## Conventions
-- Go 1.23+, standard library preferred
+- Go 1.25+, standard library preferred
 - Table-driven tests, `_test.go` beside source
 - No test frameworks — use `testing` package only
 - Conventional commits: `feat:`, `fix:`, `chore:`, `docs:`, `test:`
