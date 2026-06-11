@@ -58,10 +58,13 @@ func main() {
 			return
 		default:
 			// Management CLI subcommands (provider/zone/agent/server/domain/...).
-			// If handled, we're done; otherwise fall through to running the server.
+			// If handled, we're done. An unhandled non-flag argument is a typo'd
+			// subcommand: refuse it instead of silently booting the server. Flags
+			// (-port, --data-dir, ...) still fall through to the server path.
 			if runCLI(os.Args[1], os.Args[2:]) {
 				return
 			}
+			failUnknownCommand(os.Args[1])
 		}
 	}
 
@@ -219,6 +222,31 @@ func main() {
 	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("HTTP server error: %v", err)
 	}
+}
+
+// usageText is the brief command overview printed for a typo'd subcommand.
+const usageText = `usage: nurproxy [command] [flags]
+
+Commands:
+  install, uninstall                                manage the system service
+  backup, restore                                   back up / restore the data directory
+  version                                           print the version
+  provider, zone, agent, server, domain, apikey, auth
+                                                    management CLI (each supports -h)
+
+Running nurproxy without a command starts the orchestrator
+(flags: -port, -data-dir, -dry-run).
+`
+
+// failUnknownCommand exits non-zero for a typo'd subcommand. A first argument
+// that looks like a flag is not a subcommand and returns, so flag-only
+// invocations (nurproxy -port 9000) keep starting the server.
+func failUnknownCommand(arg string) {
+	if strings.HasPrefix(arg, "-") {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", arg, usageText)
+	os.Exit(1)
 }
 
 // newHTTPServer builds the orchestrator's HTTP server with hardened timeouts.
