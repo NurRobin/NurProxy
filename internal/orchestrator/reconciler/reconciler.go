@@ -502,12 +502,14 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 
 		// route (Caddy JSON) feeds only the inbound same-host fallback; the stream
 		// path uses intent. A raw intent for a file backend can't render to Caddy
-		// JSON, so fall back to the stored bytes there (the fallback never serves a
-		// file backend anyway).
+		// JSON, so fall back to the raw bytes there (the fallback never serves a
+		// file backend anyway). Read them from the intent, not storedArt: a raw
+		// intent can also come from the domain row's manual config before any
+		// artifact exists (ConfigFromDomain), where storedArt is nil.
 		route, gErr := caddygen.GenerateRoute(intent)
 		if gErr != nil {
 			if intent.IsRaw() {
-				route = json.RawMessage(storedArt.Content)
+				route = json.RawMessage(intent.Raw.Content)
 			} else {
 				log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
@@ -543,8 +545,12 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 	// orchestrator can reach the agent directly. Keep carries the drifted-but-retained
 	// paths so the agent's prune doesn't mistake them for orphans (invariant #3).
 	if r.hub != nil && r.hub.Connected(agent.ID) {
+		// Same preflight ordering as PushAgentRoutes (§5/§7): the periodic tick must
+		// also carry the cert bundles, or an agent that missed the instant push (or
+		// lost its cert store) keeps receiving TLS configs it can never validate.
 		r.hub.PublishIntentSet(agent.ID, proxymodel.IntentSet{
 			Intents: intentsFromDesired(desiredByFQDN, backendForAgent(agent)),
+			Certs:   r.gatherCerts(desiredByFQDN),
 			Keep:    keepExtra,
 		})
 		return nil

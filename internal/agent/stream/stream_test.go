@@ -620,3 +620,128 @@ func TestApplyIntents_noCerts_doesNotInstall(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyIntents_suppressesUnchangedSet pins the change-suppression gate: the
+// periodic reconcile tick re-pushes the same desired set every interval, and an
+// identical push within suppressionTTL must skip the apply phase (no Apply, no
+// Prune — on a real nginx that is a validate + reload per tick) while still
+// ACKing so domain status stays fresh. The TTL bounds it: out-of-band divergence
+// the agent cannot see self-heals on the next full apply.
+func TestApplyIntents_suppressesUnchangedSet(t *testing.T) {
+	acks := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", func(w http.ResponseWriter, r *http.Request) {
+		acks++
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	be := &fileBackend{path: dir + "/app.conf", content: "server { listen 80; }"}
+	c := New(srv.URL, "agent-1", "tok", be, health.New())
+
+	set := proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "nginx",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+	}
+	c.applyIntents(context.Background(), set)
+	if !be.applyHit {
+		t.Fatal("first push must apply")
+	}
+
+	be.applyHit, be.pruneHit = false, false
+	c.applyIntents(context.Background(), set)
+	if be.applyHit {
+		t.Error("identical second push within the TTL must be suppressed (no Apply)")
+	}
+	if be.pruneHit {
+		t.Error("suppressed push must not Prune")
+	}
+	if acks != 2 {
+		t.Errorf("acks = %d, want 2 (a suppressed push still ACKs)", acks)
+	}
+	// The managed snapshot survives suppression — the heartbeat drift signal
+	// must keep reporting the artifact.
+	sums := c.ManagedChecksums()
+	if len(sums) != 1 || sums[0].ArtifactID != "dom-1" {
+		t.Fatalf("managed snapshot lost across a suppressed push: %+v", sums)
+	}
+
+	// Past the TTL the same set re-applies in full (self-heal bound).
+	c.applyStateMu.Lock()
+	c.lastFullApply = time.Now().Add(-suppressionTTL - time.Minute)
+	c.applyStateMu.Unlock()
+	c.applyIntents(context.Background(), set)
+	if !be.applyHit {
+		t.Error("push after suppressionTTL must re-apply in full")
+	}
+
+	// A content change defeats suppression immediately.
+	be.applyHit = false
+	be.content = "server { listen 8080; }"
+	c.applyIntents(context.Background(), set)
+	if !be.applyHit {
+		t.Error("a push whose rendered content changed must re-apply")
+	}
+}
+
+// TestApplyIntents_changedCertDefeatsSuppression proves a renewed certificate
+// forces a full re-apply even though the rendered route content is unchanged —
+// the proxy must reload to pick up the new cert material (§7 renewal).
+func TestApplyIntents_changedCertDefeatsSuppression(t *testing.T) {
+	be := &fakeCaddyBackend{}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	set := proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "caddy",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+		Certs: []proxymodel.CertBundle{{Host: "app.example.com", CertPEM: "CERT-V1", KeyPEM: "KEY-V1"}},
+	}
+	c.applyIntents(context.Background(), set)
+	if be.addRoutes != 1 {
+		t.Fatalf("first push: addRoutes = %d, want 1", be.addRoutes)
+	}
+
+	c.applyIntents(context.Background(), set)
+	if be.addRoutes != 1 {
+		t.Fatalf("identical push must be suppressed: addRoutes = %d, want 1", be.addRoutes)
+	}
+
+	set.Certs = []proxymodel.CertBundle{{Host: "app.example.com", CertPEM: "CERT-V2", KeyPEM: "KEY-V2"}}
+	c.applyIntents(context.Background(), set)
+	if be.addRoutes != 2 {
+		t.Errorf("renewed cert must defeat suppression: addRoutes = %d, want 2", be.addRoutes)
+	}
+}
+
+// TestApplyIntents_uncleanApplyDefeatsSuppression proves a failed apply never
+// seeds the suppression gate: the next push — even an identical one — must retry
+// the apply phase rather than silently staying broken until the TTL.
+func TestApplyIntents_uncleanApplyDefeatsSuppression(t *testing.T) {
+	dir := t.TempDir()
+	be := &fileBackend{path: dir + "/app.conf", content: "server { listen 80; }", applyErr: fmt.Errorf("nginx -t failed")}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	set := proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "nginx",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+	}
+	c.applyIntents(context.Background(), set)
+	if !be.applyHit {
+		t.Fatal("first push must attempt the apply")
+	}
+
+	be.applyErr = nil
+	be.applyHit = false
+	c.applyIntents(context.Background(), set)
+	if !be.applyHit {
+		t.Error("a push after a failed apply must not be suppressed")
+	}
+}
