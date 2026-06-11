@@ -2,6 +2,25 @@ import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, Con
 
 const BASE = '/api/v1';
 
+// Registered by App.tsx: a 401 from any non-auth endpoint means the session
+// expired, so the app should drop back to the login screen instead of leaving
+// every poll toasting errors forever.
+let unauthorizedHandler: (() => void) | null = null;
+export function onUnauthorized(handler: (() => void) | null) {
+  unauthorizedHandler = handler;
+}
+
+/**
+ * Thrown on a 401 outside /auth/*. The global handler already redirects to
+ * login, so the toast layer suppresses this error (see errMessage).
+ */
+export class UnauthorizedError extends Error {
+  constructor(body: string) {
+    super(`API error 401: ${body}`);
+    this.name = 'UnauthorizedError';
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...options?.headers },
@@ -9,6 +28,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.text();
+    // Auth endpoints legitimately return 401 (e.g. wrong password on login)
+    // and surface it inline — only a 401 elsewhere means an expired session.
+    if (res.status === 401 && !path.startsWith('/auth/')) {
+      unauthorizedHandler?.();
+      throw new UnauthorizedError(body);
+    }
     throw new Error(`API error ${res.status}: ${body}`);
   }
   // 204 No Content (and other empty bodies) have nothing to parse — return
@@ -48,6 +73,9 @@ export interface DomainConfig {
   // config is a JSON route object; for nginx/apache it is the native config text.
   backend?: string;
   config: unknown;
+  // true when the served bytes are the agent's applied artifact rather than a
+  // fresh render (optional — older orchestrators don't send it).
+  applied?: boolean;
 }
 
 export const api = {
