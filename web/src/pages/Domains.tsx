@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import i18n from '../lib/i18n';
+import { usePolling } from '../lib/usePolling';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
@@ -61,6 +62,7 @@ export default function Domains() {
   const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
   const [editRawConfig, setEditRawConfig] = useState('');
   const [editConfigBackend, setEditConfigBackend] = useState('caddy');
+  const [configManual, setConfigManual] = useState(false);
   const [advancedError, setAdvancedError] = useState('');
   const [editLoading, setEditLoading] = useState(false);
 
@@ -90,7 +92,10 @@ export default function Domains() {
     }
   }, [toast, t]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  // Poll instead of fetching once: domain status flips out-of-band (agent
+  // apply-ACKs, DNS reconciliation, TLS issuance) and the table should reflect
+  // that without a reload. Pauses while the tab is hidden.
+  usePolling(fetchData, 10000);
 
   const getZoneName = (zoneId: string) => zones.find((z) => z.id === zoneId)?.name ?? '';
   const getServerInfo = (serverId: string) => allServers.find((s) => s.id === serverId);
@@ -104,7 +109,11 @@ export default function Domains() {
     if (!srv) return undefined;
     return agents.find((a) => a.id === srv.agent_id);
   };
-  const detailAgent = detailDomain ? getAgentForDomain(detailDomain) : undefined;
+  // detailDomain is a snapshot captured when the modal opened; re-derive the
+  // displayed domain from the freshly polled list by id so status/error_msg
+  // updates show up while the modal is open.
+  const liveDomain = detailDomain ? domains.find((d) => d.id === detailDomain.id) ?? detailDomain : null;
+  const detailAgent = liveDomain ? getAgentForDomain(liveDomain) : undefined;
   const caps = detailAgent?.proxy_capabilities;
   // A capability is "supported" unless the agent reported it false. With no
   // reported matrix we leave everything enabled.
@@ -156,6 +165,7 @@ export default function Domains() {
       : []);
     setEditRawConfig('');
     setEditConfigBackend('caddy');
+    setConfigManual(false);
     setAdvancedError('');
   }
 
@@ -191,6 +201,7 @@ export default function Domains() {
       const cfg = await api.getDomainConfig(detailDomain.id);
       const backend = cfg.backend || 'caddy';
       setEditConfigBackend(backend);
+      setConfigManual(cfg.manual);
       // Caddy config is a JSON object; nginx/apache configs are native text.
       setEditRawConfig(
         typeof cfg.config === 'string' ? cfg.config : JSON.stringify(cfg.config, null, 2),
@@ -217,10 +228,19 @@ export default function Domains() {
     setAdvancedError('');
     setEditLoading(true);
     try {
-      await api.updateDomainConfig(detailDomain.id, payload);
+      const domainId = detailDomain.id;
+      await api.updateDomainConfig(domainId, payload);
       toast.success(t('domains.manualSaved'));
       setDetailDomain(null);
       fetchData();
+      // The agent ACKs the apply asynchronously (pending → active/error), so
+      // refetch once more shortly after — and surface the error if it failed.
+      window.setTimeout(() => {
+        fetchData();
+        api.getDomain(domainId)
+          .then((d) => { if (d.status === 'error' && d.error_msg) toast.error(d.error_msg); })
+          .catch(() => { /* the regular poll catches up */ });
+      }, 3000);
     } catch (err) {
       setAdvancedError(errMessage(err, t('domains.saveConfigFailed')));
     } finally {
@@ -427,16 +447,16 @@ export default function Domains() {
       </Modal>
 
       {/* Detail / edit modal — tabbed */}
-      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title={t('domains.settingsTitle')} description={detailDomain ? `${detailDomain.subdomain}.${getZoneName(detailDomain.zone_id)}` : undefined} wide>
-        {detailDomain && (
+      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title={t('domains.settingsTitle')} description={liveDomain ? `${liveDomain.subdomain}.${getZoneName(liveDomain.zone_id)}` : undefined} wide>
+        {liveDomain && (
           <div className="space-y-5">
             <div className="flex flex-wrap items-center gap-3">
-              <StatusBadge status={detailDomain.status} />
-              <span className="text-xs text-fg-faint">{t('domains.lastSynced', { time: seen(detailDomain.last_synced) })}</span>
-              {detailDomain.dns_record_id && <span className="truncate font-mono text-xs text-fg-faint">{t('domains.dns', { id: detailDomain.dns_record_id })}</span>}
+              <StatusBadge status={liveDomain.status} />
+              <span className="text-xs text-fg-faint">{t('domains.lastSynced', { time: seen(liveDomain.last_synced) })}</span>
+              {liveDomain.dns_record_id && <span className="truncate font-mono text-xs text-fg-faint">{t('domains.dns', { id: liveDomain.dns_record_id })}</span>}
             </div>
 
-            {detailDomain.error_msg && <Callout tone="danger">{detailDomain.error_msg}</Callout>}
+            {liveDomain.error_msg && <Callout tone="danger">{liveDomain.error_msg}</Callout>}
 
             {/* Tabs */}
             <div className="flex gap-1 border-b border-border">
@@ -460,7 +480,7 @@ export default function Domains() {
                   <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder={t('domains.maxBodyPh')} />
                 </Field>
                 <div className="flex justify-end gap-3 pt-1">
-                  <Button variant="danger-ghost" onClick={() => removeDomain(detailDomain)}>{t('common.delete')}</Button>
+                  <Button variant="danger-ghost" onClick={() => removeDomain(liveDomain)}>{t('common.delete')}</Button>
                   <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>
                 </div>
               </div>
@@ -494,15 +514,15 @@ export default function Domains() {
             {editTab === 'advanced' && (
               <div className="space-y-4">
                 <Callout tone="warning" title={t('domains.manualConfig')}>
-                  {t('domains.manualConfigBody')}
+                  {configManual ? t('domains.manualActiveBody') : t('domains.manualConfigBody')}
                 </Callout>
                 {advancedError && <Callout tone="danger">{advancedError}</Callout>}
                 <p className="text-xs text-fg-faint">
                   {t('domains.configBackend', { backend: editConfigBackend })}
                 </p>
                 <Textarea value={editRawConfig} onChange={(e) => { setEditRawConfig(e.target.value); setAdvancedError(''); }} rows={14} className="font-mono text-xs" spellCheck={false} />
-                <div className="flex justify-between">
-                  <Button variant="secondary" onClick={handleResetConfig} loading={editLoading}>{t('domains.resetAuto')}</Button>
+                <div className={`flex ${configManual ? 'justify-between' : 'justify-end'}`}>
+                  {configManual && <Button variant="secondary" onClick={handleResetConfig} loading={editLoading}>{t('domains.resetAuto')}</Button>}
                   <Button onClick={handleSaveAdvanced} loading={editLoading}>{t('domains.saveManual')}</Button>
                 </div>
               </div>
