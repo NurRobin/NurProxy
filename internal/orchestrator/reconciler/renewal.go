@@ -56,13 +56,49 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		return nil, fmt.Errorf("listing certificates due for renewal: %w", err)
 	}
 
+	domains, dErr := s.db.ListDomains(db.DomainFilter{})
+	if dErr != nil {
+		return nil, fmt.Errorf("listing domains for renewal resolution: %w", dErr)
+	}
+	zoneNames := make(map[string]string, len(zones))
+	for i := range zones {
+		zoneNames[zones[i].ID] = zones[i].Name
+	}
+
+	// centralHosts is the set of FQDNs a stored cert can currently be consumed
+	// for: every non-deleting domain that resolves to the host AND wants central
+	// TLS (the same host→domain matching gatherCerts uses, and the same policy
+	// resolution the renderers use). It gates the renewal pass below.
+	centralHosts := make(map[string]bool)
+	for i := range domains {
+		dom := &domains[i]
+		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok {
+			continue
+		}
+		if caddygen.TLSPolicyForDomain(*dom) != proxymodel.TLSPolicyCentral {
+			continue
+		}
+		centralHosts[dom.FQDN(zoneName)] = true
+	}
+
 	var targets []tls.RenewTarget
 	seen := make(map[string]bool)
 
 	// 1) Existing certs entering the renew window — re-issue keeping the exact name
-	//    set and wildcard scope.
+	//    set and wildcard scope. A cert with no current central-TLS consumer is
+	//    orphaned (its domain was deleted or switched policy): skip it rather than
+	//    drive ACME forever for a host nobody serves. Skip, never delete — cert
+	//    removal belongs to the teardown path, not the renewer.
 	for i := range certs {
 		c := &certs[i]
+		if !certHasCentralConsumer(c, centralHosts) {
+			log.Printf("reconciler: renewal: no central-TLS domain consumes cert host %q, skipping renewal", c.Host)
+			continue
+		}
 		t, ok := s.resolveTarget(c.Host, append([]string(nil), c.Names...), c.IsWildcard, zones)
 		if !ok {
 			log.Printf("reconciler: renewal: cannot resolve zone/provider for cert host %q, skipping", c.Host)
@@ -76,14 +112,6 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 	//    new domain would never get a cert (the file backends then render plaintext;
 	//    built-in Caddy hides it via self-ACME). Skip domains being deleted and any
 	//    host already covered by the renewal pass above.
-	domains, dErr := s.db.ListDomains(db.DomainFilter{})
-	if dErr != nil {
-		return nil, fmt.Errorf("listing domains for first-issuance: %w", dErr)
-	}
-	zoneNames := make(map[string]string, len(zones))
-	for i := range zones {
-		zoneNames[zones[i].ID] = zones[i].Name
-	}
 	for i := range domains {
 		dom := &domains[i]
 		if dom.Status == models.DomainStatusDeleting {
@@ -191,6 +219,41 @@ func (s *CertRenewalStore) SaveRenewed(_ context.Context, res *tls.CertResult, i
 		return fmt.Errorf("reconciler: renewal: saving renewed cert for %q: %w", res.Host, err)
 	}
 	return nil
+}
+
+// certHasCentralConsumer reports whether any name the stored certificate covers
+// is currently consumed: a live central-TLS domain's FQDN equals it, or — for a
+// wildcard name — sits beneath its apex. centralHosts is the precomputed FQDN
+// set of those domains. A cert covering none of them has no consumer left and
+// must not be re-issued (DueForRenewal skips it).
+func certHasCentralConsumer(c *models.Certificate, centralHosts map[string]bool) bool {
+	names := append([]string{c.Host}, c.Names...)
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		wildcard := strings.HasPrefix(name, "*.")
+		if wildcard {
+			name = strings.TrimPrefix(name, "*.")
+		} else if c.IsWildcard && name == c.Host {
+			// A wildcard cert is keyed at its apex (see zoneForHost): the bare host
+			// stands for "*.host" too.
+			wildcard = true
+		}
+		if centralHosts[name] {
+			return true
+		}
+		if !wildcard {
+			continue
+		}
+		suffix := "." + name
+		for h := range centralHosts {
+			if strings.HasSuffix(h, suffix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // zoneForHost picks the zone a certificate host belongs to. For a per-host cert
