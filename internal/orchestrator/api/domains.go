@@ -400,6 +400,27 @@ func (s *Server) handleGetDomainConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Prefer the applied artifact: the agent round-trips the config it actually
+	// rendered and applied (real cert-store paths, real listener set) into the
+	// store via its apply-ACK (§3/B1). Showing those bytes means an operator who
+	// edits "the generated config" starts from what is genuinely on disk — a
+	// fresh re-render here would have to guess agent-local paths and has already
+	// produced manual configs pointing at cert files that do not exist.
+	if art, aErr := s.db.GetConfigArtifact(artifactIDForDomainID(id)); aErr == nil && art.Content != "" {
+		out := map[string]interface{}{"manual": false, "backend": art.Backend, "applied": true}
+		var raw json.RawMessage
+		if art.Backend == "caddy" && json.Unmarshal([]byte(art.Content), &raw) == nil {
+			out["config"] = raw
+		} else {
+			out["config"] = art.Content
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	// No applied artifact yet (domain not pushed to its agent so far): fall back
+	// to a fresh preview render with the conventional default paths.
+
 	// Get server for upstream address
 	srv, err := s.db.GetServer(dom.ServerID)
 	if err != nil {
@@ -476,15 +497,22 @@ func (s *Server) backendForDomain(srv *models.Server) string {
 }
 
 // previewCertDir is the conventional agent cert-store directory used to render
-// cert paths in the advanced preview. The agent's real directory is derived from
-// its own data dir; this is a sensible default the operator can adjust.
-const previewCertDir = "/var/lib/nurproxy/certs"
+// cert paths in the advanced preview, matching the agent's default data dir
+// (<data-dir>/certs with data-dir /var/lib/nurproxy-agent — NOT the
+// orchestrator's /var/lib/nurproxy). The agent's real directory is derived from
+// its own data dir; this default only seeds the preview for a domain that has
+// never been applied (once it has, the handler returns the applied artifact
+// with the agent's real paths instead).
+const previewCertDir = "/var/lib/nurproxy-agent/certs"
 
 // previewCertPaths returns the conventional cert/key paths for a host, matching
-// the agent cert store's file-naming (host as the base, ".crt"/".key").
+// the agent cert store's file-naming: <host>.crt for the leaf+chain and
+// <host>.key.plain for the proxy-readable key (the agent encrypts the stored
+// key at rest as <host>.key.enc and materializes the plaintext sibling the
+// proxy actually loads).
 func previewCertPaths(fqdn string) (certPath, keyPath string) {
 	base := sanitizeHostForPreview(fqdn)
-	return previewCertDir + "/" + base + ".crt", previewCertDir + "/" + base + ".key"
+	return previewCertDir + "/" + base + ".crt", previewCertDir + "/" + base + ".key.plain"
 }
 
 // sanitizeHostForPreview mirrors certstore.SanitizeHost for preview file names
