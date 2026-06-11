@@ -3,6 +3,8 @@ package tls
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"time"
 
 	"github.com/go-acme/lego/v4/acme"
 )
@@ -29,15 +31,44 @@ type RateLimitError struct {
 	// UnblockURL is the link the CA provides for human verification / unblocking
 	// (the ProblemDetails Instance field). Empty if the CA gave none.
 	UnblockURL string
+	// RetryAfter is when the CA says issuance may be retried, parsed from the
+	// Detail ("...retry after 2026-06-06 10:08:13 UTC..."). Nil when the CA gave
+	// no parseable timestamp. The dashboard can render this as a friendly
+	// "retry after <date>" instead of the raw CA sentence (§7).
+	RetryAfter *time.Time
 	// Err is the underlying ACME error, preserved for unwrapping.
 	Err error
 }
 
 func (e *RateLimitError) Error() string {
-	if e.UnblockURL != "" {
-		return fmt.Sprintf("tls: ACME rate limited: %s (unblock: %s)", e.Detail, e.UnblockURL)
+	msg := fmt.Sprintf("tls: ACME rate limited: %s", e.Detail)
+	if e.RetryAfter != nil {
+		msg += fmt.Sprintf(" (retry after %s)", e.RetryAfter.UTC().Format("2006-01-02 15:04 MST"))
 	}
-	return fmt.Sprintf("tls: ACME rate limited: %s", e.Detail)
+	if e.UnblockURL != "" {
+		msg += fmt.Sprintf(" (unblock: %s)", e.UnblockURL)
+	}
+	return msg
+}
+
+// retryAfterRe extracts the "retry after <timestamp> UTC" instant Let's Encrypt
+// embeds in its rate-limit detail strings, e.g.
+// "...retry after 2026-06-06 10:08:13 UTC: see https://...".
+var retryAfterRe = regexp.MustCompile(`retry after (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC`)
+
+// parseRetryAfter pulls the retry-after instant out of a CA rate-limit detail
+// string, returning nil when there is none (other limit types omit it).
+func parseRetryAfter(detail string) *time.Time {
+	m := retryAfterRe.FindStringSubmatch(detail)
+	if m == nil {
+		return nil
+	}
+	t, err := time.Parse("2006-01-02 15:04:05", m[1])
+	if err != nil {
+		return nil
+	}
+	t = t.UTC()
+	return &t
 }
 
 func (e *RateLimitError) Unwrap() error { return e.Err }
@@ -60,6 +91,7 @@ func classifyACMEError(err error) error {
 			return &RateLimitError{
 				Detail:     pd.Detail,
 				UnblockURL: pd.Instance,
+				RetryAfter: parseRetryAfter(pd.Detail),
 				Err:        err,
 			}
 		}
@@ -77,6 +109,7 @@ func classifyACMEError(err error) error {
 		return &RateLimitError{
 			Detail:     rl.RateLimitDetail(),
 			UnblockURL: rl.UnblockLink(),
+			RetryAfter: parseRetryAfter(rl.RateLimitDetail()),
 			Err:        err,
 		}
 	}

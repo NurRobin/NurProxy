@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/google/uuid"
@@ -33,12 +35,13 @@ type Manager struct {
 
 // registerRequest is the JSON body for POST /api/v1/agents/register.
 type registerRequest struct {
-	ID       string `json:"id"`
-	FQDN     string `json:"fqdn"`
-	Token    string `json:"token"`
-	APIURL   string `json:"api_url"`
-	PublicIP string `json:"public_ip"`
-	Version  string `json:"version"`
+	ID        string `json:"id"`
+	FQDN      string `json:"fqdn"`
+	Token     string `json:"token"`
+	APIURL    string `json:"api_url"`
+	PublicIP  string `json:"public_ip"`
+	PublicIP6 string `json:"public_ip6,omitempty"`
+	Version   string `json:"version"`
 	// ProxyDetection is the agent's read-only Phase-0 detection (§13.0/§2.1/§9):
 	// installed proxy + version + paths + bind-conflict holder. The agent dials
 	// out and carries it here so the orchestrator can store it on the agent row.
@@ -117,6 +120,9 @@ func (m *Manager) AgentID() string {
 // Register sends a registration request to the orchestrator.
 func (m *Manager) Register(ctx context.Context) error {
 	publicIP, _ := detectPublicIPSimple(ctx)
+	// IPv6 is best-effort and never gates registration; a v6-less host just omits
+	// it. The heartbeat re-reports both families every beat regardless.
+	publicIP6, _ := ddns.DetectPublicIP6(ctx)
 
 	apiURL := fmt.Sprintf("http://%s:%d", m.fqdn, m.apiPort)
 	if publicIP != "" {
@@ -129,6 +135,7 @@ func (m *Manager) Register(ctx context.Context) error {
 		Token:             m.token,
 		APIURL:            apiURL,
 		PublicIP:          publicIP,
+		PublicIP6:         publicIP6,
 		Version:           m.version,
 		ProxyDetection:    m.detection,
 		ProxyCapabilities: m.capabilities,
@@ -254,17 +261,23 @@ func (m *Manager) loadOrGenerateAgentID() (string, error) {
 	return id, nil
 }
 
-// detectPublicIPSimple is a minimal IP detection for the registration request.
-// The full implementation lives in the ddns package.
+// detectPublicIPv4Services is the ordered list of IPv4 detection endpoints used
+// by detectPublicIPSimple. It is a package var so tests can point it at a stub.
+var detectPublicIPv4Services = []string{
+	"https://api.ipify.org",
+	"https://ifconfig.me/ip",
+	"https://icanhazip.com",
+}
+
+// detectPublicIPSimple is a minimal IPv4 detection for the registration request.
+// The full implementation lives in the ddns package. Every candidate is validated
+// as a public IPv4 address before it is accepted: a detection service can return
+// an error page, garbage, a private/loopback address or the wrong family, and any
+// of those would otherwise be published verbatim as A-record content.
 func detectPublicIPSimple(ctx context.Context) (string, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	services := []string{
-		"https://api.ipify.org",
-		"https://ifconfig.me/ip",
-		"https://icanhazip.com",
-	}
 
-	for _, svc := range services {
+	for _, svc := range detectPublicIPv4Services {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, svc, nil)
 		if err != nil {
 			continue
@@ -273,14 +286,34 @@ func detectPublicIPSimple(ctx context.Context) (string, error) {
 		if err != nil {
 			continue
 		}
-		defer resp.Body.Close()
 
 		var buf [64]byte
 		n, _ := resp.Body.Read(buf[:])
-		if n > 0 {
-			return strings.TrimSpace(string(buf[:n])), nil
+		_ = resp.Body.Close()
+		candidate := strings.TrimSpace(string(buf[:n]))
+		if isValidPublicIPv4(candidate) {
+			return candidate, nil
 		}
 	}
 
 	return "", fmt.Errorf("could not detect public IP")
+}
+
+// isValidPublicIPv4 reports whether s parses as an IPv4 address that is routable
+// on the public internet. It rejects malformed input, IPv6 (wrong family for an
+// A record), and non-public ranges (private, loopback, link-local, unspecified,
+// multicast) so that only a usable A-record value is ever accepted.
+func isValidPublicIPv4(s string) bool {
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return false
+	}
+	if !addr.Is4() {
+		return false
+	}
+	if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return false
+	}
+	return true
 }

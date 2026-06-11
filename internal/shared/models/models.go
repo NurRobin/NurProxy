@@ -23,6 +23,12 @@ const (
 	DomainStatusActive   DomainStatus = "active"
 	DomainStatusError    DomainStatus = "error"
 	DomainStatusDeleting DomainStatus = "deleting"
+	// DomainStatusDegraded means the route is applied and serving, but not as the
+	// operator intended: a central-TLS domain is being served over plaintext HTTP
+	// because no certificate has been issued yet (TLS + force_https were dropped).
+	// Distinct from "active" so the dashboard never implies HTTPS is enforced when
+	// it is not (§78).
+	DomainStatusDegraded DomainStatus = "degraded"
 )
 
 // DNSMode indicates whether DNS records are static or use dynamic DNS.
@@ -111,6 +117,33 @@ type ProxyDetection struct {
 	LogPaths []string `json:"log_paths,omitempty"`
 	// PortConflicts lists the holders of :80/:443 when those ports are occupied.
 	PortConflicts []ProxyPortConflict `json:"port_conflicts,omitempty"`
+	// DiscoveredUpstreams are the backend targets the host proxy already points at,
+	// scanned read-only from its config (§52), so the dashboard can suggest them as
+	// Servers. nginx only for now; empty otherwise.
+	DiscoveredUpstreams []DiscoveredUpstream `json:"discovered_upstreams,omitempty"`
+	// Networks are the IP subnets attached to the agent host's interfaces (§38), so
+	// the dashboard can suggest a CIDR when adding a Server.
+	Networks []DiscoveredNetwork `json:"networks,omitempty"`
+}
+
+// DiscoveredNetwork is one IP subnet attached to the agent host (§38): the host's
+// own address, the surrounding network CIDR (the suggestion), and the interface.
+type DiscoveredNetwork struct {
+	Interface    string `json:"interface,omitempty"`
+	Address      string `json:"address,omitempty"`
+	PrefixLength int    `json:"prefix_length,omitempty"`
+	Network      string `json:"network"`
+}
+
+// DiscoveredUpstream is one backend target found in the host proxy's existing
+// config: where it points (scheme/host/port) and the vhost server_name(s) that
+// reference it. It is a suggestion source for Servers (§52) — read-only, never
+// auto-created; the operator adds it with a name/notes.
+type DiscoveredUpstream struct {
+	Scheme      string   `json:"scheme,omitempty"`
+	Host        string   `json:"host"`
+	Port        int      `json:"port,omitempty"`
+	ServerNames []string `json:"server_names,omitempty"`
 }
 
 // ProxyPermissions is the agent's structured §12 permission self-test for an
@@ -193,18 +226,32 @@ type RemediationStep struct {
 
 // Agent represents a registered proxy agent.
 type Agent struct {
-	ID           string      `json:"id"`
-	Name         string      `json:"name"`
-	FQDN         string      `json:"fqdn"`
-	APIURL       string      `json:"api_url"`
-	TokenHash    string      `json:"-"`
-	DNSMode      DNSMode     `json:"dns_mode"`
-	DDNSInterval int         `json:"ddns_interval"`
-	PublicIP     string      `json:"public_ip,omitempty"`
-	DNSRecordID  string      `json:"dns_record_id,omitempty"`
+	ID           string  `json:"id"`
+	Name         string  `json:"name"`
+	FQDN         string  `json:"fqdn"`
+	APIURL       string  `json:"api_url"`
+	TokenHash    string  `json:"-"`
+	DNSMode      DNSMode `json:"dns_mode"`
+	DDNSInterval int     `json:"ddns_interval"`
+	PublicIP     string  `json:"public_ip,omitempty"`
+	// PublicIP6 is the agent's detected public IPv6 address, used to publish an
+	// AAAA record for its anchor FQDN alongside the A record. Empty when the agent
+	// has no routable IPv6 (IPv4-only host); in that case no AAAA record is made.
+	PublicIP6   string `json:"public_ip6,omitempty"`
+	DNSRecordID string `json:"dns_record_id,omitempty"`
+	// DNSRecordID6 is the provider record ID of the agent's AAAA record, tracked
+	// separately from the A record's DNSRecordID so DDNS can update each address
+	// family independently. Empty until an AAAA record is created/adopted.
+	DNSRecordID6 string      `json:"dns_record_id6,omitempty"`
 	Status       AgentStatus `json:"status"`
 	LastSeen     *time.Time  `json:"last_seen,omitempty"`
 	Version      string      `json:"version,omitempty"`
+	// VersionStatus is a COMPUTED, non-persisted comparison of the agent's version
+	// against the orchestrator's, set by the API when listing/showing an agent so
+	// the dashboard can flag skew: "current" | "outdated" | "ahead" | "unknown"
+	// (unknown when either version is missing or non-semver, e.g. a dev build). It
+	// is never stored — it has no DB column and is recomputed per response.
+	VersionStatus string `json:"version_status,omitempty"`
 	// CaddyRunning reports whether the agent's embedded Caddy is serving
 	// traffic. It can be false (e.g. ports 80/443 are taken by another service)
 	// while the agent itself is perfectly healthy and connected.
@@ -318,22 +365,27 @@ type ProxyConfig struct {
 
 // Domain represents a proxied subdomain.
 type Domain struct {
-	ID           int64        `json:"id"`
-	Subdomain    string       `json:"subdomain"`
-	ZoneID       string       `json:"zone_id"`
-	ServerID     string       `json:"server_id"`
-	Port         int          `json:"port"`
-	ProxyConfig  ProxyConfig  `json:"proxy_config"`
-	ManualConfig bool         `json:"manual_config"`
-	WebSocket    bool         `json:"websocket"`
-	ForceHTTPS   bool         `json:"force_https"`
-	SSLMode      SSLMode      `json:"ssl_mode"`
-	DNSRecordID  string       `json:"dns_record_id,omitempty"`
-	Status       DomainStatus `json:"status"`
-	ErrorMsg     string       `json:"error_msg,omitempty"`
-	LastSynced   *time.Time   `json:"last_synced,omitempty"`
-	CreatedAt    time.Time    `json:"created_at"`
-	UpdatedAt    time.Time    `json:"updated_at"`
+	ID           int64       `json:"id"`
+	Subdomain    string      `json:"subdomain"`
+	ZoneID       string      `json:"zone_id"`
+	ServerID     string      `json:"server_id"`
+	Port         int         `json:"port"`
+	ProxyConfig  ProxyConfig `json:"proxy_config"`
+	ManualConfig bool        `json:"manual_config"`
+	WebSocket    bool        `json:"websocket"`
+	ForceHTTPS   bool        `json:"force_https"`
+	SSLMode      SSLMode     `json:"ssl_mode"`
+	DNSRecordID  string      `json:"dns_record_id,omitempty"`
+	// DNSManaged reports whether NurProxy created this domain's DNS record (true)
+	// or adopted a matching pre-existing one (false). On delete, only created
+	// records are removed from the provider — an adopted record predates NurProxy
+	// and must not be destroyed.
+	DNSManaged bool         `json:"dns_managed"`
+	Status     DomainStatus `json:"status"`
+	ErrorMsg   string       `json:"error_msg,omitempty"`
+	LastSynced *time.Time   `json:"last_synced,omitempty"`
+	CreatedAt  time.Time    `json:"created_at"`
+	UpdatedAt  time.Time    `json:"updated_at"`
 }
 
 // FQDN returns the full domain name (subdomain + zone).
@@ -350,6 +402,7 @@ const (
 	AuditSourceMCP    AuditSource = "mcp"    // MCP tool call
 	AuditSourceAgent  AuditSource = "agent"  // an agent (token auth)
 	AuditSourceSystem AuditSource = "system" // orchestrator itself (reconciler)
+	AuditSourceDryRun AuditSource = "dryrun" // sandbox mode — DNS/ACME calls were simulated, not real (#93)
 )
 
 // AuditLogEntry records a single change event for audit purposes.

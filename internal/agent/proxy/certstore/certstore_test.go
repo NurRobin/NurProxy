@@ -221,3 +221,97 @@ func TestCertPaths_missingCert_errors(t *testing.T) {
 		t.Fatal("CertPaths for a missing cert returned nil error, want error")
 	}
 }
+
+func TestRemove_deletesAllArtifacts(t *testing.T) {
+	host := "app.example.com"
+	base := SanitizeHost(host)
+
+	tests := []struct {
+		name      string
+		encrypted bool
+		// extra files to drop in the dir beyond Install's output, simulating the
+		// CertPaths-materialized plaintext key and the no-at-rest plaintext key.
+		extraSuffixes []string
+	}{
+		{
+			name:          "encrypted at rest plus materialized plaintext",
+			encrypted:     true,
+			extraSuffixes: []string{keyMaterializedSuffix},
+		},
+		{
+			name:          "plaintext key (no at-rest key)",
+			encrypted:     false,
+			extraSuffixes: nil,
+		},
+		{
+			name:          "all four artifact kinds present",
+			encrypted:     true,
+			extraSuffixes: []string{keyPlainSuffix, keyMaterializedSuffix},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var encKey []byte
+			if tc.encrypted {
+				k, err := crypto.GenerateKey()
+				if err != nil {
+					t.Fatalf("GenerateKey: %v", err)
+				}
+				encKey = k
+			}
+			s := New(dir, encKey)
+
+			certPEM := []byte("-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n")
+			keyPEM := []byte("-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n")
+			if _, err := s.Install(Bundle{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			// Materialize the decrypted plaintext key on the encrypted path so we can
+			// prove Remove scrubs it (this is the at-rest-encryption-negating file).
+			if tc.encrypted {
+				if _, err := s.CertPaths(host); err != nil {
+					t.Fatalf("CertPaths: %v", err)
+				}
+			}
+			// Drop any additional artifact kinds so Remove must clear them too.
+			for _, suf := range tc.extraSuffixes {
+				p := filepath.Join(dir, base+suf)
+				if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+					t.Fatalf("seed %s: %v", suf, err)
+				}
+			}
+
+			if err := s.Remove(host); err != nil {
+				t.Fatalf("Remove: %v", err)
+			}
+
+			// Every artifact kind for this host must be gone.
+			for _, suf := range []string{certSuffix, keySuffix, keyPlainSuffix, keyMaterializedSuffix} {
+				p := filepath.Join(dir, base+suf)
+				if _, err := os.Stat(p); !os.IsNotExist(err) {
+					t.Errorf("artifact %s still present after Remove (stat err=%v)", base+suf, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRemove_missingFiles_isNoOp(t *testing.T) {
+	s := New(t.TempDir(), nil)
+	if err := s.Remove("never.installed.example.com"); err != nil {
+		t.Errorf("Remove of absent host should be a no-op, got %v", err)
+	}
+	// Calling it twice is also fine (idempotent).
+	if err := s.Remove("never.installed.example.com"); err != nil {
+		t.Errorf("second Remove should be a no-op, got %v", err)
+	}
+}
+
+func TestRemove_emptyHost_errors(t *testing.T) {
+	s := New(t.TempDir(), nil)
+	if err := s.Remove(""); err == nil {
+		t.Error("Remove with empty host should error")
+	}
+}

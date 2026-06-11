@@ -28,6 +28,26 @@ export interface ProxyDetection {
   config_dir?: string;
   log_paths?: string[];
   port_conflicts?: ProxyPortConflict[];
+  discovered_upstreams?: DiscoveredUpstream[];
+  networks?: DiscoveredNetwork[];
+}
+
+/** An IP subnet attached to the agent host — a CIDR suggestion for the Server
+ *  address dialog (§38). */
+export interface DiscoveredNetwork {
+  interface?: string;
+  address?: string;
+  prefix_length?: number;
+  network: string;
+}
+
+/** A backend target found in the host proxy's existing config — a suggestion
+ *  source for Servers (§52). */
+export interface DiscoveredUpstream {
+  scheme?: string;
+  host: string;
+  port?: number;
+  server_names?: string[];
 }
 
 /** One ordered remediation step: a human title plus copy-paste shell commands. */
@@ -123,6 +143,12 @@ export interface Agent {
   status: 'pending' | 'adopted' | 'offline' | 'error';
   last_seen?: string;
   version?: string;
+  /**
+   * Computed server-side: how the agent's version compares to the orchestrator's
+   * ('current' | 'outdated' | 'ahead'). 'unknown' when either side is missing or
+   * a non-release (dev) build.
+   */
+  version_status?: 'current' | 'outdated' | 'ahead' | 'unknown';
   caddy_running?: boolean;
   /**
    * The agent's CURRENT live reverse-proxy mode (§19): 'built-in' (bundled Caddy)

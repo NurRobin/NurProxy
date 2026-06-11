@@ -111,7 +111,7 @@ func TestClientEnsureServer(t *testing.T) {
 	// semantics: GET 404s on a missing path, and the admin API does NOT create
 	// intermediate parents — so a fresh instance (only admin configured) has no
 	// apps/http/servers, and EnsureServer must build the structure top-down.
-	var appsExists, httpExists, srv0Exists bool
+	var appsExists, httpExists, srv0Exists, srv0HasRoutes bool
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		exists := func(b bool) {
 			if b {
@@ -123,28 +123,43 @@ func TestClientEnsureServer(t *testing.T) {
 		}
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http/servers/srv0":
-			exists(srv0Exists)
+			if !srv0Exists {
+				w.WriteHeader(http.StatusNotFound)
+			} else if srv0HasRoutes {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"listen":[":443",":80"],"routes":[]}`))
+			} else {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"listen":[":443",":80"]}`))
+			}
 		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http":
 			exists(httpExists)
 		case r.Method == http.MethodGet && r.URL.Path == "/config/apps":
 			exists(appsExists)
 		// PUT creates the value at a path whose immediate parent already exists.
 		case r.Method == http.MethodPut && r.URL.Path == "/config/apps":
-			appsExists, httpExists, srv0Exists = true, true, true
+			appsExists, httpExists, srv0Exists, srv0HasRoutes = true, true, true, true
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http":
 			if !appsExists {
 				w.WriteHeader(http.StatusInternalServerError) // no parent
 				return
 			}
-			httpExists, srv0Exists = true, true
+			httpExists, srv0Exists, srv0HasRoutes = true, true, true
 			w.WriteHeader(http.StatusOK)
 		case (r.Method == http.MethodPut || r.Method == http.MethodPost) && r.URL.Path == "/config/apps/http/servers/srv0":
 			if !httpExists {
 				w.WriteHeader(http.StatusInternalServerError) // no parent
 				return
 			}
-			srv0Exists = true
+			srv0Exists, srv0HasRoutes = true, true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http/servers/srv0/routes":
+			if !srv0Exists {
+				w.WriteHeader(http.StatusInternalServerError) // no parent
+				return
+			}
+			srv0HasRoutes = true
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -165,10 +180,49 @@ func TestClientEnsureServer(t *testing.T) {
 	if !srv0Exists {
 		t.Error("server should have been created")
 	}
+	if !srv0HasRoutes {
+		t.Error("created server must have a routes array")
+	}
 
 	// Second call should succeed without creating again.
 	if err := c.EnsureServer(ctx); err != nil {
 		t.Fatalf("EnsureServer (second call) failed: %v", err)
+	}
+}
+
+// A srv0 that already exists WITHOUT a routes array (e.g. created by the TLS
+// strategy apply, which PUTs only automatic_https) must be repaired by
+// EnsureServer: it seeds an empty routes array so the subsequent AddRoute POST
+// appends to a list instead of writing an object Caddy rejects as a RouteList
+// (regression for issue #106).
+func TestClientEnsureServer_seedsRoutesOnExistingServerWithoutRoutes(t *testing.T) {
+	srv0HasRoutes := false
+	seeded := false
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http/servers/srv0":
+			w.WriteHeader(http.StatusOK)
+			if srv0HasRoutes {
+				w.Write([]byte(`{"automatic_https":{"disable":true},"routes":[]}`))
+			} else {
+				w.Write([]byte(`{"automatic_https":{"disable":true}}`))
+			}
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http/servers/srv0/routes":
+			srv0HasRoutes = true
+			seeded = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mock.Close()
+
+	c := &Client{baseURL: mock.URL, http: mock.Client()}
+	if err := c.EnsureServer(context.Background()); err != nil {
+		t.Fatalf("EnsureServer failed: %v", err)
+	}
+	if !seeded {
+		t.Error("EnsureServer must seed a routes array on an existing srv0 that lacks one")
 	}
 }
 

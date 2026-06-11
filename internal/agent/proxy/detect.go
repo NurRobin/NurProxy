@@ -17,6 +17,8 @@ import (
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/netdiscover"
+	"github.com/NurRobin/NurProxy/internal/shared/nginxdiscover"
 )
 
 // Kind identifies a supported reverse-proxy implementation.
@@ -47,6 +49,13 @@ type Detection struct {
 	LogPaths []string `json:"log_paths,omitempty"`
 	// PortConflicts lists the holders of :80/:443 when those ports are occupied.
 	PortConflicts []PortConflict `json:"port_conflicts,omitempty"`
+	// DiscoveredUpstreams are the backend targets the host proxy already points at,
+	// scanned read-only from its config (§52) so the dashboard can suggest them as
+	// Servers. nginx only for now; empty otherwise.
+	DiscoveredUpstreams []nginxdiscover.Upstream `json:"discovered_upstreams,omitempty"`
+	// Networks are the IP subnets attached to the host's interfaces (§38), so the
+	// dashboard can suggest a CIDR when adding a Server. Reported regardless of proxy.
+	Networks []netdiscover.Network `json:"networks,omitempty"`
 }
 
 // PortConflict identifies which process holds a listening port (§2.1). It is
@@ -74,6 +83,22 @@ func (d Detection) ToModel() *models.ProxyDetection {
 			Port:    c.Port,
 			Process: c.Process,
 			PID:     c.PID,
+		})
+	}
+	for _, u := range d.DiscoveredUpstreams {
+		m.DiscoveredUpstreams = append(m.DiscoveredUpstreams, models.DiscoveredUpstream{
+			Scheme:      u.Scheme,
+			Host:        u.Host,
+			Port:        u.Port,
+			ServerNames: u.ServerNames,
+		})
+	}
+	for _, n := range d.Networks {
+		m.Networks = append(m.Networks, models.DiscoveredNetwork{
+			Interface:    n.Interface,
+			Address:      n.Address,
+			PrefixLength: n.PrefixLength,
+			Network:      n.Network,
 		})
 	}
 	return m
@@ -157,12 +182,21 @@ func (d *Detector) Detect(ctx context.Context) (Detection, error) {
 		paths := ResolvePaths(c.kind)
 		det.ConfigDir = paths.ConfigDir
 		det.LogPaths = paths.LogPaths
+		if c.kind == KindNginx {
+			det.DiscoveredUpstreams = nginxdiscover.Discover(gatherNginxConfig(paths.ConfigDir))
+		}
 		break
 	}
 
 	det.PortConflicts = d.detectPortConflicts(ctx)
+	// Networks are a host property, independent of which proxy (if any) is installed.
+	det.Networks = collectNetworks()
 	return det, nil
 }
+
+// collectNetworks reads the host's attached subnets (§38). A package variable so
+// detection tests can stub it instead of reading the real host's interfaces.
+var collectNetworks = netdiscover.Collect
 
 // resolveBinary returns the first resolvable binary path from the candidates.
 func (d *Detector) resolveBinary(names []string) (string, bool) {

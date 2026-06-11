@@ -5,8 +5,12 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/provider"
 )
 
 // fakeStore is a hand-written RenewalStore. due is what DueForRenewal returns;
@@ -287,6 +291,285 @@ func TestRenewer_customWindow(t *testing.T) {
 	}
 }
 
+// lockStore models the real DB seam closely enough to exercise the per-host
+// issuance lock: TargetForHost re-checks for an already-issued cert (the same
+// GetCertificate guard the orchestrator's store uses) and returns nil once one
+// exists, so a second caller for the same host collapses to a no-op. SaveRenewed
+// records the host. All access is mutex-guarded since callers hit it from
+// goroutines.
+type lockStore struct {
+	mu        sync.Mutex
+	provider  provider.Provider
+	hasCert   map[string]bool // host -> already issued (TargetForHost returns nil)
+	saveCount map[string]int  // host -> #SaveRenewed
+	due       []RenewTarget   // what DueForRenewal returns (scan path)
+}
+
+func newLockStore(p provider.Provider) *lockStore {
+	return &lockStore{provider: p, hasCert: map[string]bool{}, saveCount: map[string]int{}}
+}
+
+func (s *lockStore) DueForRenewal(context.Context, time.Duration) ([]RenewTarget, error) {
+	return s.due, nil
+}
+
+func (s *lockStore) TargetForHost(_ context.Context, host string) (*RenewTarget, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hasCert[host] {
+		return nil, nil // cert already on file — the winner already issued
+	}
+	return &RenewTarget{Host: host, Names: []string{host}, Provider: s.provider}, nil
+}
+
+func (s *lockStore) SaveRenewed(_ context.Context, res *CertResult, _ bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hasCert[res.Host] = true
+	s.saveCount[res.Host]++
+	return nil
+}
+
+// barrierACME counts Obtain calls and, when width > 1, holds every caller inside
+// Obtain until the test releases them — so the different-hosts test can prove the
+// issuance critical sections actually overlap (a global lock would never let the
+// barrier fill). The `arrived` signal is sent non-blocking so an unexpected extra
+// caller (e.g. the same-host test if the per-host lock regressed and let more than
+// one through) never deadlocks the harness — the assertion on `calls` catches the
+// regression instead. width <= 1 closes `release` up front so single-issuer paths
+// never block at all.
+type barrierACME struct {
+	calls   int32
+	arrived chan struct{}
+	release chan struct{}
+	result  *CertResult
+}
+
+func newBarrierACME(width int, res *CertResult) *barrierACME {
+	if width < 1 {
+		width = 1
+	}
+	b := &barrierACME{arrived: make(chan struct{}, width), release: make(chan struct{}), result: res}
+	if width <= 1 {
+		close(b.release) // never block single-issuer paths
+	}
+	return b
+}
+
+func (b *barrierACME) ObtainViaDNS01(_ context.Context, names []string, _ DNSSolver) (*CertResult, error) {
+	atomic.AddInt32(&b.calls, 1)
+	select {
+	case b.arrived <- struct{}{}: // signal arrival; never block on a full buffer
+	default:
+	}
+	<-b.release
+	res := *b.result
+	res.Names = names
+	if len(names) > 0 {
+		res.Host = strings.TrimPrefix(names[0], "*.")
+	}
+	return &res, nil
+}
+
+// TestRenewer_EnsureCertForHost_concurrentSameHost_issuesOnce verifies the
+// per-host issuance guard: two concurrent EnsureCertForHost calls for the SAME
+// host must drive ACME exactly once. The first to take the lock issues + saves;
+// the second re-resolves TargetForHost inside the lock, sees the cert now exists,
+// and no-ops. Without the lock both would issue, double-burning the CA quota.
+func TestRenewer_EnsureCertForHost_concurrentSameHost_issuesOnce(t *testing.T) {
+	store := newLockStore(newFakeProvider("TXT"))
+	acme := newBarrierACME(1, &CertResult{CertPEM: []byte("C"), KeyPEM: []byte("K")})
+	// nil reloader/audit: the test fakes are not concurrency-safe and the lock under
+	// test serializes per host, not globally — the store's own mutex is the only
+	// shared state the assertions read.
+	r := newRenewer(store, acme, nil, nil)
+
+	const host = "race.example.com"
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start // release all goroutines together to maximize contention
+			errs[idx] = r.EnsureCertForHost(context.Background(), host)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("EnsureCertForHost[%d]: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&acme.calls); got != 1 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 1 (per-host lock must collapse concurrent issuance)", got)
+	}
+	if got := store.saveCount[host]; got != 1 {
+		t.Errorf("SaveRenewed for %s = %d, want 1", host, got)
+	}
+}
+
+// TestRenewer_EnsureCertForHost_concurrentDifferentHosts_proceedConcurrently
+// verifies the lock is per-host, not global: issuance for distinct hosts must run
+// concurrently. The barrier forces all callers to sit inside Obtain at once; if
+// the lock were global, only one could be in flight and the barrier would never
+// fill, tripping the deadline.
+func TestRenewer_EnsureCertForHost_concurrentDifferentHosts_proceedConcurrently(t *testing.T) {
+	const n = 4
+	store := newLockStore(newFakeProvider("TXT"))
+	acme := newBarrierACME(n, &CertResult{CertPEM: []byte("C"), KeyPEM: []byte("K")})
+	// nil reloader/audit: distinct hosts run truly concurrently here, and the test
+	// fakes are not thread-safe; the store guards its own counters with a mutex.
+	r := newRenewer(store, acme, nil, nil)
+
+	hosts := []string{"a.example.com", "b.example.com", "c.example.com", "d.example.com"}
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i, h := range hosts {
+		wg.Add(1)
+		go func(idx int, host string) {
+			defer wg.Done()
+			errs[idx] = r.EnsureCertForHost(context.Background(), host)
+		}(i, h)
+	}
+
+	// Wait until all n issuers are simultaneously inside Obtain (proving they run
+	// concurrently), then release them. A global lock would stall here.
+	deadline := time.After(2 * time.Second)
+	for got := 0; got < n; {
+		select {
+		case <-acme.arrived:
+			got++
+		case <-deadline:
+			t.Fatalf("only %d/%d issuers reached ACME concurrently — lock is not per-host", got, n)
+		}
+	}
+	close(acme.release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("EnsureCertForHost[%d]: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&acme.calls); got != n {
+		t.Errorf("ObtainViaDNS01 calls = %d, want %d (one per distinct host)", got, n)
+	}
+	for _, h := range hosts {
+		if store.saveCount[h] != 1 {
+			t.Errorf("SaveRenewed for %s = %d, want 1", h, store.saveCount[h])
+		}
+	}
+}
+
+// TestRenewer_EnsureAndScan_concurrentSameHost_firstIssuanceOnce covers the race
+// between the on-create fast path (EnsureCertForHost) and the periodic scan's
+// first-issuance pass (RunOnce → renewOne) for the SAME host with no cert yet.
+// The scan's target is resolved by DueForRenewal BEFORE any lock is taken; once
+// the create path issues+saves+unlocks, renewOne takes the freed lock against a
+// now-stale target. Without the under-lock re-check renewOne would re-drive ACME,
+// double-burning the CA duplicate-cert quota. With FirstIssue set, renewOne
+// re-resolves TargetForHost inside the lock, sees the cert now on file, and
+// no-ops — so ACME is hit exactly once regardless of which path wins.
+func TestRenewer_EnsureAndScan_concurrentSameHost_firstIssuanceOnce(t *testing.T) {
+	const host = "first.example.com"
+	store := newLockStore(newFakeProvider("TXT"))
+	// The scan resolves a first-issuance target (no cert yet) — the pre-lock
+	// snapshot that becomes stale the moment the create path issues.
+	store.due = []RenewTarget{
+		{Host: host, Names: []string{host}, Provider: store.provider, FirstIssue: true},
+	}
+	acme := newBarrierACME(1, &CertResult{CertPEM: []byte("C"), KeyPEM: []byte("K")})
+	// nil reloader/audit: the lock under test serializes per host; the store's own
+	// mutex guards the only shared state the assertions read.
+	r := newRenewer(store, acme, nil, nil)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	var ensureErr, scanErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		ensureErr = r.EnsureCertForHost(context.Background(), host)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		scanErr = r.RunOnce(context.Background())
+	}()
+	close(start) // release both together to maximize contention
+	wg.Wait()
+
+	if ensureErr != nil {
+		t.Fatalf("EnsureCertForHost: %v", ensureErr)
+	}
+	if scanErr != nil {
+		t.Fatalf("RunOnce: %v", scanErr)
+	}
+	if got := atomic.LoadInt32(&acme.calls); got != 1 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 1 (create+scan must collapse to a single issuance)", got)
+	}
+	if got := store.saveCount[host]; got != 1 {
+		t.Errorf("SaveRenewed for %s = %d, want 1", host, got)
+	}
+}
+
+// TestRenewer_RunOnce_firstIssuance_skipsWhenCertAppears isolates the under-lock
+// re-check: a first-issuance scan target whose cert already exists on file (a
+// concurrent create path issued it before the scan reached this host) must NO-OP
+// — TargetForHost returns nil and renewOne re-drives nothing.
+func TestRenewer_RunOnce_firstIssuance_skipsWhenCertAppears(t *testing.T) {
+	const host = "done.example.com"
+	store := newLockStore(newFakeProvider("TXT"))
+	store.hasCert[host] = true // cert already on file -> TargetForHost returns nil
+	store.due = []RenewTarget{
+		{Host: host, Names: []string{host}, Provider: store.provider, FirstIssue: true},
+	}
+	acme := newBarrierACME(1, &CertResult{CertPEM: []byte("C"), KeyPEM: []byte("K")})
+	r := newRenewer(store, acme, nil, nil)
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := atomic.LoadInt32(&acme.calls); got != 0 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 0 (first-issuance must skip when cert already on file)", got)
+	}
+	if got := store.saveCount[host]; got != 0 {
+		t.Errorf("SaveRenewed for %s = %d, want 0", host, got)
+	}
+}
+
+// TestRenewer_RunOnce_renewal_proceedsDespiteCertOnFile guards the safe default:
+// a renewal target (FirstIssue=false) has an in-window cert on file by
+// definition, and the scan exists precisely to re-issue it. The under-lock
+// re-check must NOT collapse it — renewal must always drive ACME even though
+// TargetForHost would report a cert present.
+func TestRenewer_RunOnce_renewal_proceedsDespiteCertOnFile(t *testing.T) {
+	const host = "renew.example.com"
+	store := newLockStore(newFakeProvider("TXT"))
+	store.hasCert[host] = true // an in-window cert is on file
+	store.due = []RenewTarget{
+		{Host: host, Names: []string{host}, Provider: store.provider}, // FirstIssue=false
+	}
+	acme := newBarrierACME(1, &CertResult{CertPEM: []byte("C"), KeyPEM: []byte("K")})
+	r := newRenewer(store, acme, nil, nil)
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := atomic.LoadInt32(&acme.calls); got != 1 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 1 (renewal must re-issue even with a cert on file)", got)
+	}
+	if got := store.saveCount[host]; got != 1 {
+		t.Errorf("SaveRenewed for %s = %d, want 1", host, got)
+	}
+}
+
 func containsEvent(events []string, want string) bool {
 	for _, e := range events {
 		if e == want {
@@ -294,4 +577,67 @@ func containsEvent(events []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// flakyACME fails its first failBefore Obtain calls with err, then returns result.
+type flakyACME struct {
+	failBefore int
+	calls      int
+	err        error
+	result     *CertResult
+}
+
+func (f *flakyACME) ObtainViaDNS01(_ context.Context, _ []string, _ DNSSolver) (*CertResult, error) {
+	f.calls++
+	if f.calls <= f.failBefore {
+		return nil, f.err
+	}
+	return f.result, nil
+}
+
+// withFastBackoff shrinks the issuance backoff for the duration of a test and
+// restores it afterwards, so retry tests run in milliseconds.
+func withFastBackoff(t *testing.T) {
+	t.Helper()
+	base, max := issueBaseBackoff, issueMaxBackoff
+	issueBaseBackoff, issueMaxBackoff = time.Millisecond, 2*time.Millisecond
+	t.Cleanup(func() { issueBaseBackoff, issueMaxBackoff = base, max })
+}
+
+func TestRenewer_issueWithRetry_succeedsAfterTransientFailures(t *testing.T) {
+	withFastBackoff(t)
+	fp := newFakeProvider("TXT")
+	store := &fakeStore{forHost: map[string]*RenewTarget{
+		"flaky.example.com": {Host: "flaky.example.com", Names: []string{"flaky.example.com"}, Provider: fp},
+	}}
+	acme := &flakyACME{failBefore: 2, err: errors.New("dial tcp 172.65.32.248:443: i/o timeout"),
+		result: &CertResult{CertPEM: []byte("OK"), KeyPEM: []byte("K")}}
+	r := newRenewer(store, acme, &fakeReloader{}, &fakeAudit{})
+
+	if err := r.EnsureCertForHost(context.Background(), "flaky.example.com"); err != nil {
+		t.Fatalf("expected success after transient retries, got %v", err)
+	}
+	if acme.calls != 3 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 3 (2 transient failures + 1 success)", acme.calls)
+	}
+	if len(store.saved) != 1 || string(store.saved[0].CertPEM) != "OK" {
+		t.Fatalf("cert not saved after retry: %+v", store.saved)
+	}
+}
+
+func TestRenewer_issueWithRetry_doesNotRetryRateLimit(t *testing.T) {
+	withFastBackoff(t)
+	fp := newFakeProvider("TXT")
+	store := &fakeStore{forHost: map[string]*RenewTarget{
+		"rl.example.com": {Host: "rl.example.com", Names: []string{"rl.example.com"}, Provider: fp},
+	}}
+	acme := &flakyACME{failBefore: 99, err: &RateLimitError{Detail: "too many certificates"}}
+	r := newRenewer(store, acme, &fakeReloader{}, &fakeAudit{})
+
+	if err := r.EnsureCertForHost(context.Background(), "rl.example.com"); err == nil {
+		t.Fatal("expected rate-limit error to surface")
+	}
+	if acme.calls != 1 {
+		t.Errorf("ObtainViaDNS01 calls = %d, want 1 (rate limit must not be retried)", acme.calls)
+	}
 }

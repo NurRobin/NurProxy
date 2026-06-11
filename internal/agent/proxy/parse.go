@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -90,6 +92,74 @@ func ResolvePaths(kind Kind) Paths {
 		}
 	}
 	return Paths{}
+}
+
+// maxConfigBytes caps how much nginx config we read for upstream discovery, so a
+// pathological include never blows up memory. 8 MiB is far above any real config.
+const maxConfigBytes = 8 << 20
+
+// gatherNginxConfig reads the host's nginx config files relevant to upstream
+// discovery (§52) and returns them concatenated, so a single nginxdiscover.Discover
+// pass sees every server{} and upstream{} block (including cross-file upstream
+// references). It reads the resolved config dir, the Debian sites-enabled sibling,
+// conf.d, and the main nginx.conf — best-effort and read-only; an unreadable file
+// is skipped, never fatal. It is a package variable so tests can stub it.
+var gatherNginxConfig = func(configDir string) string {
+	dirs := []string{configDir}
+	if filepath.Base(configDir) == "sites-available" {
+		dirs = append(dirs, filepath.Join(filepath.Dir(configDir), "sites-enabled"))
+	}
+	dirs = append(dirs, "/etc/nginx/conf.d")
+	files := []string{"/etc/nginx/nginx.conf"}
+
+	seen := map[string]struct{}{}
+	var b strings.Builder
+	add := func(path string) {
+		if b.Len() >= maxConfigBytes {
+			return
+		}
+		real := path
+		if rp, err := filepath.EvalSymlinks(path); err == nil {
+			real = rp
+		}
+		if _, dup := seen[real]; dup {
+			return
+		}
+		seen[real] = struct{}{}
+		f, err := os.Open(path)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		// Bound this file's contribution to the remaining budget so a single
+		// huge config can never blow up memory — the cap holds across files and
+		// within any one file.
+		remaining := maxConfigBytes - b.Len()
+		if _, err := io.Copy(&b, io.LimitReader(f, int64(remaining))); err != nil {
+			return
+		}
+		b.WriteByte('\n')
+	}
+
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			add(filepath.Join(d, e.Name()))
+		}
+	}
+	for _, f := range files {
+		add(f)
+	}
+	return b.String()
 }
 
 // dirExists is the existence check used by path resolution. It is a package

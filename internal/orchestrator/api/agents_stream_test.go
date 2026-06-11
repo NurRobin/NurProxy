@@ -160,6 +160,11 @@ func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 	if err := database.CreateDomain(dom); err != nil {
 		t.Fatalf("CreateDomain: %v", err)
 	}
+	// A cert exists for the host so the applied domain ends "active"; without one a
+	// central-TLS domain would be "degraded" (served plaintext), per §78.
+	if err := database.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	artifactID := fmt.Sprintf("dom-%d", dom.ID)
 	content := `{"@id":"r1","match":[{"host":["app.example.com"]}]}`

@@ -4,13 +4,37 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
 )
+
+// registerLimiter blunts abuse of the unauthenticated /agents/register endpoint:
+// too many register attempts from one IP within the window trip a temporary
+// lockout, so an attacker can't hammer the endpoint (each attempt runs a linear
+// token-hash scan via CreateAgent's uniqueness check and writes a pending row).
+// It lives at package scope because the endpoint's handler is the only caller
+// and the Server's constructor (server.go) is owned by another unit; keying on
+// the peer IP makes a single shared limiter correct regardless of Server count.
+//
+// 10 attempts per IP within 15 min → locked out for 15 min. A legitimate agent
+// registers once (and retries a handful of times at most), so this is generous
+// for real adoption while still capping a flood.
+var registerLimiter = ratelimit.New(10, 15*time.Minute, 15*time.Minute)
+
+// maxProxyDetectionEntries bounds each variable-length slice the agent supplies
+// in its register payload's ProxyDetection. The body is already capped at a few
+// MiB (readJSON), but that still permits tens of thousands of tiny entries; this
+// caps what a single registration can persist into the agent row. Far above any
+// real host's interface/log/upstream/conflict count.
+const maxProxyDetectionEntries = 256
 
 // GET /api/v1/agents
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +61,7 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		if zones == nil {
 			zones = []models.Zone{}
 		}
+		a.VersionStatus = s.agentVersionStatus(a.Version)
 		resp[i] = agentResponse{
 			Agent: a,
 			Zones: zones,
@@ -48,12 +73,25 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/agents/register — called BY the agent during adoption.
 // No auth required (agent doesn't have a token yet — it's registering one).
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
+	// Per-IP rate limit: this endpoint is unauthenticated and does real work per
+	// call (a uniqueness scan + a pending-row insert), so cap how fast one peer
+	// can hit it. Each attempt consumes budget (there is no credential to verify
+	// and clear on), so N attempts from one IP trip the lockout.
+	ip := clientIP(r)
+	if ok, retryAfter := registerLimiter.Allow(ip); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many registration attempts; try again later")
+		return
+	}
+	registerLimiter.Fail(ip)
+
 	var req struct {
 		ID                string                    `json:"id"`
 		FQDN              string                    `json:"fqdn"`
 		Token             string                    `json:"token"`
 		APIURL            string                    `json:"api_url"`
 		PublicIP          string                    `json:"public_ip"`
+		PublicIP6         string                    `json:"public_ip6"`
 		Version           string                    `json:"version"`
 		ProxyDetection    *models.ProxyDetection    `json:"proxy_detection"`
 		ProxyCapabilities *models.ProxyCapabilities `json:"proxy_capabilities"`
@@ -66,6 +104,26 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	if req.ID == "" || req.FQDN == "" || req.Token == "" {
 		writeError(w, http.StatusBadRequest, "id, fqdn, and token are required")
 		return
+	}
+
+	// Validate the FQDN at the boundary so a malformed anchor name is rejected
+	// here rather than failing later at the DNS provider or in route rendering.
+	req.FQDN = strings.TrimSpace(strings.ToLower(req.FQDN))
+	if err := dnsname.ValidateSubdomain(req.FQDN); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid FQDN: "+err.Error())
+		return
+	}
+
+	// Bound the variable-length detection slices a single registration can
+	// persist (the body cap still permits many tiny entries).
+	if d := req.ProxyDetection; d != nil {
+		if len(d.LogPaths) > maxProxyDetectionEntries ||
+			len(d.PortConflicts) > maxProxyDetectionEntries ||
+			len(d.DiscoveredUpstreams) > maxProxyDetectionEntries ||
+			len(d.Networks) > maxProxyDetectionEntries {
+			writeError(w, http.StatusBadRequest, "proxy_detection has too many entries")
+			return
+		}
 	}
 
 	// Check for duplicate FQDN
@@ -84,6 +142,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		APIURL:    req.APIURL,
 		TokenHash: tokenHash,
 		PublicIP:  req.PublicIP,
+		PublicIP6: req.PublicIP6,
 		Status:    models.AgentStatusPending,
 		Version:   req.Version,
 		// Assume healthy until the agent reports otherwise via heartbeat, so a
@@ -261,6 +320,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
 
+	// Refuse while domains still reference this agent's servers: the ON DELETE
+	// CASCADE (agent -> servers -> domains) would orphan their DNS records/certs
+	// ahead of the reconciler teardown (see guardChildDomains).
+	if s.guardChildDomains(w, "agent", db.DomainFilter{AgentID: id}) {
+		return
+	}
+
 	if err := s.db.DeleteAgent(id); err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
@@ -274,6 +340,10 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/agents/{id}/status
 func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
+	if callerID, _ := r.Context().Value(ctxAgentID).(string); callerID != id {
+		writeError(w, http.StatusForbidden, "agent can only read its own status")
+		return
+	}
 
 	agent, err := s.db.GetAgent(id)
 	if err != nil {
@@ -287,6 +357,7 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 		"last_seen":          agent.LastSeen,
 		"public_ip":          agent.PublicIP,
 		"version":            agent.Version,
+		"version_status":     s.agentVersionStatus(agent.Version),
 		"caddy_running":      agent.CaddyRunning,
 		"proxy_mode":         agent.ProxyMode,
 		"last_error":         agent.LastError,
@@ -307,8 +378,9 @@ func (e *fqdnError) Error() string { return e.msg }
 
 // applyFQDNChange validates and applies an FQDN (anchor hostname) override onto
 // the agent in place. A blank fqdn or one equal to the current value is a no-op.
-// When the anchor actually moves, it clears the stored A-record id (so the
-// reconciler recreates the record at the new name) and any stale last_error.
+// When the anchor actually moves, it clears the stored A- and AAAA-record ids
+// (so the reconciler recreates both at the new name and the old records don't
+// leak at the prior name) and any stale last_error.
 func (s *Server) applyFQDNChange(agent *models.Agent, fqdn string) *fqdnError {
 	fqdn = strings.TrimSpace(strings.ToLower(fqdn))
 	if fqdn == "" || fqdn == agent.FQDN {
@@ -321,8 +393,9 @@ func (s *Server) applyFQDNChange(agent *models.Agent, fqdn string) *fqdnError {
 		return &fqdnError{http.StatusConflict, "another agent already uses this FQDN"}
 	}
 	agent.FQDN = fqdn
-	agent.DNSRecordID = "" // anchor moved — recreate the A record at the new name
-	agent.DNSError = ""    // clear any stale "FQDN outside zone" error
+	agent.DNSRecordID = ""  // anchor moved — recreate the A record at the new name
+	agent.DNSRecordID6 = "" // and the AAAA record, else the old one leaks at the prior name
+	agent.DNSError = ""     // clear any stale "FQDN outside zone" error
 	return nil
 }
 
@@ -367,8 +440,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		PublicIP string `json:"public_ip"`
-		Version  string `json:"version"`
+		PublicIP  string `json:"public_ip"`
+		PublicIP6 string `json:"public_ip6"`
+		Version   string `json:"version"`
 		// CaddyRunning and LastError are the agent's self-report. CaddyRunning is
 		// a pointer so an older agent that omits it doesn't get read as "down".
 		CaddyRunning *bool  `json:"caddy_running"`
@@ -411,7 +485,7 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		caddyRunning = *req.CaddyRunning
 	}
 
-	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.LastError, caddyRunning, req.ProxyMode); err != nil {
+	if err := s.db.UpdateAgentHealth(id, req.PublicIP, req.PublicIP6, req.LastError, caddyRunning, req.ProxyMode); err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
 	}

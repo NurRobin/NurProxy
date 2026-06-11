@@ -2,15 +2,24 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
 )
+
+// sessionSecretSetting is the settings key under which the persistent HMAC
+// secret used to sign session cookies is stored (base64 of 32 random bytes).
+// It is masked from the settings API (see system.go) so it never leaves the box.
+const sessionSecretSetting = "session_secret"
 
 // RoutePusher computes an agent's desired routes and delivers them over its live
 // stream. The reconciler implements it; API handlers call it to push config the
@@ -38,6 +47,21 @@ type Server struct {
 	pusher   RoutePusher
 	issuer   CertIssuer
 	logs     *logbroker.Broker
+	// loginLimiter blunts online password guessing: too many failed logins from
+	// one IP trip a temporary lockout.
+	loginLimiter *ratelimit.Limiter
+
+	// dnsDryRun / acmeDryRun reflect sandbox mode so the health endpoint can tell
+	// the dashboard to show a "dry-run — no external calls" banner (#93).
+	dnsDryRun  bool
+	acmeDryRun bool
+}
+
+// SetDryRun records whether the orchestrator is running in DNS/ACME sandbox mode
+// so the health endpoint can surface it to the dashboard banner.
+func (s *Server) SetDryRun(dns, acme bool) {
+	s.dnsDryRun = dns
+	s.acmeDryRun = acme
 }
 
 // SetAgentHub wires the live agent connection hub and the route pusher into the
@@ -62,12 +86,54 @@ func NewServer(database *db.DB, version string) *Server {
 		db:       database,
 		version:  version,
 		mux:      http.NewServeMux(),
-		sessions: auth.NewSessionManager([]byte("nurproxy-session-key-" + version)),
+		sessions: auth.NewSessionManager(loadOrCreateSessionKey(database)),
 		logs:     logbroker.New(),
+		// 5 failed logins per IP within 15 min → locked out for 15 min.
+		loginLimiter: ratelimit.New(5, 15*time.Minute, 15*time.Minute),
 	}
+
+	// Wire the session TTL and the server-side revocation-version provider ONCE,
+	// at construction, before any handler can run. This makes token expiry and
+	// revocation enforced from the very first request after a process restart.
+	// Previously these were wired only lazily inside the auth handlers, so until
+	// an auth handler happened to run, sm.version was nil and currentVersion()
+	// returned 0 — which let a REVOKED cookie (version >= 1) pass the
+	// "ver < currentVersion()" check on every protected route. Wiring here closes
+	// that window. Doing it once (rather than on every auth call) also removes the
+	// concurrent unsynchronized writes to sm.ttl/sm.version that raced with the
+	// requireAuth Verify reads.
+	s.sessions.WithTTLFunc(s.sessionDuration)
+	s.sessions.WithVersion(func() int { return s.currentSessionVersion() })
 
 	s.registerRoutes()
 	return s
+}
+
+// loadOrCreateSessionKey returns the persistent HMAC key used to sign session
+// cookies. It is generated once (32 cryptographically random bytes) and stored
+// in the settings table so it survives restarts AND is unique per install.
+// This replaces a key derived from a public constant plus the (publicly
+// readable) version string, which let anyone who knew the version forge a valid
+// session cookie and bypass login entirely. If the secret cannot be persisted,
+// an ephemeral random key is used: still unforgeable, but sessions reset on the
+// next restart.
+func loadOrCreateSessionKey(database *db.DB) []byte {
+	if v, err := database.GetSetting(sessionSecretSetting); err == nil && v != "" {
+		if key, derr := base64.StdEncoding.DecodeString(v); derr == nil && len(key) == 32 {
+			return key
+		}
+		log.Printf("warning: stored session secret is malformed; regenerating (existing sessions will be invalidated)")
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		// crypto/rand is broken — unrecoverable for a security-sensitive key.
+		log.Fatalf("failed to generate session secret: %v", err)
+	}
+	if err := database.SetSetting(sessionSecretSetting, base64.StdEncoding.EncodeToString(key)); err != nil {
+		log.Printf("warning: could not persist session secret, sessions will reset on restart: %v", err)
+	}
+	return key
 }
 
 // Handler returns the mux wrapped with middleware.
@@ -111,7 +177,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/adopt", s.requireAuth(s.handleAdoptAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/reject", s.requireAuth(s.handleRejectAgent))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/auto-reconcile", s.requireAuth(s.handleSetAutoReconcile))
-	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAuth(s.handleAgentStatus))
+	// Adoption/status poll: the agent dials out to confirm its own adoption
+	// state (agent auth, scoped to itself). Not an admin route — honoring an
+	// agent token here does not re-open the H1 escalation because the handler
+	// rejects any id that is not the caller's own.
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAgentAuth(s.handleAgentStatus))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", s.requireAgentAuth(s.handleAgentHeartbeat))
 	// Live push channel: the agent dials out and holds this open; the
 	// orchestrator pushes config down it (works behind NAT). Agent auth.

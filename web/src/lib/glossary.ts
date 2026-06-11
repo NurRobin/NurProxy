@@ -78,7 +78,7 @@ export const glossary: Record<string, GlossaryEntry> = {
   server: {
     term: 'Server (upstream)',
     short: 'A backend address an agent proxies to, like 192.168.1.10. Domains point at a server + port.',
-    doc: 'glossary',
+    doc: 'servers',
   },
   agent: {
     term: 'Agent',

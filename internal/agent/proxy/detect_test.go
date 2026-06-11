@@ -8,6 +8,41 @@ import (
 	"testing"
 )
 
+func TestDetect_nginxPopulatesDiscoveredUpstreams(t *testing.T) {
+	restore := stubFS(
+		map[string]bool{"/etc/nginx/sites-available": true, "/etc/nginx": true},
+		map[string]bool{},
+	)
+	defer restore()
+	// stubFS neutralizes gatherNginxConfig; override it with a fixture so we verify
+	// Detect wires discovery through for nginx.
+	gatherNginxConfig = func(string) string {
+		return `server { server_name app.example.com; location / { proxy_pass http://10.0.0.4:8080; } }`
+	}
+
+	d := &Detector{
+		lookPath: func(name string) (string, error) {
+			if name == "nginx" {
+				return "/usr/sbin/nginx", nil
+			}
+			return "", exec.ErrNotFound
+		},
+		run:           func(context.Context, string, ...string) (string, error) { return "nginx version: nginx/1.24.0\n", nil },
+		listListeners: func(context.Context) ([]listener, error) { return nil, nil },
+	}
+	got, err := d.Detect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DiscoveredUpstreams) != 1 {
+		t.Fatalf("expected 1 discovered upstream, got %+v", got.DiscoveredUpstreams)
+	}
+	u := got.DiscoveredUpstreams[0]
+	if u.Host != "10.0.0.4" || u.Port != 8080 {
+		t.Errorf("bad discovered upstream: %+v", u)
+	}
+}
+
 func TestDetect_nginxInstalledPortConflict_reportsAll(t *testing.T) {
 	restore := stubFS(
 		map[string]bool{"/etc/nginx/sites-available": true, "/etc/nginx": true},

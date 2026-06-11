@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"log"
 	"net/http"
 	"strings"
@@ -19,8 +20,17 @@ const (
 	ctxSource  contextKey = "source"
 )
 
-// requireAuth wraps a handler to require authentication.
-// Checks: 1) session cookie, 2) Bearer token (admin API key), 3) agent token.
+// requireAuth wraps an operator-only (admin) handler. It accepts EXACTLY two
+// credentials: 1) a valid admin session cookie (dashboard) or 2) the admin API
+// key as a Bearer token (REST API).
+//
+// It deliberately does NOT accept agent bearer tokens. Every route guarded by
+// requireAuth is operator-only (providers, zones, domains, servers, settings,
+// api-key, audit, agent management). Agent self-endpoints (register, heartbeat,
+// stream, routes/ack, artifact/log/admin-op reporting) use requireAgentAuth
+// instead, which scopes each agent to its own resources. Honoring an agent
+// token here would let any leaked agent credential drive the whole control
+// plane — a privilege escalation to full admin (H1).
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1) Session cookie → dashboard (UI)
@@ -33,29 +43,16 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		// 2) Bearer token — admin API key → REST API
+		// 2) Bearer token — admin API key only → REST API. An agent token is NOT
+		// a substitute here (see the doc comment above); it is rejected so a
+		// leaked agent credential cannot reach admin routes.
 		if token := bearerToken(r); token != "" {
 			apiKey, err := s.db.GetSetting("admin_api_key")
-			if err == nil && apiKey != "" && apiKey == token {
+			if err == nil && apiKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(token)) == 1 {
 				ctx := context.WithValue(r.Context(), ctxActor, "api_key")
 				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
-			}
-
-			// 3) Agent token
-			agents, err := s.db.ListAgents()
-			if err == nil {
-				tokenHash := auth.HashToken(token)
-				for _, a := range agents {
-					if a.TokenHash == tokenHash {
-						ctx := context.WithValue(r.Context(), ctxActor, "agent:"+a.ID)
-						ctx = context.WithValue(ctx, ctxAgentID, a.ID)
-						ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAgent)
-						next.ServeHTTP(w, r.WithContext(ctx))
-						return
-					}
-				}
 			}
 		}
 
@@ -93,13 +90,18 @@ func (s *Server) requireAgentAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// corsMiddleware adds CORS headers.
+// corsMiddleware adds CORS headers. It allows any origin for header-based
+// (Bearer API key) access but deliberately does NOT set
+// Access-Control-Allow-Credentials: a wildcard origin combined with credentials
+// is rejected by browsers anyway, and the dashboard is served from the same
+// origin as the API, so its session cookie never needs a cross-origin grant.
+// Keeping the two consistent removes the misconfiguration without losing any
+// supported access path.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

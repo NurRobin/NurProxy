@@ -413,10 +413,53 @@ var migrations = []string{
 	`
 	ALTER TABLE config_artifacts ADD COLUMN drift_content TEXT NOT NULL DEFAULT '';
 	`,
+
+	// Migration 15: backend targets discovered in an existing nginx config (§52),
+	// stored as a JSON array on the agent row alongside the other detection
+	// columns. Read-only suggestions for Servers; empty until an agent reports them.
+	`
+	ALTER TABLE agents ADD COLUMN detected_upstreams TEXT NOT NULL DEFAULT '';
+	`,
+
+	// Migration 16: IP subnets attached to the agent host's interfaces (§38), a
+	// JSON array alongside the other detection columns. Suggestions for the Server
+	// dialog; empty until an agent reports them.
+	`
+	ALTER TABLE agents ADD COLUMN detected_networks TEXT NOT NULL DEFAULT '';
+	`,
+
+	// Migration 17: track whether NurProxy CREATED a domain's DNS record or merely
+	// ADOPTED a matching pre-existing one. On teardown we must only delete records
+	// we created — deleting an adopted record would destroy DNS the operator owned
+	// before NurProxy ever touched it. Default 0 (not managed) is the safe value
+	// for existing rows: a record whose provenance we don't know is treated as
+	// adopted and never auto-deleted.
+	`
+	ALTER TABLE domains ADD COLUMN dns_managed INTEGER NOT NULL DEFAULT 0;
+	`,
+
+	// Migration 18: IPv6 support. public_ip6 holds the agent's detected public
+	// IPv6 address; dns_record_id6 tracks the provider ID of its AAAA record,
+	// separate from the A record's dns_record_id so each family updates
+	// independently under DDNS. Empty for IPv4-only hosts.
+	`
+	ALTER TABLE agents ADD COLUMN public_ip6     TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN dns_record_id6 TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
 // schema_version table to track which migrations have already run.
+//
+// All pending migrations are applied inside a SINGLE transaction: begin once,
+// apply every version > current and record its schema_version row, then commit
+// once. This is both faster on a fresh database (one WAL fsync instead of one
+// per migration — a cold boot of N migrations no longer pays N fsyncs, which
+// previously pushed first-boot readiness past the sandbox health-wait) and
+// strictly all-or-nothing: any failure rolls the whole batch back, so the
+// schema is never left at a partially-migrated version. Idempotency is
+// preserved — only versions strictly greater than the recorded maximum are
+// applied, so a second call with nothing pending opens no transaction at all.
 func (d *DB) migrate() error {
 	// Ensure the version tracking table exists.
 	if _, err := d.sql.Exec(`
@@ -433,12 +476,17 @@ func (d *DB) migrate() error {
 		return fmt.Errorf("reading schema version: %w", err)
 	}
 
-	for i := current; i < len(migrations); i++ {
-		tx, err := d.sql.Begin()
-		if err != nil {
-			return fmt.Errorf("beginning migration %d: %w", i+1, err)
-		}
+	// Nothing pending — no transaction, no work.
+	if current >= len(migrations) {
+		return nil
+	}
 
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning migrations: %w", err)
+	}
+
+	for i := current; i < len(migrations); i++ {
 		if _, err := tx.Exec(migrations[i]); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("executing migration %d: %w", i+1, err)
@@ -448,10 +496,10 @@ func (d *DB) migrate() error {
 			tx.Rollback()
 			return fmt.Errorf("recording migration %d: %w", i+1, err)
 		}
+	}
 
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("committing migration %d: %w", i+1, err)
-		}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing migrations: %w", err)
 	}
 
 	return nil

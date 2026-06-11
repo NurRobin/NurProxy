@@ -56,25 +56,13 @@ jobs:
         if: steps.guard.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           mkdir -p packages
-          # On a release event the 'published' webhook can fire before GoReleaser
-          # finishes uploading assets — wait (up to 5 min) for this tag's packages.
-          if [ -n "${TAG:-}" ]; then
-            n=0
-            for i in $(seq 1 30); do
-              n=$(gh release view "$TAG" --json assets \
-                    --jq '[.assets[].name | select(endswith(".deb") or endswith(".rpm"))] | length')
-              echo "attempt $i: $n deb/rpm assets on $TAG"
-              [ "$n" -gt 0 ] && break
-              sleep 10
-            done
-            [ "$n" -gt 0 ] || { echo "::error::no .deb/.rpm assets on $TAG after waiting 5m"; exit 1; }
-          fi
-          # Rebuild the repo from every release's packages so it stays complete.
-          for tag in $(gh release list --limit 200 --json tagName --jq '.[].tagName'); do
+          # Rebuild the repo from every STABLE release's packages so it stays
+          # complete. Pre-releases (-rc/-beta) are excluded — an RC's .deb/.rpm
+          # must never enter the stable apt/yum repo; only final tags ship here.
+          for tag in $(gh release list --limit 200 --exclude-pre-releases --json tagName --jq '.[].tagName'); do
             gh release download "$tag" -D packages -p '*.deb' -p '*.rpm' --clobber || true
           done
           count=$(find packages -name '*.deb' -o -name '*.rpm' | wc -l)

@@ -4,11 +4,50 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// sessionVersionSetting holds a monotonically increasing server-side session
+// version. Bumping it (logout / password change) invalidates every outstanding
+// session cookie, because each signed token carries the version it was minted
+// under and Verify rejects anything older. Stored in the settings table.
+const sessionVersionSetting = "session_version"
+
+// secureCookiesSetting gates the Secure attribute on the session cookie. When
+// set to "true"/"1" Secure is forced on; "false"/"0" forces it off. When unset
+// the cookie is Secure exactly when the request arrived over HTTPS (directly or
+// through a TLS-terminating proxy), so HTTPS deployments get Secure automatically
+// while a plain-http deployment reached over its IP keeps working instead of
+// locking the operator out.
+const secureCookiesSetting = "secure_cookies"
+
+// currentSessionVersion reads the server-side session version (0 when unset).
+func (s *Server) currentSessionVersion() int {
+	v, err := s.db.GetSetting(sessionVersionSetting)
+	if err != nil || v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// bumpSessionVersion increments the server-side session version, immediately
+// invalidating every outstanding cookie. Used by logout and change-password so
+// those actions take effect for live tokens rather than only nudging the
+// client-side cookie.
+func (s *Server) bumpSessionVersion() {
+	next := s.currentSessionVersion() + 1
+	if err := s.db.SetSetting(sessionVersionSetting, strconv.Itoa(next)); err != nil {
+		log.Printf("failed to bump session version: %v", err)
+	}
+}
 
 // GET /api/v1/auth/status — returns authentication state.
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -74,7 +113,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create session
-	s.setSessionCookie(w)
+	s.setSessionCookie(w, r)
 
 	// Audit log — bootstrap happens through the dashboard, so source is ui.
 	if err := s.db.InsertAuditLog(&models.AuditLogEntry{
@@ -91,8 +130,17 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "setup complete"})
 }
 
-// POST /api/v1/auth/login — admin login.
+// POST /api/v1/auth/login — admin login. Failed attempts are rate-limited per
+// client IP to blunt online password guessing (bcrypt slows each attempt, but
+// the lockout caps the total).
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if ok, retryAfter := s.loginLimiter.Allow(ip); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many failed login attempts; try again later")
+		return
+	}
+
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -107,16 +155,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	hash, err := s.db.GetSetting("admin_password_hash")
 	if err != nil {
+		s.loginLimiter.Fail(ip)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 
 	if err := auth.CheckPassword(hash, req.Password); err != nil {
+		s.loginLimiter.Fail(ip)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 
-	s.setSessionCookie(w)
+	s.loginLimiter.Reset(ip)
+	s.setSessionCookie(w, r)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged in"})
 }
@@ -161,24 +212,33 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Invalidate every outstanding session so a changed password forces re-login
+	// everywhere (e.g. after a suspected credential compromise).
+	s.bumpSessionVersion()
+
 	s.audit(r, "system", "admin", "change_password", "admin password changed")
 	writeJSON(w, http.StatusOK, map[string]string{"message": "password changed"})
 }
 
-// POST /api/v1/auth/logout — clears session cookie.
+// POST /api/v1/auth/logout — clears the session cookie and invalidates every
+// outstanding session server-side. Clearing the cookie alone only logs out the
+// calling browser; bumping the session version makes any copy of the token
+// (including ones already exfiltrated) fail Verify immediately.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.bumpSessionVersion()
 	http.SetCookie(w, &http.Cookie{
 		Name:     "nurproxy_session",
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   s.useSecureCookies(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out"})
 }
 
-func (s *Server) setSessionCookie(w http.ResponseWriter) {
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request) {
 	token, _ := auth.GenerateSessionToken()
 	signed := s.sessions.Sign(token)
 	d := s.sessionDuration()
@@ -188,9 +248,40 @@ func (s *Server) setSessionCookie(w http.ResponseWriter) {
 		Path:     "/",
 		MaxAge:   int(d.Seconds()),
 		HttpOnly: true,
+		Secure:   s.useSecureCookies(r),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Now().Add(d),
 	})
+}
+
+// useSecureCookies decides whether the session cookie carries the Secure
+// attribute. An explicit secure_cookies setting wins; otherwise Secure tracks
+// whether the request itself arrived over HTTPS. Tying it to the actual scheme
+// (rather than to "non-localhost") means a plain-http deployment reached over
+// its LAN IP still receives a usable cookie, while any HTTPS request, direct or
+// proxied, gets Secure. Trusting X-Forwarded-Proto here is safe: a forged
+// "https" over plain http only marks the cookie Secure, which the same plain-http
+// client then declines to send back, so it can never weaken a real session.
+func (s *Server) useSecureCookies(r *http.Request) bool {
+	if v, err := s.db.GetSetting(secureCookiesSetting); err == nil && v != "" {
+		switch v {
+		case "true", "1":
+			return true
+		case "false", "0":
+			return false
+		}
+	}
+	return requestIsHTTPS(r)
+}
+
+// requestIsHTTPS reports whether the request reached the server over TLS, either
+// on a direct connection or via a TLS-terminating proxy that sets
+// X-Forwarded-Proto.
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // sessionDuration returns the configured session lifetime, read from the

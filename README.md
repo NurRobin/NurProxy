@@ -260,6 +260,40 @@ nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port
 
 Auth comes from `NP_API_KEY` (Bearer) or `NP_API_PASSWORD` (the CLI logs in for you). Add `--json` to any command for script-friendly output. See [wiki/cli.md](wiki/cli.md) for the full command reference.
 
+## Sandbox / dry-run mode
+
+For local development and CI you can run the orchestrator in **dry-run mode**: it runs the full control plane — reconciler, DNS state machine, certificate issuance and renewal — but **simulates every DNS and ACME call instead of executing it**. No live Cloudflare zone, no Let's Encrypt round trips, and no rate-limit risk. DNS mutations land in an in-memory store that reads back correctly (so `create CNAME → present TXT challenge → clean up TXT` sequences behave realistically), and ACME issuance returns a self-signed certificate with a 90-day validity.
+
+```bash
+# Mock everything (DNS + ACME):
+NP_DRY_RUN=true ./nurproxy
+
+# Or per subsystem, for partial testing:
+NP_DNS_DRY_RUN=true ./nurproxy     # mock DNS, real ACME (DNS-01 cannot complete — see note)
+NP_ACME_DRY_RUN=true ./nurproxy    # real DNS, mock ACME
+
+# Exercise issuance error paths without waiting for a real failure:
+NP_ACME_DRY_RUN=true NP_DRY_RUN_FAIL=ratelimit ./nurproxy   # ratelimit | challenge | propagation
+```
+
+Note that `NP_DNS_DRY_RUN` (mock DNS) combined with **real** ACME cannot complete a DNS-01 challenge: the challenge TXT record only lands in the in-memory DNS store and is never published to a resolvable zone, so Let's Encrypt can't validate it. Use that combination for non-issuance DNS testing only; for full TLS flows use `NP_DRY_RUN` (mock both) or `NP_ACME_DRY_RUN` (real DNS, mock ACME).
+
+The `-dry-run` CLI flag is equivalent to `NP_DRY_RUN=true`. Every simulated call is logged and tagged in the audit log with `source: dryrun`, the dashboard shows a persistent **"Dry-run mode"** banner, and `/api/v1/health` reports `dry_run`, `dns_dry_run`, and `acme_dry_run` so there's no confusion with a live instance. Provider setup (validate + list zones) is mocked too, so you can wire up a Cloudflare provider with a dummy token and run the whole flow end-to-end without provisioning anything.
+
+### The agent runs dry too
+
+The agent has its own sandbox mode (`-dry-run` / `NP_DRY_RUN`): the reverse proxy is simulated entirely in-memory — no Caddy subprocess, no `:80`/`:443` binding, no privileged file ops — while registration, adoption, heartbeat, the push stream, and route rendering all run for real. Because nothing binds a port, you can run many agents on one machine. Route rendering still goes through the real renderer, so the artifacts match production built-in Caddy exactly.
+
+```bash
+nurproxy-agent -dry-run -orchestrator http://localhost:8080 -fqdn edge1.example.com
+```
+
+### One command for the whole stack
+
+`make dev-sandbox` builds and launches a dry-run orchestrator plus one or more dry-run agents and seeds a working topology (provider with a dummy token, zone, adopted agents, servers, and central-TLS domains) — a fully populated, "live"-looking environment with zero external calls and zero privileges. Knobs: `AGENTS=3`, `PORT=9000`, `KEEP=0` (tear down after seeding). The launcher lives at [`scripts/dev-sandbox.sh`](scripts/dev-sandbox.sh).
+
+`make test-sandbox` runs the same flow as a self-contained end-to-end test (`test/sandbox`, behind the `sandbox` build tag): it boots both binaries in dry-run, drives the REST API to stand up a central-TLS domain, and asserts the control plane converges (domain active, certificate issued, DNS records simulated, audit tagged `dryrun`) — no secrets, no external dependencies. It also runs in CI.
+
 ## Tech stack
 
 - **Backend**: Go, SQLite (embedded, no CGo), single binary

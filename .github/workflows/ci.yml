@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, 'release/**']
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, 'release/**']
 
 jobs:
   lint:
@@ -46,6 +46,18 @@ jobs:
         with:
           name: coverage
           path: coverage.out
+
+  sandbox:
+    name: Sandbox E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - name: Dry-run end-to-end (no external DNS/ACME, no privileges)
+        run: go test -count=1 -tags=sandbox -timeout=180s ./test/sandbox/...
 
   build:
     name: Build

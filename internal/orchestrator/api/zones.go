@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -116,6 +117,13 @@ func (s *Server) handleCreateZonesBatch(w http.ResponseWriter, r *http.Request) 
 // DELETE /api/v1/zones/{id}
 func (s *Server) handleDeleteZone(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
+
+	// Refuse while domains still reference this zone: the ON DELETE CASCADE would
+	// orphan their DNS records/certs ahead of the reconciler teardown (see
+	// guardChildDomains).
+	if s.guardChildDomains(w, "zone", db.DomainFilter{ZoneID: id}) {
+		return
+	}
 
 	if err := s.db.DeleteZone(id); err != nil {
 		writeError(w, http.StatusNotFound, "zone not found")

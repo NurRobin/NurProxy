@@ -5,7 +5,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, Check, X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv } from '../lib/types';
+import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv, RemediationStep } from '../lib/types';
 import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
 import { isDegraded } from '../lib/status';
@@ -16,6 +16,7 @@ import EmptyState from '../components/EmptyState';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
+import { useHelp } from '../components/help-context';
 import MultiSelect from '../components/MultiSelect';
 import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
@@ -288,7 +289,28 @@ export default function Agents() {
                         {selected.dns_mode === 'ddns' && <Row label={t('agents.ddnsInterval')} value={`${selected.ddns_interval}s`} />}
                         {selected.zones && selected.zones.length > 0 && <Row label={t('agents.zones')} value={selected.zones.map((z) => z.name).join(', ')} />}
                         {selected.public_ip && <Row label={t('agents.ip')} value={selected.public_ip} />}
-                        {selected.version && <Row label={t('agents.version')} value={selected.version} />}
+                        {selected.version && (
+                          <Row
+                            label={t('agents.version')}
+                            value={
+                              <span className="flex items-center gap-2">
+                                {selected.version}
+                                {(selected.version_status === 'outdated' || selected.version_status === 'ahead') && (
+                                  <span
+                                    className={`rounded px-1.5 py-0.5 text-xs font-medium ${
+                                      selected.version_status === 'outdated'
+                                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                                        : 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300'
+                                    }`}
+                                    title={t(`agents.versionStatus.${selected.version_status}Hint`)}
+                                  >
+                                    {t(`agents.versionStatus.${selected.version_status}`)}
+                                  </span>
+                                )}
+                              </span>
+                            }
+                          />
+                        )}
                         <Row
                           label={t('agents.proxyMode')}
                           value={
@@ -655,6 +677,7 @@ function PermissionSelfTest({
   onAdjust: () => void;
 }) {
   const { t } = useTranslation();
+  const { openHelp } = useHelp();
   const ok = perm?.ok ?? true; // no report yet → don't cry wolf
   const steps = perm?.remediation?.steps ?? [];
 
@@ -688,10 +711,30 @@ function PermissionSelfTest({
       {!ok && steps.length > 0 && (
         <div className="space-y-3 rounded-lg border border-border bg-surface-2/40 p-3">
           <p className="text-xs font-medium text-fg-muted">{t('agents.permFixHint')}</p>
+          {/* Why these commands — least-privilege rationale, so an operator
+              understands what they paste as root rather than running it on trust. */}
+          <details className="group rounded-md bg-surface-2/60 p-2">
+            <summary className="cursor-pointer list-none text-xs font-medium text-fg-muted hover:text-fg">
+              <span className="mr-1 inline-block select-none transition-transform group-open:rotate-90">▸</span>
+              {t('agents.permWhyTitle')}
+            </summary>
+            <p className="mt-2 whitespace-pre-line text-xs leading-relaxed text-fg-faint">{t('agents.permWhyBody')}</p>
+            <button
+              type="button"
+              onClick={() => openHelp('existing-proxy-permissions')}
+              className="mt-2 text-xs font-medium text-accent hover:underline"
+            >
+              {t('common.learnMore')}
+            </button>
+          </details>
           {steps.map((s, i) => (
             <div key={i} className="space-y-1.5">
               <p className="text-sm font-medium text-fg">{s.title}</p>
-              <CommandBlock text={s.commands.join('\n')} label={t('agents.permStepLabel', { n: i + 1 })} />
+              <CommandBlock
+                text={s.commands.join('\n')}
+                label={t('agents.permStepLabel', { n: i + 1 })}
+                explanation={stepExplanation(s, t)}
+              />
             </div>
           ))}
         </div>
@@ -702,6 +745,18 @@ function PermissionSelfTest({
       </Button>
     </div>
   );
+}
+
+// stepExplanation returns a plain-language "what does this command do, and why
+// is it scoped this way" note for a remediation step (§54), chosen from the
+// step's content. Empty when we have nothing specific to add (CommandBlock then
+// shows no disclosure).
+function stepExplanation(step: RemediationStep, t: (key: string) => string): string {
+  const hay = (step.title + ' ' + step.commands.join(' ')).toLowerCase();
+  if (hay.includes('readwritepaths') || hay.includes('cap_dac_override')) return t('agents.permExplainSandbox');
+  if (hay.includes('sudoers')) return t('agents.permExplainSudoers');
+  if (hay.includes('groupadd') || hay.includes('chgrp')) return t('agents.permExplainGroup');
+  return '';
 }
 
 // PermCheckLine is one ✓/✗ row of the permission self-test, with an optional

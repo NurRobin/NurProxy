@@ -3,10 +3,12 @@ package cloudflare
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
 )
@@ -25,6 +27,43 @@ func makeConfig(token, zoneID string) json.RawMessage {
 	}
 	b, _ := json.Marshal(cfg)
 	return b
+}
+
+// Deleting a record Cloudflare reports as nonexistent (HTTP 404, API code 81044)
+// must surface as provider.ErrRecordNotFound so callers can treat it as an
+// idempotent no-op — while other error codes stay plain errors.
+func TestDeleteRecord_notFound_mapsToErrRecordNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"success":false,"errors":[{"code":81044,"message":"Record does not exist."}],"result":null}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	err := p.DeleteRecord(context.Background(), makeConfig("tok", "zone1"), "rec-123")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, provider.ErrRecordNotFound) {
+		t.Fatalf("error should wrap provider.ErrRecordNotFound, got %v", err)
+	}
+}
+
+func TestDeleteRecord_otherError_isNotNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"success":false,"errors":[{"code":9109,"message":"Unauthorized"}],"result":null}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	err := p.DeleteRecord(context.Background(), makeConfig("tok", "zone1"), "rec-123")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if errors.Is(err, provider.ErrRecordNotFound) {
+		t.Fatal("a non-81044 error must NOT be treated as record-not-found")
+	}
 }
 
 func TestInfo(t *testing.T) {
@@ -313,5 +352,51 @@ func TestInvalidConfigJSON(t *testing.T) {
 	err := p.ValidateConfig(context.Background(), json.RawMessage(`not json`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
+	}
+}
+
+func TestGetClient(t *testing.T) {
+	configured := &http.Client{Timeout: 5 * time.Second}
+
+	tests := []struct {
+		name        string
+		client      *http.Client
+		wantSame    bool
+		wantTimeout time.Duration
+	}{
+		{
+			name:        "nil client falls back to a client with a non-zero timeout",
+			client:      nil,
+			wantSame:    false,
+			wantTimeout: 30 * time.Second,
+		},
+		{
+			name:        "explicit client is returned unchanged",
+			client:      configured,
+			wantSame:    true,
+			wantTimeout: 5 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &CloudflareProvider{client: tt.client}
+			got := p.getClient()
+			if got == nil {
+				t.Fatal("getClient returned nil")
+			}
+			if tt.wantSame && got != tt.client {
+				t.Errorf("expected the configured client to be returned unchanged")
+			}
+			if !tt.wantSame && got == http.DefaultClient {
+				t.Errorf("expected fallback client, got http.DefaultClient")
+			}
+			if got.Timeout != tt.wantTimeout {
+				t.Errorf("Timeout = %v, want %v", got.Timeout, tt.wantTimeout)
+			}
+			if got.Timeout == 0 {
+				t.Errorf("Timeout must be non-zero to avoid hanging on a black-holing endpoint")
+			}
+		})
 	}
 }

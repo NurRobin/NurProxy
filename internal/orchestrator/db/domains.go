@@ -13,6 +13,7 @@ import (
 type DomainFilter struct {
 	AgentID  string
 	ServerID string
+	ZoneID   string
 	Status   string
 }
 
@@ -43,13 +44,13 @@ func (d *DB) CreateDomain(dom *models.Domain) error {
 	res, err := d.sql.Exec(`
 		INSERT INTO domains (subdomain, zone_id, server_id, port, proxy_config,
 			manual_config, websocket, force_https, ssl_mode, dns_record_id,
-			status, error_msg, last_synced, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			status, error_msg, last_synced, created_at, updated_at, dns_managed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID,
 		string(dom.Status), dom.ErrorMsg, lastSynced,
-		now.Format(time.RFC3339), now.Format(time.RFC3339),
+		now.Format(time.RFC3339), now.Format(time.RFC3339), boolToInt(dom.DNSManaged),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting domain: %w", err)
@@ -69,7 +70,7 @@ func scanDomain(sc interface {
 }) (*models.Domain, error) {
 	var dom models.Domain
 	var pcJSON string
-	var manualConfig, websocket, forceHTTPS int
+	var manualConfig, websocket, forceHTTPS, dnsManaged int
 	var lastSynced sql.NullString
 	var createdAt, updatedAt string
 
@@ -77,7 +78,7 @@ func scanDomain(sc interface {
 		&dom.ID, &dom.Subdomain, &dom.ZoneID, &dom.ServerID, &dom.Port,
 		&pcJSON, &manualConfig, &websocket, &forceHTTPS,
 		&dom.SSLMode, &dom.DNSRecordID, &dom.Status, &dom.ErrorMsg,
-		&lastSynced, &createdAt, &updatedAt,
+		&lastSynced, &createdAt, &updatedAt, &dnsManaged,
 	)
 	if err != nil {
 		return nil, err
@@ -86,6 +87,7 @@ func scanDomain(sc interface {
 	dom.ManualConfig = manualConfig != 0
 	dom.WebSocket = websocket != 0
 	dom.ForceHTTPS = forceHTTPS != 0
+	dom.DNSManaged = dnsManaged != 0
 	dom.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	dom.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	if lastSynced.Valid {
@@ -102,7 +104,7 @@ func scanDomain(sc interface {
 
 const domainColumns = `id, subdomain, zone_id, server_id, port, proxy_config,
 	manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
-	error_msg, last_synced, created_at, updated_at`
+	error_msg, last_synced, created_at, updated_at, dns_managed`
 
 // GetDomain retrieves a domain by its auto-incremented ID.
 func (d *DB) GetDomain(id int64) (*models.Domain, error) {
@@ -130,6 +132,10 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 	if filter.ServerID != "" {
 		conditions = append(conditions, "server_id = ?")
 		args = append(args, filter.ServerID)
+	}
+	if filter.ZoneID != "" {
+		conditions = append(conditions, "zone_id = ?")
+		args = append(args, filter.ZoneID)
 	}
 	if filter.Status != "" {
 		conditions = append(conditions, "status = ?")
@@ -194,12 +200,13 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 		UPDATE domains
 		SET subdomain = ?, zone_id = ?, server_id = ?, port = ?, proxy_config = ?,
 			manual_config = ?, websocket = ?, force_https = ?, ssl_mode = ?,
-			dns_record_id = ?, status = ?, error_msg = ?, last_synced = ?, updated_at = ?
+			dns_record_id = ?, status = ?, error_msg = ?, last_synced = ?, updated_at = ?,
+			dns_managed = ?
 		WHERE id = ?`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID, string(dom.Status), dom.ErrorMsg,
-		lastSynced, dom.UpdatedAt.Format(time.RFC3339), dom.ID,
+		lastSynced, dom.UpdatedAt.Format(time.RFC3339), boolToInt(dom.DNSManaged), dom.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("updating domain: %w", err)
@@ -264,12 +271,58 @@ func (d *DB) MarkDomainSynced(id int64) error {
 	return nil
 }
 
-// UpdateDomainDNSRecord sets the dns_record_id for a domain.
-func (d *DB) UpdateDomainDNSRecord(id int64, recordID string) error {
+// MarkDomainApplied records a successful route apply. For a domain that wants a
+// central-TLS certificate (wantsCentralTLS), it first checks whether one has
+// actually been issued for fqdn: if not, the agent is serving the route over
+// plaintext HTTP (TLS and any force_https redirect were dropped), so the domain
+// is marked "degraded" with an explanatory error rather than a bare "active"
+// that would hide the downgrade (§78). Otherwise the domain is marked active.
+func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) error {
+	if wantsCentralTLS {
+		// Distinguish a genuinely absent certificate (degrade — the route is
+		// served plaintext) from a transient DB read error (propagate — do not
+		// mislabel a healthy domain as degraded). A bare existence probe avoids
+		// the key decryption that GetCertificate performs and lets sql.ErrNoRows
+		// cleanly signal not-found.
+		var dummy int
+		err := d.sql.QueryRow(
+			"SELECT 1 FROM certificates WHERE host = ?", fqdn,
+		).Scan(&dummy)
+		switch {
+		case err == sql.ErrNoRows:
+			now := time.Now().UTC().Format(time.RFC3339)
+			res, xErr := d.sql.Exec(`
+				UPDATE domains SET status = ?, error_msg = ?, last_synced = ?, updated_at = ? WHERE id = ?`,
+				string(models.DomainStatusDegraded),
+				"served over plaintext HTTP — no TLS certificate issued yet; force_https not enforced",
+				now, now, id,
+			)
+			if xErr != nil {
+				return fmt.Errorf("marking domain degraded: %w", xErr)
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return fmt.Errorf("domain not found: %d", id)
+			}
+			return nil
+		case err != nil:
+			return fmt.Errorf("checking central-TLS certificate for %s: %w", fqdn, err)
+		}
+	}
+	return d.MarkDomainSynced(id)
+}
+
+// UpdateDomainDNSRecord stores the provider record id for a domain and records
+// whether NurProxy created that record (managed=true) or adopted a pre-existing
+// matching one (managed=false). Only created records are deleted on teardown.
+func (d *DB) UpdateDomainDNSRecord(id int64, recordID string, managed bool) error {
 	now := time.Now().UTC().Format(time.RFC3339)
+	managedInt := 0
+	if managed {
+		managedInt = 1
+	}
 	res, err := d.sql.Exec(`
-		UPDATE domains SET dns_record_id = ?, updated_at = ? WHERE id = ?`,
-		recordID, now, id,
+		UPDATE domains SET dns_record_id = ?, dns_managed = ?, updated_at = ? WHERE id = ?`,
+		recordID, managedInt, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("updating domain DNS record: %w", err)
@@ -287,7 +340,7 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 	// Qualify all column references with d. to avoid ambiguity with the servers join.
 	qualifiedColumns := `d.id, d.subdomain, d.zone_id, d.server_id, d.port, d.proxy_config,
 		d.manual_config, d.websocket, d.force_https, d.ssl_mode, d.dns_record_id, d.status,
-		d.error_msg, d.last_synced, d.created_at, d.updated_at`
+		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed`
 
 	rows, err := d.sql.Query(`
 		SELECT `+qualifiedColumns+`

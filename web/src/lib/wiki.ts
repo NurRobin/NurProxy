@@ -8,6 +8,9 @@ import existingProxies from '../../../wiki/existing-proxies.md?raw';
 import existingProxyPermissions from '../../../wiki/existing-proxy-permissions.md?raw';
 import security from '../../../wiki/security.md?raw';
 import glossary from '../../../wiki/glossary.md?raw';
+import serversDoc from '../../../wiki/servers.md?raw';
+import troubleshooting from '../../../wiki/troubleshooting.md?raw';
+import cli from '../../../wiki/cli.md?raw';
 
 export interface Topic {
   slug: string;
@@ -21,11 +24,14 @@ export const TOPICS: Topic[] = [
   { slug: 'cloudflare-token', title: 'Cloudflare API token', blurb: 'Exactly which permissions, and where to click.', content: cloudflareToken },
   { slug: 'agent-reachability', title: 'Agent can’t connect', blurb: 'Fix the #1 setup snag: the orchestrator URL.', content: agentReachability },
   { slug: 'agents', title: 'Agents', blurb: 'Register, approve, and manage edge servers.', content: agentsDoc },
+  { slug: 'servers', title: 'Servers', blurb: 'Backends an agent forwards to, and config suggestions.', content: serversDoc },
   { slug: 'domains', title: 'Domains', blurb: 'Proxy a subdomain to a server, plus advanced config.', content: domainsDoc },
   { slug: 'existing-proxies', title: 'Managing existing proxies', blurb: 'Built-in vs Existing, and the apply-code flow.', content: existingProxies },
   { slug: 'existing-proxy-permissions', title: 'Existing-mode permissions', blurb: 'Least-privilege grants for nginx/Apache, no blanket sudo.', content: existingProxyPermissions },
   { slug: 'dns-modes', title: 'DNS modes', blurb: 'Static vs DDNS — which to choose.', content: dnsModes },
   { slug: 'security', title: 'Security', blurb: 'Passwords, tokens, API keys, agent trust.', content: security },
+  { slug: 'cli', title: 'CLI', blurb: 'Headless setup and the apply-code flow from a shell.', content: cli },
+  { slug: 'troubleshooting', title: 'Troubleshooting', blurb: 'The problems people actually hit, and where to look.', content: troubleshooting },
   { slug: 'glossary', title: 'Glossary', blurb: 'Every term in one place.', content: glossary },
 ];
 
