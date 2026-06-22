@@ -89,7 +89,7 @@ func Open(dbPath string, cryptoKey []byte) (*DB, error) {
 	// Migrations are writes — run them on the writer before the reader pool serves
 	// any query, so a fresh database's schema exists by the time reads arrive.
 	if err := d.migrate(); err != nil {
-		d.Close()
+		_ = d.Close() // best-effort cleanup; the migration error is what matters
 		return nil, fmt.Errorf("running migrations: %w", err)
 	}
 
