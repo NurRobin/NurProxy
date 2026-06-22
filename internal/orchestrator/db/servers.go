@@ -41,7 +41,7 @@ func scanServer(sc interface {
 
 // GetServer retrieves a server by ID.
 func (d *DB) GetServer(id string) (*models.Server, error) {
-	row := d.sql.QueryRow(`
+	row := d.read.QueryRow(`
 		SELECT id, agent_id, name, address, notes, created_at
 		FROM servers WHERE id = ?`, id)
 
@@ -57,7 +57,7 @@ func (d *DB) GetServer(id string) (*models.Server, error) {
 
 // ListServersByAgent returns all servers belonging to the given agent.
 func (d *DB) ListServersByAgent(agentID string) ([]models.Server, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, agent_id, name, address, notes, created_at
 		FROM servers WHERE agent_id = ? ORDER BY created_at`, agentID)
 	if err != nil {
