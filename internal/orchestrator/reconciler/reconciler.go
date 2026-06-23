@@ -149,7 +149,7 @@ func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertB
 		if cErr != nil {
 			continue // not issued yet; installs on a later push
 		}
-		bundles = append(bundles, proxymodel.CertBundle{Host: cert.Host, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM})
+		bundles = append(bundles, proxymodel.CertBundle{Host: cert.Host, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM, MaterializeKey: true})
 		if dom.Status != models.DomainStatusActive {
 			if uErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusActive, ""); uErr != nil {
 				log.Printf("reconciler: failed to mark cert-only domain %d active: %v", dom.ID, uErr)
@@ -1214,6 +1214,21 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 				log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)
 			} else {
 				r.audit("config_artifact", artifactID, "remove", "domain deleted")
+			}
+		}
+
+		// Remove the central certificate for this host, so the renewal scan does not
+		// keep renewing a cert for a domain that no longer exists (wasting ACME
+		// quota). Best-effort and gated on existence (not every domain has a central
+		// cert: self-acme/off have none). Mirrors the artifact cleanup above.
+		if zone, zErr := r.db.GetZone(dom.ZoneID); zErr == nil {
+			fqdn := dom.FQDN(zone.Name)
+			if _, cErr := r.db.GetCertificate(fqdn); cErr == nil {
+				if dErr := r.db.DeleteCertificate(fqdn); dErr != nil {
+					log.Printf("reconciler: failed to delete cert for %s on domain %d teardown: %v", fqdn, dom.ID, dErr)
+				} else {
+					r.audit("certificate", fqdn, "remove", "domain deleted")
+				}
 			}
 		}
 

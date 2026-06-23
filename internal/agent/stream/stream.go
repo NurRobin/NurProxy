@@ -615,9 +615,10 @@ func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle
 	bundles := make([]proxy.CertBundle, 0, len(certs))
 	for _, cb := range certs {
 		bundles = append(bundles, proxy.CertBundle{
-			Host:    cb.Host,
-			CertPEM: []byte(cb.CertPEM),
-			KeyPEM:  []byte(cb.KeyPEM),
+			Host:           cb.Host,
+			CertPEM:        []byte(cb.CertPEM),
+			KeyPEM:         []byte(cb.KeyPEM),
+			MaterializeKey: cb.MaterializeKey,
 		})
 	}
 	if err := c.caddy.InstallCerts(ctx, bundles); err != nil {

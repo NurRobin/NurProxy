@@ -72,6 +72,12 @@ type CertBundle struct {
 	// KeyPEM is the private key in PEM form (sensitive; encrypted at rest by the
 	// agent after install).
 	KeyPEM string `json:"key_pem"`
+	// MaterializeKey asks the agent to also write the decrypted private key in
+	// plaintext (.key.plain) so a hand-written config can read it. Set for
+	// cert-only hosts (§7), where NurProxy renders no vhost and would otherwise
+	// only leave the at-rest-encrypted key — useless to the operator. Off for
+	// normal routes, where the key is materialized transiently during render.
+	MaterializeKey bool `json:"materialize_key,omitempty"`
 }
 
 // ArtifactReport is the agent's atomic apply-ACK for one artifact: the rendered

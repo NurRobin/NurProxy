@@ -57,6 +57,11 @@ type Bundle struct {
 	CertPEM []byte
 	// KeyPEM is the private key (sensitive; encrypted at rest if a key is given).
 	KeyPEM []byte
+	// MaterializePlain also writes the decrypted private key to <host>.key.plain on
+	// install, so a hand-written config can read it. Used for cert-only hosts that
+	// have no rendered vhost to materialize it via CertPaths (§7). Otherwise the
+	// plaintext key is materialized only transiently during a backend render.
+	MaterializePlain bool
 }
 
 // InstalledPaths reports where a bundle's files landed, returned by Install so a
@@ -133,6 +138,16 @@ func (s *Store) Install(b Bundle) (InstalledPaths, error) {
 	}
 	if err := writeAtomic(keyPath, keyBytes, keyMode); err != nil {
 		return InstalledPaths{}, fmt.Errorf("certstore: writing key for %q: %w", b.Host, err)
+	}
+
+	// Cert-only hosts (§7) have no rendered vhost to materialize the plaintext key,
+	// so write it here on install — the operator's hand-written config reads it. The
+	// documented stable path is <host>.key.plain regardless of at-rest encryption.
+	if b.MaterializePlain {
+		plainPath := filepath.Join(s.dir, base+keyMaterializedSuffix)
+		if err := writeAtomic(plainPath, b.KeyPEM, keyMode); err != nil {
+			return InstalledPaths{}, fmt.Errorf("certstore: materializing plaintext key for %q: %w", b.Host, err)
+		}
 	}
 
 	return InstalledPaths{CertPath: certPath, KeyPath: keyPath, Encrypted: encrypted}, nil

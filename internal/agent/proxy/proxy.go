@@ -214,4 +214,8 @@ type CertBundle struct {
 	CertPEM []byte `json:"cert_pem"`
 	// KeyPEM is the private key in PEM form (sensitive).
 	KeyPEM []byte `json:"key_pem"`
+	// MaterializeKey asks the backend to also write the decrypted plaintext key
+	// (.key.plain) so a hand-written config can read it — for cert-only hosts that
+	// have no rendered vhost to materialize it transiently (§7).
+	MaterializeKey bool `json:"materialize_key,omitempty"`
 }
