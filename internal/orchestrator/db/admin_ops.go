@@ -90,7 +90,7 @@ func (d *DB) CreateAdminOp(ctx context.Context, agentID, opType, payloadJSON, co
 
 // GetAdminOp retrieves a single admin op by ID.
 func (d *DB) GetAdminOp(ctx context.Context, id string) (*models.AgentAdminOp, error) {
-	row := d.sql.QueryRowContext(ctx,
+	row := d.read.QueryRowContext(ctx,
 		"SELECT "+adminOpColumns+" FROM agent_admin_ops WHERE id = ?", id,
 	)
 	op, err := scanAdminOp(row)
@@ -120,7 +120,7 @@ func (d *DB) ListPendingAdminOps(ctx context.Context, agentID string) ([]models.
 		return nil, fmt.Errorf("expiring stale admin ops: %w", err)
 	}
 
-	rows, err := d.sql.QueryContext(ctx,
+	rows, err := d.read.QueryContext(ctx,
 		"SELECT "+adminOpColumns+` FROM agent_admin_ops
 		WHERE agent_id = ? AND status = ?
 		ORDER BY created_at DESC, id`,

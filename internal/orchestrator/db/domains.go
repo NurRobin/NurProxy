@@ -108,7 +108,7 @@ const domainColumns = `id, subdomain, zone_id, server_id, port, proxy_config,
 
 // GetDomain retrieves a domain by its auto-incremented ID.
 func (d *DB) GetDomain(id int64) (*models.Domain, error) {
-	row := d.sql.QueryRow(
+	row := d.read.QueryRow(
 		"SELECT "+domainColumns+" FROM domains WHERE id = ?", id,
 	)
 
@@ -157,7 +157,7 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 	}
 	query += " ORDER BY created_at"
 
-	rows, err := d.sql.Query(query, args...)
+	rows, err := d.read.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing domains: %w", err)
 	}
@@ -285,7 +285,7 @@ func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) erro
 		// the key decryption that GetCertificate performs and lets sql.ErrNoRows
 		// cleanly signal not-found.
 		var dummy int
-		err := d.sql.QueryRow(
+		err := d.read.QueryRow(
 			"SELECT 1 FROM certificates WHERE host = ?", fqdn,
 		).Scan(&dummy)
 		switch {
@@ -342,7 +342,7 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 		d.manual_config, d.websocket, d.force_https, d.ssl_mode, d.dns_record_id, d.status,
 		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed`
 
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT `+qualifiedColumns+`
 		FROM domains d
 		JOIN servers s ON d.server_id = s.id

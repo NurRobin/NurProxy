@@ -269,7 +269,7 @@ func boolToInt(b bool) int {
 
 // GetAgent retrieves an agent by ID.
 func (d *DB) GetAgent(id string) (*models.Agent, error) {
-	row := d.sql.QueryRow(
+	row := d.read.QueryRow(
 		"SELECT "+agentColumns+" FROM agents WHERE id = ?", id)
 
 	a, err := scanAgent(row)
@@ -284,7 +284,7 @@ func (d *DB) GetAgent(id string) (*models.Agent, error) {
 
 // GetAgentByFQDN retrieves an agent by its unique FQDN.
 func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
-	row := d.sql.QueryRow(
+	row := d.read.QueryRow(
 		"SELECT "+agentColumns+" FROM agents WHERE fqdn = ?", fqdn)
 
 	a, err := scanAgent(row)
@@ -299,7 +299,7 @@ func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
 
 // ListAgents returns all agents ordered by creation time.
 func (d *DB) ListAgents() ([]models.Agent, error) {
-	rows, err := d.sql.Query(
+	rows, err := d.read.Query(
 		"SELECT " + agentColumns + " FROM agents ORDER BY created_at")
 	if err != nil {
 		return nil, fmt.Errorf("listing agents: %w", err)
@@ -618,7 +618,7 @@ func (d *DB) SetAgentDNSError(id, dnsError string) error {
 
 // ListPendingAgents returns all agents with status "pending".
 func (d *DB) ListPendingAgents() ([]models.Agent, error) {
-	rows, err := d.sql.Query(
+	rows, err := d.read.Query(
 		"SELECT "+agentColumns+" FROM agents WHERE status = ? ORDER BY created_at",
 		string(models.AgentStatusPending))
 	if err != nil {

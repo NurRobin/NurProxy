@@ -5,13 +5,28 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"runtime"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
 
-// DB wraps a SQLite connection and an encryption key for provider configs.
+// DB wraps the SQLite connection pools and an encryption key for provider
+// configs.
+//
+// SQLite (WAL) allows exactly one writer but any number of concurrent readers.
+// We model that with two pools: a single-connection WRITER pool that serializes
+// every mutation (so write-write races never hit the WAL lock), and a
+// multi-connection READER pool for SELECTs that proceed in parallel. Without the
+// split, the whole orchestrator — reconciler reads, every agent heartbeat/ACK,
+// the dashboard — funnels through one connection, and a busy reconciler cycle
+// (many per-domain reads interleaved with slow DNS/agent calls) starves agent
+// heartbeats long enough that the agent's 15s client times out and reports the
+// orchestrator as unreachable. Reads MUST go through d.read; writes (and
+// transactions) MUST go through d.sql.
 type DB struct {
-	sql       *sql.DB
+	sql       *sql.DB // writer pool: single connection, serializes all mutations
+	read      *sql.DB // reader pool: concurrent SELECTs (WAL readers never block)
 	cryptoKey []byte
 }
 
@@ -47,22 +62,75 @@ func Open(dbPath string, cryptoKey []byte) (*DB, error) {
 		return nil, fmt.Errorf("enabling WAL: %w", err)
 	}
 
+	// Reader pool: a SECOND handle to the same file, used only for SELECTs, with
+	// several connections so reads run concurrently (WAL readers never block the
+	// writer or each other) instead of queueing behind the single writer.
+	//
+	// Exception — an in-memory database (":memory:") lives inside ONE connection:
+	// a separate pool would open its own, empty database and every read would fail
+	// with "no such table". There is also no concurrency to win for an in-memory
+	// DB (only tests use it). So in that case the reader shares the writer pool.
+	readDB := sqlDB
+	if !isInMemory(dbPath) {
+		readDB, err = sql.Open("sqlite", dsn)
+		if err != nil {
+			sqlDB.Close()
+			return nil, fmt.Errorf("opening reader pool: %w", err)
+		}
+		readDB.SetMaxOpenConns(readPoolSize())
+	}
+
 	d := &DB{
 		sql:       sqlDB,
+		read:      readDB,
 		cryptoKey: cryptoKey,
 	}
 
+	// Migrations are writes — run them on the writer before the reader pool serves
+	// any query, so a fresh database's schema exists by the time reads arrive.
 	if err := d.migrate(); err != nil {
-		sqlDB.Close()
+		_ = d.Close() // best-effort cleanup; the migration error is what matters
 		return nil, fmt.Errorf("running migrations: %w", err)
 	}
 
 	return d, nil
 }
 
-// Close closes the underlying database connection.
+// isInMemory reports whether dbPath addresses a SQLite in-memory database, which
+// cannot be shared across separate connection pools.
+func isInMemory(dbPath string) bool {
+	return dbPath == ":memory:" ||
+		strings.Contains(dbPath, ":memory:") ||
+		strings.Contains(dbPath, "mode=memory")
+}
+
+// readPoolSize caps the reader pool to the host's CPU count, clamped to a sane
+// [4, 8] range: enough for the orchestrator's concurrent heartbeat/ACK/dashboard
+// reads without spending a file descriptor and WAL read-mark per idle core.
+func readPoolSize() int {
+	n := runtime.NumCPU()
+	switch {
+	case n < 4:
+		return 4
+	case n > 8:
+		return 8
+	default:
+		return n
+	}
+}
+
+// Close closes the underlying database connection pools. For an in-memory
+// database the reader shares the writer pool, so it is closed only once.
 func (d *DB) Close() error {
-	return d.sql.Close()
+	var rerr error
+	if d.read != nil && d.read != d.sql {
+		rerr = d.read.Close()
+	}
+	werr := d.sql.Close()
+	if werr != nil {
+		return werr
+	}
+	return rerr
 }
 
 // Ping verifies the database is reachable and responsive by running a trivial
