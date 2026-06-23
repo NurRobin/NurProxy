@@ -94,8 +94,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 19 {
-		t.Fatalf("this test pins the schema target at 19 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 20 {
+		t.Fatalf("this test pins the schema target at 20 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -132,6 +132,17 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if dnsManaged != 0 {
 			t.Errorf("domains.dns_managed = %d, want 0 (default on pre-existing row)", dnsManaged)
+		}
+	})
+
+	// migration 20: domains.cert_only INTEGER default 0.
+	t.Run("domain_cert_only_default", func(t *testing.T) {
+		var certOnly int
+		if err := d.sql.QueryRow("SELECT cert_only FROM domains WHERE id=1").Scan(&certOnly); err != nil {
+			t.Fatalf("select cert_only: %v", err)
+		}
+		if certOnly != 0 {
+			t.Errorf("domains.cert_only = %d, want 0 (default on pre-existing row)", certOnly)
 		}
 	})
 

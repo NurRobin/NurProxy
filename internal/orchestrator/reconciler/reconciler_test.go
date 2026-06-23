@@ -1745,3 +1745,53 @@ func TestReconcileDeletions_KeepsAdoptedRecord(t *testing.T) {
 		t.Error("expected domain row to be removed even though the adopted record was kept")
 	}
 }
+
+// TestCertOnly_excludedFromRoutesAndCertGathered asserts a cert-only domain (§7)
+// gets its certificate gathered for the agent push and flips active, but is never
+// rendered as a route (no vhost — the operator hand-writes the config).
+func TestCertOnly_excludedFromRoutesAndCertGathered(t *testing.T) {
+	d := testDB(t)
+	_, zone, agent, srv, _ := setupScenario(t, d)
+
+	co := &models.Domain{
+		Subdomain: "certonly", ZoneID: zone.ID, ServerID: srv.ID,
+		SSLMode: models.SSLModeAuto, CertOnly: true, Status: models.DomainStatusPending,
+	}
+	if err := d.CreateDomain(co); err != nil {
+		t.Fatalf("CreateDomain: %v", err)
+	}
+	fqdn := co.FQDN(zone.Name)
+	if err := d.UpsertCertificate(&models.Certificate{ID: "c-certonly", Host: fqdn, Names: []string{fqdn}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	// Excluded from the route set.
+	desired, _, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes: %v", err)
+	}
+	if _, ok := desired[fqdn]; ok {
+		t.Error("cert-only domain must not be rendered as a route")
+	}
+
+	// Its cert is gathered and the domain flips active.
+	bundles := r.gatherCertOnlyCerts(agent)
+	found := false
+	for _, b := range bundles {
+		if b.Host == fqdn {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("cert-only cert should be gathered, got %+v", bundles)
+	}
+	got, err := d.GetDomain(co.ID)
+	if err != nil {
+		t.Fatalf("GetDomain: %v", err)
+	}
+	if got.Status != models.DomainStatusActive {
+		t.Errorf("cert-only domain status = %q, want active after cert gathered", got.Status)
+	}
+}

@@ -49,6 +49,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		ForceHTTPS  bool                `json:"force_https"`
 		SSLMode     models.SSLMode      `json:"ssl_mode"`
 		ProxyConfig *models.ProxyConfig `json:"proxy_config"`
+		// CertOnly issues + renews a cert for this host and installs it on the
+		// agent without serving a vhost (§7). No upstream/port is needed.
+		CertOnly bool `json:"cert_only"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -63,7 +66,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Port <= 0 || req.Port > 65535 {
+	// A cert-only domain proxies nothing, so no port is required. A served domain
+	// needs a valid upstream port.
+	if !req.CertOnly && (req.Port <= 0 || req.Port > 65535) {
 		writeError(w, http.StatusBadRequest, "port must be between 1 and 65535")
 		return
 	}
@@ -102,6 +107,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		WebSocket:  req.WebSocket,
 		ForceHTTPS: req.ForceHTTPS,
 		SSLMode:    sslMode,
+		CertOnly:   req.CertOnly,
 		Status:     models.DomainStatusPending,
 	}
 
