@@ -1097,6 +1097,11 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
 		t.Fatalf("UpdateDomainStatus: %v", err)
 	}
+	// The domain has a central cert; teardown must delete its row too so the
+	// renewal scan stops renewing a cert for a domain that no longer exists.
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -1133,6 +1138,10 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	// Domain row gone.
 	if _, err := d.GetDomain(dom.ID); err == nil {
 		t.Error("expected domain row to be deleted")
+	}
+	// Central cert row gone (no orphaned cert renewing forever).
+	if _, err := d.GetCertificate("app.example.com"); err == nil {
+		t.Error("expected the domain's certificate row to be deleted on teardown")
 	}
 	// Audit trail recorded the deletion.
 	entries, _, _ := d.ListAuditLog(20, 0)
