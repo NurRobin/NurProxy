@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,7 +22,8 @@ import (
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/apache" // registers the apache backend in the proxy registry
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
-	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // registers the nginx backend in the proxy registry
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/generic" // registers the custom (template) backend in the proxy registry
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"   // registers the nginx backend in the proxy registry
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 
@@ -300,7 +302,11 @@ func main() {
 	// existing with no process restart. While nobody calls Reconfigure the Holder
 	// forwards every call to this same caddy backend, so the built-in path stays
 	// byte-for-byte identical (invariant #1).
-	holder := proxy.NewHolder(caddyBackend, string(cfg.ProxyMode))
+	holder := proxy.NewHolder(caddyBackend, string(cfg.ProxyMode)).
+		// Allow the operator's local custom-engine command binaries past cmdguard
+		// (§9). Empty for the native engines, so the built-in allow-list still
+		// governs every network-supplied override.
+		WithAllowedCommands(cfg.ProxyAllowedCommands)
 	// Guard the invariant: the bundled caddy backend must satisfy the admin-API
 	// primitives the Holder forwards, so wrapping it in the Holder is a transparent
 	// pass-through (not a silent no-op). This is a compile-time check via the
@@ -381,7 +387,7 @@ func main() {
 	// the next beat instead of silently reverting to built-in. Fail-soft: a missing
 	// grant is reported via health, never crashes. Built-in mode skips this entirely.
 	if existingMode {
-		res := holder.Reconfigure(ctx, proxy.ReconfigureRequest{
+		req := proxy.ReconfigureRequest{
 			Mode:      "existing",
 			Type:      cfg.ProxyType,
 			ConfigDir: cfg.ProxyConfigDir,
@@ -390,7 +396,22 @@ func main() {
 			TestCmd:   cfg.ProxyTestCmd,
 			Service:   cfg.ProxyService,
 			LogPaths:  cfg.ProxyLogPaths,
-		}, reconfigureDeps)
+		}
+		// Custom engine (§9): resolve the operator's template (inline or file) and
+		// declared capabilities locally, then drive the same hot-switch path. These
+		// are set only here (local startup), never by the network handlers — custom
+		// engines stay local-only.
+		if cfg.ProxyType == string(proxy.KindCustom) {
+			tmpl, terr := resolveCustomTemplate(cfg)
+			if terr != nil {
+				log.Printf("WARNING: custom proxy: %v", terr)
+				hs.SetError(fmt.Sprintf("custom proxy: %v", terr))
+			}
+			req.Template = tmpl
+			req.FileExt = cfg.ProxyFileExt
+			req.DeclaredCaps = declaredCapsFromNames(cfg.ProxyCaps)
+		}
+		res := holder.Reconfigure(ctx, req, reconfigureDeps)
 		log.Printf("Existing mode honored at startup: %s", res.Message)
 	}
 
@@ -559,4 +580,57 @@ func toRuntimeEnv(env runtimeenv.Env) *models.RuntimeEnv {
 func detectCapabilities() *models.ProxyCapabilities {
 	b := caddybackend.New(caddy.NewMockClient())
 	return b.Capabilities().ToModel()
+}
+
+// resolveCustomTemplate returns the custom engine's route template: the inline
+// proxy_template if set, otherwise the contents of proxy_template_file. An error
+// is returned when neither is configured or the file cannot be read; the caller
+// surfaces it via health and the backend's New() then rejects the empty template
+// (so a misconfigured custom engine fails loudly, never silently serves nothing).
+func resolveCustomTemplate(cfg *agentconfig.Config) (string, error) {
+	if strings.TrimSpace(cfg.ProxyTemplate) != "" {
+		return cfg.ProxyTemplate, nil
+	}
+	if cfg.ProxyTemplateFile == "" {
+		return "", fmt.Errorf("proxy_type=custom requires proxy_template or proxy_template_file")
+	}
+	data, err := os.ReadFile(cfg.ProxyTemplateFile)
+	if err != nil {
+		return "", fmt.Errorf("reading proxy_template_file %q: %w", cfg.ProxyTemplateFile, err)
+	}
+	return string(data), nil
+}
+
+// declaredCapsFromNames maps the operator's declared capability names (§8) onto a
+// proxy.Capabilities. Reverse proxy is always implied. An empty list yields the
+// safe default (reverse proxy + central TLS); a non-empty list is taken as the
+// authoritative set the operator asserts their template supports. Unknown names
+// are ignored.
+func declaredCapsFromNames(names []string) *proxy.Capabilities {
+	c := proxy.Capabilities{ReverseProxy: true, CentralTLS: true}
+	if len(names) == 0 {
+		return &c
+	}
+	c.CentralTLS = false // an explicit declaration replaces the default set
+	for _, n := range names {
+		switch strings.ToLower(strings.TrimSpace(n)) {
+		case "websocket":
+			c.WebSocket = true
+		case "force_https", "forcehttps":
+			c.ForceHTTPS = true
+		case "custom_headers", "customheaders":
+			c.CustomHeaders = true
+		case "path_rewrite", "pathrewrite":
+			c.PathRewrite = true
+		case "basic_auth", "basicauth":
+			c.BasicAuth = true
+		case "ip_filter", "ipfilter":
+			c.IPFilter = true
+		case "rate_limit", "ratelimit":
+			c.RateLimit = true
+		case "central_tls", "centraltls":
+			c.CentralTLS = true
+		}
+	}
+	return &c
 }

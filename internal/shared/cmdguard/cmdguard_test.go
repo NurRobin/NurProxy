@@ -54,6 +54,28 @@ func TestValidateProxyCommand(t *testing.T) {
 	}
 }
 
+func TestValidateProxyCommand_extraAllowed(t *testing.T) {
+	// A custom engine binary is rejected by the built-in list...
+	if err := ValidateProxyCommand("proxy_test_cmd", "haproxy -c -f /etc/haproxy/haproxy.cfg"); err == nil {
+		t.Error("haproxy should be rejected without a local allow-list entry")
+	}
+	// ...but accepted when the local operator opted it in.
+	if err := ValidateProxyCommand("proxy_test_cmd", "haproxy -c -f /etc/haproxy/haproxy.cfg", "haproxy"); err != nil {
+		t.Errorf("haproxy should be accepted when allow-listed, got %v", err)
+	}
+	// The allow-list never overrides the sudo refusal.
+	if err := ValidateProxyCommand("proxy_reload_cmd", "sudo haproxy -sf", "haproxy"); err == nil {
+		t.Error("sudo must still be refused even with an allow-list")
+	}
+	// ValidateProxyBinary honors the same opt-in.
+	if err := ValidateProxyBinary("/usr/sbin/haproxy", "haproxy"); err != nil {
+		t.Errorf("allow-listed binary should pass, got %v", err)
+	}
+	if err := ValidateProxyBinary("/usr/sbin/haproxy"); err == nil {
+		t.Error("non-allow-listed custom binary should be rejected")
+	}
+}
+
 func TestValidateConfigDir(t *testing.T) {
 	if err := ValidateConfigDir(""); err != nil {
 		t.Errorf("empty config dir should pass: %v", err)
