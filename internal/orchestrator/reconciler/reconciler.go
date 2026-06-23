@@ -550,8 +550,24 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		return nil
 	}
 
+	// The inbound fallback authenticates with the agent's plaintext token
+	// (decrypted from the master-key-encrypted store). The stored hash is no
+	// longer a credential — accepting it made the hash pass-equivalent and a DB
+	// leak yielded working agent credentials.
+	agentToken, err := r.db.GetAgentToken(agent.ID)
+	if err != nil {
+		return fmt.Errorf("loading inbound credentials for agent %s: %w", agent.ID, err)
+	}
+	if agentToken == "" {
+		// Pre-migration row that has not heartbeated since: no inbound
+		// credentials yet. The agent-dialed stream remains the control path;
+		// the token backfills on its next authenticated request.
+		log.Printf("reconciler: agent %s has no stored inbound token yet; skipping inbound sync", agent.ID)
+		return nil
+	}
+
 	// Get actual routes from the agent.
-	actualRoutes, err := r.agentClient.GetRoutes(ctx, agent.APIURL, agent.TokenHash)
+	actualRoutes, err := r.agentClient.GetRoutes(ctx, agent.APIURL, agentToken)
 	if err != nil {
 		return fmt.Errorf("getting routes from agent %s: %w", agent.ID, err)
 	}
@@ -571,7 +587,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if !exists {
 			// Missing on agent — push it.
 			log.Printf("reconciler: pushing missing route for %s to agent %s", fqdn, agent.ID)
-			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agent.TokenHash, desired.route); pErr != nil {
+			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 				log.Printf("reconciler: failed to push route for %s: %v", fqdn, pErr)
 				if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("route push failed: %v", pErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
@@ -606,7 +622,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 
 		// Push corrected route.
 		log.Printf("reconciler: fixing drift for %s on agent %s", fqdn, agent.ID)
-		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agent.TokenHash, desired.route); pErr != nil {
+		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 			log.Printf("reconciler: failed to fix drift for %s: %v", fqdn, pErr)
 			if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("drift fix failed: %v", pErr)); dErr != nil {
 				log.Printf("reconciler: failed to update domain status: %v", dErr)

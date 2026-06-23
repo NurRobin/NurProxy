@@ -78,10 +78,12 @@ func TestAuthMiddlewareValidToken(t *testing.T) {
 	}
 }
 
-func TestAuthMiddlewareAcceptsHashedToken(t *testing.T) {
-	// The orchestrator only stores the hashed token and presents that hash as
-	// the bearer token. The agent must accept it, otherwise every reconciler
-	// route push is rejected with 403.
+func TestAuthMiddlewareRejectsHashedToken(t *testing.T) {
+	// The stored SHA-256 hash is NOT a credential. Accepting it (as the agent
+	// once did, because the orchestrator persisted nothing else) made the hash
+	// pass-equivalent: a leaked orchestrator DB yielded working API credentials
+	// for every agent. The orchestrator now keeps the token encrypted at rest and
+	// presents the plaintext, so the agent must reject the bare hash with 403.
 	s := newTestServer()
 
 	called := false
@@ -96,8 +98,8 @@ func TestAuthMiddlewareAcceptsHashedToken(t *testing.T) {
 
 	handler(w, req)
 
-	if !called || w.Code != http.StatusOK {
-		t.Errorf("agent rejected the hashed token: called=%v code=%d", called, w.Code)
+	if called || w.Code != http.StatusForbidden {
+		t.Errorf("agent accepted the hashed token (should reject): called=%v code=%d, want code=%d", called, w.Code, http.StatusForbidden)
 	}
 }
 
