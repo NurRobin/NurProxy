@@ -1,0 +1,6 @@
+{
+  "orchestrator_url": "http://localhost:8099",
+  "fqdn": "edge1.sandbox.test",
+  "api_port": 8781,
+  "agent_id": "a11d08a1-c6b1-4c81-b00c-d1904b55fff3"
+}

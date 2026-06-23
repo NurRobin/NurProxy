@@ -1,0 +1,63 @@
+time=2026-06-23T14:49:20.913Z level=INFO msg="nurproxy-agent v0.3.0-15-g4486c02 starting" component=agent
+time=2026-06-23T14:49:20.913Z level=INFO msg="  Orchestrator: http://localhost:8099" component=agent
+time=2026-06-23T14:49:20.913Z level=INFO msg="  FQDN:         edge1.sandbox.test" component=agent
+time=2026-06-23T14:49:20.913Z level=INFO msg="  Data dir:     /home/main/nurproxy/.dev-sandbox/agent1" component=agent
+time=2026-06-23T14:49:20.913Z level=INFO msg="  API port:     8781" component=agent
+time=2026-06-23T14:49:20.913Z level=INFO msg="  Caddy admin:  2019" component=agent
+time=2026-06-23T14:49:20.913Z level=INFO msg="  Proxy mode:   built-in" component=agent
+time=2026-06-23T14:49:20.913Z level=INFO msg="  DRY-RUN:      proxy simulated in-memory — no Caddy process, no :80/:443, no privileged file ops" component=agent
+time=2026-06-23T14:49:20.928Z level=INFO msg="Proxy detection: installed=false kind=\"\" version=\"\" config_dir=\"\"" component=agent
+time=2026-06-23T14:49:20.928Z level=INFO msg="Proxy capabilities: rate_limit=false central_tls=true" component=agent
+time=2026-06-23T14:49:20.928Z level=INFO msg="Agent ID: a11d08a1-c6b1-4c81-b00c-d1904b55fff3" component=agent
+time=2026-06-23T14:49:20.928Z level=INFO msg="Agent Token: sha256:fdf65f6fccb4… (full token in the agent state file)" component=agent
+time=2026-06-23T14:49:21.683Z level=INFO msg="Registered agent a11d08a1-c6b1-4c81-b00c-d1904b55fff3 with orchestrator" component=agent
+time=2026-06-23T14:49:21.683Z level=INFO msg="Waiting for adoption... (agent ID: a11d08a1-c6b1-4c81-b00c-d1904b55fff3)" component=agent
+time=2026-06-23T14:49:26.688Z level=INFO msg="Agent adopted (status: adopted)" component=agent
+time=2026-06-23T14:49:26.688Z level=INFO msg="Dry-run: not starting the bundled Caddy (proxy simulated in-memory)" component=agent
+time=2026-06-23T14:49:26.688Z level=INFO msg="Agent is running. Press Ctrl+C to stop." component=agent
+time=2026-06-23T14:49:26.688Z level=INFO msg="Agent API listening on 127.0.0.1:8781" component=agent
+time=2026-06-23T14:49:26.689Z level=INFO msg="Stream: connected to orchestrator" component=agent
+time=2026-06-23T14:49:27.561Z level=INFO msg="caddy: installed central cert bundle" component=agent host=app1.sandbox.test cert_path=/home/main/nurproxy/.dev-sandbox/agent1/certs/app1.sandbox.test.crt key_encrypted_at_rest=true
+time=2026-06-23T14:49:27.561Z level=INFO msg="Stream: installed 1 cert bundle(s) before apply" component=agent
+time=2026-06-23T14:49:27.561Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:49:27.561Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:49:27.770Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:49:58.183Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:50:19.861Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:50:19.861Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:50:28.071Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:50:59.335Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:51:21.166Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:51:21.167Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:51:28.070Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:51:58.181Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:52:21.170Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:52:21.170Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:52:28.193Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:52:58.659Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:53:21.172Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:53:21.172Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:53:28.125Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:53:58.122Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:54:21.174Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:54:21.174Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:54:28.072Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:54:58.115Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:55:21.176Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:55:21.176Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:55:28.229Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:55:58.111Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:56:21.178Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:56:21.178Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:56:28.343Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:56:58.263Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:57:21.181Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:57:21.181Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:57:28.081Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:57:58.117Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:58:21.182Z level=INFO msg="caddy: applied tls strategy" component=agent provided_certs=1 automatic_https_disabled=true automatic_https_skip=0
+time=2026-06-23T14:58:21.182Z level=INFO msg="Stream: applied 1/1 intents" component=agent
+time=2026-06-23T14:58:28.357Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:58:58.390Z level=INFO msg="Heartbeat sent (IPv4: 93.220.190.149, IPv6: 2003:f0:ff13:6800:be24:11ff:fe1e:d28f)" component=agent
+time=2026-06-23T14:59:09.108Z level=INFO msg="Shutting down..." component=agent
+time=2026-06-23T14:59:09.109Z level=INFO msg="Agent stopped." component=agent

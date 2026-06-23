@@ -55,6 +55,17 @@ type IntentSet struct {
 	// retained (invariant #3, no overwrite while drifted). When nil, the agent falls
 	// back to the applied targets (older orchestrators / no-prune behavior).
 	Keep []string `json:"keep,omitempty"`
+	// PruneCerts marks this as a FULL cert set (set on the orchestrator's complete
+	// per-agent push, not the periodic intent-only push). When true, the agent
+	// scrubs every cert-store entry whose host is not in CertKeep — so a deleted
+	// host's certificate (notably a cert-only host with no vhost to drive cleanup,
+	// §7) is removed from the agent rather than lingering. The periodic push leaves
+	// this false to avoid touching certs it did not gather.
+	PruneCerts bool `json:"prune_certs,omitempty"`
+	// CertKeep is the set of hosts whose certs the agent should retain when
+	// PruneCerts is set (every NurProxy cert host for this agent). Empty + PruneCerts
+	// means "remove all NurProxy certs".
+	CertKeep []string `json:"cert_keep,omitempty"`
 }
 
 // CertBundle is one leaf certificate plus its private key destined for an agent's

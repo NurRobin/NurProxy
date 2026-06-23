@@ -118,7 +118,17 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	certs := r.gatherCerts(desired)
 	// Cert-only domains have no intent but still need their cert installed (§7).
 	certs = append(certs, r.gatherCertOnlyCerts(agent)...)
-	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents, Certs: certs, Keep: keepExtra})
+	// This is the complete cert set for the agent, so the agent may scrub any
+	// cert-store entry not in it — cleaning up a deleted host's cert (notably a
+	// cert-only host with no vhost to drive removal, §7).
+	certKeep := make([]string, 0, len(certs))
+	for i := range certs {
+		certKeep = append(certKeep, certs[i].Host)
+	}
+	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{
+		Intents: intents, Certs: certs, Keep: keepExtra,
+		PruneCerts: true, CertKeep: certKeep,
+	})
 	return nil
 }
 
