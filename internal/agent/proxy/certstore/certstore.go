@@ -255,6 +255,48 @@ func (s *Store) Remove(host string) error {
 	return firstErr
 }
 
+// Prune removes every cert-store entry whose host is NOT in keepHosts. It scrubs
+// certs for deleted hosts that have no vhost to drive removal — notably a
+// cert-only host (§7). keepHosts are raw FQDNs, sanitized here for comparison
+// against the on-disk file bases. Returns the number of hosts removed. A nil
+// store dir or missing directory is a no-op.
+func (s *Store) Prune(keepHosts []string) (int, error) {
+	if s.dir == "" {
+		return 0, nil
+	}
+	keep := make(map[string]struct{}, len(keepHosts))
+	for _, h := range keepHosts {
+		keep[SanitizeHost(h)] = struct{}{}
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("certstore: reading dir %q: %w", s.dir, err)
+	}
+	removed := 0
+	var firstErr error
+	for _, e := range entries {
+		// A host is present iff its public leaf file exists; key sidecars are removed
+		// alongside it, so keying on the .crt avoids double-counting.
+		if e.IsDir() || !strings.HasSuffix(e.Name(), certSuffix) {
+			continue
+		}
+		base := strings.TrimSuffix(e.Name(), certSuffix)
+		if _, ok := keep[base]; ok {
+			continue
+		}
+		for _, suffix := range []string{certSuffix, keySuffix, keyPlainSuffix, keyMaterializedSuffix} {
+			if err := os.Remove(filepath.Join(s.dir, base+suffix)); err != nil && !os.IsNotExist(err) && firstErr == nil {
+				firstErr = fmt.Errorf("certstore: pruning %q: %w", base+suffix, err)
+			}
+		}
+		removed++
+	}
+	return removed, firstErr
+}
+
 // SanitizeHost turns an FQDN into a safe file-name base, mapping a leading
 // wildcard label "*." to "_wildcard." and dropping any path separators so a
 // crafted host can never escape the cert directory.

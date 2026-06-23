@@ -345,3 +345,26 @@ func TestInstall_materializePlain_writesPlaintextKey(t *testing.T) {
 		t.Errorf(".key.plain should be the decrypted key, got %q", string(plain))
 	}
 }
+
+func TestPrune_removesOrphanHosts(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir, nil)
+	for _, h := range []string{"keep.example.com", "drop.example.com"} {
+		if _, err := s.Install(Bundle{Host: h, CertPEM: []byte("C"), KeyPEM: []byte("K")}); err != nil {
+			t.Fatalf("Install %s: %v", h, err)
+		}
+	}
+	n, err := s.Prune([]string{"keep.example.com"})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("pruned %d, want 1", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "keep.example.com.crt")); err != nil {
+		t.Error("kept host cert should survive")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "drop.example.com.crt")); !os.IsNotExist(err) {
+		t.Error("orphan host cert should be pruned")
+	}
+}

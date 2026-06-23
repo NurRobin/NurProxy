@@ -421,7 +421,8 @@ func main() {
 	// artifacts it has applied so the heartbeat can report their checksums for
 	// drift detection (§11).
 	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), holder, hs).
-		WithLogPaths(cfg.ProxyLogPaths)
+		WithLogPaths(cfg.ProxyLogPaths).
+		WithCertStore(certStore)
 
 	// In existing mode, report the host config the agent can READ into the central
 	// store (§17 "adoption reads all files") so it shows under Config immediately —

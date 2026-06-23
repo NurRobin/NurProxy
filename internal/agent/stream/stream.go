@@ -24,6 +24,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/logtail"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -90,6 +91,10 @@ type Client struct {
 	caddy           caddyBackend
 	health          *health.State
 	http            *http.Client
+	// certStore scrubs cert-store entries for deleted hosts on a full push (§7).
+	// Nil (e.g. dry-run) disables cert pruning. It is the same store the backends
+	// install into, so install + prune act on one directory.
+	certStore *certstore.Store
 
 	// managedMu guards managed, the agent's snapshot of the artifacts it currently
 	// has applied (artifactID -> applied state). It is refreshed on every successful
@@ -128,6 +133,14 @@ func New(orchestratorURL, agentID, token string, backend caddyBackend, hs *healt
 		// are driven by the context and by read errors.
 		http: &http.Client{},
 	}
+}
+
+// WithCertStore wires the agent's cert store so a full push can prune certs for
+// deleted hosts (§7). Returns the receiver for chaining; nil leaves cert pruning
+// disabled (e.g. dry-run, where no cert store is configured).
+func (c *Client) WithCertStore(s *certstore.Store) *Client {
+	c.certStore = s
+	return c
 }
 
 // WithLogPaths sets the proxy_log_paths allowlist that bounds on-demand log
@@ -394,6 +407,18 @@ func (c *Client) sendLogChunk(ctx context.Context, sessionID, path string, ch lo
 // cert will fail their own validate, attributed per-artifact.
 func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	c.installCerts(ctx, set.Certs)
+
+	// On a full push, scrub cert-store entries for hosts no longer managed (§7) —
+	// notably a deleted cert-only host, which has no vhost to drive cleanup. Only
+	// runs when the orchestrator marked this a complete cert set, so the periodic
+	// intent-only push never touches certs.
+	if set.PruneCerts && c.certStore != nil {
+		if n, err := c.certStore.Prune(set.CertKeep); err != nil {
+			log.Printf("Stream: cert prune failed: %v", err)
+		} else if n > 0 {
+			log.Printf("Stream: pruned %d orphaned cert(s) for deleted host(s)", n)
+		}
+	}
 
 	intents := set.Intents
 	reports := make([]proxymodel.ArtifactReport, 0, len(intents))
