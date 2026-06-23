@@ -53,3 +53,7 @@ coverage.html
 !/CONTRIBUTING.md
 !/RELEASING.md
 !/CHANGELOG.md
+
+# Build artifacts + local dev sandbox state
+/nurproxy-agent-*
+/.dev-sandbox/

@@ -372,6 +372,8 @@
     "port": "Port",
     "websocket": "WebSocket",
     "forceHttps": "Force HTTPS",
+    "certOnly": "Certificate only (no vhost)",
+    "certOnlyHelp": "NurProxy issues and renews the TLS certificate and installs it on the agent, but serves no vhost — you write the proxy config yourself and point it at the cert path. No public DNS record is managed.",
     "create": "Create",
     "selectDnsZone": "Please select a DNS zone.",
     "created": "{{fqdn}} created.",

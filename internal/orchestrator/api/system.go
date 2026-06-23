@@ -71,32 +71,44 @@ func (s *Server) handleAuditLog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiKeyHintSetting stores a short display preview ("abcd…wxyz") written at
+// generation time, since only the key's hash is persisted (the plaintext is
+// shown once and never recoverable from storage).
+const apiKeyHintSetting = "admin_api_key_hint"
+
 // GET /api/v1/api-key — reports whether an admin API key exists (never returns
-// the key itself, only a masked preview).
+// the key itself, only the masked preview captured at generation time).
 func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 	key, err := s.db.GetSetting("admin_api_key")
 	if err != nil || key == "" {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"exists": false})
 		return
 	}
-	masked := key
-	if len(key) > 8 {
-		masked = key[:4] + "…" + key[len(key)-4:]
-	}
+	masked, _ := s.db.GetSetting(apiKeyHintSetting)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"exists": true, "masked": masked})
 }
 
 // POST /api/v1/api-key — generates (or regenerates) the admin API key and
-// returns it once. The plaintext is only shown at creation time.
+// returns it once. Only the key's SHA-256 is persisted — the full-access
+// credential must not be readable from a leaked DB or backup, exactly like
+// agent tokens and the admin password — plus a short hint for the dashboard's
+// masked preview.
 func (s *Server) handleGenerateAPIKey(w http.ResponseWriter, r *http.Request) {
 	key, err := auth.GenerateAPIKey()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate API key")
 		return
 	}
-	if err := s.db.SetSetting("admin_api_key", key); err != nil {
+	if err := s.db.SetSetting("admin_api_key", auth.HashToken(key)); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save API key")
 		return
+	}
+	hint := ""
+	if len(key) > 8 {
+		hint = key[:4] + "…" + key[len(key)-4:]
+	}
+	if err := s.db.SetSetting(apiKeyHintSetting, hint); err != nil {
+		log.Printf("api-key: failed to save display hint: %v", err)
 	}
 	s.audit(r, "system", "admin", "generate_api_key", "admin API key generated")
 	writeJSON(w, http.StatusCreated, map[string]string{"api_key": key})
@@ -107,6 +119,9 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.SetSetting("admin_api_key", ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to revoke API key")
 		return
+	}
+	if err := s.db.SetSetting(apiKeyHintSetting, ""); err != nil {
+		log.Printf("api-key: failed to clear display hint: %v", err)
 	}
 	s.audit(r, "system", "admin", "revoke_api_key", "admin API key revoked")
 	writeJSON(w, http.StatusOK, map[string]string{"message": "API key revoked"})
@@ -123,7 +138,7 @@ func (s *Server) handleListSettings(w http.ResponseWriter, r *http.Request) {
 	// Filter out sensitive settings
 	filtered := make([]map[string]interface{}, 0, len(settings))
 	for _, setting := range settings {
-		if setting.Key == "admin_password_hash" || setting.Key == "admin_api_key" || setting.Key == sessionSecretSetting {
+		if setting.Key == "admin_password_hash" || setting.Key == "admin_api_key" || setting.Key == apiKeyHintSetting || setting.Key == sessionSecretSetting {
 			continue
 		}
 		filtered = append(filtered, map[string]interface{}{

@@ -446,9 +446,10 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 	}
 	for _, c := range certs {
 		paths, err := b.certs.Install(certstore.Bundle{
-			Host:    c.Host,
-			CertPEM: c.CertPEM,
-			KeyPEM:  c.KeyPEM,
+			Host:             c.Host,
+			CertPEM:          c.CertPEM,
+			KeyPEM:           c.KeyPEM,
+			MaterializePlain: c.MaterializeKey,
 		})
 		if err != nil {
 			return fmt.Errorf("installing cert for %q: %w", c.Host, err)

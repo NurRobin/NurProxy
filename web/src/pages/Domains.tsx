@@ -49,6 +49,7 @@ export default function Domains() {
   const [createPort, setCreatePort] = useState('80');
   const [createWebsocket, setCreateWebsocket] = useState(false);
   const [createForceHttps, setCreateForceHttps] = useState(true);
+  const [createCertOnly, setCreateCertOnly] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState('');
 
@@ -131,12 +132,13 @@ export default function Domains() {
     try {
       await api.createDomain({
         subdomain: createSub, zone_id: createZone, server_id: createServer,
-        port: parseInt(createPort, 10), websocket: createWebsocket, force_https: createForceHttps,
+        port: createCertOnly ? 0 : parseInt(createPort, 10),
+        websocket: createWebsocket, force_https: createForceHttps, cert_only: createCertOnly,
       });
       toast.success(t('domains.created', { fqdn: `${createSub}.${getZoneName(createZone)}` }));
       setShowCreate(false);
       setCreateSub(''); setCreateZone(''); setCreateServer(''); setCreatePort('80');
-      setCreateWebsocket(false); setCreateForceHttps(true);
+      setCreateWebsocket(false); setCreateForceHttps(true); setCreateCertOnly(false);
       fetchData();
     } catch (err) {
       setCreateError(errMessage(err, t('domains.createFailed')));
@@ -412,13 +414,24 @@ export default function Domains() {
               })}
             </Select>
           </Field>
-          <Field label={t('domains.port')}>
-            <Input type="number" value={createPort} onChange={(e) => setCreatePort(e.target.value)} min={1} max={65535} />
-          </Field>
+          {!createCertOnly && (
+            <Field label={t('domains.port')}>
+              <Input type="number" value={createPort} onChange={(e) => setCreatePort(e.target.value)} min={1} max={65535} />
+            </Field>
+          )}
           <div className="flex flex-wrap gap-6">
-            <span className="flex items-center gap-1.5"><Checkbox label={t('domains.websocket')} checked={createWebsocket} onChange={(e) => setCreateWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
-            <span className="flex items-center gap-1.5"><Checkbox label={t('domains.forceHttps')} checked={createForceHttps} onChange={(e) => setCreateForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
+            {!createCertOnly && <span className="flex items-center gap-1.5"><Checkbox label={t('domains.websocket')} checked={createWebsocket} onChange={(e) => setCreateWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>}
+            {!createCertOnly && <span className="flex items-center gap-1.5"><Checkbox label={t('domains.forceHttps')} checked={createForceHttps} onChange={(e) => setCreateForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>}
+            <span className="flex items-center gap-1.5"><Checkbox label={t('domains.certOnly')} checked={createCertOnly} onChange={(e) => setCreateCertOnly(e.target.checked)} /></span>
           </div>
+          {createCertOnly && (
+            <Callout tone="info">
+              {t('domains.certOnlyHelp')}
+              {createSub && createZone && (
+                <span className="mt-1 block font-mono text-xs">/var/lib/nurproxy-agent/certs/{createSub}.{getZoneName(createZone)}.crt (+ .key.plain)</span>
+              )}
+            </Callout>
+          )}
           <div className="flex justify-end gap-3 pt-1">
             <Button variant="secondary" onClick={() => setShowCreate(false)}>{t('common.cancel')}</Button>
             <Button onClick={handleCreate} loading={createLoading} disabled={!createSub || !createZone || !createServer}>{t('domains.create')}</Button>

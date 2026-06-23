@@ -194,8 +194,11 @@ export interface Domain {
   websocket: boolean;
   force_https: boolean;
   ssl_mode: 'auto' | 'manual' | 'off';
+  /** cert_only: NurProxy issues + renews the TLS cert and installs it on the
+   *  agent without serving a vhost; the operator hand-writes the config. */
+  cert_only?: boolean;
   dns_record_id?: string;
-  status: 'pending' | 'active' | 'error' | 'deleting';
+  status: 'pending' | 'active' | 'error' | 'deleting' | 'degraded';
   error_msg?: string;
   last_synced?: string;
   created_at: string;

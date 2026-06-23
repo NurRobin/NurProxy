@@ -29,7 +29,7 @@ func (d *DB) GetZone(id string) (*models.Zone, error) {
 	var z models.Zone
 	var createdAt string
 
-	err := d.sql.QueryRow(`
+	err := d.read.QueryRow(`
 		SELECT id, provider_id, external_id, name, created_at
 		FROM zones WHERE id = ?`, id,
 	).Scan(&z.ID, &z.ProviderID, &z.ExternalID, &z.Name, &createdAt)
@@ -46,7 +46,7 @@ func (d *DB) GetZone(id string) (*models.Zone, error) {
 
 // ListZones returns all zones ordered by creation time.
 func (d *DB) ListZones() ([]models.Zone, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, provider_id, external_id, name, created_at
 		FROM zones ORDER BY created_at`)
 	if err != nil {
@@ -69,7 +69,7 @@ func (d *DB) ListZones() ([]models.Zone, error) {
 
 // ListZonesByProvider returns all zones belonging to a provider.
 func (d *DB) ListZonesByProvider(providerID string) ([]models.Zone, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, provider_id, external_id, name, created_at
 		FROM zones WHERE provider_id = ? ORDER BY created_at`, providerID)
 	if err != nil {
@@ -135,7 +135,7 @@ func (d *DB) RemoveAgentZone(agentID, zoneID string) error {
 
 // ListAgentZones returns all zones assigned to an agent.
 func (d *DB) ListAgentZones(agentID string) ([]models.Zone, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT z.id, z.provider_id, z.external_id, z.name, z.created_at
 		FROM zones z
 		JOIN agent_zones az ON z.id = az.zone_id

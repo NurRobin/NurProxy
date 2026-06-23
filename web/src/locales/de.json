@@ -372,6 +372,8 @@
     "port": "Port",
     "websocket": "WebSocket",
     "forceHttps": "HTTPS erzwingen",
+    "certOnly": "Nur Zertifikat (kein vhost)",
+    "certOnlyHelp": "NurProxy stellt das TLS-Zertifikat aus, erneuert es und installiert es auf dem Agent — bedient aber keinen vhost. Du schreibst die Proxy-Config selbst und zeigst auf den Cert-Pfad. Es wird kein öffentlicher DNS-Eintrag verwaltet.",
     "create": "Erstellen",
     "selectDnsZone": "Bitte wähle eine DNS-Zone.",
     "created": "{{fqdn}} erstellt.",

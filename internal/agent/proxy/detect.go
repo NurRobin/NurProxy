@@ -29,6 +29,12 @@ const (
 	KindCaddy   Kind = "caddy"
 	KindNginx   Kind = "nginx"
 	KindApache  Kind = "apache"
+	// KindCustom is an operator-defined proxy engine NurProxy has no native
+	// renderer for (e.g. HAProxy, Traefik, lighttpd). It is configured entirely
+	// on the agent host — a config template plus reload/test commands — so the
+	// host operator, who already owns the host, opts in locally. It is never
+	// auto-detected; the operator selects proxy_type=custom explicitly (§9).
+	KindCustom Kind = "custom"
 )
 
 // Detection is the read-only result reported to the orchestrator at adoption /

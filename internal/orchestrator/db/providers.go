@@ -43,7 +43,7 @@ func (d *DB) GetProvider(id string) (*models.Provider, error) {
 	var isDefault int
 	var createdAt string
 
-	err := d.sql.QueryRow(`
+	err := d.read.QueryRow(`
 		SELECT id, type, name, config, is_default, created_at
 		FROM providers WHERE id = ?`, id,
 	).Scan(&p.ID, &p.Type, &p.Name, &encConfig, &isDefault, &createdAt)
@@ -67,7 +67,7 @@ func (d *DB) GetProvider(id string) (*models.Provider, error) {
 
 // ListProviders returns all providers with their configs decrypted.
 func (d *DB) ListProviders() ([]models.Provider, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, type, name, config, is_default, created_at
 		FROM providers ORDER BY created_at`)
 	if err != nil {

@@ -72,6 +72,23 @@ func nginxLayoutTempDir(t *testing.T) string {
 	return root
 }
 
+// allowedReloadStub returns an absolute path to a no-op executable whose
+// basename ("nginx") is on the cmdguard allow-list, so a reconfigure request
+// clears the command guard while the probe's reload still exits 0. A bare
+// /bin/true no longer works: its basename ("true") is not a recognized proxy,
+// and Reconfigure now gates every network-supplied command through cmdguard.
+func allowedReloadStub(t *testing.T) string {
+	t.Helper()
+	stub := filepath.Join(t.TempDir(), "nginx")
+	if err := os.Symlink("/bin/true", stub); err != nil {
+		// Symlinks may be unavailable; a tiny script exec'd via its shebang works too.
+		if werr := os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755); werr != nil {
+			t.Fatalf("creating reload stub: symlink=%v write=%v", err, werr)
+		}
+	}
+	return stub
+}
+
 func TestReconfigureBuiltInToExisting_WritableDir(t *testing.T) {
 	// The probe runs the reload/test command; the agent normally wraps it in
 	// `sudo -n` when non-root. This test simulates an already-privileged agent so
@@ -94,7 +111,7 @@ func TestReconfigureBuiltInToExisting_WritableDir(t *testing.T) {
 		ConfigDir: root,
 		// Point the test command at a binary that exists and exits 0 so the reload
 		// probe sees no permission denial. "true" always succeeds.
-		TestCmd: "/bin/true",
+		TestCmd: allowedReloadStub(t),
 	}, deps)
 
 	if !stopped {
@@ -138,7 +155,7 @@ func TestReconfigureBuiltInToExisting_BogusDirFailsButSwaps(t *testing.T) {
 			Mode:      "existing",
 			Type:      "nginx",
 			ConfigDir: "/nonexistent/nurproxy/bogus-config-dir",
-			TestCmd:   "/bin/true",
+			TestCmd:   allowedReloadStub(t),
 		}, deps)
 	}()
 
@@ -231,7 +248,7 @@ func TestProbePermissions(t *testing.T) {
 	root := nginxLayoutTempDir(t)
 	deps := proxy.ReconfigureDeps{Health: &fakeHealth{}, StopCaddy: func() error { return nil }}
 	h.Reconfigure(context.Background(), proxy.ReconfigureRequest{
-		Mode: "existing", Type: "nginx", ConfigDir: root, TestCmd: "/bin/true",
+		Mode: "existing", Type: "nginx", ConfigDir: root, TestCmd: allowedReloadStub(t),
 	}, deps)
 
 	res, rem, dirs, checked = h.ProbePermissions(context.Background(), runtimeenv.Env{User: "agentuser"})
@@ -248,7 +265,7 @@ func TestProbePermissions(t *testing.T) {
 	// A bogus config dir fails the write probe → checked, !OK, remediation present.
 	h2 := proxy.NewHolder(seedBackend{}, "built-in")
 	h2.Reconfigure(context.Background(), proxy.ReconfigureRequest{
-		Mode: "existing", Type: "nginx", ConfigDir: "/nonexistent/nurproxy/bogus", TestCmd: "/bin/true",
+		Mode: "existing", Type: "nginx", ConfigDir: "/nonexistent/nurproxy/bogus", TestCmd: allowedReloadStub(t),
 	}, deps)
 	res, rem, _, checked = h2.ProbePermissions(context.Background(), runtimeenv.Env{User: "agentuser"})
 	if !checked || res.OK() {
@@ -281,7 +298,7 @@ func TestHolderModeTracksReconfigure(t *testing.T) {
 	}
 
 	h.Reconfigure(context.Background(), proxy.ReconfigureRequest{
-		Mode: "existing", Type: "nginx", ConfigDir: root, TestCmd: "/bin/true",
+		Mode: "existing", Type: "nginx", ConfigDir: root, TestCmd: allowedReloadStub(t),
 	}, deps)
 	if got := h.Mode(); got != "existing" {
 		t.Errorf("mode after switch to existing = %q, want existing", got)
@@ -291,7 +308,7 @@ func TestHolderModeTracksReconfigure(t *testing.T) {
 	// live backend was swapped, which is what the mode reports.
 	h2 := proxy.NewHolder(seedBackend{}, "built-in")
 	h2.Reconfigure(context.Background(), proxy.ReconfigureRequest{
-		Mode: "existing", Type: "nginx", ConfigDir: "/nonexistent/bogus", TestCmd: "/bin/true",
+		Mode: "existing", Type: "nginx", ConfigDir: "/nonexistent/bogus", TestCmd: allowedReloadStub(t),
 	}, deps)
 	if got := h2.Mode(); got != "existing" {
 		t.Errorf("mode after applied-with-warnings switch = %q, want existing", got)

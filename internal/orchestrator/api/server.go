@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
@@ -50,6 +51,10 @@ type Server struct {
 	// loginLimiter blunts online password guessing: too many failed logins from
 	// one IP trip a temporary lockout.
 	loginLimiter *ratelimit.Limiter
+
+	// tokenBackfilled guards the once-per-agent encrypted-token backfill in
+	// requireAgentAuth (see backfillAgentToken).
+	tokenBackfilled sync.Map
 
 	// dnsDryRun / acmeDryRun reflect sandbox mode so the health endpoint can tell
 	// the dashboard to show a "dry-run — no external calls" banner (#93).
