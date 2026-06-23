@@ -28,7 +28,12 @@ type Config struct {
 	FQDN            string `yaml:"fqdn"`
 	DataDir         string `yaml:"data_dir"`
 	APIPort         int    `yaml:"api_port"`
-	CaddyAdminPort  int    `yaml:"caddy_admin_port"`
+	// APIBind is the agent API listen address. Loopback by default: the API is
+	// the local control surface (CLI reconfigure, route sync, config dump) and
+	// the production control plane is the agent-dialed stream. Widen it (e.g.
+	// "0.0.0.0") only when the orchestrator must reach this agent inbound.
+	APIBind        string `yaml:"api_bind"`
+	CaddyAdminPort int    `yaml:"caddy_admin_port"`
 
 	// ProxyMode selects built-in (bundled Caddy, default) vs existing (manage an
 	// installed proxy on disk), per §2/§9.
@@ -66,6 +71,7 @@ type Flags struct {
 	FQDN         string
 	DataDir      string
 	APIPort      int
+	APIBind      string
 	CaddyPort    int
 
 	ProxyMode      string
@@ -87,6 +93,7 @@ func defaults() Config {
 	return Config{
 		DataDir:        "/var/lib/nurproxy-agent",
 		APIPort:        8780,
+		APIBind:        "127.0.0.1",
 		CaddyAdminPort: 2019,
 		ProxyMode:      ProxyModeBuiltIn,
 	}
@@ -187,6 +194,9 @@ func mergeFile(dst *Config, src *Config) {
 	if src.APIPort != 0 {
 		dst.APIPort = src.APIPort
 	}
+	if src.APIBind != "" {
+		dst.APIBind = src.APIBind
+	}
 	if src.CaddyAdminPort != 0 {
 		dst.CaddyAdminPort = src.CaddyAdminPort
 	}
@@ -233,6 +243,9 @@ func mergeEnv(cfg *Config) {
 		if port, err := strconv.Atoi(v); err == nil {
 			cfg.APIPort = port
 		}
+	}
+	if v := os.Getenv("NP_API_BIND"); v != "" {
+		cfg.APIBind = v
 	}
 	if v := os.Getenv("NP_PROXY_MODE"); v != "" {
 		cfg.ProxyMode = ProxyMode(v)
@@ -322,6 +335,9 @@ func mergeFlags(cfg *Config, f Flags) {
 	}
 	if f.APIPort != 0 {
 		cfg.APIPort = f.APIPort
+	}
+	if f.APIBind != "" {
+		cfg.APIBind = f.APIBind
 	}
 	if f.CaddyPort != 0 {
 		cfg.CaddyAdminPort = f.CaddyPort

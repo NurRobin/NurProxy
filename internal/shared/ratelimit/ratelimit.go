@@ -25,6 +25,12 @@ type Limiter struct {
 	lockout time.Duration // how long a key is blocked once max is hit
 	maxKeys int           // hard cap on tracked keys, bounding memory
 	now     func() time.Time
+
+	// saturatedUntil is set when the table is full of active lockouts and a new
+	// key could not be tracked (see Fail). Until then, untracked keys are DENIED:
+	// an untrackable key can never be locked out, so admitting it would hand the
+	// flood exactly the bypass the eviction policy refuses to create.
+	saturatedUntil time.Time
 }
 
 type entry struct {
@@ -55,11 +61,18 @@ func New(max int, window, lockout time.Duration) *Limiter {
 func (l *Limiter) Allow(key string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
 	e := l.entries[key]
 	if e == nil {
+		// Unknown key. Normally fine — but while the table is saturated with
+		// active lockouts (an ongoing distinct-key flood), an unknown key could
+		// never be tracked and therefore never locked out, so it is denied
+		// rather than waved through (fail-closed).
+		if l.saturatedUntil.After(now) {
+			return false, l.saturatedUntil.Sub(now)
+		}
 		return true, 0
 	}
-	now := l.now()
 	if e.lockedUntil.After(now) {
 		return false, e.lockedUntil.Sub(now)
 	}
@@ -84,8 +97,11 @@ func (l *Limiter) Fail(key string) {
 			// skipping the check: a flooding key must still be tracked and lockable
 			// (fail-closed). If every entry is locked out, that is itself an active
 			// attack: keep the lockouts (a distinct-key flood must not be able to
-			// free a locked victim) and decline the new key instead.
+			// free a locked victim) and instead flip the limiter saturated, so
+			// Allow denies every untracked key until the lockouts age out — an
+			// untrackable key must not be a lockout bypass.
 			if !l.evictOldestUnlockedLocked(now) {
+				l.saturatedUntil = now.Add(l.lockout)
 				return
 			}
 		}

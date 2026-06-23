@@ -26,6 +26,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/logging"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -43,6 +44,7 @@ var (
 	fqdn            = flag.String("fqdn", "", "Agent FQDN (required)")
 	dataDir         = flag.String("data-dir", "/var/lib/nurproxy-agent", "Data directory")
 	apiPort         = flag.Int("api-port", 8780, "Agent API port")
+	apiBind         = flag.String("api-bind", "", "Agent API bind address (default 127.0.0.1; widen only if the orchestrator must reach this agent inbound)")
 	caddyAdminPort  = flag.Int("caddy-admin-port", 2019, "Caddy admin API port (localhost)")
 	showVersion     = flag.Bool("version", false, "Print version and exit")
 	dryRun          = flag.Bool("dry-run", false, "Sandbox mode: simulate the proxy in-memory (no Caddy process, no :80/:443, unprivileged)")
@@ -97,6 +99,7 @@ func main() {
 		FQDN:           *fqdn,
 		DataDir:        *dataDir,
 		APIPort:        *apiPort,
+		APIBind:        *apiBind,
 		CaddyPort:      *caddyAdminPort,
 		ProxyMode:      *proxyMode,
 		ProxyType:      *proxyType,
@@ -175,7 +178,9 @@ func main() {
 	mgr.SetCapabilities(capabilities)
 
 	log.Printf("Agent ID: %s", mgr.AgentID())
-	log.Printf("Agent Token: %s...%s", mgr.Token()[:10], mgr.Token()[len(mgr.Token())-4:])
+	// Log a non-reversible fingerprint, never token material: logs are routinely
+	// shipped/shared, and the full token lives in the agent state file anyway.
+	log.Printf("Agent Token: sha256:%s… (full token in the agent state file)", auth.HashToken(mgr.Token())[:12])
 
 	// Record runtime facts so `nurproxy-agent apply <code>` works zero-arg on this
 	// host (§19): the CLI resolves orchestrator/api-port/agent-id from here without
@@ -331,7 +336,7 @@ func main() {
 	// Step 3: Start Agent API server (non-fatal: a bind failure is reported via
 	// health and the agent keeps heartbeating).
 	api.SetVersion(version)
-	apiServer := api.New(cfg.APIPort, holder, mgr.Token())
+	apiServer := api.New(cfg.APIPort, holder, mgr.Token()).WithBind(cfg.APIBind)
 	apiServer.SetHealth(hs)
 
 	// Wire the hot-switch endpoint (§19): POST /admin/reconfigure drives the Holder.

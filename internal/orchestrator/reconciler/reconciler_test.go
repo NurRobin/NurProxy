@@ -369,6 +369,12 @@ func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, zone *models.
 	if err := d.CreateAgent(agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
 	}
+	// An adopted, heartbeating agent has its inbound token backfilled (migration
+	// 19): the reconciler's inbound route sync authenticates with the decrypted
+	// plaintext, so without a stored token it skips the sync entirely.
+	if err := d.SetAgentToken(agent.ID, "plain-token-1"); err != nil {
+		t.Fatalf("SetAgentToken: %v", err)
+	}
 
 	srv = &models.Server{
 		ID:      "srv-1",

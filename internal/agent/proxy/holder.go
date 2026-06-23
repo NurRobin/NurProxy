@@ -10,6 +10,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
+	"github.com/NurRobin/NurProxy/internal/shared/cmdguard"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -359,6 +360,19 @@ func extractRunner(be Proxy) permcheck.TestRunner {
 // in-flight forwarded call either sees the old or the new backend, never a torn
 // state.
 func (h *Holder) Reconfigure(ctx context.Context, req ReconfigureRequest, deps ReconfigureDeps) ReconfigureResult {
+	// Reconfigure requests arrive over the network (an admin op applied via the
+	// CLI, the agent's local API) and their overrides are later executed —
+	// elevated via scoped sudo when the agent is unprivileged. Gate them against
+	// the cmdguard allow-list here, the single choke point both paths share, so
+	// the control plane cannot smuggle arbitrary commands onto the host.
+	if err := validateOverrides(req); err != nil {
+		msg := "reconfigure rejected: " + err.Error()
+		log.Printf("WARNING: %s", msg)
+		if deps.Health != nil {
+			deps.Health.SetError(msg)
+		}
+		return ReconfigureResult{OK: false, Message: msg}
+	}
 	switch req.Mode {
 	case "existing":
 		return h.reconfigureExisting(ctx, req, deps)
@@ -372,6 +386,22 @@ func (h *Holder) Reconfigure(ctx context.Context, req ReconfigureRequest, deps R
 		}
 		return ReconfigureResult{OK: false, Message: msg}
 	}
+}
+
+// validateOverrides applies the cmdguard allow-list to the network-supplied
+// binary/command/config-dir overrides of a reconfigure request. Empty fields
+// pass (they mean "use the detected default").
+func validateOverrides(req ReconfigureRequest) error {
+	if err := cmdguard.ValidateProxyBinary(req.Binary); err != nil {
+		return err
+	}
+	if err := cmdguard.ValidateProxyCommand("proxy_reload_cmd", req.ReloadCmd); err != nil {
+		return err
+	}
+	if err := cmdguard.ValidateProxyCommand("proxy_test_cmd", req.TestCmd); err != nil {
+		return err
+	}
+	return cmdguard.ValidateConfigDir(req.ConfigDir)
 }
 
 // reconfigureExisting builds the requested file backend, stops the bundled Caddy

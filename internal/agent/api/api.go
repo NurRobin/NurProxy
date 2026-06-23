@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
-	"github.com/NurRobin/NurProxy/internal/shared/auth"
 )
 
 // version is set at build time via ldflags.
@@ -45,6 +45,7 @@ type reconfigurer interface {
 // Server is the agent HTTP API server.
 type Server struct {
 	port        int
+	bind        string
 	caddyClient caddyBackend
 	token       string
 	health      *health.State
@@ -74,14 +75,28 @@ func (s *Server) SetReconfigurer(r reconfigurer, deps proxy.ReconfigureDeps) {
 }
 
 // New creates a new agent API server. backend is the bundled-Caddy proxy
-// backend the agent reconciles routes through.
+// backend the agent reconciles routes through. The server binds to loopback
+// unless WithBind widens it: the API carries the local control surface
+// (reconfigure, route sync, config dump), and the production control plane is
+// the agent-dialed stream — only the orchestrator's inbound fallback ever
+// needs to reach this API from another host.
 func New(port int, backend caddyBackend, token string) *Server {
 	return &Server{
 		port:        port,
+		bind:        "127.0.0.1",
 		caddyClient: backend,
 		token:       token,
 		routes:      make(map[string]json.RawMessage),
 	}
+}
+
+// WithBind sets the listen address (e.g. "0.0.0.0" to accept the orchestrator's
+// inbound fallback from another host). Returns the receiver for chaining.
+func (s *Server) WithBind(addr string) *Server {
+	if addr != "" {
+		s.bind = addr
+	}
+	return s
 }
 
 // Start begins serving the agent API.
@@ -97,18 +112,19 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/caddy/config", s.authMiddleware(s.handleCaddyConfig))
 	mux.HandleFunc("/admin/reconfigure", s.authMiddleware(s.handleReconfigure))
 
+	addr := fmt.Sprintf("%s:%d", s.bind, s.port)
 	s.server = &http.Server{
-		Addr:              fmt.Sprintf(":%d", s.port),
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
-		log.Printf("Agent API listening on :%d", s.port)
+		log.Printf("Agent API listening on %s", addr)
 		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Agent API error: %v", err)
 			if s.health != nil {
-				s.health.SetError(fmt.Sprintf("agent API failed to listen on :%d: %v", s.port, err))
+				s.health.SetError(fmt.Sprintf("agent API failed to listen on %s: %v", addr, err))
 			}
 		}
 	}()
@@ -138,11 +154,13 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Accept either the plaintext token or its SHA-256 hash. The
-		// orchestrator only persists the hashed token (never the plaintext),
-		// so it authenticates to the agent by presenting the hash.
+		// Only the plaintext token is a credential. The stored hash used to be
+		// accepted too (the orchestrator persisted nothing else), but that made
+		// the hash pass-equivalent: a leaked orchestrator DB yielded working
+		// credentials for every agent's API. The orchestrator now keeps the
+		// token encrypted at rest and presents the plaintext on inbound calls.
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token != s.token && token != auth.HashToken(s.token) {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) != 1 {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid token"})
 			return
 		}
