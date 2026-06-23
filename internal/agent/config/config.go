@@ -56,6 +56,30 @@ type Config struct {
 	// (§9).
 	ProxyService string `yaml:"proxy_service"`
 
+	// --- Custom engine (ProxyType == "custom") ---------------------------------
+	// A proxy NurProxy has no native renderer for (HAProxy, Traefik, …). These are
+	// LOCAL operator config only — the host operator owns the host — so a custom
+	// engine is never defined over the network (§9).
+
+	// ProxyTemplate is the inline Go text/template rendering one route into the
+	// engine's native config (see generic.RouteContext). Takes precedence over
+	// ProxyTemplateFile when both are set.
+	ProxyTemplate string `yaml:"proxy_template"`
+	// ProxyTemplateFile is a path to the template file, read at startup. Used when
+	// ProxyTemplate is empty.
+	ProxyTemplateFile string `yaml:"proxy_template_file"`
+	// ProxyFileExt is the rendered per-route config file extension (default ".conf").
+	ProxyFileExt string `yaml:"proxy_file_ext"`
+	// ProxyCaps are the capability names the operator asserts their template
+	// supports (e.g. "websocket", "force_https", "custom_headers", "path_rewrite",
+	// "basic_auth", "ip_filter", "rate_limit", "central_tls"). Reverse proxy is
+	// always implied. Empty means the safe default (reverse_proxy + central_tls).
+	ProxyCaps []string `yaml:"proxy_caps"`
+	// ProxyAllowedCommands are extra reload/test command binaries (basenames, e.g.
+	// "haproxy") the operator allows past cmdguard for a custom engine. Service
+	// managers (systemctl, …) and the native proxies are always allowed.
+	ProxyAllowedCommands []string `yaml:"proxy_allowed_commands"`
+
 	// DryRun runs the agent in sandbox mode (#93): the reverse proxy is simulated
 	// entirely in-memory — no Caddy subprocess, no :80/:443 binding, no privileged
 	// file ops — while registration, heartbeat, the stream, and route rendering all
@@ -224,6 +248,21 @@ func mergeFile(dst *Config, src *Config) {
 	if src.ProxyService != "" {
 		dst.ProxyService = src.ProxyService
 	}
+	if src.ProxyTemplate != "" {
+		dst.ProxyTemplate = src.ProxyTemplate
+	}
+	if src.ProxyTemplateFile != "" {
+		dst.ProxyTemplateFile = src.ProxyTemplateFile
+	}
+	if src.ProxyFileExt != "" {
+		dst.ProxyFileExt = src.ProxyFileExt
+	}
+	if len(src.ProxyCaps) > 0 {
+		dst.ProxyCaps = src.ProxyCaps
+	}
+	if len(src.ProxyAllowedCommands) > 0 {
+		dst.ProxyAllowedCommands = src.ProxyAllowedCommands
+	}
 	if src.DryRun {
 		dst.DryRun = true
 	}
@@ -270,6 +309,21 @@ func mergeEnv(cfg *Config) {
 	}
 	if v := os.Getenv("NP_PROXY_SERVICE"); v != "" {
 		cfg.ProxyService = v
+	}
+	if v := os.Getenv("NP_PROXY_TEMPLATE"); v != "" {
+		cfg.ProxyTemplate = v
+	}
+	if v := os.Getenv("NP_PROXY_TEMPLATE_FILE"); v != "" {
+		cfg.ProxyTemplateFile = v
+	}
+	if v := os.Getenv("NP_PROXY_FILE_EXT"); v != "" {
+		cfg.ProxyFileExt = v
+	}
+	if v := os.Getenv("NP_PROXY_CAPS"); v != "" {
+		cfg.ProxyCaps = parseLogPaths(v)
+	}
+	if v := os.Getenv("NP_PROXY_ALLOWED_COMMANDS"); v != "" {
+		cfg.ProxyAllowedCommands = parseLogPaths(v)
 	}
 	if envBool("NP_DRY_RUN") {
 		cfg.DryRun = true

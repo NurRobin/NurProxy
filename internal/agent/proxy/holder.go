@@ -55,6 +55,19 @@ type Holder struct {
 	// updated atomically with current on every Reconfigure. The heartbeat reports it
 	// (§19) so the dashboard reflects a hot-switch instead of always assuming built-in.
 	mode string
+	// allowedCmds are extra reload/test command binaries the LOCAL operator opted
+	// into for a custom engine (§9). Set once from agent config; passed to cmdguard
+	// so a custom engine's native command (e.g. "haproxy -c") clears the guard
+	// while network-supplied overrides stay limited to the built-in allow-list.
+	allowedCmds []string
+}
+
+// WithAllowedCommands records the local operator's extra cmdguard allow-list
+// (custom-engine binaries) and returns the receiver for chaining. Empty leaves
+// only the built-in proxy/service-manager allow-list in force.
+func (h *Holder) WithAllowedCommands(cmds []string) *Holder {
+	h.allowedCmds = cmds
+	return h
 }
 
 // NewHolder seeds the Holder with the agent's initial backend (the bundled caddy
@@ -262,6 +275,20 @@ type ReconfigureRequest struct {
 	Service string
 	// LogPaths are the error/access log paths to surface in the dashboard (§15).
 	LogPaths []string
+
+	// --- Custom engine (Type == "custom") --------------------------------------
+	// These are populated only by the LOCAL startup path from agent config; the
+	// network reconfigure handlers leave them empty, so a network-triggered switch
+	// to "custom" fails (no template) — custom engines stay local-only by design.
+
+	// Template is the operator's Go text/template that renders one route into the
+	// engine's native config (see generic.RouteContext for the data passed).
+	Template string
+	// FileExt is the rendered per-route file extension (default ".conf").
+	FileExt string
+	// DeclaredCaps are the capabilities the operator asserts their template
+	// supports; nil means the safe default (reverse proxy + central TLS only).
+	DeclaredCaps *Capabilities
 }
 
 // healthSetter is the minimal slice of the agent's health.State the Holder needs
@@ -365,7 +392,7 @@ func (h *Holder) Reconfigure(ctx context.Context, req ReconfigureRequest, deps R
 	// elevated via scoped sudo when the agent is unprivileged. Gate them against
 	// the cmdguard allow-list here, the single choke point both paths share, so
 	// the control plane cannot smuggle arbitrary commands onto the host.
-	if err := validateOverrides(req); err != nil {
+	if err := h.validateOverrides(req); err != nil {
 		msg := "reconfigure rejected: " + err.Error()
 		log.Printf("WARNING: %s", msg)
 		if deps.Health != nil {
@@ -388,17 +415,20 @@ func (h *Holder) Reconfigure(ctx context.Context, req ReconfigureRequest, deps R
 	}
 }
 
-// validateOverrides applies the cmdguard allow-list to the network-supplied
-// binary/command/config-dir overrides of a reconfigure request. Empty fields
-// pass (they mean "use the detected default").
-func validateOverrides(req ReconfigureRequest) error {
-	if err := cmdguard.ValidateProxyBinary(req.Binary); err != nil {
+// validateOverrides applies the cmdguard allow-list to the binary/command/
+// config-dir overrides of a reconfigure request. Empty fields pass (they mean
+// "use the detected default"). The Holder's local allow-list (operator opt-in
+// for a custom engine, §9) augments the built-in list; it is never network-
+// sourced, so a custom engine's native command clears the guard while a
+// network-pushed override stays limited to the built-in engines.
+func (h *Holder) validateOverrides(req ReconfigureRequest) error {
+	if err := cmdguard.ValidateProxyBinary(req.Binary, h.allowedCmds...); err != nil {
 		return err
 	}
-	if err := cmdguard.ValidateProxyCommand("proxy_reload_cmd", req.ReloadCmd); err != nil {
+	if err := cmdguard.ValidateProxyCommand("proxy_reload_cmd", req.ReloadCmd, h.allowedCmds...); err != nil {
 		return err
 	}
-	if err := cmdguard.ValidateProxyCommand("proxy_test_cmd", req.TestCmd); err != nil {
+	if err := cmdguard.ValidateProxyCommand("proxy_test_cmd", req.TestCmd, h.allowedCmds...); err != nil {
 		return err
 	}
 	return cmdguard.ValidateConfigDir(req.ConfigDir)
@@ -427,6 +457,10 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 		TestCmd:   req.TestCmd,
 		Service:   req.Service,
 		LogPaths:  req.LogPaths,
+		// Custom-engine fields (ignored by the native backends, §9).
+		Template:     req.Template,
+		FileExt:      req.FileExt,
+		DeclaredCaps: req.DeclaredCaps,
 		// Wire the agent's cert store so the file backend can install + reference
 		// central TLS bundles (§7); without this an existing-mode agent drops TLS.
 		CertDir:    deps.CertDir,

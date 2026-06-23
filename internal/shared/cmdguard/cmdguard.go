@@ -36,15 +36,22 @@ var serviceManagers = map[string]bool{
 
 // ValidateProxyBinary checks a network-supplied proxy binary override: it must
 // be an absolute path to a recognized proxy binary. Empty means "use the
-// detected default" and is always fine.
-func ValidateProxyBinary(path string) error {
+// detected default" and is always fine. extraAllowed are local-operator opt-in
+// basenames (the custom-engine allow-list, §9), never sourced from the network.
+func ValidateProxyBinary(path string, extraAllowed ...string) error {
 	if path == "" {
 		return nil
 	}
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("proxy binary %q must be an absolute path", path)
 	}
-	if !proxyBinaries[filepath.Base(path)] {
+	base := filepath.Base(path)
+	for _, a := range extraAllowed {
+		if base == a {
+			return nil
+		}
+	}
+	if !proxyBinaries[base] {
 		return fmt.Errorf("proxy binary %q is not a recognized proxy (allowed: %s)", path, allowedList(proxyBinaries))
 	}
 	return nil
@@ -55,7 +62,13 @@ func ValidateProxyBinary(path string) error {
 // must be a recognized proxy binary or service manager. sudo is rejected — the
 // agent decides its own elevation, and a sudo prefix would let the rest of the
 // line name any command.
-func ValidateProxyCommand(field, cmd string) error {
+//
+// extraAllowed are additional binary basenames the LOCAL host operator opted
+// into via agent config (the custom-engine allow-list, §9). They are never
+// sourced from the network — the orchestrator-side checks pass none — so a
+// custom engine's native command (e.g. "haproxy -c") is accepted only because
+// the operator who owns the host allow-listed it locally.
+func ValidateProxyCommand(field, cmd string, extraAllowed ...string) error {
 	if cmd == "" {
 		return nil
 	}
@@ -66,6 +79,11 @@ func ValidateProxyCommand(field, cmd string) error {
 	base := filepath.Base(tokens[0])
 	if base == "sudo" {
 		return fmt.Errorf("%s must not invoke sudo (the agent elevates itself when needed)", field)
+	}
+	for _, a := range extraAllowed {
+		if base == a {
+			return nil
+		}
 	}
 	if !proxyBinaries[base] && !serviceManagers[base] {
 		return fmt.Errorf("%s starts with %q, which is not a recognized proxy or service manager (allowed: %s, %s)",
