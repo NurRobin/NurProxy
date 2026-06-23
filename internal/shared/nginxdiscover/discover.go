@@ -286,14 +286,39 @@ func dedup(in []string) []string {
 	return out
 }
 
-// dedup2 collapses upstreams by addr, merging the server_names that reference
-// the same backend, and returns them sorted by addr for stable output.
+// canonKey collapses upstreams that point at the same backend: loopback hosts
+// are unified (localhost = 127.0.0.1 = ::1) and the scheme's default port is
+// filled in, so "localhost", "localhost:80", "127.0.0.1:80" and
+// "http://localhost" all key the same. Without this the dedup keyed on the raw
+// host:port, so localhost and 127.0.0.1 surfaced as two separate suggestions.
+func canonKey(u Upstream) string {
+	h := strings.ToLower(strings.Trim(u.Host, "[]"))
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+		h = "localhost"
+	}
+	p := u.Port
+	if p == 0 {
+		switch u.Scheme {
+		case "https":
+			p = 443
+		case "http":
+			p = 80
+		}
+	}
+	if p == 0 {
+		return u.Scheme + "|" + h
+	}
+	return u.Scheme + "|" + h + ":" + strconv.Itoa(p)
+}
+
+// dedup2 collapses upstreams that resolve to the same backend, merging the
+// server_names that reference it, and returns them sorted for stable output.
 func dedup2(in []Upstream) []Upstream {
 	byAddr := map[string]*Upstream{}
 	var order []string
 	for i := range in {
 		u := in[i]
-		key := u.Scheme + "|" + u.Addr()
+		key := canonKey(u)
 		if e, ok := byAddr[key]; ok {
 			e.ServerNames = dedup(append(e.ServerNames, u.ServerNames...))
 			continue

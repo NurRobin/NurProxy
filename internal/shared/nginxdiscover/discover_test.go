@@ -75,6 +75,29 @@ server { server_name c.com; location / { proxy_pass https://10.0.0.9:443; } }`
 	}
 }
 
+func TestDiscover_collapsesLoopbackForms(t *testing.T) {
+	cfg := `
+server { server_name a.com; location / { proxy_pass http://localhost:8080; } }
+server { server_name b.com; location / { proxy_pass http://127.0.0.1:8080; } }`
+	got := Discover(cfg)
+	if len(got) != 1 {
+		t.Fatalf("localhost and 127.0.0.1 on the same port must collapse to one upstream, got %d: %+v", len(got), got)
+	}
+	if !reflect.DeepEqual(got[0].ServerNames, []string{"a.com", "b.com"}) {
+		t.Errorf("collapsed loopback upstream should merge both vhost names, got %v", got[0].ServerNames)
+	}
+}
+
+func TestDiscover_collapsesDefaultPort(t *testing.T) {
+	cfg := `
+server { server_name a.com; location / { proxy_pass http://10.0.0.5; } }
+server { server_name b.com; location / { proxy_pass http://10.0.0.5:80; } }`
+	got := Discover(cfg)
+	if len(got) != 1 {
+		t.Fatalf("http://host and host:80 must collapse to one upstream, got %d: %+v", len(got), got)
+	}
+}
+
 func TestDiscover_skipsVariablesAndSchemeless(t *testing.T) {
 	cfg := `
 server {
