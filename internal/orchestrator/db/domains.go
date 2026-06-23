@@ -44,13 +44,15 @@ func (d *DB) CreateDomain(dom *models.Domain) error {
 	res, err := d.sql.Exec(`
 		INSERT INTO domains (subdomain, zone_id, server_id, port, proxy_config,
 			manual_config, websocket, force_https, ssl_mode, dns_record_id,
-			status, error_msg, last_synced, created_at, updated_at, dns_managed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			status, error_msg, last_synced, created_at, updated_at, dns_managed,
+			cert_only)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID,
 		string(dom.Status), dom.ErrorMsg, lastSynced,
 		now.Format(time.RFC3339), now.Format(time.RFC3339), boolToInt(dom.DNSManaged),
+		boolToInt(dom.CertOnly),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting domain: %w", err)
@@ -70,7 +72,7 @@ func scanDomain(sc interface {
 }) (*models.Domain, error) {
 	var dom models.Domain
 	var pcJSON string
-	var manualConfig, websocket, forceHTTPS, dnsManaged int
+	var manualConfig, websocket, forceHTTPS, dnsManaged, certOnly int
 	var lastSynced sql.NullString
 	var createdAt, updatedAt string
 
@@ -78,7 +80,7 @@ func scanDomain(sc interface {
 		&dom.ID, &dom.Subdomain, &dom.ZoneID, &dom.ServerID, &dom.Port,
 		&pcJSON, &manualConfig, &websocket, &forceHTTPS,
 		&dom.SSLMode, &dom.DNSRecordID, &dom.Status, &dom.ErrorMsg,
-		&lastSynced, &createdAt, &updatedAt, &dnsManaged,
+		&lastSynced, &createdAt, &updatedAt, &dnsManaged, &certOnly,
 	)
 	if err != nil {
 		return nil, err
@@ -88,6 +90,7 @@ func scanDomain(sc interface {
 	dom.WebSocket = websocket != 0
 	dom.ForceHTTPS = forceHTTPS != 0
 	dom.DNSManaged = dnsManaged != 0
+	dom.CertOnly = certOnly != 0
 	dom.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	dom.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	if lastSynced.Valid {
@@ -104,7 +107,7 @@ func scanDomain(sc interface {
 
 const domainColumns = `id, subdomain, zone_id, server_id, port, proxy_config,
 	manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
-	error_msg, last_synced, created_at, updated_at, dns_managed`
+	error_msg, last_synced, created_at, updated_at, dns_managed, cert_only`
 
 // GetDomain retrieves a domain by its auto-incremented ID.
 func (d *DB) GetDomain(id int64) (*models.Domain, error) {
@@ -340,7 +343,7 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 	// Qualify all column references with d. to avoid ambiguity with the servers join.
 	qualifiedColumns := `d.id, d.subdomain, d.zone_id, d.server_id, d.port, d.proxy_config,
 		d.manual_config, d.websocket, d.force_https, d.ssl_mode, d.dns_record_id, d.status,
-		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed`
+		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed, d.cert_only`
 
 	rows, err := d.read.Query(`
 		SELECT `+qualifiedColumns+`

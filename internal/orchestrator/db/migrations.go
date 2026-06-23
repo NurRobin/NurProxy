@@ -457,6 +457,15 @@ var migrations = []string{
 	`
 	ALTER TABLE agents ADD COLUMN token_enc TEXT NOT NULL DEFAULT '';
 	`,
+
+	// Migration 20: cert_only marks a domain NurProxy issues + renews a TLS
+	// certificate for and installs on the agent's cert store WITHOUT serving a
+	// vhost (§7) — the operator hand-writes the engine config and points it at the
+	// stable cert path. Default 0 keeps every existing domain a normal served
+	// route.
+	`
+	ALTER TABLE domains ADD COLUMN cert_only INTEGER NOT NULL DEFAULT 0;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

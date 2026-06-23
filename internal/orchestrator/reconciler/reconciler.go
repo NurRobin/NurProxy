@@ -116,8 +116,47 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	// referencing config, so a generated config never validates against a missing
 	// cert file. Certs ride this agent-initiated stream — no inbound probe.
 	certs := r.gatherCerts(desired)
+	// Cert-only domains have no intent but still need their cert installed (§7).
+	certs = append(certs, r.gatherCertOnlyCerts(agent)...)
 	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents, Certs: certs, Keep: keepExtra})
 	return nil
+}
+
+// gatherCertOnlyCerts collects the cert bundles for an agent's cert-only domains
+// (§7): NurProxy issues + renews their certificate and installs it on the agent,
+// but renders no vhost, so they are excluded from the desired route set and their
+// certs must be gathered here to ride the push. A domain whose cert is not issued
+// yet is skipped (it installs on the next push after issuance); when its cert is
+// present the domain flips to active so the dashboard reflects "cert ready".
+func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertBundle {
+	domains, err := r.db.ListDomainsByAgent(agent.ID)
+	if err != nil {
+		log.Printf("reconciler: cannot list cert-only domains for agent %s: %v", agent.ID, err)
+		return nil
+	}
+	var bundles []proxymodel.CertBundle
+	for i := range domains {
+		dom := &domains[i]
+		if !dom.CertOnly || dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zone, zErr := r.db.GetZone(dom.ZoneID)
+		if zErr != nil {
+			continue
+		}
+		fqdn := dom.FQDN(zone.Name)
+		cert, cErr := r.db.GetCertificate(fqdn)
+		if cErr != nil {
+			continue // not issued yet; installs on a later push
+		}
+		bundles = append(bundles, proxymodel.CertBundle{Host: cert.Host, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM})
+		if dom.Status != models.DomainStatusActive {
+			if uErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusActive, ""); uErr != nil {
+				log.Printf("reconciler: failed to mark cert-only domain %d active: %v", dom.ID, uErr)
+			}
+		}
+	}
+	return bundles
 }
 
 // RepushCertForHost re-pushes the config + cert bundle for the agent serving
@@ -443,6 +482,13 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
+		// Cert-only domains get a certificate installed on the agent but NO vhost
+		// (§7): the operator hand-writes the config. Exclude them from the route
+		// set; their certs ride the push via gatherCertOnlyCerts.
+		if dom.CertOnly {
+			continue
+		}
+
 		// Resolve zone name from the domain's zone.
 		zoneName, ok := zoneNames[dom.ZoneID]
 		if !ok {
@@ -665,6 +711,13 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 
 		// Skip domains not in an actionable state.
 		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+
+		// Cert-only domains: NurProxy issues the cert (DNS-01 challenge records are
+		// handled by the issuer) but does NOT manage the public record — the
+		// operator owns DNS for their own hand-written vhost (§7).
+		if dom.CertOnly {
 			continue
 		}
 
