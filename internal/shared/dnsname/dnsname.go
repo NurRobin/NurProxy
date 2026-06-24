@@ -13,11 +13,14 @@ import (
 // wildcard). It enforces the DNS label rules: each dot-separated label is 1–63
 // characters of letters, digits, or hyphens, not starting or ending with a
 // hyphen; the whole name is at most 253 characters. A single leading "*" label
-// is allowed (wildcard); "*" anywhere else is rejected. Validation is
-// case-insensitive.
+// is allowed (wildcard); "*" anywhere else is rejected. The "@" sentinel selects
+// the zone apex (root). Validation is case-insensitive.
 func ValidateSubdomain(s string) error {
 	if s == "" {
 		return fmt.Errorf("subdomain is required")
+	}
+	if s == "@" {
+		return nil // apex/root sentinel — the record lives at the zone apex
 	}
 	if len(s) > 253 {
 		return fmt.Errorf("subdomain is too long (max 253 characters)")

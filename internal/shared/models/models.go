@@ -394,8 +394,16 @@ type Domain struct {
 	UpdatedAt  time.Time    `json:"updated_at"`
 }
 
-// FQDN returns the full domain name (subdomain + zone).
+// IsApex reports whether the domain targets the zone apex (root), represented by
+// the "@" subdomain sentinel.
+func (d Domain) IsApex() bool { return d.Subdomain == "@" }
+
+// FQDN returns the full domain name (subdomain + zone). The "@" sentinel means
+// the zone apex, so the bare zone name is returned.
 func (d Domain) FQDN(zoneName string) string {
+	if d.Subdomain == "@" {
+		return zoneName
+	}
 	return d.Subdomain + "." + zoneName
 }
 

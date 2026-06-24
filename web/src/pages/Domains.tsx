@@ -21,6 +21,13 @@ function seen(date?: string) {
   return date ? formatRelativeTime(date) : i18n.t('time.never');
 }
 
+// domainFqdn renders a domain's full name, honoring the "@" apex sentinel: an
+// apex domain ("@") resolves to the bare zone (e.g. "@" + "example.com" →
+// "example.com") instead of the malformed "@.example.com".
+function domainFqdn(subdomain: string, zoneName: string): string {
+  return subdomain === '@' ? zoneName : `${subdomain}.${zoneName}`;
+}
+
 interface ServerWithAgent extends Server {
   agentName: string;
 }
@@ -250,7 +257,7 @@ export default function Domains() {
     setSelected((prev) => { const n = new Set(prev); n.delete(d.id); return n; });
     if (detailDomain?.id === d.id) setDetailDomain(null);
     undoableDelete({
-      message: t('domains.deleted', { fqdn: `${d.subdomain}.${getZoneName(d.zone_id)}` }),
+      message: t('domains.deleted', { fqdn: domainFqdn(d.subdomain, getZoneName(d.zone_id)) }),
       doDelete: async () => { await api.deleteDomain(d.id); },
       onUndo: () => setDomains((prev) => (prev.some((x) => x.id === d.id) ? prev : [...prev, d])),
       failMessage: t('domains.deleteFailed'),
@@ -372,7 +379,7 @@ export default function Domains() {
                         onChange={() => toggleSelected(d.id)}
                       />
                     </td>
-                    <td className="px-4 py-3 font-medium text-fg">{zone ? `${d.subdomain}.${zone}` : d.subdomain}</td>
+                    <td className="px-4 py-3 font-medium text-fg">{zone ? domainFqdn(d.subdomain, zone) : d.subdomain}</td>
                     <td className="px-4 py-3 font-mono text-xs text-fg-muted">{srv ? `${srv.address}:${d.port}` : `:${d.port}`}</td>
                     <td className="px-4 py-3 text-fg-muted">{srv?.agentName ?? '—'}</td>
                     <td className="px-4 py-3"><StatusBadge status={d.status} /></td>
@@ -395,7 +402,7 @@ export default function Domains() {
       <Modal open={showCreate} onClose={() => setShowCreate(false)} title={t('domains.createTitle')}>
         <div className="space-y-4">
           {createError && <Callout tone="danger">{createError}</Callout>}
-          <Field label={t('domains.subdomain')} hint={createSub && createZone ? t('domains.fqdnPreview', { fqdn: `${createSub}.${getZoneName(createZone)}` }) : undefined}>
+          <Field label={t('domains.subdomain')} hint={createSub && createZone ? t('domains.fqdnPreview', { fqdn: domainFqdn(createSub, getZoneName(createZone)) }) : t('domains.subdomainApexHint')}>
             <Input value={createSub} onChange={(e) => setCreateSub(e.target.value)} placeholder={t('domains.subdomainPh')} />
           </Field>
           <Field label={t('domains.zone')} help="zone">
@@ -440,7 +447,7 @@ export default function Domains() {
       </Modal>
 
       {/* Detail / edit modal — tabbed */}
-      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title={t('domains.settingsTitle')} description={detailDomain ? `${detailDomain.subdomain}.${getZoneName(detailDomain.zone_id)}` : undefined} wide>
+      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title={t('domains.settingsTitle')} description={detailDomain ? domainFqdn(detailDomain.subdomain, getZoneName(detailDomain.zone_id)) : undefined} wide>
         {detailDomain && (
           <div className="space-y-5">
             <div className="flex flex-wrap items-center gap-3">

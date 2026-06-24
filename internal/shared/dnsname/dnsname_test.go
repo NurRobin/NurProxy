@@ -14,6 +14,7 @@ func TestValidateSubdomain(t *testing.T) {
 		"x1-y2",
 		"*",          // bare wildcard
 		"*.internal", // leading wildcard label
+		"@",          // apex/root sentinel
 		strings.Repeat("a", 63),
 	}
 	for _, s := range valid {
@@ -33,6 +34,8 @@ func TestValidateSubdomain(t *testing.T) {
 		"trailing-dot.",         // empty last label
 		"foo.*",                 // wildcard not in first position
 		"*bad",                  // '*' mixed into a label
+		"@.foo",                 // '@' is only valid as the whole apex sentinel
+		"foo.@",                 // '@' not a normal label
 		strings.Repeat("a", 64), // label too long
 	}
 	for _, s := range invalid {
