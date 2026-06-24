@@ -138,6 +138,10 @@ func main() {
 	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
 	srv.SetAgentHub(hub, rec)
+	// Wire the DNS-takeover override so an operator can migrate an existing domain
+	// whose public DNS predates NurProxy (overwrite a conflicting foreign record
+	// with the desired CNAME, using the provider's own stored credentials).
+	srv.SetDNSTakeover(rec)
 	// Surface sandbox state so the dashboard can show a "dry-run" banner (#93).
 	srv.SetDryRun(dnsDryRun, acmeDryRun)
 	// Wire the on-demand cert issuer so creating a central-TLS domain kicks

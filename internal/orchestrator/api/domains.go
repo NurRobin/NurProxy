@@ -621,3 +621,36 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "config reset to auto-generated"})
 }
+
+// POST /api/v1/domains/{id}/dns/takeover — admin override that authorizes NurProxy
+// to overwrite a conflicting pre-existing DNS record (an A record, or a CNAME to a
+// different target) with the desired CNAME → agent FQDN, using the zone provider's
+// own stored credentials. The default reconcile path never touches a record it did
+// not create; this is the explicit, audited escape hatch for migrating an existing
+// domain whose public DNS predates NurProxy. It also re-pushes the agent's routes so
+// the now-resolvable domain re-renders with its certificate.
+func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid domain ID")
+		return
+	}
+	if s.takeover == nil {
+		writeError(w, http.StatusServiceUnavailable, "DNS takeover unavailable (reconciler not wired)")
+		return
+	}
+	dom, err := s.db.GetDomain(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+	if err := s.takeover.TakeoverDomainDNS(r.Context(), id); err != nil {
+		writeError(w, http.StatusBadGateway, "DNS takeover failed: "+err.Error())
+		return
+	}
+	s.audit(r, "domain", strconv.FormatInt(id, 10), "dns_takeover", dom.Subdomain)
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "DNS takeover applied — the record now points at the agent and routes were re-pushed",
+	})
+}
