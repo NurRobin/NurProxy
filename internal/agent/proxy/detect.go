@@ -130,6 +130,19 @@ type Detector struct {
 	// socket to a pid + command, best-effort. Defaults to resolveHolderViaProc; a
 	// nil resolver disables the fallback. Returns ok=false when it cannot attribute.
 	resolveHolder func(port int) (process string, pid int, ok bool)
+	// configDirOverride, when non-empty, replaces the §9-detected config dir for
+	// both the reported ConfigDir and upstream discovery — so an operator who
+	// points NurProxy at a non-default config tree (the §9 minority) has THAT
+	// scanned, not the OS default. Set via WithConfigDir from the agent config.
+	configDirOverride string
+}
+
+// WithConfigDir overrides the §9-detected config directory used for the reported
+// ConfigDir and upstream discovery. Empty keeps the OS default. Returns the
+// Detector for chaining (mirrors the agent's NewHolder(...).With... style).
+func (d *Detector) WithConfigDir(dir string) *Detector {
+	d.configDirOverride = strings.TrimSpace(dir)
+	return d
 }
 
 // NewDetector returns a Detector wired to the real host.
@@ -186,10 +199,14 @@ func (d *Detector) Detect(ctx context.Context) (Detection, error) {
 		}
 
 		paths := ResolvePaths(c.kind)
-		det.ConfigDir = paths.ConfigDir
+		configDir := paths.ConfigDir
+		if d.configDirOverride != "" {
+			configDir = d.configDirOverride
+		}
+		det.ConfigDir = configDir
 		det.LogPaths = paths.LogPaths
 		if c.kind == KindNginx {
-			det.DiscoveredUpstreams = nginxdiscover.Discover(gatherNginxConfig(paths.ConfigDir))
+			det.DiscoveredUpstreams = nginxdiscover.Discover(gatherNginxConfig(configDir))
 		}
 		break
 	}
