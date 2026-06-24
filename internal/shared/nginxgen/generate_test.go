@@ -306,6 +306,65 @@ func TestRender_structured_intentToConfig(t *testing.T) {
 	}
 }
 
+func TestRender_http2SyntaxByNginxVersion(t *testing.T) {
+	mkInput := func(version string) Input {
+		r := proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8080}}
+		r.TLS = proxymodel.TLSConfig{Policy: proxymodel.TLSPolicyCentral}
+		return Input{Route: r, CertPath: "/c.crt", KeyPath: "/c.key", NginxVersion: version}
+	}
+	tests := []struct {
+		name       string
+		version    string
+		wantServer []string
+		notServer  []string
+	}{
+		{"nginx 1.18 uses listen http2", "1.18.0",
+			[]string{"listen 443 ssl http2;", "listen [::]:443 ssl http2;"}, []string{"http2 on;"}},
+		{"nginx 1.25.0 still legacy", "1.25.0",
+			[]string{"listen 443 ssl http2;"}, []string{"http2 on;"}},
+		{"nginx 1.25.1 uses http2 on", "1.25.1",
+			[]string{"listen 443 ssl;", "http2 on;"}, []string{"listen 443 ssl http2;"}},
+		{"nginx 1.31.2 uses http2 on", "1.31.2",
+			[]string{"http2 on;"}, []string{"listen 443 ssl http2;"}},
+		{"empty version defaults to modern", "",
+			[]string{"http2 on;"}, []string{"listen 443 ssl http2;"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := Render(mkInput(tt.version))
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			for _, want := range tt.wantServer {
+				if !strings.Contains(res.Server, want) {
+					t.Errorf("server should contain %q\n%s", want, res.Server)
+				}
+			}
+			for _, no := range tt.notServer {
+				if strings.Contains(res.Server, no) {
+					t.Errorf("server should NOT contain %q\n%s", no, res.Server)
+				}
+			}
+		})
+	}
+}
+
+func TestHTTP2OnSupported(t *testing.T) {
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{"1.18.0", false}, {"1.24.0", false}, {"1.25.0", false},
+		{"1.25.1", true}, {"1.26.0", true}, {"1.31.2", true}, {"2.0.0", true},
+		{"", true}, {"garbage", true}, {"1", true},
+	}
+	for _, tt := range tests {
+		if got := http2OnSupported(tt.version); got != tt.want {
+			t.Errorf("http2OnSupported(%q) = %v, want %v", tt.version, got, tt.want)
+		}
+	}
+}
+
 func TestRender_rawNginx_returnedVerbatim(t *testing.T) {
 	content := "server {\n    listen 80;\n    # operator's own block\n}\n"
 	res, err := Render(Input{Route: proxymodel.Route{
