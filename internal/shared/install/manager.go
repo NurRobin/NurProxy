@@ -5,8 +5,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -66,21 +68,67 @@ func requireRoot() error {
 
 // ensureDataDir creates the data directory and writes the config file
 // (e.g. agent.yaml) — the OS-neutral filesystem prep shared by every manager.
+// Both are handed to Service.User: the installer runs as root, so without the
+// chown a non-root service user cannot write its data dir (or read its config)
+// and the service dies at first boot.
 func ensureDataDir(s Service, out io.Writer) error {
 	if s.DataDir != "" {
 		if err := os.MkdirAll(s.DataDir, 0o750); err != nil {
 			return fmt.Errorf("creating data dir %s: %w", s.DataDir, err)
 		}
+		if err := chownForServiceUser(s, s.DataDir); err != nil {
+			return err
+		}
 		fprintf(out, "• data dir %s\n", s.DataDir)
 	}
 	if s.ConfigFile != "" {
-		if err := os.MkdirAll(filepath.Dir(s.ConfigFile), 0o750); err != nil {
+		confDir := filepath.Dir(s.ConfigFile)
+		_, statErr := os.Stat(confDir)
+		confDirCreated := os.IsNotExist(statErr)
+		if err := os.MkdirAll(confDir, 0o750); err != nil {
 			return fmt.Errorf("creating config dir: %w", err)
 		}
 		if err := os.WriteFile(s.ConfigFile, []byte(s.ConfigData), 0o640); err != nil {
 			return fmt.Errorf("writing config file %s: %w", s.ConfigFile, err)
 		}
+		// The config file must be readable by the service user (mode 0640); its
+		// parent is only re-owned when this install created it, so a shared
+		// pre-existing directory keeps its ownership.
+		paths := []string{s.ConfigFile}
+		if confDirCreated {
+			paths = append(paths, confDir)
+		}
+		if err := chownForServiceUser(s, paths...); err != nil {
+			return err
+		}
 		fprintf(out, "• config %s\n", s.ConfigFile)
+	}
+	return nil
+}
+
+// chownForServiceUser hands paths to Service.User so a non-root service can
+// use the files the (root) installer laid out. Root or an unset user needs no
+// change.
+func chownForServiceUser(s Service, paths ...string) error {
+	if s.User == "" || s.User == "root" {
+		return nil
+	}
+	u, err := user.Lookup(s.User)
+	if err != nil {
+		return fmt.Errorf("looking up service user %q (create the user first, or install without --user): %w", s.User, err)
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return fmt.Errorf("parsing uid %q of service user %s: %w", u.Uid, s.User, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return fmt.Errorf("parsing gid %q of service user %s: %w", u.Gid, s.User, err)
+	}
+	for _, p := range paths {
+		if err := os.Chown(p, uid, gid); err != nil {
+			return fmt.Errorf("chowning %s to %s: %w", p, s.User, err)
+		}
 	}
 	return nil
 }

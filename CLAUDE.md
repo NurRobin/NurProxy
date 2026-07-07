@@ -15,7 +15,7 @@ make lint           # Run golangci-lint
 - `cmd/nurproxy-agent/` — Agent entry point
 - `internal/orchestrator/` — Orchestrator logic (API, DB, reconciler, TLS issuance)
 - `internal/agent/` — Agent logic (proxy management, adoption, heartbeat)
-- `internal/proxy/` — Proxy backend interface + Caddy, nginx, Apache implementations
+- `internal/agent/proxy/` — Proxy backend interface + Caddy, nginx, Apache implementations
 - `internal/provider/` — DNS provider plugin system
 - `internal/shared/` — Shared code (models, auth, crypto, route generation)
 - `web/` — Dashboard (Vite + React + Tailwind)
