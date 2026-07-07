@@ -232,14 +232,13 @@ func certHasCentralConsumer(c *models.Certificate, centralHosts map[string]bool)
 		if name == "" {
 			continue
 		}
-		wildcard := strings.HasPrefix(name, "*.")
-		if wildcard {
+		switch {
+		case strings.HasPrefix(name, "*."):
 			name = strings.TrimPrefix(name, "*.")
-		} else if c.IsWildcard && name == c.Host {
+		case c.IsWildcard && name == c.Host:
 			// A wildcard cert is keyed at its apex (see zoneForHost): the bare host
 			// stands for "*.host" too.
-			wildcard = true
-		} else {
+		default:
 			// A plain SAN consumes only its exact host.
 			if centralHosts[name] {
 				return true
