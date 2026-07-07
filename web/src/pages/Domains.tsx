@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
 import type { Domain, Agent, Server, Zone, ProxyCapabilities } from '../lib/types';
-import { formatRelativeTime } from '../lib/utils';
+import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -150,7 +150,7 @@ export default function Domains() {
         port: createCertOnly ? 0 : parseInt(createPort, 10),
         websocket: createWebsocket, force_https: createForceHttps, cert_only: createCertOnly,
       });
-      toast.success(t('domains.created', { fqdn: `${createSub}.${getZoneName(createZone)}` }));
+      toast.success(t('domains.created', { fqdn: domainFqdn(createSub, getZoneName(createZone)) }));
       setShowCreate(false);
       setCreateSub(''); setCreateZone(''); setCreateServer(''); setCreatePort('80');
       setCreateWebsocket(false); setCreateForceHttps(true); setCreateCertOnly(false);
@@ -277,7 +277,7 @@ export default function Domains() {
     setSelected((prev) => { const n = new Set(prev); n.delete(d.id); return n; });
     if (detailDomain?.id === d.id) setDetailDomain(null);
     undoableDelete({
-      message: t('domains.deleted', { fqdn: `${d.subdomain}.${getZoneName(d.zone_id)}` }),
+      message: t('domains.deleted', { fqdn: domainFqdn(d.subdomain, getZoneName(d.zone_id)) }),
       doDelete: async () => { await api.deleteDomain(d.id); },
       onUndo: () => setDomains((prev) => (prev.some((x) => x.id === d.id) ? prev : [...prev, d])),
       failMessage: t('domains.deleteFailed'),
@@ -399,7 +399,7 @@ export default function Domains() {
                         onChange={() => toggleSelected(d.id)}
                       />
                     </td>
-                    <td className="px-4 py-3 font-medium text-fg">{zone ? `${d.subdomain}.${zone}` : d.subdomain}</td>
+                    <td className="px-4 py-3 font-medium text-fg">{zone ? domainFqdn(d.subdomain, zone) : d.subdomain}</td>
                     <td className="px-4 py-3 font-mono text-xs text-fg-muted">{srv ? `${srv.address}:${d.port}` : `:${d.port}`}</td>
                     <td className="px-4 py-3 text-fg-muted">{srv?.agentName ?? '—'}</td>
                     <td className="px-4 py-3"><StatusBadge status={d.status} /></td>
@@ -422,7 +422,7 @@ export default function Domains() {
       <Modal open={showCreate} onClose={() => setShowCreate(false)} title={t('domains.createTitle')}>
         <div className="space-y-4">
           {createError && <Callout tone="danger">{createError}</Callout>}
-          <Field label={t('domains.subdomain')} hint={createSub && createZone ? t('domains.fqdnPreview', { fqdn: `${createSub}.${getZoneName(createZone)}` }) : undefined}>
+          <Field label={t('domains.subdomain')} hint={createSub && createZone ? t('domains.fqdnPreview', { fqdn: domainFqdn(createSub, getZoneName(createZone)) }) : t('domains.subdomainApexHint')}>
             <Input value={createSub} onChange={(e) => setCreateSub(e.target.value)} placeholder={t('domains.subdomainPh')} />
           </Field>
           <Field label={t('domains.zone')} help="zone">
@@ -467,7 +467,7 @@ export default function Domains() {
       </Modal>
 
       {/* Detail / edit modal — tabbed */}
-      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title={t('domains.settingsTitle')} description={liveDomain ? `${liveDomain.subdomain}.${getZoneName(liveDomain.zone_id)}` : undefined} wide>
+      <Modal open={detailDomain !== null} onClose={() => setDetailDomain(null)} title={t('domains.settingsTitle')} description={liveDomain ? domainFqdn(liveDomain.subdomain, getZoneName(liveDomain.zone_id)) : undefined} wide>
         {liveDomain && (
           <div className="space-y-5">
             <div className="flex flex-wrap items-center gap-3">

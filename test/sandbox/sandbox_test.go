@@ -132,6 +132,18 @@ func TestSandboxEndToEnd(t *testing.T) {
 		"port": 8080, "ssl_mode": "central",
 	}, &domain)
 
+	// Apex (@) domain alongside it (apex support, #92): the "@" sentinel must
+	// converge through the same dry pipeline — DNS record created at the zone apex
+	// (FQDN == bare zone), cert issued for the bare zone, route rendered. Created
+	// now so it converges in the same reconciler cycle as "app" (no extra wait).
+	var apex struct {
+		ID int `json:"id"`
+	}
+	api.post("/api/v1/domains", map[string]any{
+		"subdomain": "@", "zone_id": zone.ID, "server_id": server.ID,
+		"port": 8080, "ssl_mode": "central",
+	}, &apex)
+
 	// --- assert convergence ---------------------------------------------------
 	// The CNAME (which flips the domain to active) is written on a reconciler
 	// cycle; the default interval is 60s, so allow one full cycle plus margin.
@@ -148,6 +160,23 @@ func TestSandboxEndToEnd(t *testing.T) {
 	})
 	if final != "active" {
 		t.Fatalf("domain never became active (last status %q)", final)
+	}
+
+	// The apex (@) domain must converge the same way — proves the "@" sentinel
+	// flows correctly through DNS create / issuance / render (apex support, #92).
+	var apexFinal string
+	waitFor(t, 75*time.Second, func() bool {
+		var d struct {
+			Status      string `json:"status"`
+			DNSManaged  bool   `json:"dns_managed"`
+			DNSRecordID string `json:"dns_record_id"`
+		}
+		api.get(fmt.Sprintf("/api/v1/domains/%d", apex.ID), &d)
+		apexFinal = d.Status
+		return d.Status == "active" && d.DNSManaged && d.DNSRecordID != ""
+	})
+	if apexFinal != "active" {
+		t.Fatalf("apex (@) domain never became active (last status %q)", apexFinal)
 	}
 
 	// The DNS record must be a simulated one (dryrun-* ID from the in-memory store).
