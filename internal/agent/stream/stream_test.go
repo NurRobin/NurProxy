@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -628,10 +629,10 @@ func TestApplyIntents_noCerts_doesNotInstall(t *testing.T) {
 // ACKing so domain status stays fresh. The TTL bounds it: out-of-band divergence
 // the agent cannot see self-heals on the next full apply.
 func TestApplyIntents_suppressesUnchangedSet(t *testing.T) {
-	acks := 0
+	var acks atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/agents/{id}/routes/ack", func(w http.ResponseWriter, r *http.Request) {
-		acks++
+		acks.Add(1)
 		w.WriteHeader(http.StatusOK)
 	})
 	srv := httptest.NewServer(mux)
@@ -660,8 +661,8 @@ func TestApplyIntents_suppressesUnchangedSet(t *testing.T) {
 	if be.pruneHit {
 		t.Error("suppressed push must not Prune")
 	}
-	if acks != 2 {
-		t.Errorf("acks = %d, want 2 (a suppressed push still ACKs)", acks)
+	if got := acks.Load(); got != 2 {
+		t.Errorf("acks = %d, want 2 (a suppressed push still ACKs)", got)
 	}
 	// The managed snapshot survives suppression — the heartbeat drift signal
 	// must keep reporting the artifact.
