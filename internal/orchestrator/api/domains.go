@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -606,11 +607,20 @@ func (s *Server) handleUpdateDomainConfig(w http.ResponseWriter, r *http.Request
 func (s *Server) resetManualArtifact(r *http.Request, domainID int64) {
 	artifactID := artifactIDForDomainID(domainID)
 	art, err := s.db.GetConfigArtifact(artifactID)
-	if err != nil || art.Source != models.ArtifactSourceManual {
+	if err != nil {
+		// No artifact is the common case (nothing to reset); anything else is a
+		// real lookup failure that would leave a stale manual artifact silently
+		// overriding the domain row — make it visible.
+		if !errors.Is(err, db.ErrArtifactNotFound) {
+			log.Printf("resetManualArtifact: looking up artifact %s: %v", artifactID, err)
+		}
+		return
+	}
+	if art.Source != models.ArtifactSourceManual {
 		return
 	}
 	if dErr := s.db.DeleteConfigArtifact(artifactID); dErr != nil {
-		log.Printf("config reset: failed to delete manual artifact %s: %v", artifactID, dErr)
+		log.Printf("resetManualArtifact: failed to delete manual artifact %s: %v", artifactID, dErr)
 		return
 	}
 	s.audit(r, "config_artifact", artifactID, "reset", "manual artifact removed; agent re-renders from the domain model")
