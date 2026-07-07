@@ -29,6 +29,14 @@ type RoutePusher interface {
 	PushAgentRoutes(agentID string) error
 }
 
+// DNSTakeover forcibly aligns a domain's public DNS record with NurProxy's desired
+// CNAME using the zone provider's stored credentials — the explicit admin override
+// of the default "never touch a record we didn't create" stance, used to migrate an
+// existing domain whose DNS predates NurProxy. The reconciler implements it.
+type DNSTakeover interface {
+	TakeoverDomainDNS(ctx context.Context, domID int64) error
+}
+
 // CertIssuer obtains a central TLS certificate for a host on demand (the §7
 // first-issuance fast path). The TLS Renewer implements it; the domain-create
 // handler kicks it asynchronously so a new central-TLS domain gets HTTPS within
@@ -46,6 +54,7 @@ type Server struct {
 	sessions *auth.SessionManager
 	hub      *agenthub.Hub
 	pusher   RoutePusher
+	takeover DNSTakeover
 	issuer   CertIssuer
 	logs     *logbroker.Broker
 	// loginLimiter blunts online password guessing: too many failed logins from
@@ -76,6 +85,14 @@ func (s *Server) SetDryRun(dns, acme bool) {
 func (s *Server) SetAgentHub(hub *agenthub.Hub, pusher RoutePusher) {
 	s.hub = hub
 	s.pusher = pusher
+}
+
+// SetDNSTakeover wires the DNS-takeover capability (the admin override that lets
+// NurProxy overwrite a conflicting foreign DNS record with the desired CNAME using
+// the provider's own credentials). Optional: when unset, the takeover endpoint
+// reports the capability unavailable.
+func (s *Server) SetDNSTakeover(t DNSTakeover) {
+	s.takeover = t
 }
 
 // SetCertIssuer wires the on-demand TLS issuer so domain creation can trigger
@@ -226,6 +243,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/domains/{id}/config", s.requireAuth(s.handleGetDomainConfig))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/config", s.requireAuth(s.handleUpdateDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/config/reset", s.requireAuth(s.handleResetDomainConfig))
+	s.mux.HandleFunc("POST /api/v1/domains/{id}/dns/takeover", s.requireAuth(s.handleDomainDNSTakeover))
 
 	// Config artifacts + drift review (auth required, §11 Phase 3)
 	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAuth(s.handleListArtifacts))

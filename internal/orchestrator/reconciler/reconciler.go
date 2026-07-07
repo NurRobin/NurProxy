@@ -883,6 +883,92 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
 }
 
+// TakeoverDomainDNS forcibly aligns a domain's public DNS record with NurProxy's
+// desired CNAME → agent FQDN, using the zone provider's stored credentials. It is
+// the explicit, audited admin override of the default "never overwrite a record we
+// didn't create" stance (ensureDomainCNAME): on a conflict it DELETES the
+// pre-existing record(s) at the provider and creates the CNAME, marks it managed,
+// clears the conflict error, and re-pushes the agent's routes so the now-resolvable
+// domain re-renders WITH its (already issued) certificate. It is the supported path
+// to migrate an existing domain whose public DNS predates NurProxy (an A record, or
+// a CNAME pointing somewhere else).
+func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
+	dom, err := r.db.GetDomain(domID)
+	if err != nil {
+		return fmt.Errorf("domain %d: %w", domID, err)
+	}
+	if dom.CertOnly {
+		return fmt.Errorf("domain %d is cert-only; NurProxy does not manage its public DNS", domID)
+	}
+
+	zone, err := r.db.GetZone(dom.ZoneID)
+	if err != nil {
+		return fmt.Errorf("resolving zone for domain %d: %w", domID, err)
+	}
+	prov, err := r.db.GetProvider(zone.ProviderID)
+	if err != nil {
+		return fmt.Errorf("resolving provider for zone %s: %w", zone.ID, err)
+	}
+	dnsProvider, err := provider.Get(prov.Type)
+	if err != nil {
+		return fmt.Errorf("DNS provider %s not registered: %w", prov.Type, err)
+	}
+	dnsProvider = r.wrapDNS(dnsProvider)
+	provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
+
+	fqdn := dom.FQDN(zone.Name)
+	srv, err := r.db.GetServer(dom.ServerID)
+	if err != nil {
+		return fmt.Errorf("resolving server for domain %d: %w", domID, err)
+	}
+	agent, err := r.db.GetAgent(srv.AgentID)
+	if err != nil {
+		return fmt.Errorf("resolving agent for domain %d: %w", domID, err)
+	}
+	target := agent.FQDN
+
+	existing, err := lookupRecordsByName(ctx, dnsProvider, provConfig, fqdn)
+	if err != nil {
+		return fmt.Errorf("looking up existing DNS records for %s: %w", fqdn, err)
+	}
+
+	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
+		// Already the record we want — just take ownership (managed=true) and fall
+		// through to the re-push so a stuck HTTP-only render heals.
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, true); dErr != nil {
+			return fmt.Errorf("storing adopted record id: %w", dErr)
+		}
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s", fqdn, target))
+	} else {
+		// Delete every conflicting record at this name, then create the CNAME.
+		for i := range existing {
+			if dErr := dnsProvider.DeleteRecord(ctx, provConfig, existing[i].ID); dErr != nil {
+				return fmt.Errorf("deleting conflicting record %s (%s): %w", existing[i].ID, existing[i].Type, dErr)
+			}
+		}
+		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0})
+		if cErr != nil {
+			return fmt.Errorf("creating CNAME for %s: %w", fqdn, cErr)
+		}
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
+			return fmt.Errorf("storing created record id: %w", dErr)
+		}
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took over DNS for %s: replaced %s with CNAME -> %s", fqdn, describeRecords(existing), target))
+	}
+
+	// Clear the conflict error; the proxy apply sets the real status next.
+	if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+		return fmt.Errorf("clearing domain status: %w", dErr)
+	}
+	// Re-push so the now-resolvable domain re-renders WITH its certificate — the
+	// create-time push rendered HTTP-only before issuance completed. No-op if the
+	// agent isn't connected; the periodic reconcile is the backstop.
+	if pErr := r.PushAgentRoutes(srv.AgentID); pErr != nil {
+		log.Printf("reconciler: DNS takeover for %s done, but route re-push failed (next cycle retries): %v", fqdn, pErr)
+	}
+	return nil
+}
+
 // lookupRecordsByName returns the provider's records whose name equals fqdn
 // (normalized), so the reconciler can adopt or diff before creating. An empty
 // result means the name is free.
