@@ -1961,6 +1961,13 @@ func TestDueForRenewal_skipsCertsWithoutCentralConsumer(t *testing.T) {
 			prep: parkAppCert,
 			want: []string{"example.com"},
 		},
+		{
+			// "*.app.example.com" does not cover its bare apex, so the live
+			// app.example.com domain is no consumer of this wildcard-only cert.
+			name: "wildcard cert does not consume its bare apex host",
+			cert: models.Certificate{ID: "app.example.com", Host: "app.example.com", Names: []string{"*.app.example.com"}, IsWildcard: true, CertPEM: "C", KeyPEM: "K", ExpiresAt: soon},
+			want: nil,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

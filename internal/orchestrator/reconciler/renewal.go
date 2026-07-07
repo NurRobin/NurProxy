@@ -239,13 +239,16 @@ func certHasCentralConsumer(c *models.Certificate, centralHosts map[string]bool)
 			// A wildcard cert is keyed at its apex (see zoneForHost): the bare host
 			// stands for "*.host" too.
 			wildcard = true
-		}
-		if centralHosts[name] {
-			return true
-		}
-		if !wildcard {
+		} else {
+			// A plain SAN consumes only its exact host.
+			if centralHosts[name] {
+				return true
+			}
 			continue
 		}
+		// A wildcard name covers hosts beneath its apex, NOT the apex itself —
+		// "*.example.com" does not serve "example.com". The apex only counts when
+		// it is also listed as a plain SAN (handled above).
 		suffix := "." + name
 		for h := range centralHosts {
 			if strings.HasSuffix(h, suffix) {

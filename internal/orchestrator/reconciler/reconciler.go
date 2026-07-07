@@ -1277,7 +1277,13 @@ func (r *Reconciler) cleanupCertForDomain(dom *models.Domain) {
 	}
 	host := dom.FQDN(zone.Name)
 	if _, err := r.db.GetCertificate(host); err != nil {
-		return // no stored cert for this host — nothing to clean up
+		// No stored cert is the normal case (self-acme/off domains). Anything
+		// else (DB failure, key decryption) must not be mistaken for "nothing to
+		// clean up" — log it so the lingering cert row is visible.
+		if !errors.Is(err, db.ErrCertNotFound) {
+			log.Printf("reconciler: cannot look up certificate for %s, leaving it in place: %v", host, err)
+		}
+		return
 	}
 	served, err := r.hostStillServed(host)
 	if err != nil {
@@ -1316,7 +1322,10 @@ func (r *Reconciler) hostStillServed(host string) (bool, error) {
 		if !ok {
 			zone, zErr := r.db.GetZone(dom.ZoneID)
 			if zErr != nil {
-				continue
+				// Skipping this domain could return a false "not served" and let the
+				// caller delete a certificate the domain still needs. Fail the check
+				// instead — the caller keeps the cert and retries next cycle.
+				return false, fmt.Errorf("resolving zone %s for domain %d: %w", dom.ZoneID, dom.ID, zErr)
 			}
 			zoneName = zone.Name
 			zoneNames[dom.ZoneID] = zoneName
