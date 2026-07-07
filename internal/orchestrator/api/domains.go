@@ -507,9 +507,12 @@ const previewCertDir = "/var/lib/nurproxy-agent/certs"
 
 // previewCertPaths returns the conventional cert/key paths for a host, matching
 // the agent cert store's file-naming: <host>.crt for the leaf+chain and
-// <host>.key.plain for the proxy-readable key (the agent encrypts the stored
-// key at rest as <host>.key.enc and materializes the plaintext sibling the
-// proxy actually loads).
+// <host>.key.plain for the proxy-readable key. That is the common case — an
+// agent with an at-rest key encrypts the stored key as <host>.key.enc and
+// materializes the plaintext sibling the proxy actually loads. An agent
+// without an at-rest key stores the key as plaintext <host>.key and serves
+// that path instead; the preview assumes the encrypted layout since it cannot
+// know the agent's key configuration (the operator adjusts if needed).
 func previewCertPaths(fqdn string) (certPath, keyPath string) {
 	base := sanitizeHostForPreview(fqdn)
 	return previewCertDir + "/" + base + ".crt", previewCertDir + "/" + base + ".key.plain"
