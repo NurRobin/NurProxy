@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,11 +22,13 @@ import (
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/apache" // registers the apache backend in the proxy registry
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
-	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx" // registers the nginx backend in the proxy registry
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/generic" // registers the custom (template) backend in the proxy registry
+	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"   // registers the nginx backend in the proxy registry
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/logging"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -43,6 +46,7 @@ var (
 	fqdn            = flag.String("fqdn", "", "Agent FQDN (required)")
 	dataDir         = flag.String("data-dir", "/var/lib/nurproxy-agent", "Data directory")
 	apiPort         = flag.Int("api-port", 8780, "Agent API port")
+	apiBind         = flag.String("api-bind", "", "Agent API bind address (default 127.0.0.1; widen only if the orchestrator must reach this agent inbound)")
 	caddyAdminPort  = flag.Int("caddy-admin-port", 2019, "Caddy admin API port (localhost)")
 	showVersion     = flag.Bool("version", false, "Print version and exit")
 	dryRun          = flag.Bool("dry-run", false, "Sandbox mode: simulate the proxy in-memory (no Caddy process, no :80/:443, unprivileged)")
@@ -97,6 +101,7 @@ func main() {
 		FQDN:           *fqdn,
 		DataDir:        *dataDir,
 		APIPort:        *apiPort,
+		APIBind:        *apiBind,
 		CaddyPort:      *caddyAdminPort,
 		ProxyMode:      *proxyMode,
 		ProxyType:      *proxyType,
@@ -153,7 +158,7 @@ func main() {
 	// which proxy is installed (+ version/paths) and which process holds :80/:443.
 	// The result rides the agent-initiated adoption + heartbeat payloads (the
 	// agent always dials out; the orchestrator never probes it inbound).
-	detection := detectProxy(ctx)
+	detection := detectProxy(ctx, cfg.ProxyConfigDir)
 	if detection != nil {
 		log.Printf("Proxy detection: installed=%t kind=%q version=%q config_dir=%q",
 			detection.Installed, detection.Kind, detection.Version, detection.ConfigDir)
@@ -175,7 +180,9 @@ func main() {
 	mgr.SetCapabilities(capabilities)
 
 	log.Printf("Agent ID: %s", mgr.AgentID())
-	log.Printf("Agent Token: %s...%s", mgr.Token()[:10], mgr.Token()[len(mgr.Token())-4:])
+	// Log a non-reversible fingerprint, never token material: logs are routinely
+	// shipped/shared, and the full token lives in the agent state file anyway.
+	log.Printf("Agent Token: sha256:%s… (full token in the agent state file)", auth.HashToken(mgr.Token())[:12])
 
 	// Record runtime facts so `nurproxy-agent apply <code>` works zero-arg on this
 	// host (§19): the CLI resolves orchestrator/api-port/agent-id from here without
@@ -295,7 +302,11 @@ func main() {
 	// existing with no process restart. While nobody calls Reconfigure the Holder
 	// forwards every call to this same caddy backend, so the built-in path stays
 	// byte-for-byte identical (invariant #1).
-	holder := proxy.NewHolder(caddyBackend, string(cfg.ProxyMode))
+	holder := proxy.NewHolder(caddyBackend, string(cfg.ProxyMode)).
+		// Allow the operator's local custom-engine command binaries past cmdguard
+		// (§9). Empty for the native engines, so the built-in allow-list still
+		// governs every network-supplied override.
+		WithAllowedCommands(cfg.ProxyAllowedCommands)
 	// Guard the invariant: the bundled caddy backend must satisfy the admin-API
 	// primitives the Holder forwards, so wrapping it in the Holder is a transparent
 	// pass-through (not a silent no-op). This is a compile-time check via the
@@ -331,7 +342,7 @@ func main() {
 	// Step 3: Start Agent API server (non-fatal: a bind failure is reported via
 	// health and the agent keeps heartbeating).
 	api.SetVersion(version)
-	apiServer := api.New(cfg.APIPort, holder, mgr.Token())
+	apiServer := api.New(cfg.APIPort, holder, mgr.Token()).WithBind(cfg.APIBind)
 	apiServer.SetHealth(hs)
 
 	// Wire the hot-switch endpoint (§19): POST /admin/reconfigure drives the Holder.
@@ -376,7 +387,7 @@ func main() {
 	// the next beat instead of silently reverting to built-in. Fail-soft: a missing
 	// grant is reported via health, never crashes. Built-in mode skips this entirely.
 	if existingMode {
-		res := holder.Reconfigure(ctx, proxy.ReconfigureRequest{
+		req := proxy.ReconfigureRequest{
 			Mode:      "existing",
 			Type:      cfg.ProxyType,
 			ConfigDir: cfg.ProxyConfigDir,
@@ -385,7 +396,22 @@ func main() {
 			TestCmd:   cfg.ProxyTestCmd,
 			Service:   cfg.ProxyService,
 			LogPaths:  cfg.ProxyLogPaths,
-		}, reconfigureDeps)
+		}
+		// Custom engine (§9): resolve the operator's template (inline or file) and
+		// declared capabilities locally, then drive the same hot-switch path. These
+		// are set only here (local startup), never by the network handlers — custom
+		// engines stay local-only.
+		if cfg.ProxyType == string(proxy.KindCustom) {
+			tmpl, terr := resolveCustomTemplate(cfg)
+			if terr != nil {
+				log.Printf("WARNING: custom proxy: %v", terr)
+				hs.SetError(fmt.Sprintf("custom proxy: %v", terr))
+			}
+			req.Template = tmpl
+			req.FileExt = cfg.ProxyFileExt
+			req.DeclaredCaps = declaredCapsFromNames(cfg.ProxyCaps)
+		}
+		res := holder.Reconfigure(ctx, req, reconfigureDeps)
 		log.Printf("Existing mode honored at startup: %s", res.Message)
 	}
 
@@ -395,7 +421,8 @@ func main() {
 	// artifacts it has applied so the heartbeat can report their checksums for
 	// drift detection (§11).
 	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), holder, hs).
-		WithLogPaths(cfg.ProxyLogPaths)
+		WithLogPaths(cfg.ProxyLogPaths).
+		WithCertStore(certStore)
 
 	// In existing mode, report the host config the agent can READ into the central
 	// store (§17 "adoption reads all files") so it shows under Config immediately —
@@ -420,7 +447,7 @@ func main() {
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
 	// host changes (e.g. a previously-conflicting proxy releasing :443).
-	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx) })
+	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx, cfg.ProxyConfigDir) })
 	// Re-report the capability matrix on each beat so module changes (e.g.
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
@@ -491,9 +518,11 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 
 // detectProxy runs read-only proxy detection and converts it to the shared wire
 // model. It never mutates host state; a detection error is logged and reported
-// as nil (the orchestrator keeps any prior value), never fatal.
-func detectProxy(ctx context.Context) *models.ProxyDetection {
-	det, err := proxy.NewDetector().Detect(ctx)
+// as nil (the orchestrator keeps any prior value), never fatal. configDir is the
+// operator's optional proxy-config-dir override (empty = §9 OS default), applied
+// to both the reported config dir and upstream discovery.
+func detectProxy(ctx context.Context, configDir string) *models.ProxyDetection {
+	det, err := proxy.NewDetector().WithConfigDir(configDir).Detect(ctx)
 	if err != nil {
 		log.Printf("Proxy detection failed: %v", err)
 		return nil
@@ -554,4 +583,57 @@ func toRuntimeEnv(env runtimeenv.Env) *models.RuntimeEnv {
 func detectCapabilities() *models.ProxyCapabilities {
 	b := caddybackend.New(caddy.NewMockClient())
 	return b.Capabilities().ToModel()
+}
+
+// resolveCustomTemplate returns the custom engine's route template: the inline
+// proxy_template if set, otherwise the contents of proxy_template_file. An error
+// is returned when neither is configured or the file cannot be read; the caller
+// surfaces it via health and the backend's New() then rejects the empty template
+// (so a misconfigured custom engine fails loudly, never silently serves nothing).
+func resolveCustomTemplate(cfg *agentconfig.Config) (string, error) {
+	if strings.TrimSpace(cfg.ProxyTemplate) != "" {
+		return cfg.ProxyTemplate, nil
+	}
+	if cfg.ProxyTemplateFile == "" {
+		return "", fmt.Errorf("proxy_type=custom requires proxy_template or proxy_template_file")
+	}
+	data, err := os.ReadFile(cfg.ProxyTemplateFile)
+	if err != nil {
+		return "", fmt.Errorf("reading proxy_template_file %q: %w", cfg.ProxyTemplateFile, err)
+	}
+	return string(data), nil
+}
+
+// declaredCapsFromNames maps the operator's declared capability names (§8) onto a
+// proxy.Capabilities. Reverse proxy is always implied. An empty list yields the
+// safe default (reverse proxy + central TLS); a non-empty list is taken as the
+// authoritative set the operator asserts their template supports. Unknown names
+// are ignored.
+func declaredCapsFromNames(names []string) *proxy.Capabilities {
+	c := proxy.Capabilities{ReverseProxy: true, CentralTLS: true}
+	if len(names) == 0 {
+		return &c
+	}
+	c.CentralTLS = false // an explicit declaration replaces the default set
+	for _, n := range names {
+		switch strings.ToLower(strings.TrimSpace(n)) {
+		case "websocket":
+			c.WebSocket = true
+		case "force_https", "forcehttps":
+			c.ForceHTTPS = true
+		case "custom_headers", "customheaders":
+			c.CustomHeaders = true
+		case "path_rewrite", "pathrewrite":
+			c.PathRewrite = true
+		case "basic_auth", "basicauth":
+			c.BasicAuth = true
+		case "ip_filter", "ipfilter":
+			c.IPFilter = true
+		case "rate_limit", "ratelimit":
+			c.RateLimit = true
+		case "central_tls", "centraltls":
+			c.CentralTLS = true
+		}
+	}
+	return &c
 }

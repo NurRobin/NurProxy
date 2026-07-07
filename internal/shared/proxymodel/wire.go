@@ -55,6 +55,17 @@ type IntentSet struct {
 	// retained (invariant #3, no overwrite while drifted). When nil, the agent falls
 	// back to the applied targets (older orchestrators / no-prune behavior).
 	Keep []string `json:"keep,omitempty"`
+	// PruneCerts marks this as a FULL cert set (set on the orchestrator's complete
+	// per-agent push, not the periodic intent-only push). When true, the agent
+	// scrubs every cert-store entry whose host is not in CertKeep — so a deleted
+	// host's certificate (notably a cert-only host with no vhost to drive cleanup,
+	// §7) is removed from the agent rather than lingering. The periodic push leaves
+	// this false to avoid touching certs it did not gather.
+	PruneCerts bool `json:"prune_certs,omitempty"`
+	// CertKeep is the set of hosts whose certs the agent should retain when
+	// PruneCerts is set (every NurProxy cert host for this agent). Empty + PruneCerts
+	// means "remove all NurProxy certs".
+	CertKeep []string `json:"cert_keep,omitempty"`
 }
 
 // CertBundle is one leaf certificate plus its private key destined for an agent's
@@ -72,6 +83,12 @@ type CertBundle struct {
 	// KeyPEM is the private key in PEM form (sensitive; encrypted at rest by the
 	// agent after install).
 	KeyPEM string `json:"key_pem"`
+	// MaterializeKey asks the agent to also write the decrypted private key in
+	// plaintext (.key.plain) so a hand-written config can read it. Set for
+	// cert-only hosts (§7), where NurProxy renders no vhost and would otherwise
+	// only leave the at-rest-encrypted key — useless to the operator. Off for
+	// normal routes, where the key is materialized transiently during render.
+	MaterializeKey bool `json:"materialize_key,omitempty"`
 }
 
 // ArtifactReport is the agent's atomic apply-ACK for one artifact: the rendered

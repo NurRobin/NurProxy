@@ -16,13 +16,24 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const [history, setHistory] = useState<ToastRecord[]>([]);
   const [unseen, setUnseen] = useState(0);
   const counter = useRef(0);
+  // Currently visible toasts keyed by variant+message, so repeated identical
+  // failures (e.g. the same poll erroring every cycle) don't stack up.
+  const activeKeys = useRef(new Map<string, number>());
 
   const remove = useCallback((id: number) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
+    for (const [key, toastId] of activeKeys.current) {
+      if (toastId === id) activeKeys.current.delete(key);
+    }
   }, []);
 
   const push = useCallback((message: string, variant: ToastVariant = 'info', opts?: ToastOptions) => {
+    // Empty messages mark errors handled elsewhere (see errMessage) — drop them.
+    if (!message) return;
+    const key = `${variant}:${message}`;
+    if (activeKeys.current.has(key)) return;
     const id = ++counter.current;
+    activeKeys.current.set(key, id);
     setToasts((prev) => [...prev, { id, message, variant, action: opts?.action }]);
     setHistory((prev) => [{ id, message, variant, at: new Date().toISOString() }, ...prev].slice(0, HISTORY_CAP));
     if (variant === 'error') setUnseen((n) => n + 1);
@@ -57,7 +68,7 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
   const s = styles[toast.variant];
   return (
     <div
-      role="status"
+      role={toast.variant === 'error' ? 'alert' : 'status'}
       className={`animate-toast-in pointer-events-auto flex items-start gap-3 rounded-lg border px-4 py-3 shadow-pop ${s.box}`}
     >
       <s.Icon className="mt-0.5 h-5 w-5 flex-shrink-0" aria-hidden="true" />

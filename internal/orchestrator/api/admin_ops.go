@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/shared/cmdguard"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -52,6 +53,19 @@ func validateAdminOpPayload(opType string, raw json.RawMessage) (string, error) 
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return "", fmt.Errorf("invalid set_proxy_mode payload: %w", err)
 			}
+		}
+		// The payload's command overrides are executed on the agent host (elevated
+		// when the agent is unprivileged). Reject raw command strings here at mint
+		// time — the agent re-validates on apply, but a dashboard credential must
+		// not be able to even stage arbitrary command execution (defense in depth).
+		if err := cmdguard.ValidateProxyCommand("proxy_reload_cmd", p.ProxyReloadCmd); err != nil {
+			return "", err
+		}
+		if err := cmdguard.ValidateProxyCommand("proxy_test_cmd", p.ProxyTestCmd); err != nil {
+			return "", err
+		}
+		if err := cmdguard.ValidateConfigDir(p.ProxyConfigDir); err != nil {
+			return "", err
 		}
 		return models.MarshalSetProxyModePayload(p)
 	default:

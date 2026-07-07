@@ -50,6 +50,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		ForceHTTPS  bool                `json:"force_https"`
 		SSLMode     models.SSLMode      `json:"ssl_mode"`
 		ProxyConfig *models.ProxyConfig `json:"proxy_config"`
+		// CertOnly issues + renews a cert for this host and installs it on the
+		// agent without serving a vhost (§7). No upstream/port is needed.
+		CertOnly bool `json:"cert_only"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -64,7 +67,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Port <= 0 || req.Port > 65535 {
+	// A cert-only domain proxies nothing, so no port is required. A served domain
+	// needs a valid upstream port.
+	if !req.CertOnly && (req.Port <= 0 || req.Port > 65535) {
 		writeError(w, http.StatusBadRequest, "port must be between 1 and 65535")
 		return
 	}
@@ -103,6 +108,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		WebSocket:  req.WebSocket,
 		ForceHTTPS: req.ForceHTTPS,
 		SSLMode:    sslMode,
+		CertOnly:   req.CertOnly,
 		Status:     models.DomainStatusPending,
 	}
 
@@ -401,6 +407,27 @@ func (s *Server) handleGetDomainConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Prefer the applied artifact: the agent round-trips the config it actually
+	// rendered and applied (real cert-store paths, real listener set) into the
+	// store via its apply-ACK (§3/B1). Showing those bytes means an operator who
+	// edits "the generated config" starts from what is genuinely on disk — a
+	// fresh re-render here would have to guess agent-local paths and has already
+	// produced manual configs pointing at cert files that do not exist.
+	if art, aErr := s.db.GetConfigArtifact(artifactIDForDomainID(id)); aErr == nil && art.Content != "" {
+		out := map[string]interface{}{"manual": false, "backend": art.Backend, "applied": true}
+		var raw json.RawMessage
+		if art.Backend == "caddy" && json.Unmarshal([]byte(art.Content), &raw) == nil {
+			out["config"] = raw
+		} else {
+			out["config"] = art.Content
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	// No applied artifact yet (domain not pushed to its agent so far): fall back
+	// to a fresh preview render with the conventional default paths.
+
 	// Get server for upstream address
 	srv, err := s.db.GetServer(dom.ServerID)
 	if err != nil {
@@ -477,15 +504,25 @@ func (s *Server) backendForDomain(srv *models.Server) string {
 }
 
 // previewCertDir is the conventional agent cert-store directory used to render
-// cert paths in the advanced preview. The agent's real directory is derived from
-// its own data dir; this is a sensible default the operator can adjust.
-const previewCertDir = "/var/lib/nurproxy/certs"
+// cert paths in the advanced preview, matching the agent's default data dir
+// (<data-dir>/certs with data-dir /var/lib/nurproxy-agent — NOT the
+// orchestrator's /var/lib/nurproxy). The agent's real directory is derived from
+// its own data dir; this default only seeds the preview for a domain that has
+// never been applied (once it has, the handler returns the applied artifact
+// with the agent's real paths instead).
+const previewCertDir = "/var/lib/nurproxy-agent/certs"
 
 // previewCertPaths returns the conventional cert/key paths for a host, matching
-// the agent cert store's file-naming (host as the base, ".crt"/".key").
+// the agent cert store's file-naming: <host>.crt for the leaf+chain and
+// <host>.key.plain for the proxy-readable key. That is the common case — an
+// agent with an at-rest key encrypts the stored key as <host>.key.enc and
+// materializes the plaintext sibling the proxy actually loads. An agent
+// without an at-rest key stores the key as plaintext <host>.key and serves
+// that path instead; the preview assumes the encrypted layout since it cannot
+// know the agent's key configuration (the operator adjusts if needed).
 func previewCertPaths(fqdn string) (certPath, keyPath string) {
 	base := sanitizeHostForPreview(fqdn)
-	return previewCertDir + "/" + base + ".crt", previewCertDir + "/" + base + ".key"
+	return previewCertDir + "/" + base + ".crt", previewCertDir + "/" + base + ".key.plain"
 }
 
 // sanitizeHostForPreview mirrors certstore.SanitizeHost for preview file names
@@ -656,4 +693,37 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "config reset to auto-generated"})
+}
+
+// POST /api/v1/domains/{id}/dns/takeover — admin override that authorizes NurProxy
+// to overwrite a conflicting pre-existing DNS record (an A record, or a CNAME to a
+// different target) with the desired CNAME → agent FQDN, using the zone provider's
+// own stored credentials. The default reconcile path never touches a record it did
+// not create; this is the explicit, audited escape hatch for migrating an existing
+// domain whose public DNS predates NurProxy. It also re-pushes the agent's routes so
+// the now-resolvable domain re-renders with its certificate.
+func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid domain ID")
+		return
+	}
+	if s.takeover == nil {
+		writeError(w, http.StatusServiceUnavailable, "DNS takeover unavailable (reconciler not wired)")
+		return
+	}
+	dom, err := s.db.GetDomain(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+	if err := s.takeover.TakeoverDomainDNS(r.Context(), id); err != nil {
+		writeError(w, http.StatusBadGateway, "DNS takeover failed: "+err.Error())
+		return
+	}
+	s.audit(r, "domain", strconv.FormatInt(id, 10), "dns_takeover", dom.Subdomain)
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "DNS takeover applied — the record now points at the agent and routes were re-pushed",
+	})
 }

@@ -126,7 +126,7 @@ func scanConfigArtifact(sc interface {
 
 // GetConfigArtifact retrieves a single artifact by ID.
 func (d *DB) GetConfigArtifact(id string) (*models.ConfigArtifact, error) {
-	row := d.sql.QueryRow(
+	row := d.read.QueryRow(
 		"SELECT "+configArtifactColumns+" FROM config_artifacts WHERE id = ?", id,
 	)
 	art, err := scanConfigArtifact(row)
@@ -146,7 +146,7 @@ func (d *DB) GetConfigArtifact(id string) (*models.ConfigArtifact, error) {
 // creating a duplicate "adopt-…" row that would violate the unique constraint.
 // Returns (nil, nil) when no artifact occupies that target.
 func (d *DB) GetConfigArtifactByTarget(agentID, targetKind, targetPath string) (*models.ConfigArtifact, error) {
-	row := d.sql.QueryRow(
+	row := d.read.QueryRow(
 		"SELECT "+configArtifactColumns+" FROM config_artifacts WHERE agent_id = ? AND target_kind = ? AND target_path = ?",
 		agentID, targetKind, targetPath,
 	)
@@ -199,7 +199,7 @@ func (d *DB) ListConfigArtifacts(filter ConfigArtifactFilter) ([]models.ConfigAr
 	}
 	query += " ORDER BY updated_at DESC, id"
 
-	rows, err := d.sql.Query(query, args...)
+	rows, err := d.read.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing config artifacts: %w", err)
 	}
@@ -315,7 +315,7 @@ func (d *DB) AppendConfigArtifactVersion(artifactID, content string, source mode
 // ListConfigArtifactVersions returns the full version history of an artifact,
 // newest version first.
 func (d *DB) ListConfigArtifactVersions(artifactID string) ([]models.ConfigArtifactVersion, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, artifact_id, version, content, checksum, source, actor, note, created_at
 		FROM config_artifact_versions
 		WHERE artifact_id = ?
@@ -342,7 +342,7 @@ func (d *DB) ListConfigArtifactVersions(artifactID string) ([]models.ConfigArtif
 // GetConfigArtifactVersion retrieves a single version of an artifact by its
 // version number.
 func (d *DB) GetConfigArtifactVersion(artifactID string, version int) (*models.ConfigArtifactVersion, error) {
-	row := d.sql.QueryRow(`
+	row := d.read.QueryRow(`
 		SELECT id, artifact_id, version, content, checksum, source, actor, note, created_at
 		FROM config_artifact_versions
 		WHERE artifact_id = ? AND version = ?`, artifactID, version)

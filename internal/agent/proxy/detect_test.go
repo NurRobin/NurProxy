@@ -43,6 +43,46 @@ func TestDetect_nginxPopulatesDiscoveredUpstreams(t *testing.T) {
 	}
 }
 
+func TestDetect_configDirOverride_usedForDiscovery(t *testing.T) {
+	restore := stubFS(
+		map[string]bool{"/etc/nginx/sites-available": true, "/etc/nginx": true},
+		map[string]bool{},
+	)
+	defer restore()
+	// Capture the directory discovery actually scans so we can assert the
+	// operator's override — not the §9 OS default — is what gets read.
+	var scanned string
+	gatherNginxConfig = func(dir string) string {
+		scanned = dir
+		return `server { server_name app.example.com; location / { proxy_pass http://10.0.0.7:9000; } }`
+	}
+
+	d := (&Detector{
+		lookPath: func(name string) (string, error) {
+			if name == "nginx" {
+				return "/usr/sbin/nginx", nil
+			}
+			return "", exec.ErrNotFound
+		},
+		run:           func(context.Context, string, ...string) (string, error) { return "nginx version: nginx/1.24.0\n", nil },
+		listListeners: func(context.Context) ([]listener, error) { return nil, nil },
+	}).WithConfigDir("/opt/custom/nginx/vhosts")
+
+	got, err := d.Detect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanned != "/opt/custom/nginx/vhosts" {
+		t.Errorf("discovery scanned %q, want the override dir", scanned)
+	}
+	if got.ConfigDir != "/opt/custom/nginx/vhosts" {
+		t.Errorf("ConfigDir = %q, want the override dir", got.ConfigDir)
+	}
+	if len(got.DiscoveredUpstreams) != 1 || got.DiscoveredUpstreams[0].Host != "10.0.0.7" {
+		t.Errorf("override discovery upstreams = %+v", got.DiscoveredUpstreams)
+	}
+}
+
 func TestDetect_nginxInstalledPortConflict_reportsAll(t *testing.T) {
 	restore := stubFS(
 		map[string]bool{"/etc/nginx/sites-available": true, "/etc/nginx": true},

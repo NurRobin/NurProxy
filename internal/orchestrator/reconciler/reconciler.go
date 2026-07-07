@@ -116,8 +116,57 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	// referencing config, so a generated config never validates against a missing
 	// cert file. Certs ride this agent-initiated stream — no inbound probe.
 	certs := r.gatherCerts(desired)
-	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents, Certs: certs, Keep: keepExtra})
+	// Cert-only domains have no intent but still need their cert installed (§7).
+	certs = append(certs, r.gatherCertOnlyCerts(agent)...)
+	// This is the complete cert set for the agent, so the agent may scrub any
+	// cert-store entry not in it — cleaning up a deleted host's cert (notably a
+	// cert-only host with no vhost to drive removal, §7).
+	certKeep := make([]string, 0, len(certs))
+	for i := range certs {
+		certKeep = append(certKeep, certs[i].Host)
+	}
+	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{
+		Intents: intents, Certs: certs, Keep: keepExtra,
+		PruneCerts: true, CertKeep: certKeep,
+	})
 	return nil
+}
+
+// gatherCertOnlyCerts collects the cert bundles for an agent's cert-only domains
+// (§7): NurProxy issues + renews their certificate and installs it on the agent,
+// but renders no vhost, so they are excluded from the desired route set and their
+// certs must be gathered here to ride the push. A domain whose cert is not issued
+// yet is skipped (it installs on the next push after issuance); when its cert is
+// present the domain flips to active so the dashboard reflects "cert ready".
+func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertBundle {
+	domains, err := r.db.ListDomainsByAgent(agent.ID)
+	if err != nil {
+		log.Printf("reconciler: cannot list cert-only domains for agent %s: %v", agent.ID, err)
+		return nil
+	}
+	var bundles []proxymodel.CertBundle
+	for i := range domains {
+		dom := &domains[i]
+		if !dom.CertOnly || dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zone, zErr := r.db.GetZone(dom.ZoneID)
+		if zErr != nil {
+			continue
+		}
+		fqdn := dom.FQDN(zone.Name)
+		cert, cErr := r.db.GetCertificate(fqdn)
+		if cErr != nil {
+			continue // not issued yet; installs on a later push
+		}
+		bundles = append(bundles, proxymodel.CertBundle{Host: cert.Host, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM, MaterializeKey: true})
+		if dom.Status != models.DomainStatusActive {
+			if uErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusActive, ""); uErr != nil {
+				log.Printf("reconciler: failed to mark cert-only domain %d active: %v", dom.ID, uErr)
+			}
+		}
+	}
+	return bundles
 }
 
 // RepushCertForHost re-pushes the config + cert bundle for the agent serving
@@ -443,6 +492,13 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
+		// Cert-only domains get a certificate installed on the agent but NO vhost
+		// (§7): the operator hand-writes the config. Exclude them from the route
+		// set; their certs ride the push via gatherCertOnlyCerts.
+		if dom.CertOnly {
+			continue
+		}
+
 		// Resolve zone name from the domain's zone.
 		zoneName, ok := zoneNames[dom.ZoneID]
 		if !ok {
@@ -550,8 +606,24 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		return nil
 	}
 
+	// The inbound fallback authenticates with the agent's plaintext token
+	// (decrypted from the master-key-encrypted store). The stored hash is no
+	// longer a credential — accepting it made the hash pass-equivalent and a DB
+	// leak yielded working agent credentials.
+	agentToken, err := r.db.GetAgentToken(agent.ID)
+	if err != nil {
+		return fmt.Errorf("loading inbound credentials for agent %s: %w", agent.ID, err)
+	}
+	if agentToken == "" {
+		// Pre-migration row that has not heartbeated since: no inbound
+		// credentials yet. The agent-dialed stream remains the control path;
+		// the token backfills on its next authenticated request.
+		log.Printf("reconciler: agent %s has no stored inbound token yet; skipping inbound sync", agent.ID)
+		return nil
+	}
+
 	// Get actual routes from the agent.
-	actualRoutes, err := r.agentClient.GetRoutes(ctx, agent.APIURL, agent.TokenHash)
+	actualRoutes, err := r.agentClient.GetRoutes(ctx, agent.APIURL, agentToken)
 	if err != nil {
 		return fmt.Errorf("getting routes from agent %s: %w", agent.ID, err)
 	}
@@ -571,7 +643,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if !exists {
 			// Missing on agent — push it.
 			log.Printf("reconciler: pushing missing route for %s to agent %s", fqdn, agent.ID)
-			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agent.TokenHash, desired.route); pErr != nil {
+			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 				log.Printf("reconciler: failed to push route for %s: %v", fqdn, pErr)
 				if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("route push failed: %v", pErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
@@ -606,7 +678,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 
 		// Push corrected route.
 		log.Printf("reconciler: fixing drift for %s on agent %s", fqdn, agent.ID)
-		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agent.TokenHash, desired.route); pErr != nil {
+		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 			log.Printf("reconciler: failed to fix drift for %s: %v", fqdn, pErr)
 			if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("drift fix failed: %v", pErr)); dErr != nil {
 				log.Printf("reconciler: failed to update domain status: %v", dErr)
@@ -649,6 +721,13 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 
 		// Skip domains not in an actionable state.
 		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+
+		// Cert-only domains: NurProxy issues the cert (DNS-01 challenge records are
+		// handled by the issuer) but does NOT manage the public record — the
+		// operator owns DNS for their own hand-written vhost (§7).
+		if dom.CertOnly {
 			continue
 		}
 
@@ -802,6 +881,92 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
 	}
 	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
+}
+
+// TakeoverDomainDNS forcibly aligns a domain's public DNS record with NurProxy's
+// desired CNAME → agent FQDN, using the zone provider's stored credentials. It is
+// the explicit, audited admin override of the default "never overwrite a record we
+// didn't create" stance (ensureDomainCNAME): on a conflict it DELETES the
+// pre-existing record(s) at the provider and creates the CNAME, marks it managed,
+// clears the conflict error, and re-pushes the agent's routes so the now-resolvable
+// domain re-renders WITH its (already issued) certificate. It is the supported path
+// to migrate an existing domain whose public DNS predates NurProxy (an A record, or
+// a CNAME pointing somewhere else).
+func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
+	dom, err := r.db.GetDomain(domID)
+	if err != nil {
+		return fmt.Errorf("domain %d: %w", domID, err)
+	}
+	if dom.CertOnly {
+		return fmt.Errorf("domain %d is cert-only; NurProxy does not manage its public DNS", domID)
+	}
+
+	zone, err := r.db.GetZone(dom.ZoneID)
+	if err != nil {
+		return fmt.Errorf("resolving zone for domain %d: %w", domID, err)
+	}
+	prov, err := r.db.GetProvider(zone.ProviderID)
+	if err != nil {
+		return fmt.Errorf("resolving provider for zone %s: %w", zone.ID, err)
+	}
+	dnsProvider, err := provider.Get(prov.Type)
+	if err != nil {
+		return fmt.Errorf("DNS provider %s not registered: %w", prov.Type, err)
+	}
+	dnsProvider = r.wrapDNS(dnsProvider)
+	provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
+
+	fqdn := dom.FQDN(zone.Name)
+	srv, err := r.db.GetServer(dom.ServerID)
+	if err != nil {
+		return fmt.Errorf("resolving server for domain %d: %w", domID, err)
+	}
+	agent, err := r.db.GetAgent(srv.AgentID)
+	if err != nil {
+		return fmt.Errorf("resolving agent for domain %d: %w", domID, err)
+	}
+	target := agent.FQDN
+
+	existing, err := lookupRecordsByName(ctx, dnsProvider, provConfig, fqdn)
+	if err != nil {
+		return fmt.Errorf("looking up existing DNS records for %s: %w", fqdn, err)
+	}
+
+	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
+		// Already the record we want — just take ownership (managed=true) and fall
+		// through to the re-push so a stuck HTTP-only render heals.
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, true); dErr != nil {
+			return fmt.Errorf("storing adopted record id: %w", dErr)
+		}
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s", fqdn, target))
+	} else {
+		// Delete every conflicting record at this name, then create the CNAME.
+		for i := range existing {
+			if dErr := dnsProvider.DeleteRecord(ctx, provConfig, existing[i].ID); dErr != nil {
+				return fmt.Errorf("deleting conflicting record %s (%s): %w", existing[i].ID, existing[i].Type, dErr)
+			}
+		}
+		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0})
+		if cErr != nil {
+			return fmt.Errorf("creating CNAME for %s: %w", fqdn, cErr)
+		}
+		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
+			return fmt.Errorf("storing created record id: %w", dErr)
+		}
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took over DNS for %s: replaced %s with CNAME -> %s", fqdn, describeRecords(existing), target))
+	}
+
+	// Clear the conflict error; the proxy apply sets the real status next.
+	if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+		return fmt.Errorf("clearing domain status: %w", dErr)
+	}
+	// Re-push so the now-resolvable domain re-renders WITH its certificate — the
+	// create-time push rendered HTTP-only before issuance completed. No-op if the
+	// agent isn't connected; the periodic reconcile is the backstop.
+	if pErr := r.PushAgentRoutes(srv.AgentID); pErr != nil {
+		log.Printf("reconciler: DNS takeover for %s done, but route re-push failed (next cycle retries): %v", fqdn, pErr)
+	}
+	return nil
 }
 
 // lookupRecordsByName returns the provider's records whose name equals fqdn
@@ -1145,6 +1310,21 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 				log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)
 			} else {
 				r.audit("config_artifact", artifactID, "remove", "domain deleted")
+			}
+		}
+
+		// Remove the central certificate for this host, so the renewal scan does not
+		// keep renewing a cert for a domain that no longer exists (wasting ACME
+		// quota). Best-effort and gated on existence (not every domain has a central
+		// cert: self-acme/off have none). Mirrors the artifact cleanup above.
+		if zone, zErr := r.db.GetZone(dom.ZoneID); zErr == nil {
+			fqdn := dom.FQDN(zone.Name)
+			if _, cErr := r.db.GetCertificate(fqdn); cErr == nil {
+				if dErr := r.db.DeleteCertificate(fqdn); dErr != nil {
+					log.Printf("reconciler: failed to delete cert for %s on domain %d teardown: %v", fqdn, dom.ID, dErr)
+				} else {
+					r.audit("certificate", fqdn, "remove", "domain deleted")
+				}
 			}
 		}
 

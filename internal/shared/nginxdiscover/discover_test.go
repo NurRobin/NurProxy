@@ -27,6 +27,30 @@ server {
 	}
 }
 
+func TestDiscover_skipsACMEChallengeLocation(t *testing.T) {
+	// Real-world vhost shape: the app backend in `location /`, plus a shared ACME
+	// HTTP-01 challenge responder. The challenge proxy is cert tooling, not an
+	// application backend, so it must not surface as a suggestion — otherwise that
+	// one internal address (e.g. 127.0.0.1:9180) rides along on every vhost.
+	cfg := `
+server {
+    server_name radarr.example.com;
+    location / {
+        proxy_pass http://192.168.1.213:7878;
+    }
+    location ~ /.well-known/acme-challenge {
+        proxy_pass http://127.0.0.1:9180;
+    }
+}`
+	got := Discover(cfg)
+	if len(got) != 1 {
+		t.Fatalf("ACME-challenge proxy_pass must be skipped, want 1 upstream, got %d: %+v", len(got), got)
+	}
+	if got[0].Host != "192.168.1.213" || got[0].Port != 7878 {
+		t.Errorf("only the real backend should remain, got %+v", got[0])
+	}
+}
+
 func TestDiscover_namedUpstreamResolved(t *testing.T) {
 	cfg := `
 upstream backend {
@@ -72,6 +96,29 @@ server { server_name c.com; location / { proxy_pass https://10.0.0.9:443; } }`
 	}
 	if !reflect.DeepEqual(shared.ServerNames, []string{"a.com", "b.com"}) {
 		t.Errorf("shared upstream should merge both vhost names, got %v", shared.ServerNames)
+	}
+}
+
+func TestDiscover_collapsesLoopbackForms(t *testing.T) {
+	cfg := `
+server { server_name a.com; location / { proxy_pass http://localhost:8080; } }
+server { server_name b.com; location / { proxy_pass http://127.0.0.1:8080; } }`
+	got := Discover(cfg)
+	if len(got) != 1 {
+		t.Fatalf("localhost and 127.0.0.1 on the same port must collapse to one upstream, got %d: %+v", len(got), got)
+	}
+	if !reflect.DeepEqual(got[0].ServerNames, []string{"a.com", "b.com"}) {
+		t.Errorf("collapsed loopback upstream should merge both vhost names, got %v", got[0].ServerNames)
+	}
+}
+
+func TestDiscover_collapsesDefaultPort(t *testing.T) {
+	cfg := `
+server { server_name a.com; location / { proxy_pass http://10.0.0.5; } }
+server { server_name b.com; location / { proxy_pass http://10.0.0.5:80; } }`
+	got := Discover(cfg)
+	if len(got) != 1 {
+		t.Fatalf("http://host and host:80 must collapse to one upstream, got %d: %+v", len(got), got)
 	}
 }
 

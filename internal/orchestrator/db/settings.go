@@ -11,7 +11,7 @@ import (
 // GetSetting retrieves a single setting value by key.
 func (d *DB) GetSetting(key string) (string, error) {
 	var value string
-	err := d.sql.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
+	err := d.read.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("setting not found: %s", key)
 	}
@@ -38,7 +38,7 @@ func (d *DB) SetSetting(key, value string) error {
 
 // ListSettings returns all stored settings.
 func (d *DB) ListSettings() ([]models.Setting, error) {
-	rows, err := d.sql.Query("SELECT key, value, updated_at FROM settings ORDER BY key")
+	rows, err := d.read.Query("SELECT key, value, updated_at FROM settings ORDER BY key")
 	if err != nil {
 		return nil, fmt.Errorf("listing settings: %w", err)
 	}

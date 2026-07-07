@@ -107,7 +107,17 @@ const maxConfigBytes = 8 << 20
 var gatherNginxConfig = func(configDir string) string {
 	dirs := []string{configDir}
 	if filepath.Base(configDir) == "sites-available" {
-		dirs = append(dirs, filepath.Join(filepath.Dir(configDir), "sites-enabled"))
+		// nginx serves only what is symlinked into sites-enabled; sites-available
+		// also accumulates disabled sites and backup copies (e.g. *.conf.bak.*)
+		// that nginx never loads. Prefer the active set so discovery sees the same
+		// upstreams nginx actually proxies to, and fall back to sites-available
+		// only when nothing is enabled.
+		enabled := filepath.Join(filepath.Dir(configDir), "sites-enabled")
+		if dirHasActiveConfig(enabled) {
+			dirs = []string{enabled}
+		} else {
+			dirs = append(dirs, enabled)
+		}
 	}
 	dirs = append(dirs, "/etc/nginx/conf.d")
 	files := []string{"/etc/nginx/nginx.conf"}
@@ -150,7 +160,7 @@ var gatherNginxConfig = func(configDir string) string {
 			continue
 		}
 		for _, e := range entries {
-			if e.IsDir() {
+			if e.IsDir() || isInactiveConfigFile(e.Name()) {
 				continue
 			}
 			add(filepath.Join(d, e.Name()))
@@ -160,6 +170,44 @@ var gatherNginxConfig = func(configDir string) string {
 		add(f)
 	}
 	return b.String()
+}
+
+// isInactiveConfigFile reports whether a filename in an nginx config dir is a
+// backup/inactive copy that nginx never loads — editor swap files, dotfiles,
+// package-manager leftovers, and manual/timestamped backups (e.g.
+// "site.conf.bak.preproxmox-20260419", "site.conf~", "site.conf.dpkg-old").
+// Reading these into upstream discovery surfaces phantom backends, such as a
+// pre-migration *.bak copy still naming a host's old upstream addresses.
+func isInactiveConfigFile(name string) bool {
+	n := strings.ToLower(name)
+	if n == "" || strings.HasPrefix(n, ".") || strings.HasSuffix(n, "~") {
+		return true
+	}
+	for _, marker := range []string{
+		".bak", ".old", ".orig", ".save", ".swp", ".swo",
+		".disabled", ".dpkg-", ".rpmsave", ".rpmnew",
+	} {
+		if strings.Contains(n, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// dirHasActiveConfig reports whether dir holds at least one loadable (non-dir,
+// non-backup) config file, so gatherNginxConfig prefers sites-enabled only when
+// it is actually populated.
+func dirHasActiveConfig(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && !isInactiveConfigFile(e.Name()) {
+			return true
+		}
+	}
+	return false
 }
 
 // dirExists is the existence check used by path resolution. It is a package
