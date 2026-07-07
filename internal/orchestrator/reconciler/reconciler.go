@@ -1269,28 +1269,37 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 		// later-step failure this cycle does not re-attempt a delete against an id
 		// that no longer exists.
 		if dom.DNSRecordID != "" && dom.DNSManaged {
-			if zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID); ok {
-				provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
-				dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID)
-				switch {
-				case dErr == nil:
-					r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
-				case errors.Is(dErr, provider.ErrRecordNotFound):
-					// Already removed at the provider — proceed with the rest of teardown.
-					r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_skipped", fmt.Sprintf("record %s already absent", dom.DNSRecordID))
-				default:
-					log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
-					r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
-					// Keep the domain around so we retry next cycle.
-					continue
-				}
-				// Record gone: clear its id and the managed flag so a later-step
-				// failure this cycle does not re-attempt a delete against a dead id.
-				if uErr := r.db.UpdateDomainDNSRecord(dom.ID, "", false); uErr != nil {
-					log.Printf("reconciler: failed to clear DNS record id for domain %d: %v", dom.ID, uErr)
-				}
-				dom.DNSRecordID = ""
+			zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID)
+			if !ok {
+				// The zone→provider chain is unresolvable, so the managed record cannot
+				// be deleted at the provider. Tearing the row down anyway would orphan
+				// that record permanently — nothing would be left to retry the delete.
+				// Keep the domain in "deleting" and retry next cycle, like any other
+				// failed record delete.
+				log.Printf("reconciler: cannot resolve DNS provider for zone %s, deferring teardown of domain %d (managed record %s)", dom.ZoneID, dom.ID, dom.DNSRecordID)
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", fmt.Sprintf("zone/provider unresolvable for managed record %s; teardown deferred", dom.DNSRecordID))
+				continue
 			}
+			provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
+			dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID)
+			switch {
+			case dErr == nil:
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+			case errors.Is(dErr, provider.ErrRecordNotFound):
+				// Already removed at the provider — proceed with the rest of teardown.
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_skipped", fmt.Sprintf("record %s already absent", dom.DNSRecordID))
+			default:
+				log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
+				// Keep the domain around so we retry next cycle.
+				continue
+			}
+			// Record gone: clear its id and the managed flag so a later-step
+			// failure this cycle does not re-attempt a delete against a dead id.
+			if uErr := r.db.UpdateDomainDNSRecord(dom.ID, "", false); uErr != nil {
+				log.Printf("reconciler: failed to clear DNS record id for domain %d: %v", dom.ID, uErr)
+			}
+			dom.DNSRecordID = ""
 		} else if dom.DNSRecordID != "" && !dom.DNSManaged {
 			log.Printf("reconciler: leaving adopted DNS record %s for domain %d in place (NurProxy did not create it)", dom.DNSRecordID, dom.ID)
 			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_left_adopted", fmt.Sprintf("kept operator-owned record %s", dom.DNSRecordID))
@@ -1313,27 +1322,17 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 			}
 		}
 
-		// Remove the central certificate for this host, so the renewal scan does not
-		// keep renewing a cert for a domain that no longer exists (wasting ACME
-		// quota). Best-effort and gated on existence (not every domain has a central
-		// cert: self-acme/off have none). Mirrors the artifact cleanup above.
-		if zone, zErr := r.db.GetZone(dom.ZoneID); zErr == nil {
-			fqdn := dom.FQDN(zone.Name)
-			if _, cErr := r.db.GetCertificate(fqdn); cErr == nil {
-				if dErr := r.db.DeleteCertificate(fqdn); dErr != nil {
-					log.Printf("reconciler: failed to delete cert for %s on domain %d teardown: %v", fqdn, dom.ID, dErr)
-				} else {
-					r.audit("certificate", fqdn, "remove", "domain deleted")
-				}
-			}
-		}
-
 		// Finally remove the domain row.
 		if dErr := r.db.DeleteDomain(dom.ID); dErr != nil {
 			log.Printf("reconciler: failed to delete domain row %d: %v", dom.ID, dErr)
 			continue
 		}
 		r.audit("domain", fmt.Sprintf("%d", dom.ID), "deleted", "domain removed after cleanup")
+
+		// The host's central certificate goes with its last domain — unless another
+		// live domain still resolves to the same host (certs are keyed by host and
+		// shared), in which case it stays for that consumer.
+		r.cleanupCertForDomain(dom)
 	}
 
 	// Re-push each affected agent's now-smaller desired set over its stream so it
@@ -1347,6 +1346,81 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// cleanupCertForDomain deletes the stored central certificate for a torn-down
+// domain's host, so a deleted domain's key material does not accumulate in the
+// store (and keep being renewed) forever. Certs are keyed by FQDN host and can
+// be shared across domain rows, so the cert survives as long as ANY non-deleting
+// domain still resolves to the host. Best-effort: the domain row is already
+// gone, so a failure here is logged (the cert lingers until its next consumer's
+// teardown) rather than wedging the teardown.
+func (r *Reconciler) cleanupCertForDomain(dom *models.Domain) {
+	zone, err := r.db.GetZone(dom.ZoneID)
+	if err != nil {
+		log.Printf("reconciler: cannot resolve zone %s for deleted domain %d, leaving its certificate (if any) in place: %v", dom.ZoneID, dom.ID, err)
+		return
+	}
+	host := dom.FQDN(zone.Name)
+	if _, err := r.db.GetCertificate(host); err != nil {
+		// No stored cert is the normal case (self-acme/off domains). Anything
+		// else (DB failure, key decryption) must not be mistaken for "nothing to
+		// clean up" — log it so the lingering cert row is visible.
+		if !errors.Is(err, db.ErrCertNotFound) {
+			log.Printf("reconciler: cannot look up certificate for %s, leaving it in place: %v", host, err)
+		}
+		return
+	}
+	served, err := r.hostStillServed(host)
+	if err != nil {
+		log.Printf("reconciler: cannot check remaining domains for host %s, keeping its certificate: %v", host, err)
+		return
+	}
+	if served {
+		// Another live domain resolves to the same host: the cert is still that
+		// domain's — never delete a shared cert out from under its consumer.
+		log.Printf("reconciler: keeping certificate for %s (another domain still serves this host)", host)
+		return
+	}
+	if dErr := r.db.DeleteCertificate(host); dErr != nil {
+		log.Printf("reconciler: failed to delete certificate for %s: %v", host, dErr)
+		return
+	}
+	r.audit("certificate", host, "deleted", "removed with domain teardown; no remaining domain serves this host")
+}
+
+// hostStillServed reports whether any domain NOT being torn down currently
+// resolves to host, using the same host→domain matching as agentServingHost
+// (the domain's computed FQDN). Domains in "deleting" do not count — they are on
+// their way out and must not keep a dead host's certificate alive.
+func (r *Reconciler) hostStillServed(host string) (bool, error) {
+	domains, err := r.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return false, fmt.Errorf("listing domains to resolve host %q: %w", host, err)
+	}
+	zoneNames := make(map[string]string)
+	for i := range domains {
+		dom := &domains[i]
+		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok {
+			zone, zErr := r.db.GetZone(dom.ZoneID)
+			if zErr != nil {
+				// Skipping this domain could return a false "not served" and let the
+				// caller delete a certificate the domain still needs. Fail the check
+				// instead — the caller keeps the cert and retries next cycle.
+				return false, fmt.Errorf("resolving zone %s for domain %d: %w", dom.ZoneID, dom.ID, zErr)
+			}
+			zoneName = zone.Name
+			zoneNames[dom.ZoneID] = zoneName
+		}
+		if dom.FQDN(zoneName) == host {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // resolveDNS resolves a zone ID to its zone, provider, and DNS provider plugin.
