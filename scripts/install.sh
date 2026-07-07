@@ -149,7 +149,13 @@ verify_checksum() {
   asset="$1"
   fetch_checksums
   info "verifying checksum for ${asset}"
-  ( cd "$tmp" && grep " ${asset}\$" checksums.txt | $SHA256 -c - >/dev/null 2>&1 ) \
+  # Match the filename field exactly (grep would treat dots in the asset name
+  # as regex wildcards) and accept the "*name" binary-mode form. An empty
+  # match must fail here explicitly: without pipefail a failed grep piped
+  # into `$SHA256 -c` is not a reliable failure on every implementation.
+  sum_line="$(awk -v a="$asset" '$2 == a || $2 == "*" a' "${tmp}/checksums.txt")"
+  [ -n "$sum_line" ] || err "no checksum entry for ${asset} in checksums.txt — aborting (incomplete release?)"
+  ( cd "$tmp" && printf '%s\n' "$sum_line" | $SHA256 -c - >/dev/null 2>&1 ) \
     || err "checksum verification FAILED for ${asset} — aborting (corrupt or tampered download?)"
 }
 

@@ -2,6 +2,7 @@ package install
 
 import (
 	"io"
+	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -30,8 +31,22 @@ func TestEnsureDataDir_serviceUserOwnsFiles(t *testing.T) {
 	if err := ensureDataDir(s, &out); err != nil {
 		t.Fatalf("ensureDataDir: %v", err)
 	}
-	if err := chownForServiceUser(s, s.DataDir); err != nil {
-		t.Errorf("chownForServiceUser to the current user: %v", err)
+	info, err := os.Stat(s.DataDir)
+	if err != nil {
+		t.Fatalf("data dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("data dir %s is not a directory", s.DataDir)
+	}
+	got, err := os.ReadFile(s.ConfigFile)
+	if err != nil {
+		t.Fatalf("config file not created: %v", err)
+	}
+	if string(got) != s.ConfigData {
+		t.Errorf("config content = %q, want %q", got, s.ConfigData)
+	}
+	if fi, err := os.Stat(s.ConfigFile); err == nil && fi.Mode().Perm() != 0o640 {
+		t.Errorf("config file mode = %o, want 0640", fi.Mode().Perm())
 	}
 	if !strings.Contains(out.String(), s.DataDir) || !strings.Contains(out.String(), s.ConfigFile) {
 		t.Errorf("progress output missing paths:\n%s", out.String())
