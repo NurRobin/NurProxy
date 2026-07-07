@@ -625,6 +625,15 @@ func TestInfo_reportsNginxKindAndPaths(t *testing.T) {
 	}
 }
 
+func TestNew_versionFromConfig(t *testing.T) {
+	// Config.Version is honored without a separate WithVersion call (it selects the
+	// HTTP/2 render syntax); a non-empty value means New does not probe the binary.
+	b := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available", Version: "1.18.0"})
+	if got := b.Info().Version; got != "1.18.0" {
+		t.Errorf("Info().Version = %q, want 1.18.0 (from Config.Version)", got)
+	}
+}
+
 func TestFactory_registered(t *testing.T) {
 	p, err := proxy.Get("nginx", proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available"})
 	if err != nil {
