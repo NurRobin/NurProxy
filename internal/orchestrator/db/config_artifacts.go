@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,6 +15,11 @@ import (
 	_ "github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// ErrArtifactNotFound marks a config-artifact lookup that matched no row, so
+// callers can distinguish "nothing there" (often fine) from a real query
+// failure via errors.Is.
+var ErrArtifactNotFound = errors.New("config artifact not found")
 
 // ChecksumContent returns the hex-encoded SHA-256 of the given config content.
 // It is the raw-checksum used for file artifacts and version equality (§11);
@@ -125,7 +131,7 @@ func (d *DB) GetConfigArtifact(id string) (*models.ConfigArtifact, error) {
 	)
 	art, err := scanConfigArtifact(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("config artifact not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrArtifactNotFound, id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("querying config artifact: %w", err)
