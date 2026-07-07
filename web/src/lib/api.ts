@@ -31,7 +31,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     // Auth endpoints legitimately return 401 (e.g. wrong password on login)
     // and surface it inline — only a 401 elsewhere means an expired session.
     if (res.status === 401 && !path.startsWith('/auth/')) {
-      unauthorizedHandler?.();
+      // Defer to a macrotask so the handler runs after the caller's catch
+      // block: a catch that sets its own state (e.g. App's checkSetupWizard
+      // setting authState='error') would otherwise overwrite the redirect to
+      // login. A microtask is not enough — the awaiting catch resumes as a
+      // microtask too, after one queued here.
+      window.setTimeout(() => unauthorizedHandler?.(), 0);
       throw new UnauthorizedError(body);
     }
     throw new Error(`API error ${res.status}: ${body}`);

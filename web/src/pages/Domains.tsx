@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import i18n from '../lib/i18n';
 import { usePolling } from '../lib/usePolling';
@@ -52,6 +52,12 @@ export default function Domains() {
   const [createForceHttps, setCreateForceHttps] = useState(true);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState('');
+
+  // Post-save ACK refetch timer — cleared on unmount and before rescheduling
+  // so a navigation away (or a second save) doesn't fire a stale refetch
+  // against an unmounted component.
+  const ackRefetchTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(ackRefetchTimer.current), []);
 
   // Detail / edit
   const [detailDomain, setDetailDomain] = useState<Domain | null>(null);
@@ -235,7 +241,8 @@ export default function Domains() {
       fetchData();
       // The agent ACKs the apply asynchronously (pending → active/error), so
       // refetch once more shortly after — and surface the error if it failed.
-      window.setTimeout(() => {
+      window.clearTimeout(ackRefetchTimer.current);
+      ackRefetchTimer.current = window.setTimeout(() => {
         fetchData();
         api.getDomain(domainId)
           .then((d) => { if (d.status === 'error' && d.error_msg) toast.error(d.error_msg); })
