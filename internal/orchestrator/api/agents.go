@@ -169,6 +169,14 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Also keep the token encrypted at rest (master key), so the reconciler's
+	// inbound fallback can present the plaintext to the agent — the stored hash
+	// alone must never be a usable credential. Best-effort: a failure here only
+	// delays inbound access until the heartbeat backfill.
+	if err := s.db.SetAgentToken(agent.ID, req.Token); err != nil {
+		log.Printf("register: failed to store encrypted token for agent %s: %v", agent.ID, err)
+	}
+
 	s.auditAs(r, models.AuditSourceAgent, "agent", agent.ID, "register", agent.FQDN)
 
 	writeJSON(w, http.StatusCreated, map[string]string{

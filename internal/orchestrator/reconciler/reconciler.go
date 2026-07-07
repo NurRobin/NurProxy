@@ -116,8 +116,57 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	// referencing config, so a generated config never validates against a missing
 	// cert file. Certs ride this agent-initiated stream — no inbound probe.
 	certs := r.gatherCerts(desired)
-	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{Intents: intents, Certs: certs, Keep: keepExtra})
+	// Cert-only domains have no intent but still need their cert installed (§7).
+	certs = append(certs, r.gatherCertOnlyCerts(agent)...)
+	// This is the complete cert set for the agent, so the agent may scrub any
+	// cert-store entry not in it — cleaning up a deleted host's cert (notably a
+	// cert-only host with no vhost to drive removal, §7).
+	certKeep := make([]string, 0, len(certs))
+	for i := range certs {
+		certKeep = append(certKeep, certs[i].Host)
+	}
+	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{
+		Intents: intents, Certs: certs, Keep: keepExtra,
+		PruneCerts: true, CertKeep: certKeep,
+	})
 	return nil
+}
+
+// gatherCertOnlyCerts collects the cert bundles for an agent's cert-only domains
+// (§7): NurProxy issues + renews their certificate and installs it on the agent,
+// but renders no vhost, so they are excluded from the desired route set and their
+// certs must be gathered here to ride the push. A domain whose cert is not issued
+// yet is skipped (it installs on the next push after issuance); when its cert is
+// present the domain flips to active so the dashboard reflects "cert ready".
+func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertBundle {
+	domains, err := r.db.ListDomainsByAgent(agent.ID)
+	if err != nil {
+		log.Printf("reconciler: cannot list cert-only domains for agent %s: %v", agent.ID, err)
+		return nil
+	}
+	var bundles []proxymodel.CertBundle
+	for i := range domains {
+		dom := &domains[i]
+		if !dom.CertOnly || dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zone, zErr := r.db.GetZone(dom.ZoneID)
+		if zErr != nil {
+			continue
+		}
+		fqdn := dom.FQDN(zone.Name)
+		cert, cErr := r.db.GetCertificate(fqdn)
+		if cErr != nil {
+			continue // not issued yet; installs on a later push
+		}
+		bundles = append(bundles, proxymodel.CertBundle{Host: cert.Host, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM, MaterializeKey: true})
+		if dom.Status != models.DomainStatusActive {
+			if uErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusActive, ""); uErr != nil {
+				log.Printf("reconciler: failed to mark cert-only domain %d active: %v", dom.ID, uErr)
+			}
+		}
+	}
+	return bundles
 }
 
 // RepushCertForHost re-pushes the config + cert bundle for the agent serving
@@ -443,6 +492,13 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
+		// Cert-only domains get a certificate installed on the agent but NO vhost
+		// (§7): the operator hand-writes the config. Exclude them from the route
+		// set; their certs ride the push via gatherCertOnlyCerts.
+		if dom.CertOnly {
+			continue
+		}
+
 		// Resolve zone name from the domain's zone.
 		zoneName, ok := zoneNames[dom.ZoneID]
 		if !ok {
@@ -550,8 +606,24 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		return nil
 	}
 
+	// The inbound fallback authenticates with the agent's plaintext token
+	// (decrypted from the master-key-encrypted store). The stored hash is no
+	// longer a credential — accepting it made the hash pass-equivalent and a DB
+	// leak yielded working agent credentials.
+	agentToken, err := r.db.GetAgentToken(agent.ID)
+	if err != nil {
+		return fmt.Errorf("loading inbound credentials for agent %s: %w", agent.ID, err)
+	}
+	if agentToken == "" {
+		// Pre-migration row that has not heartbeated since: no inbound
+		// credentials yet. The agent-dialed stream remains the control path;
+		// the token backfills on its next authenticated request.
+		log.Printf("reconciler: agent %s has no stored inbound token yet; skipping inbound sync", agent.ID)
+		return nil
+	}
+
 	// Get actual routes from the agent.
-	actualRoutes, err := r.agentClient.GetRoutes(ctx, agent.APIURL, agent.TokenHash)
+	actualRoutes, err := r.agentClient.GetRoutes(ctx, agent.APIURL, agentToken)
 	if err != nil {
 		return fmt.Errorf("getting routes from agent %s: %w", agent.ID, err)
 	}
@@ -571,7 +643,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if !exists {
 			// Missing on agent — push it.
 			log.Printf("reconciler: pushing missing route for %s to agent %s", fqdn, agent.ID)
-			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agent.TokenHash, desired.route); pErr != nil {
+			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 				log.Printf("reconciler: failed to push route for %s: %v", fqdn, pErr)
 				if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("route push failed: %v", pErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
@@ -606,7 +678,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 
 		// Push corrected route.
 		log.Printf("reconciler: fixing drift for %s on agent %s", fqdn, agent.ID)
-		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agent.TokenHash, desired.route); pErr != nil {
+		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 			log.Printf("reconciler: failed to fix drift for %s: %v", fqdn, pErr)
 			if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("drift fix failed: %v", pErr)); dErr != nil {
 				log.Printf("reconciler: failed to update domain status: %v", dErr)
@@ -649,6 +721,13 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 
 		// Skip domains not in an actionable state.
 		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+
+		// Cert-only domains: NurProxy issues the cert (DNS-01 challenge records are
+		// handled by the issuer) but does NOT manage the public record — the
+		// operator owns DNS for their own hand-written vhost (§7).
+		if dom.CertOnly {
 			continue
 		}
 

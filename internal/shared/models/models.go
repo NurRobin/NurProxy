@@ -380,7 +380,13 @@ type Domain struct {
 	// or adopted a matching pre-existing one (false). On delete, only created
 	// records are removed from the provider — an adopted record predates NurProxy
 	// and must not be destroyed.
-	DNSManaged bool         `json:"dns_managed"`
+	DNSManaged bool `json:"dns_managed"`
+	// CertOnly marks a domain NurProxy issues + renews a TLS certificate for and
+	// installs on the agent's cert store, WITHOUT rendering or serving a vhost
+	// (§7). The operator hand-writes the engine config and points it at the stable
+	// cert path; NurProxy keeps the cert fresh. No public DNS record is managed —
+	// the operator owns DNS for their own hand-written vhost.
+	CertOnly   bool         `json:"cert_only"`
 	Status     DomainStatus `json:"status"`
 	ErrorMsg   string       `json:"error_msg,omitempty"`
 	LastSynced *time.Time   `json:"last_synced,omitempty"`

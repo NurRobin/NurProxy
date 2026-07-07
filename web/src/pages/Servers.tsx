@@ -26,6 +26,34 @@ function prefillFromNetwork(n: DiscoveredNetwork): string {
   return base;
 }
 
+// canonAddr collapses addresses that point at the same backend so a server is
+// suggested at most once and never when it already exists. Loopback names are
+// unified (localhost = 127.0.0.1 = ::1) and the scheme's default port is filled
+// in (http→80, https→443), so "localhost", "localhost:80" and "127.0.0.1:80" all
+// produce the same key. Without this the dedup was a raw string compare, so
+// localhost and 127.0.0.1 showed as two suggestions and an existing server in a
+// different spelling never suppressed its suggestion.
+function canonAddr(host: string, port?: number, scheme?: string): string {
+  let h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h === '127.0.0.1' || h === '::1') h = 'localhost';
+  const p = port && port > 0 ? port : scheme === 'https' ? 443 : scheme === 'http' ? 80 : 0;
+  return p ? `${h}:${p}` : h;
+}
+
+// parseAddr splits a stored Server address ("host", "host:port", "[::1]:port")
+// into host + port so it can be canonicalized the same way as a discovered
+// upstream.
+function parseAddr(addr: string): { host: string; port?: number } {
+  const a = addr.trim();
+  const m6 = a.match(/^\[(.+)\]:(\d+)$/); // [ipv6]:port
+  if (m6) return { host: m6[1], port: Number(m6[2]) };
+  const i = a.lastIndexOf(':');
+  if (i > 0 && /^\d+$/.test(a.slice(i + 1)) && !a.slice(0, i).includes(':')) {
+    return { host: a.slice(0, i), port: Number(a.slice(i + 1)) };
+  }
+  return { host: a };
+}
+
 export default function Servers() {
   const { t } = useTranslation();
   const toast = useToast();
@@ -78,14 +106,16 @@ export default function Servers() {
   // that is already a Server. The operator confirms each with a name/notes — the
   // orchestrator never creates these on its own.
   const suggestionsFor = (agent: Agent, servers: Server[]) => {
-    const existing = new Set(servers.map((s) => s.address.trim()));
-    const byAddr = new Map<string, string[]>();
+    const existing = new Set(servers.map((s) => { const { host, port } = parseAddr(s.address); return canonAddr(host, port); }));
+    const byKey = new Map<string, { addr: string; names: string[] }>();
     for (const u of agent.proxy_detection?.discovered_upstreams ?? []) {
-      const addr = u.port ? `${u.host}:${u.port}` : u.host;
-      if (existing.has(addr)) continue;
-      byAddr.set(addr, [...(byAddr.get(addr) ?? []), ...(u.server_names ?? [])]);
+      const key = canonAddr(u.host, u.port, u.scheme);
+      if (existing.has(key)) continue;
+      const entry = byKey.get(key);
+      if (entry) entry.names.push(...(u.server_names ?? []));
+      else byKey.set(key, { addr: u.port ? `${u.host}:${u.port}` : u.host, names: [...(u.server_names ?? [])] });
     }
-    return [...byAddr.entries()].map(([addr, names]) => ({ addr, names: [...new Set(names)] }));
+    return [...byKey.values()].map(({ addr, names }) => ({ addr, names: [...new Set(names)] }));
   };
 
   async function handleCreate() {

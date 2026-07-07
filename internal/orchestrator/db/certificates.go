@@ -63,7 +63,7 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 // GetCertificate retrieves the certificate for a host and decrypts its private
 // key. Returns an error if not found.
 func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
-	row := d.sql.QueryRow(`
+	row := d.read.QueryRow(`
 		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
 		FROM certificates WHERE host = ?`, host)
 	c, err := d.scanCertificate(row)
@@ -78,7 +78,7 @@ func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
 
 // ListCertificates returns all stored certificates with private keys decrypted.
 func (d *DB) ListCertificates() ([]models.Certificate, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
 		FROM certificates ORDER BY host`)
 	if err != nil {
@@ -102,7 +102,7 @@ func (d *DB) ListCertificates() ([]models.Certificate, error) {
 // no recorded expiry are skipped (nothing to compute against).
 func (d *DB) CertificatesDueForRenewal(window time.Duration) ([]models.Certificate, error) {
 	cutoff := time.Now().UTC().Add(window).Format(time.RFC3339)
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
 		FROM certificates
 		WHERE expires_at != '' AND expires_at <= ?

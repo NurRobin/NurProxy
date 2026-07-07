@@ -369,6 +369,12 @@ func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, zone *models.
 	if err := d.CreateAgent(agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
 	}
+	// An adopted, heartbeating agent has its inbound token backfilled (migration
+	// 19): the reconciler's inbound route sync authenticates with the decrypted
+	// plaintext, so without a stored token it skips the sync entirely.
+	if err := d.SetAgentToken(agent.ID, "plain-token-1"); err != nil {
+		t.Fatalf("SetAgentToken: %v", err)
+	}
 
 	srv = &models.Server{
 		ID:      "srv-1",
@@ -1091,6 +1097,11 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
 		t.Fatalf("UpdateDomainStatus: %v", err)
 	}
+	// The domain has a central cert; teardown must delete its row too so the
+	// renewal scan stops renewing a cert for a domain that no longer exists.
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -1127,6 +1138,10 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	// Domain row gone.
 	if _, err := d.GetDomain(dom.ID); err == nil {
 		t.Error("expected domain row to be deleted")
+	}
+	// Central cert row gone (no orphaned cert renewing forever).
+	if _, err := d.GetCertificate("app.example.com"); err == nil {
+		t.Error("expected the domain's certificate row to be deleted on teardown")
 	}
 	// Audit trail recorded the deletion.
 	entries, _, _ := d.ListAuditLog(20, 0)
@@ -1978,5 +1993,55 @@ func TestDueForRenewal_skipsCertsWithoutCentralConsumer(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCertOnly_excludedFromRoutesAndCertGathered asserts a cert-only domain (§7)
+// gets its certificate gathered for the agent push and flips active, but is never
+// rendered as a route (no vhost — the operator hand-writes the config).
+func TestCertOnly_excludedFromRoutesAndCertGathered(t *testing.T) {
+	d := testDB(t)
+	_, zone, agent, srv, _ := setupScenario(t, d)
+
+	co := &models.Domain{
+		Subdomain: "certonly", ZoneID: zone.ID, ServerID: srv.ID,
+		SSLMode: models.SSLModeAuto, CertOnly: true, Status: models.DomainStatusPending,
+	}
+	if err := d.CreateDomain(co); err != nil {
+		t.Fatalf("CreateDomain: %v", err)
+	}
+	fqdn := co.FQDN(zone.Name)
+	if err := d.UpsertCertificate(&models.Certificate{ID: "c-certonly", Host: fqdn, Names: []string{fqdn}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	// Excluded from the route set.
+	desired, _, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes: %v", err)
+	}
+	if _, ok := desired[fqdn]; ok {
+		t.Error("cert-only domain must not be rendered as a route")
+	}
+
+	// Its cert is gathered and the domain flips active.
+	bundles := r.gatherCertOnlyCerts(agent)
+	found := false
+	for _, b := range bundles {
+		if b.Host == fqdn {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("cert-only cert should be gathered, got %+v", bundles)
+	}
+	got, err := d.GetDomain(co.ID)
+	if err != nil {
+		t.Fatalf("GetDomain: %v", err)
+	}
+	if got.Status != models.DomainStatusActive {
+		t.Errorf("cert-only domain status = %q, want active after cert gathered", got.Status)
 	}
 }
