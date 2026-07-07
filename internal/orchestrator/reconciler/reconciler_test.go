@@ -369,6 +369,12 @@ func setupScenario(t *testing.T, d *db.DB) (prov *models.Provider, zone *models.
 	if err := d.CreateAgent(agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
 	}
+	// An adopted, heartbeating agent has its inbound token backfilled (migration
+	// 19): the reconciler's inbound route sync authenticates with the decrypted
+	// plaintext, so without a stored token it skips the sync entirely.
+	if err := d.SetAgentToken(agent.ID, "plain-token-1"); err != nil {
+		t.Fatalf("SetAgentToken: %v", err)
+	}
 
 	srv = &models.Server{
 		ID:      "srv-1",
@@ -1091,6 +1097,11 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
 		t.Fatalf("UpdateDomainStatus: %v", err)
 	}
+	// The domain has a central cert; teardown must delete its row too so the
+	// renewal scan stops renewing a cert for a domain that no longer exists.
+	if err := d.UpsertCertificate(&models.Certificate{ID: "cert-app", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
 
 	mc := newMockAgentClient()
 	mc.setHealthy(agent.APIURL, true)
@@ -1127,6 +1138,10 @@ func TestReconcileDeletions_RemovesRecordRouteAndRow(t *testing.T) {
 	// Domain row gone.
 	if _, err := d.GetDomain(dom.ID); err == nil {
 		t.Error("expected domain row to be deleted")
+	}
+	// Central cert row gone (no orphaned cert renewing forever).
+	if _, err := d.GetCertificate("app.example.com"); err == nil {
+		t.Error("expected the domain's certificate row to be deleted on teardown")
 	}
 	// Audit trail recorded the deletion.
 	entries, _, _ := d.ListAuditLog(20, 0)
@@ -1696,6 +1711,72 @@ func TestReconcileDNS_conflictOnDifferentExistingRecord(t *testing.T) {
 	}
 }
 
+// TestTakeoverDomainDNS verifies the admin DNS-takeover override: a conflicting
+// pre-existing record (an A record to some other host) is DELETED and replaced with
+// the desired CNAME → agent FQDN using the provider's own credentials, the domain's
+// record is marked managed, and the conflict error is cleared.
+func TestTakeoverDomainDNS(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	// Seed a conflicting A record on the same name (the pre-NurProxy DNS).
+	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99"})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+		t.Fatalf("TakeoverDomainDNS: %v", err)
+	}
+
+	// The conflicting A record must be gone.
+	if _, ok := mp.getRecord(conflictID); ok {
+		t.Errorf("conflicting record %s should have been deleted", conflictID)
+	}
+
+	// Exactly one record now exists for the name: a CNAME -> agent FQDN.
+	recs, _ := mp.ListRecords(context.Background(), nil, "app.example.com", "")
+	if len(recs) != 1 {
+		t.Fatalf("expected exactly 1 record after takeover, got %d: %+v", len(recs), recs)
+	}
+	if !strings.EqualFold(recs[0].Type, "CNAME") || recs[0].Content != agent.FQDN {
+		t.Errorf("expected CNAME -> %s, got %s -> %s", agent.FQDN, recs[0].Type, recs[0].Content)
+	}
+
+	// The domain now owns a managed record and the conflict error is cleared.
+	got, _ := d.GetDomain(dom.ID)
+	if got.DNSRecordID == "" || !got.DNSManaged {
+		t.Errorf("expected a managed record id after takeover, got id=%q managed=%v", got.DNSRecordID, got.DNSManaged)
+	}
+	if got.Status == models.DomainStatusError || got.ErrorMsg != "" {
+		t.Errorf("takeover should clear the conflict error, got status=%q err=%q", got.Status, got.ErrorMsg)
+	}
+}
+
+// TestTakeoverDomainDNS_adoptsMatchingRecord verifies takeover is idempotent: when
+// the desired CNAME already exists, it takes ownership (managed=true) without
+// creating a duplicate.
+func TestTakeoverDomainDNS_adoptsMatchingRecord(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	seedID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+		t.Fatalf("TakeoverDomainDNS: %v", err)
+	}
+
+	got, _ := d.GetDomain(dom.ID)
+	if got.DNSRecordID != seedID || !got.DNSManaged {
+		t.Errorf("expected to adopt existing record %s as managed, got id=%q managed=%v", seedID, got.DNSRecordID, got.DNSManaged)
+	}
+	recs, _ := mp.ListRecords(context.Background(), nil, "app.example.com", "")
+	if len(recs) != 1 {
+		t.Errorf("expected no duplicate (1 record), got %d", len(recs))
+	}
+}
+
 // TestReconcileDeletions_KeepsAdoptedRecord proves the #79 fix: when a domain's
 // DNS record was ADOPTED (managed=false) rather than created by NurProxy,
 // teardown must NOT delete it (that record predates NurProxy and is the
@@ -1737,6 +1818,304 @@ func TestReconcileDeletions_KeepsAdoptedRecord(t *testing.T) {
 	// The domain row is still removed — no stranding in "deleting".
 	if _, err := d.GetDomain(dom.ID); err == nil {
 		t.Error("expected domain row to be removed even though the adopted record was kept")
+	}
+}
+
+// TestReconcileDeletions_certRow proves teardown removes the host's stored
+// certificate with its last domain — and keeps it when another live domain
+// still resolves to the same host (certs are keyed by host and shared).
+func TestReconcileDeletions_certRow(t *testing.T) {
+	tests := []struct {
+		name string
+		// shareHost creates a second live domain resolving to the same FQDN via a
+		// second zone with the same name (UNIQUE(subdomain, zone_id) forbids a
+		// duplicate inside one zone).
+		shareHost    bool
+		wantCertKept bool
+	}{
+		{"last domain for the host: cert row deleted", false, false},
+		{"another live domain shares the host: cert row kept", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			prov, _, _, srv, dom := setupScenario(t, d)
+
+			if err := d.UpsertCertificate(&models.Certificate{
+				ID: "app.example.com", Host: "app.example.com",
+				Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K",
+			}); err != nil {
+				t.Fatalf("UpsertCertificate: %v", err)
+			}
+			if tt.shareHost {
+				zone2 := &models.Zone{ID: "zone-2", ProviderID: prov.ID, ExternalID: "ext-zone-2", Name: "example.com"}
+				if err := d.CreateZone(zone2); err != nil {
+					t.Fatalf("CreateZone: %v", err)
+				}
+				dom2 := &models.Domain{Subdomain: "app", ZoneID: zone2.ID, ServerID: srv.ID, Port: 8081, SSLMode: models.SSLModeAuto, Status: models.DomainStatusPending}
+				if err := d.CreateDomain(dom2); err != nil {
+					t.Fatalf("CreateDomain (sharing host): %v", err)
+				}
+			}
+			if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+				t.Fatalf("UpdateDomainStatus: %v", err)
+			}
+
+			r := New(d, newMockAgentClient(), time.Minute)
+			if err := r.reconcileDeletions(context.Background()); err != nil {
+				t.Fatalf("reconcileDeletions: %v", err)
+			}
+
+			if _, err := d.GetDomain(dom.ID); err == nil {
+				t.Error("expected domain row to be deleted")
+			}
+			_, certErr := d.GetCertificate("app.example.com")
+			if tt.wantCertKept && certErr != nil {
+				t.Errorf("certificate shared with a live domain must survive teardown, got %v", certErr)
+			}
+			if !tt.wantCertKept {
+				if certErr == nil {
+					t.Error("expected certificate row to be deleted with its last domain")
+				}
+				entries, _, _ := d.ListAuditLog(50, 0)
+				found := false
+				for _, e := range entries {
+					if e.EntityType == "certificate" && e.Action == "deleted" {
+						found = true
+					}
+				}
+				if !found {
+					t.Error("expected audit entry for the certificate deletion")
+				}
+			}
+		})
+	}
+}
+
+// TestReconcileDeletions_unresolvableProvider proves the resolve-failure gate:
+// a domain whose MANAGED record's zone→provider chain cannot be resolved must
+// stay in "deleting" for retry — tearing the row down anyway would permanently
+// leak the managed record at the provider — while an ADOPTED record (NurProxy
+// never owned it) needs no provider at all and tears down cleanly.
+func TestReconcileDeletions_unresolvableProvider(t *testing.T) {
+	tests := []struct {
+		name         string
+		managed      bool
+		wantDeferred bool
+	}{
+		{"managed record defers teardown for retry", true, true},
+		{"adopted record tears down without the provider", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			_, _, _, srv, _ := setupScenario(t, d)
+
+			// A provider type with no registered plugin: resolveDNS fails at
+			// provider.Get for every domain in its zone.
+			ghost := &models.Provider{ID: "prov-ghost", Type: "ghost-unregistered", Name: "Ghost", Config: `{}`}
+			if err := d.CreateProvider(ghost); err != nil {
+				t.Fatalf("CreateProvider: %v", err)
+			}
+			zone := &models.Zone{ID: "zone-ghost", ProviderID: ghost.ID, ExternalID: "ext-ghost", Name: "ghost.example"}
+			if err := d.CreateZone(zone); err != nil {
+				t.Fatalf("CreateZone: %v", err)
+			}
+			dom := &models.Domain{Subdomain: "app", ZoneID: zone.ID, ServerID: srv.ID, Port: 8080, SSLMode: models.SSLModeAuto, Status: models.DomainStatusPending}
+			if err := d.CreateDomain(dom); err != nil {
+				t.Fatalf("CreateDomain: %v", err)
+			}
+			if err := d.UpdateDomainDNSRecord(dom.ID, "rec-leak", tt.managed); err != nil {
+				t.Fatalf("UpdateDomainDNSRecord: %v", err)
+			}
+			if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+				t.Fatalf("UpdateDomainStatus: %v", err)
+			}
+
+			r := New(d, newMockAgentClient(), time.Minute)
+			if err := r.reconcileDeletions(context.Background()); err != nil {
+				t.Fatalf("reconcileDeletions: %v", err)
+			}
+
+			got, err := d.GetDomain(dom.ID)
+			if tt.wantDeferred {
+				if err != nil {
+					t.Fatal("domain must survive an unresolvable provider for retry (deleting it would leak the managed record)")
+				}
+				if got.Status != models.DomainStatusDeleting {
+					t.Errorf("status = %q, want still deleting", got.Status)
+				}
+				if got.DNSRecordID != "rec-leak" {
+					t.Errorf("DNS record id should be retained for retry, got %q", got.DNSRecordID)
+				}
+				return
+			}
+			if err == nil {
+				t.Error("adopted-record domain should be torn down even without a resolvable provider")
+			}
+		})
+	}
+}
+
+// TestDueForRenewal_skipsCertsWithoutCentralConsumer proves the renewal scan
+// does not re-issue orphaned certs: a stored cert none of whose covered names
+// match a live central-TLS domain is skipped — and ONLY skipped, deletion is
+// the teardown path's job — while certs with a live consumer keep renewing.
+func TestDueForRenewal_skipsCertsWithoutCentralConsumer(t *testing.T) {
+	registerMockProvider(t)
+
+	soon := time.Now().UTC().Add(24 * time.Hour)       // inside DefaultRenewWindow
+	later := time.Now().UTC().Add(90 * 24 * time.Hour) // outside the window
+
+	// parkAppCert gives the scenario's live domain a far-future cert so the
+	// first-issuance pass stays out of the scan under test.
+	parkAppCert := func(t *testing.T, d *db.DB, _ *models.Domain) {
+		t.Helper()
+		if err := d.UpsertCertificate(&models.Certificate{
+			ID: "app.example.com", Host: "app.example.com",
+			Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K", ExpiresAt: later,
+		}); err != nil {
+			t.Fatalf("UpsertCertificate (parked): %v", err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		cert models.Certificate
+		// prep adjusts the scenario (domain app.example.com, central by default)
+		// before the scan.
+		prep func(t *testing.T, d *db.DB, dom *models.Domain)
+		want []string // hosts expected as renewal targets
+	}{
+		{
+			name: "live central domain renews",
+			cert: models.Certificate{ID: "app.example.com", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K", ExpiresAt: soon},
+			want: []string{"app.example.com"},
+		},
+		{
+			name: "no domain resolves to the cert host: skipped",
+			cert: models.Certificate{ID: "gone.example.com", Host: "gone.example.com", Names: []string{"gone.example.com"}, CertPEM: "C", KeyPEM: "K", ExpiresAt: soon},
+			prep: parkAppCert,
+			want: nil,
+		},
+		{
+			name: "domain being deleted does not count as a consumer",
+			cert: models.Certificate{ID: "app.example.com", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K", ExpiresAt: soon},
+			prep: func(t *testing.T, d *db.DB, dom *models.Domain) {
+				t.Helper()
+				if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+					t.Fatalf("UpdateDomainStatus: %v", err)
+				}
+			},
+			want: nil,
+		},
+		{
+			name: "tls-off domain does not count as a consumer",
+			cert: models.Certificate{ID: "app.example.com", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K", ExpiresAt: soon},
+			prep: func(t *testing.T, d *db.DB, dom *models.Domain) {
+				t.Helper()
+				dom.SSLMode = models.SSLModeOff
+				if err := d.UpdateDomain(dom); err != nil {
+					t.Fatalf("UpdateDomain: %v", err)
+				}
+			},
+			want: nil,
+		},
+		{
+			name: "wildcard cert covering a live central domain renews",
+			cert: models.Certificate{ID: "example.com", Host: "example.com", Names: []string{"*.example.com"}, IsWildcard: true, CertPEM: "C", KeyPEM: "K", ExpiresAt: soon},
+			prep: parkAppCert,
+			want: []string{"example.com"},
+		},
+		{
+			// "*.app.example.com" does not cover its bare apex, so the live
+			// app.example.com domain is no consumer of this wildcard-only cert.
+			name: "wildcard cert does not consume its bare apex host",
+			cert: models.Certificate{ID: "app.example.com", Host: "app.example.com", Names: []string{"*.app.example.com"}, IsWildcard: true, CertPEM: "C", KeyPEM: "K", ExpiresAt: soon},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			_, _, _, _, dom := setupScenario(t, d)
+			if tt.prep != nil {
+				tt.prep(t, d, dom)
+			}
+			c := tt.cert
+			if err := d.UpsertCertificate(&c); err != nil {
+				t.Fatalf("UpsertCertificate: %v", err)
+			}
+
+			store := NewCertRenewalStore(d)
+			targets, err := store.DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+			if err != nil {
+				t.Fatalf("DueForRenewal: %v", err)
+			}
+
+			got := make(map[string]bool, len(targets))
+			for _, target := range targets {
+				got[target.Host] = true
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("renewal targets = %v, want hosts %v", got, tt.want)
+			}
+			for _, h := range tt.want {
+				if !got[h] {
+					t.Errorf("missing renewal target for %q (got %v)", h, got)
+				}
+			}
+		})
+	}
+}
+
+// TestCertOnly_excludedFromRoutesAndCertGathered asserts a cert-only domain (§7)
+// gets its certificate gathered for the agent push and flips active, but is never
+// rendered as a route (no vhost — the operator hand-writes the config).
+func TestCertOnly_excludedFromRoutesAndCertGathered(t *testing.T) {
+	d := testDB(t)
+	_, zone, agent, srv, _ := setupScenario(t, d)
+
+	co := &models.Domain{
+		Subdomain: "certonly", ZoneID: zone.ID, ServerID: srv.ID,
+		SSLMode: models.SSLModeAuto, CertOnly: true, Status: models.DomainStatusPending,
+	}
+	if err := d.CreateDomain(co); err != nil {
+		t.Fatalf("CreateDomain: %v", err)
+	}
+	fqdn := co.FQDN(zone.Name)
+	if err := d.UpsertCertificate(&models.Certificate{ID: "c-certonly", Host: fqdn, Names: []string{fqdn}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	// Excluded from the route set.
+	desired, _, err := r.buildDesiredRoutes(agent)
+	if err != nil {
+		t.Fatalf("buildDesiredRoutes: %v", err)
+	}
+	if _, ok := desired[fqdn]; ok {
+		t.Error("cert-only domain must not be rendered as a route")
+	}
+
+	// Its cert is gathered and the domain flips active.
+	bundles := r.gatherCertOnlyCerts(agent)
+	found := false
+	for _, b := range bundles {
+		if b.Host == fqdn {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("cert-only cert should be gathered, got %+v", bundles)
+	}
+	got, err := d.GetDomain(co.ID)
+	if err != nil {
+		t.Fatalf("GetDomain: %v", err)
+	}
+	if got.Status != models.DomainStatusActive {
+		t.Errorf("cert-only domain status = %q, want active after cert gathered", got.Status)
 	}
 }
 

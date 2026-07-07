@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -269,7 +270,7 @@ func boolToInt(b bool) int {
 
 // GetAgent retrieves an agent by ID.
 func (d *DB) GetAgent(id string) (*models.Agent, error) {
-	row := d.sql.QueryRow(
+	row := d.read.QueryRow(
 		"SELECT "+agentColumns+" FROM agents WHERE id = ?", id)
 
 	a, err := scanAgent(row)
@@ -284,7 +285,7 @@ func (d *DB) GetAgent(id string) (*models.Agent, error) {
 
 // GetAgentByFQDN retrieves an agent by its unique FQDN.
 func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
-	row := d.sql.QueryRow(
+	row := d.read.QueryRow(
 		"SELECT "+agentColumns+" FROM agents WHERE fqdn = ?", fqdn)
 
 	a, err := scanAgent(row)
@@ -299,7 +300,7 @@ func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
 
 // ListAgents returns all agents ordered by creation time.
 func (d *DB) ListAgents() ([]models.Agent, error) {
-	rows, err := d.sql.Query(
+	rows, err := d.read.Query(
 		"SELECT " + agentColumns + " FROM agents ORDER BY created_at")
 	if err != nil {
 		return nil, fmt.Errorf("listing agents: %w", err)
@@ -616,9 +617,51 @@ func (d *DB) SetAgentDNSError(id, dnsError string) error {
 	return nil
 }
 
+// SetAgentToken stores the agent's plaintext token encrypted with the master
+// key (AES-256-GCM, like provider configs and cert keys). The plaintext is what
+// the orchestrator must present on inbound agent-API calls; only its hash would
+// be pass-equivalent and defeat hashing entirely. Narrow UPDATE: token_enc only.
+func (d *DB) SetAgentToken(id, token string) error {
+	enc, err := crypto.EncryptString(d.cryptoKey, token)
+	if err != nil {
+		return fmt.Errorf("encrypting agent token: %w", err)
+	}
+	res, err := d.sql.Exec(`UPDATE agents SET token_enc = ? WHERE id = ?`, enc, id)
+	if err != nil {
+		return fmt.Errorf("storing agent token: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+// GetAgentToken returns the agent's decrypted plaintext token, or "" when none
+// is stored yet (a pre-migration row that has not heartbeated since). Callers
+// needing inbound access must treat "" as "credentials unavailable".
+func (d *DB) GetAgentToken(id string) (string, error) {
+	var enc string
+	err := d.read.QueryRow(`SELECT token_enc FROM agents WHERE id = ?`, id).Scan(&enc)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("agent not found: %s", id)
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading agent token: %w", err)
+	}
+	if enc == "" {
+		return "", nil
+	}
+	token, err := crypto.DecryptString(d.cryptoKey, enc)
+	if err != nil {
+		return "", fmt.Errorf("decrypting agent token: %w", err)
+	}
+	return token, nil
+}
+
 // ListPendingAgents returns all agents with status "pending".
 func (d *DB) ListPendingAgents() ([]models.Agent, error) {
-	rows, err := d.sql.Query(
+	rows, err := d.read.Query(
 		"SELECT "+agentColumns+" FROM agents WHERE status = ? ORDER BY created_at",
 		string(models.AgentStatusPending))
 	if err != nil {

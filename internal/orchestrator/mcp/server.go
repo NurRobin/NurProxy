@@ -358,7 +358,7 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if in.Subdomain == "" || in.ZoneID == "" || in.ServerID == "" {
 		return nil, fmt.Errorf("subdomain, zone_id, and server_id are required")
 	}
-	if err := dnsname.ValidateSubdomain(in.Subdomain); err != nil {
+	if err := dnsname.ValidateSubdomainOrApex(in.Subdomain); err != nil {
 		return nil, err
 	}
 	if in.Port <= 0 || in.Port > 65535 {

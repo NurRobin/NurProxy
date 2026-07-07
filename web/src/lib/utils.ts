@@ -21,3 +21,14 @@ export function formatRelativeTime(dateString: string): string {
   if (Math.abs(mo) < 12) return rtf.format(-mo, 'month');
   return rtf.format(-Math.round(mo / 12), 'year');
 }
+
+/**
+ * domainFqdn renders a domain's full name, honoring the "@" apex sentinel: an
+ * apex domain ("@") resolves to the bare zone (e.g. "@" + "example.com" →
+ * "example.com") instead of the malformed "@.example.com". An empty zone (still
+ * loading) falls back to the raw subdomain.
+ */
+export function domainFqdn(subdomain: string, zoneName: string): string {
+  if (!zoneName) return subdomain;
+  return subdomain === '@' ? zoneName : `${subdomain}.${zoneName}`;
+}

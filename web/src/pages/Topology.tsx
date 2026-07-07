@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import { Search, ChevronDown, X, Globe, Server as ServerGlyph } from 'lucide-react';
 import { api } from '../lib/api';
 import type { Agent, Server, Domain, Zone } from '../lib/types';
-import { formatRelativeTime } from '../lib/utils';
+import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import { usePolling } from '../lib/usePolling';
 import { statusMeta } from '../lib/status';
 import StatusBadge from '../components/StatusBadge';
@@ -62,7 +62,7 @@ export default function Topology() {
 
   const allServers = useMemo(() => Object.values(serversByAgent).flat(), [serversByAgent]);
   const zoneName = (id: string) => zones.find((z) => z.id === id)?.name ?? '';
-  const fqdn = (d: Domain) => { const z = zoneName(d.zone_id); return z ? `${d.subdomain}.${z}` : d.subdomain; };
+  const fqdn = (d: Domain) => domainFqdn(d.subdomain, zoneName(d.zone_id));
 
   // Ordered columns (grouped so connectors cross as little as possible).
   const orderedServers = useMemo(() => agents.flatMap((a) => serversByAgent[a.id] ?? []), [agents, serversByAgent]);

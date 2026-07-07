@@ -441,8 +441,17 @@ func cmdDomain(args []string) {
 		}
 		c.emit(raw, "domain marked for deletion: "+id)
 
+	case "dns-takeover":
+		c, fs := parseClient("domain dns-takeover", rest, nil)
+		id := requireArg(fs, "domain id")
+		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/dns/takeover", nil)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		c.emit(raw, "DNS takeover applied for domain "+id)
+
 	default:
-		usage("domain", "list", "add", "update <id>", "delete <id>")
+		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>")
 	}
 }
 

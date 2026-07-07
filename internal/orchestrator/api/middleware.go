@@ -48,11 +48,27 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		// leaked agent credential cannot reach admin routes.
 		if token := bearerToken(r); token != "" {
 			apiKey, err := s.db.GetSetting("admin_api_key")
-			if err == nil && apiKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(token)) == 1 {
-				ctx := context.WithValue(r.Context(), ctxActor, "api_key")
-				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
+			if err == nil && apiKey != "" {
+				// The setting holds the key's SHA-256 (never the plaintext), so a
+				// leaked DB cannot mint admin access. Compare hash-to-hash.
+				if subtle.ConstantTimeCompare([]byte(apiKey), []byte(auth.HashToken(token))) == 1 {
+					ctx := context.WithValue(r.Context(), ctxActor, "api_key")
+					ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+				// Legacy row: pre-hashing installs stored the plaintext. Accept it
+				// once and upgrade the row in place, so existing keys keep working
+				// while the stored value stops being a credential.
+				if subtle.ConstantTimeCompare([]byte(apiKey), []byte(token)) == 1 {
+					if err := s.db.SetSetting("admin_api_key", auth.HashToken(token)); err != nil {
+						log.Printf("api-key: failed to upgrade legacy plaintext key to hash: %v", err)
+					}
+					ctx := context.WithValue(r.Context(), ctxActor, "api_key")
+					ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
 			}
 		}
 
@@ -78,6 +94,11 @@ func (s *Server) requireAgentAuth(next http.HandlerFunc) http.HandlerFunc {
 		tokenHash := auth.HashToken(token)
 		for _, a := range agents {
 			if a.TokenHash == tokenHash {
+				// Backfill the encrypted-at-rest token for rows that predate it
+				// (migration 19 leaves token_enc empty): the verified plaintext is in
+				// hand right now, and the reconciler's inbound fallback needs it. Once
+				// per agent per process — never on the hot path after that.
+				s.backfillAgentToken(a.ID, token)
 				ctx := context.WithValue(r.Context(), ctxActor, "agent:"+a.ID)
 				ctx = context.WithValue(ctx, ctxAgentID, a.ID)
 				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAgent)
@@ -88,6 +109,24 @@ func (s *Server) requireAgentAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		writeError(w, http.StatusUnauthorized, "invalid agent token")
 	}
+}
+
+// backfillAgentToken stores the encrypted-at-rest token for an agent whose row
+// predates token_enc (empty after migration 19), using the plaintext bearer the
+// agent just authenticated with. The sync.Map guard makes it a single DB
+// round-trip per agent per process lifetime.
+func (s *Server) backfillAgentToken(agentID, token string) {
+	if _, done := s.tokenBackfilled.Load(agentID); done {
+		return
+	}
+	stored, err := s.db.GetAgentToken(agentID)
+	if err == nil && stored == "" {
+		if err := s.db.SetAgentToken(agentID, token); err != nil {
+			log.Printf("agent auth: failed to backfill encrypted token for %s: %v", agentID, err)
+			return // retry on a later request
+		}
+	}
+	s.tokenBackfilled.Store(agentID, true)
 }
 
 // corsMiddleware adds CORS headers. It allows any origin for header-based

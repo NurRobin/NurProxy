@@ -53,11 +53,11 @@ func (d *DB) ListAuditLogFiltered(source string, limit, offset int) ([]models.Au
 	listQ += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
 
 	var total int
-	if err := d.sql.QueryRow(countQ, args...).Scan(&total); err != nil {
+	if err := d.read.QueryRow(countQ, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("counting audit log: %w", err)
 	}
 
-	rows, err := d.sql.Query(listQ, append(args, limit, offset)...)
+	rows, err := d.read.Query(listQ, append(args, limit, offset)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("listing audit log: %w", err)
 	}

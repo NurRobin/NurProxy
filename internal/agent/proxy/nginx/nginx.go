@@ -129,10 +129,30 @@ func New(cfg proxy.Config) *Backend {
 		logPaths: cfg.LogPaths,
 		runner:   &execRunner{binary: binary, reloadCmd: cfg.ReloadCmd, testCmd: cfg.TestCmd},
 	}
+	// Record the nginx version (used to pick the HTTP/2 render syntax, §5). Prefer
+	// the value the caller already detected; otherwise probe the binary ourselves so
+	// the version is never silently empty (which would default to the >=1.25.1
+	// `http2 on;` form and break `nginx -t` on older nginx).
+	b.version = cfg.Version
+	if b.version == "" && binary != "" {
+		b.version = probeNginxVersion(binary)
+	}
 	if cfg.CertDir != "" {
 		b.certs = certstore.New(cfg.CertDir, cfg.EncryptKey)
 	}
 	return b
+}
+
+// probeNginxVersion runs `<binary> -v` and parses the version (e.g. "1.18.0").
+// It is best-effort: any failure yields "" and the renderer then defaults to the
+// modern `http2 on;` syntax. nginx prints its version banner to stderr, so the
+// combined output is read.
+func probeNginxVersion(binary string) string {
+	out, err := exec.Command(binary, "-v").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return proxy.ParseVersion(proxy.KindNginx, string(out))
 }
 
 // WithRunner overrides the host-command runner (tests, scoped-sudoers wiring).
@@ -193,7 +213,7 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 // options (invariant #4) are logged here and carried back in the apply-ACK so
 // the orchestrator audits each one; they never fail the render.
 func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
-	in := nginxgen.Input{Route: route}
+	in := nginxgen.Input{Route: route, NginxVersion: b.version}
 	// Resolve provided-cert paths for a TLS route so the renderer can emit the
 	// listener; a missing store or cert leaves the paths empty and nginxgen drops
 	// the TLS listener with a warning rather than referencing a missing file.
@@ -550,7 +570,7 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 		return nil
 	}
 	for _, c := range certs {
-		paths, err := b.certs.Install(certstore.Bundle{Host: c.Host, CertPEM: c.CertPEM, KeyPEM: c.KeyPEM})
+		paths, err := b.certs.Install(certstore.Bundle{Host: c.Host, CertPEM: c.CertPEM, KeyPEM: c.KeyPEM, MaterializePlain: c.MaterializeKey})
 		if err != nil {
 			return fmt.Errorf("installing cert for %q: %w", c.Host, err)
 		}

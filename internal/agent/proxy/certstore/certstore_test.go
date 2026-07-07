@@ -315,3 +315,56 @@ func TestRemove_emptyHost_errors(t *testing.T) {
 		t.Error("Remove with empty host should error")
 	}
 }
+
+func TestInstall_materializePlain_writesPlaintextKey(t *testing.T) {
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	s := New(dir, key) // at-rest encryption on
+	keyPEM := []byte("-----BEGIN PRIVATE KEY-----\nsecret-plain\n-----END PRIVATE KEY-----\n")
+
+	// Without MaterializePlain: only the encrypted key lands, no .key.plain.
+	if _, err := s.Install(Bundle{Host: "co1.example.com", CertPEM: []byte("C"), KeyPEM: keyPEM}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "co1.example.com.key.plain")); !os.IsNotExist(err) {
+		t.Error("plaintext key should NOT exist without MaterializePlain")
+	}
+
+	// With MaterializePlain: .key.plain holds the decrypted key for a hand-written config.
+	if _, err := s.Install(Bundle{Host: "co2.example.com", CertPEM: []byte("C"), KeyPEM: keyPEM, MaterializePlain: true}); err != nil {
+		t.Fatalf("Install (materialize): %v", err)
+	}
+	plain, err := os.ReadFile(filepath.Join(dir, "co2.example.com.key.plain"))
+	if err != nil {
+		t.Fatalf("read .key.plain: %v", err)
+	}
+	if !bytes.Equal(plain, keyPEM) {
+		t.Errorf(".key.plain should be the decrypted key, got %q", string(plain))
+	}
+}
+
+func TestPrune_removesOrphanHosts(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir, nil)
+	for _, h := range []string{"keep.example.com", "drop.example.com"} {
+		if _, err := s.Install(Bundle{Host: h, CertPEM: []byte("C"), KeyPEM: []byte("K")}); err != nil {
+			t.Fatalf("Install %s: %v", h, err)
+		}
+	}
+	n, err := s.Prune([]string{"keep.example.com"})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("pruned %d, want 1", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "keep.example.com.crt")); err != nil {
+		t.Error("kept host cert should survive")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "drop.example.com.crt")); !os.IsNotExist(err) {
+		t.Error("orphan host cert should be pruned")
+	}
+}

@@ -3,12 +3,18 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// ErrCertNotFound marks a certificate lookup that matched no row, so callers
+// can tell "no cert stored for this host" (usually fine) from a real query or
+// decryption failure via errors.Is.
+var ErrCertNotFound = errors.New("certificate not found")
 
 // UpsertCertificate inserts or replaces the certificate for a host. The private
 // key (KeyPEM) is encrypted with the existing AES-256-GCM key before storage;
@@ -63,12 +69,12 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 // GetCertificate retrieves the certificate for a host and decrypts its private
 // key. Returns an error if not found.
 func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
-	row := d.sql.QueryRow(`
+	row := d.read.QueryRow(`
 		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
 		FROM certificates WHERE host = ?`, host)
 	c, err := d.scanCertificate(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("certificate not found: %s", host)
+		return nil, fmt.Errorf("%w: %s", ErrCertNotFound, host)
 	}
 	if err != nil {
 		return nil, err
@@ -78,7 +84,7 @@ func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
 
 // ListCertificates returns all stored certificates with private keys decrypted.
 func (d *DB) ListCertificates() ([]models.Certificate, error) {
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
 		FROM certificates ORDER BY host`)
 	if err != nil {
@@ -102,7 +108,7 @@ func (d *DB) ListCertificates() ([]models.Certificate, error) {
 // no recorded expiry are skipped (nothing to compute against).
 func (d *DB) CertificatesDueForRenewal(window time.Duration) ([]models.Certificate, error) {
 	cutoff := time.Now().UTC().Add(window).Format(time.RFC3339)
-	rows, err := d.sql.Query(`
+	rows, err := d.read.Query(`
 		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
 		FROM certificates
 		WHERE expires_at != '' AND expires_at <= ?

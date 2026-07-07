@@ -16,6 +16,7 @@ func TestDomain_FQDN(t *testing.T) {
 		{"nested subdomain", "api.v2", "example.com", "api.v2.example.com"},
 		{"wildcard", "*", "example.com", "*.example.com"},
 		{"long zone", "svc", "my.long.zone.name", "svc.my.long.zone.name"},
+		{"apex", "@", "example.com", "example.com"},
 	}
 
 	for _, tt := range tests {
@@ -24,6 +25,9 @@ func TestDomain_FQDN(t *testing.T) {
 			got := d.FQDN(tt.zone)
 			if got != tt.expected {
 				t.Errorf("FQDN(%q) = %q, want %q", tt.zone, got, tt.expected)
+			}
+			if apex := d.IsApex(); apex != (tt.sub == "@") {
+				t.Errorf("IsApex() = %v for subdomain %q", apex, tt.sub)
 			}
 		})
 	}
