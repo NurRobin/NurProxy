@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Agent, Domain, Server, Zone } from '../lib/types';
-import { formatRelativeTime } from '../lib/utils';
+import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import { usePolling } from '../lib/usePolling';
 import StatusBadge from '../components/StatusBadge';
 import { buttonClass } from '../components/button-styles';
@@ -53,7 +53,7 @@ export default function SpreadsheetOverview() {
 
   const zoneName = (id: string) => zones.find((z) => z.id === id)?.name ?? '';
   const srvOf = (id: string) => allServers.find((s) => s.id === id);
-  const fqdn = (d: Domain) => { const z = zoneName(d.zone_id); return z ? `${d.subdomain}.${z}` : d.subdomain; };
+  const fqdn = (d: Domain) => domainFqdn(d.subdomain, zoneName(d.zone_id));
   const target = (d: Domain) => { const s = srvOf(d.server_id); return s ? `${s.address}:${d.port}` : `:${d.port}`; };
 
   const val = (d: Domain, k: SortKey): string => {

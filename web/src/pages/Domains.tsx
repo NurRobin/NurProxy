@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
 import type { Domain, Agent, Server, Zone, ProxyCapabilities } from '../lib/types';
-import { formatRelativeTime } from '../lib/utils';
+import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -19,13 +19,6 @@ import { useUndoableDelete } from '../lib/undo';
 
 function seen(date?: string) {
   return date ? formatRelativeTime(date) : i18n.t('time.never');
-}
-
-// domainFqdn renders a domain's full name, honoring the "@" apex sentinel: an
-// apex domain ("@") resolves to the bare zone (e.g. "@" + "example.com" →
-// "example.com") instead of the malformed "@.example.com".
-function domainFqdn(subdomain: string, zoneName: string): string {
-  return subdomain === '@' ? zoneName : `${subdomain}.${zoneName}`;
 }
 
 interface ServerWithAgent extends Server {
