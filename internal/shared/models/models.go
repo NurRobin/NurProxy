@@ -401,7 +401,7 @@ func (d Domain) IsApex() bool { return d.Subdomain == "@" }
 // FQDN returns the full domain name (subdomain + zone). The "@" sentinel means
 // the zone apex, so the bare zone name is returned.
 func (d Domain) FQDN(zoneName string) string {
-	if d.Subdomain == "@" {
+	if d.IsApex() {
 		return zoneName
 	}
 	return d.Subdomain + "." + zoneName

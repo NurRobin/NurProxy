@@ -62,7 +62,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "subdomain, zone_id, and server_id are required")
 		return
 	}
-	if err := dnsname.ValidateSubdomain(req.Subdomain); err != nil {
+	if err := dnsname.ValidateSubdomainOrApex(req.Subdomain); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -201,7 +201,7 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Subdomain != nil {
-		if err := dnsname.ValidateSubdomain(*req.Subdomain); err != nil {
+		if err := dnsname.ValidateSubdomainOrApex(*req.Subdomain); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

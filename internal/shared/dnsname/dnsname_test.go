@@ -14,7 +14,6 @@ func TestValidateSubdomain(t *testing.T) {
 		"x1-y2",
 		"*",          // bare wildcard
 		"*.internal", // leading wildcard label
-		"@",          // apex/root sentinel
 		strings.Repeat("a", 63),
 	}
 	for _, s := range valid {
@@ -36,11 +35,28 @@ func TestValidateSubdomain(t *testing.T) {
 		"*bad",                  // '*' mixed into a label
 		"@.foo",                 // '@' is only valid as the whole apex sentinel
 		"foo.@",                 // '@' not a normal label
+		"@",                     // apex sentinel is a domain-row concept, not a hostname
 		strings.Repeat("a", 64), // label too long
 	}
 	for _, s := range invalid {
 		if err := ValidateSubdomain(s); err == nil {
 			t.Errorf("ValidateSubdomain(%q) = nil, want error", s)
+		}
+	}
+}
+
+// TestValidateSubdomainOrApex pins the split: the "@" sentinel passes here (and
+// only here), everything else follows the strict rules.
+func TestValidateSubdomainOrApex(t *testing.T) {
+	if err := ValidateSubdomainOrApex("@"); err != nil {
+		t.Errorf("ValidateSubdomainOrApex(\"@\") = %v, want nil", err)
+	}
+	if err := ValidateSubdomainOrApex("jellyfin"); err != nil {
+		t.Errorf("ValidateSubdomainOrApex(\"jellyfin\") = %v, want nil", err)
+	}
+	for _, s := range []string{"", "@.foo", "foo.@", "-bad"} {
+		if err := ValidateSubdomainOrApex(s); err == nil {
+			t.Errorf("ValidateSubdomainOrApex(%q) = nil, want error", s)
 		}
 	}
 }
