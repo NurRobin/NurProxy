@@ -158,7 +158,7 @@ func main() {
 	// which proxy is installed (+ version/paths) and which process holds :80/:443.
 	// The result rides the agent-initiated adoption + heartbeat payloads (the
 	// agent always dials out; the orchestrator never probes it inbound).
-	detection := detectProxy(ctx)
+	detection := detectProxy(ctx, cfg.ProxyConfigDir)
 	if detection != nil {
 		log.Printf("Proxy detection: installed=%t kind=%q version=%q config_dir=%q",
 			detection.Installed, detection.Kind, detection.Version, detection.ConfigDir)
@@ -447,7 +447,7 @@ func main() {
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
 	// host changes (e.g. a previously-conflicting proxy releasing :443).
-	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx) })
+	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx, cfg.ProxyConfigDir) })
 	// Re-report the capability matrix on each beat so module changes (e.g.
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
@@ -518,9 +518,11 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 
 // detectProxy runs read-only proxy detection and converts it to the shared wire
 // model. It never mutates host state; a detection error is logged and reported
-// as nil (the orchestrator keeps any prior value), never fatal.
-func detectProxy(ctx context.Context) *models.ProxyDetection {
-	det, err := proxy.NewDetector().Detect(ctx)
+// as nil (the orchestrator keeps any prior value), never fatal. configDir is the
+// operator's optional proxy-config-dir override (empty = §9 OS default), applied
+// to both the reported config dir and upstream discovery.
+func detectProxy(ctx context.Context, configDir string) *models.ProxyDetection {
+	det, err := proxy.NewDetector().WithConfigDir(configDir).Detect(ctx)
 	if err != nil {
 		log.Printf("Proxy detection failed: %v", err)
 		return nil

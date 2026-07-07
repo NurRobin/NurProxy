@@ -241,6 +241,53 @@ func stubFS(dirs, files map[string]bool) func() {
 	}
 }
 
+func TestIsInactiveConfigFile(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"radarr.nurrobin.de.conf", false},
+		{"site.conf", false},
+		{"default", false}, // nginx's default site is a real symlink, not a backup
+		{"radarr.nurrobin.de.conf.bak.preproxmox-20260419", true},
+		{"jarvis.nurrobin.de.conf.bak.2026-05-04-2056", true},
+		{"llm.nurrobin.de.conf.bak-keepalive-20260604-124847", true},
+		{"site.conf~", true},
+		{".hidden.conf", true},
+		{"site.conf.dpkg-old", true},
+		{"site.conf.save", true},
+		{"site.conf.orig", true},
+		{"site.conf.swp", true},
+		{"site.conf.disabled", true},
+		{"", true},
+	}
+	for _, tt := range tests {
+		if got := isInactiveConfigFile(tt.name); got != tt.want {
+			t.Errorf("isInactiveConfigFile(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestGatherNginxConfig_skipsBackupFiles(t *testing.T) {
+	dir := t.TempDir()
+	live := "server { location / { proxy_pass http://10.9.9.9:9000; } }\n"
+	stale := "server { location / { proxy_pass http://10.9.9.22:9000; } }\n"
+	if err := os.WriteFile(filepath.Join(dir, "live.conf"), []byte(live), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "live.conf.bak.preproxmox-20260419"), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := gatherNginxConfig(dir)
+	if !strings.Contains(got, "10.9.9.9:9000") {
+		t.Errorf("live config should be gathered, but its upstream is missing from the result")
+	}
+	if strings.Contains(got, "10.9.9.22:9000") {
+		t.Errorf("backup (.bak) config must be skipped, but its upstream leaked into the result")
+	}
+}
+
 func TestGatherNginxConfig_capsTotalBytes(t *testing.T) {
 	tests := []struct {
 		name      string
