@@ -26,16 +26,20 @@ function prefillFromNetwork(n: DiscoveredNetwork): string {
   return base;
 }
 
-// canonAddr collapses addresses that point at the same backend so a server is
-// suggested at most once and never when it already exists. Loopback names are
-// unified (localhost = 127.0.0.1 = ::1) and the scheme's default port is filled
-// in (http→80, https→443), so "localhost", "localhost:80" and "127.0.0.1:80" all
-// produce the same key. Without this the dedup was a raw string compare, so
-// localhost and 127.0.0.1 showed as two suggestions and an existing server in a
-// different spelling never suppressed its suggestion.
+// canonHost normalizes a host so the same backend in a different spelling keys
+// the same: it lowercases, strips IPv6 brackets, and unifies the loopback names
+// (localhost = 127.0.0.1 = ::1).
+function canonHost(host: string): string {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' ? 'localhost' : h;
+}
+
+// canonAddr collapses addresses that point at the same backend so a discovered
+// upstream is suggested at most once. Loopback names are unified and the scheme's
+// default port is filled in (http→80, https→443), so "localhost", "localhost:80"
+// and "127.0.0.1:80" all produce the same key.
 function canonAddr(host: string, port?: number, scheme?: string): string {
-  let h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h === '127.0.0.1' || h === '::1') h = 'localhost';
+  const h = canonHost(host);
   const p = port && port > 0 ? port : scheme === 'https' ? 443 : scheme === 'http' ? 80 : 0;
   return p ? `${h}:${p}` : h;
 }
@@ -102,15 +106,18 @@ export default function Servers() {
   }
 
   // suggestionsFor turns an agent's discovered nginx upstreams (§52) into Server
-  // suggestions: collapse by address, merge the vhost names, and drop any address
-  // that is already a Server. The operator confirms each with a name/notes — the
+  // suggestions: collapse by address, merge the vhost names, and drop any host
+  // that is already a Server. A Server is identified by its host (the port lives
+  // on the domain, not the server), so a registered host suppresses every
+  // discovered upstream on it — re-suggesting :2412 on a box already added as a
+  // Server is pure noise. The operator confirms each with a name/notes — the
   // orchestrator never creates these on its own.
   const suggestionsFor = (agent: Agent, servers: Server[]) => {
-    const existing = new Set(servers.map((s) => { const { host, port } = parseAddr(s.address); return canonAddr(host, port); }));
+    const existingHosts = new Set(servers.map((s) => canonHost(parseAddr(s.address).host)));
     const byKey = new Map<string, { addr: string; names: string[] }>();
     for (const u of agent.proxy_detection?.discovered_upstreams ?? []) {
+      if (existingHosts.has(canonHost(u.host))) continue;
       const key = canonAddr(u.host, u.port, u.scheme);
-      if (existing.has(key)) continue;
       const entry = byKey.get(key);
       if (entry) entry.names.push(...(u.server_names ?? []));
       else byKey.set(key, { addr: u.port ? `${u.host}:${u.port}` : u.host, names: [...(u.server_names ?? [])] });

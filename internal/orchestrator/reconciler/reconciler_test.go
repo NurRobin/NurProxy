@@ -1711,6 +1711,72 @@ func TestReconcileDNS_conflictOnDifferentExistingRecord(t *testing.T) {
 	}
 }
 
+// TestTakeoverDomainDNS verifies the admin DNS-takeover override: a conflicting
+// pre-existing record (an A record to some other host) is DELETED and replaced with
+// the desired CNAME → agent FQDN using the provider's own credentials, the domain's
+// record is marked managed, and the conflict error is cleared.
+func TestTakeoverDomainDNS(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	// Seed a conflicting A record on the same name (the pre-NurProxy DNS).
+	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99"})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+		t.Fatalf("TakeoverDomainDNS: %v", err)
+	}
+
+	// The conflicting A record must be gone.
+	if _, ok := mp.getRecord(conflictID); ok {
+		t.Errorf("conflicting record %s should have been deleted", conflictID)
+	}
+
+	// Exactly one record now exists for the name: a CNAME -> agent FQDN.
+	recs, _ := mp.ListRecords(context.Background(), nil, "app.example.com", "")
+	if len(recs) != 1 {
+		t.Fatalf("expected exactly 1 record after takeover, got %d: %+v", len(recs), recs)
+	}
+	if !strings.EqualFold(recs[0].Type, "CNAME") || recs[0].Content != agent.FQDN {
+		t.Errorf("expected CNAME -> %s, got %s -> %s", agent.FQDN, recs[0].Type, recs[0].Content)
+	}
+
+	// The domain now owns a managed record and the conflict error is cleared.
+	got, _ := d.GetDomain(dom.ID)
+	if got.DNSRecordID == "" || !got.DNSManaged {
+		t.Errorf("expected a managed record id after takeover, got id=%q managed=%v", got.DNSRecordID, got.DNSManaged)
+	}
+	if got.Status == models.DomainStatusError || got.ErrorMsg != "" {
+		t.Errorf("takeover should clear the conflict error, got status=%q err=%q", got.Status, got.ErrorMsg)
+	}
+}
+
+// TestTakeoverDomainDNS_adoptsMatchingRecord verifies takeover is idempotent: when
+// the desired CNAME already exists, it takes ownership (managed=true) without
+// creating a duplicate.
+func TestTakeoverDomainDNS_adoptsMatchingRecord(t *testing.T) {
+	mp := registerMockProvider(t)
+	d := testDB(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+
+	seedID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN})
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+		t.Fatalf("TakeoverDomainDNS: %v", err)
+	}
+
+	got, _ := d.GetDomain(dom.ID)
+	if got.DNSRecordID != seedID || !got.DNSManaged {
+		t.Errorf("expected to adopt existing record %s as managed, got id=%q managed=%v", seedID, got.DNSRecordID, got.DNSManaged)
+	}
+	recs, _ := mp.ListRecords(context.Background(), nil, "app.example.com", "")
+	if len(recs) != 1 {
+		t.Errorf("expected no duplicate (1 record), got %d", len(recs))
+	}
+}
+
 // TestReconcileDeletions_KeepsAdoptedRecord proves the #79 fix: when a domain's
 // DNS record was ADOPTED (managed=false) rather than created by NurProxy,
 // teardown must NOT delete it (that record predates NurProxy and is the

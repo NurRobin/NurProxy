@@ -86,6 +86,11 @@ func Discover(content string) []Upstream {
 					if len(cur) > 1 {
 						f.name = cur[1]
 					}
+				case "location":
+					// Keep the match argument(s) so a proxy_pass can tell which
+					// location it sits in (e.g. the ACME-challenge responder).
+					f.kind = "location"
+					f.name = strings.Join(cur[1:], " ")
 				}
 			}
 			stack = append(stack, f)
@@ -113,7 +118,13 @@ func Discover(content string) []Upstream {
 						f.names = append(f.names, cleanNames(cur[1:])...)
 					}
 				case "proxy_pass":
-					if len(cur) >= 2 {
+					// Skip the ACME HTTP-01 challenge responder: a location matching
+					// /.well-known/acme-challenge proxies to the host's cert-renewal
+					// sidecar (certbot/webroot helper), not an application backend.
+					// Without this, that one internal target rides along on every vhost
+					// that supports cert renewal and floods the suggestions.
+					lf := nearest("location")
+					if len(cur) >= 2 && (lf == nil || !strings.Contains(lf.name, "acme-challenge")) {
 						if sf := nearest("server"); sf != nil {
 							sf.refs = append(sf.refs, ref{target: cur[1]})
 						} else {
