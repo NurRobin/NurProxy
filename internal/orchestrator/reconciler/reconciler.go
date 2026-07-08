@@ -109,27 +109,32 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	if err != nil {
 		return err
 	}
-	intents := intentsFromDesired(desired, backendForAgent(agent))
-	// Preflight ordering (§5/§7): gather the certs the agent needs for these routes
-	// FIRST, then push them with the intents in one "everything is ready, go live"
-	// message. The agent installs the certs (InstallCerts) before applying the
-	// referencing config, so a generated config never validates against a missing
-	// cert file. Certs ride this agent-initiated stream — no inbound probe.
+	r.hub.PublishIntentSet(agentID, r.intentSetFor(agent, desired, keepExtra))
+	return nil
+}
+
+// intentSetFor assembles the complete stream push for an agent: the rendered
+// intents plus, under preflight ordering (§5/§7), every cert the agent needs
+// FIRST — the agent installs the certs (InstallCerts) before applying the
+// referencing config, so a generated config never validates against a missing
+// cert file. Cert-only domains have no intent but still need their cert
+// installed (§7). Because this is the agent's complete cert set, PruneCerts
+// lets the agent scrub any cert-store entry not in CertKeep — cleaning up a
+// deleted host's cert (notably a cert-only host with no vhost to drive
+// removal). Used by both the instant push and the periodic tick, so the two
+// paths cannot drift apart.
+func (r *Reconciler) intentSetFor(agent *models.Agent, desired map[string]desiredRoute, keepExtra []string) proxymodel.IntentSet {
 	certs := r.gatherCerts(desired)
-	// Cert-only domains have no intent but still need their cert installed (§7).
 	certs = append(certs, r.gatherCertOnlyCerts(agent)...)
-	// This is the complete cert set for the agent, so the agent may scrub any
-	// cert-store entry not in it — cleaning up a deleted host's cert (notably a
-	// cert-only host with no vhost to drive removal, §7).
 	certKeep := make([]string, 0, len(certs))
 	for i := range certs {
 		certKeep = append(certKeep, certs[i].Host)
 	}
-	r.hub.PublishIntentSet(agentID, proxymodel.IntentSet{
-		Intents: intents, Certs: certs, Keep: keepExtra,
+	return proxymodel.IntentSet{
+		Intents: intentsFromDesired(desired, backendForAgent(agent)),
+		Certs:   certs, Keep: keepExtra,
 		PruneCerts: true, CertKeep: certKeep,
-	})
-	return nil
+	}
 }
 
 // gatherCertOnlyCerts collects the cert bundles for an agent's cert-only domains
@@ -558,12 +563,14 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 
 		// route (Caddy JSON) feeds only the inbound same-host fallback; the stream
 		// path uses intent. A raw intent for a file backend can't render to Caddy
-		// JSON, so fall back to the stored bytes there (the fallback never serves a
-		// file backend anyway).
+		// JSON, so fall back to the raw bytes there (the fallback never serves a
+		// file backend anyway). Read them from the intent, not storedArt: a raw
+		// intent can also come from the domain row's manual config before any
+		// artifact exists (ConfigFromDomain), where storedArt is nil.
 		route, gErr := caddygen.GenerateRoute(intent)
 		if gErr != nil {
 			if intent.IsRaw() {
-				route = json.RawMessage(storedArt.Content)
+				route = json.RawMessage(intent.Raw.Content)
 			} else {
 				log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
@@ -599,10 +606,12 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 	// orchestrator can reach the agent directly. Keep carries the drifted-but-retained
 	// paths so the agent's prune doesn't mistake them for orphans (invariant #3).
 	if r.hub != nil && r.hub.Connected(agent.ID) {
-		r.hub.PublishIntentSet(agent.ID, proxymodel.IntentSet{
-			Intents: intentsFromDesired(desiredByFQDN, backendForAgent(agent)),
-			Keep:    keepExtra,
-		})
+		// Same push as PushAgentRoutes (§5/§7): the periodic tick must also carry
+		// the cert bundles (incl. cert-only hosts) and the prune/keep set, or an
+		// agent that missed the instant push (or lost its cert store) keeps
+		// receiving TLS configs it can never validate — and deleted hosts' certs
+		// would never get scrubbed by the tick.
+		r.hub.PublishIntentSet(agent.ID, r.intentSetFor(agent, desiredByFQDN, keepExtra))
 		return nil
 	}
 
