@@ -53,7 +53,14 @@ func (l Layout) IsConfD() bool { return l.Enabled == "" }
 //   - configDir ends in "conf.d" → RHEL/Fedora flat layout; Enabled empty.
 //   - otherwise (e.g. the /etc/nginx root) → default to the Debian
 //     sites-available / sites-enabled pair.
+//   - empty → the /etc/nginx OS default. filepath.Clean("") is "." and would
+//     otherwise yield RELATIVE sites-available/enabled paths, which the agent
+//     then tries to create under its working directory (read-only under the
+//     systemd sandbox) — every apply fails with "mkdir sites-available".
 func ResolveLayout(configDir string) Layout {
+	if strings.TrimSpace(configDir) == "" {
+		configDir = "/etc/nginx"
+	}
 	clean := filepath.Clean(configDir)
 	base := filepath.Base(clean)
 	parent := filepath.Dir(clean)
