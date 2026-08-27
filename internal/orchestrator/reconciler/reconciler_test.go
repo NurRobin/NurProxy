@@ -2190,3 +2190,85 @@ func TestReconcileRoutes_tickIncludesCerts(t *testing.T) {
 		t.Errorf("cert bundle = %+v, want the stored leaf for app.example.com", set.Certs[0])
 	}
 }
+
+// TestCertRenewalStore_backoffGatesScansAndFastPath covers the #70 rate-limit
+// hold end to end at the adapter: MarkRateLimited persists an exponentially
+// growing hold, DueForRenewal and TargetForHost skip a held host (first
+// issuance AND renewal), and ClearBackoff releases it.
+func TestCertRenewalStore_backoffGatesScansAndFastPath(t *testing.T) {
+	registerMockProvider(t)
+	d := testDB(t)
+	_, _, _, _, _ = setupScenario(t, d) // domain app.example.com, central TLS, no cert yet
+
+	store := NewCertRenewalStore(d)
+	ctx := context.Background()
+
+	// Sanity: without a hold the host is a first-issuance target.
+	targets, err := store.DueForRenewal(ctx, tls.DefaultRenewWindow)
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("precondition: want one target, got %v (%v)", targets, err)
+	}
+
+	next, err := store.MarkRateLimited(ctx, "app.example.com", "too many certificates", nil)
+	if err != nil {
+		t.Fatalf("MarkRateLimited: %v", err)
+	}
+	if !next.After(time.Now()) {
+		t.Fatalf("next attempt %v should be in the future", next)
+	}
+
+	// Both the scan and the on-create fast path now skip the host.
+	targets, err = store.DueForRenewal(ctx, tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatalf("DueForRenewal: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("held host must not be scanned, got %+v", targets)
+	}
+	if one, _ := store.TargetForHost(ctx, "app.example.com"); one != nil {
+		t.Errorf("TargetForHost must skip a held host, got %+v", one)
+	}
+
+	// A held RENEWAL is skipped too: store a cert already inside the window.
+	if err := d.UpsertCertificate(&models.Certificate{
+		ID: "app.example.com", Host: "app.example.com",
+		Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K",
+		ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertCertificate: %v", err)
+	}
+	targets, err = store.DueForRenewal(ctx, tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatalf("DueForRenewal: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("held renewal must be skipped, got %+v", targets)
+	}
+
+	// Consecutive limits grow the attempt counter (exponential step).
+	if _, err := store.MarkRateLimited(ctx, "app.example.com", "still limited", nil); err != nil {
+		t.Fatalf("MarkRateLimited #2: %v", err)
+	}
+	b, err := d.GetCertBackoff("app.example.com")
+	if err != nil || b == nil {
+		t.Fatalf("GetCertBackoff: %v %v", b, err)
+	}
+	if b.Attempts != 2 {
+		t.Errorf("attempts = %d, want 2", b.Attempts)
+	}
+	if b.LastError != "still limited" {
+		t.Errorf("last_error = %q, want the latest detail", b.LastError)
+	}
+
+	// Clearing releases the hold: the (due) renewal target comes back.
+	if err := store.ClearBackoff(ctx, "app.example.com"); err != nil {
+		t.Fatalf("ClearBackoff: %v", err)
+	}
+	targets, err = store.DueForRenewal(ctx, tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatalf("DueForRenewal: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Host != "app.example.com" {
+		t.Errorf("after clear the due renewal should return, got %+v", targets)
+	}
+}

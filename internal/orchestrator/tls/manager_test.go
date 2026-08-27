@@ -24,6 +24,9 @@ type fakeStore struct {
 	savedWC   []bool
 	saveErr   error
 	gotWin    time.Duration
+	// rateLimited/cleared record the backoff calls (#70).
+	rateLimited []string
+	cleared     []string
 }
 
 func (s *fakeStore) DueForRenewal(_ context.Context, window time.Duration) ([]RenewTarget, error) {
@@ -42,6 +45,14 @@ func (s *fakeStore) SaveRenewed(_ context.Context, res *CertResult, isWildcard b
 	}
 	s.saved = append(s.saved, res)
 	s.savedWC = append(s.savedWC, isWildcard)
+	return nil
+}
+func (s *fakeStore) MarkRateLimited(_ context.Context, host, detail string, retryAfter *time.Time) (time.Time, error) {
+	s.rateLimited = append(s.rateLimited, host)
+	return time.Now().Add(time.Hour), nil
+}
+func (s *fakeStore) ClearBackoff(_ context.Context, host string) error {
+	s.cleared = append(s.cleared, host)
 	return nil
 }
 
@@ -329,6 +340,10 @@ func (s *lockStore) SaveRenewed(_ context.Context, res *CertResult, _ bool) erro
 	s.saveCount[res.Host]++
 	return nil
 }
+func (s *lockStore) MarkRateLimited(_ context.Context, _, _ string, _ *time.Time) (time.Time, error) {
+	return time.Now().Add(time.Hour), nil
+}
+func (s *lockStore) ClearBackoff(_ context.Context, _ string) error { return nil }
 
 // barrierACME counts Obtain calls and, when width > 1, holds every caller inside
 // Obtain until the test releases them — so the different-hosts test can prove the
@@ -639,5 +654,45 @@ func TestRenewer_issueWithRetry_doesNotRetryRateLimit(t *testing.T) {
 	}
 	if acme.calls != 1 {
 		t.Errorf("ObtainViaDNS01 calls = %d, want 1 (rate limit must not be retried)", acme.calls)
+	}
+}
+
+// TestRenewer_rateLimit_marksBackoffAndSuccessClears asserts the #70 flow: a CA
+// rate limit persists a backoff hold (with audit) instead of only failing, and
+// a later successful issuance clears the hold.
+func TestRenewer_rateLimit_marksBackoffAndSuccessClears(t *testing.T) {
+	fp := newFakeProvider("TXT")
+	target := RenewTarget{Host: "limited.example.com", Names: []string{"limited.example.com"}, Provider: fp}
+	audit := &fakeAudit{}
+
+	store := &fakeStore{due: []RenewTarget{target}}
+	acme := &fakeACME{err: lightweightRateLimitErr{}}
+	r := newRenewer(store, acme, &fakeReloader{}, audit)
+
+	if err := r.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce should surface the rate-limit failure")
+	}
+	if len(store.rateLimited) != 1 || store.rateLimited[0] != "limited.example.com" {
+		t.Errorf("MarkRateLimited hosts = %v, want [limited.example.com]", store.rateLimited)
+	}
+	if len(store.cleared) != 0 {
+		t.Errorf("nothing should be cleared on failure, got %v", store.cleared)
+	}
+	if !containsEvent(audit.events, "cert_rate_limited:limited.example.com") {
+		t.Errorf("missing cert_rate_limited audit event, got %v", audit.events)
+	}
+
+	// Success path: the hold is cleared.
+	store2 := &fakeStore{due: []RenewTarget{target}}
+	acme2 := &fakeACME{result: &CertResult{CertPEM: []byte("C"), KeyPEM: []byte("K")}}
+	r2 := newRenewer(store2, acme2, &fakeReloader{}, &fakeAudit{})
+	if err := r2.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(store2.cleared) != 1 || store2.cleared[0] != "limited.example.com" {
+		t.Errorf("ClearBackoff hosts = %v, want [limited.example.com]", store2.cleared)
+	}
+	if len(store2.rateLimited) != 0 {
+		t.Errorf("no rate limit should be marked on success, got %v", store2.rateLimited)
 	}
 }
