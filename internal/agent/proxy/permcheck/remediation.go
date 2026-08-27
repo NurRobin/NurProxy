@@ -220,10 +220,10 @@ func systemdSandboxStep(unit string, paths []string, withCaps bool) RemediationS
 	title := "Open the service sandbox so the agent can write + reload the proxy (systemd ReadWritePaths drop-in)"
 	if withCaps {
 		lines = append(lines,
-			"AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE",
-			"CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE",
+			"AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN",
+			"CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN",
 		)
-		title = "Open the service sandbox so the root agent can read the proxy's keys + write its config/logs (systemd drop-in)"
+		title = "Open the service sandbox and restore the capabilities the root agent needs (read proxy keys, write config/logs, let nginx -t chown its temp dirs) — systemd drop-in"
 	}
 	// strings joined with a literal \n so the single-quoted printf renders the
 	// multi-line drop-in body when the operator runs it.
