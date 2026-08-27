@@ -14,8 +14,14 @@ import (
 // tests can shrink them; production never mutates them.
 var (
 	rateLimitBaseBackoff = 1 * time.Hour
-	rateLimitMaxBackoff  = 24 * time.Hour
+	rateLimitMaxBackoff  = RateLimitBackoffCap
 )
+
+// RateLimitBackoffCap is the largest hold the backoff curve produces (before
+// jitter / a later CA retry-after). Exported so the store adapter can treat a
+// hold that elapsed more than a full cap ago as stale and reset the attempt
+// counter (a new limit that long after the last one is not "consecutive").
+const RateLimitBackoffCap = 24 * time.Hour
 
 // NextRateLimitBackoff computes when issuance for a host may be retried after
 // its attempts-th consecutive rate limit (attempts >= 1): now + min(base*2^(n-1),
@@ -33,7 +39,9 @@ func NextRateLimitBackoff(now time.Time, attempts int, retryAfter *time.Time) ti
 	if d > rateLimitMaxBackoff {
 		d = rateLimitMaxBackoff
 	}
-	d += time.Duration(rand.Int64N(int64(d) / 10))
+	if j := int64(d) / 10; j > 0 { // guard: rand.Int64N panics on n <= 0 (tiny test overrides)
+		d += time.Duration(rand.Int64N(j))
+	}
 	next := now.Add(d)
 	if retryAfter != nil && retryAfter.After(next) {
 		next = *retryAfter

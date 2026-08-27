@@ -180,7 +180,13 @@ func (s *CertRenewalStore) TargetForHost(_ context.Context, host string) (*tls.R
 	// An active rate-limit hold also gates the on-create fast path: issuing now
 	// is guaranteed to fail against the CA and burn quota. The scan picks the
 	// host up once the hold elapses (#70).
-	if b, err := s.db.GetCertBackoff(host); err == nil && b != nil && b.NextAttemptAt.After(time.Now().UTC()) {
+	b, err := s.db.GetCertBackoff(host)
+	if err != nil {
+		// Fail closed: an unreadable hold must not let the fast path drive ACME —
+		// a hold may well exist, and issuing through it burns CA quota.
+		return nil, fmt.Errorf("reading cert backoff for %q: %w", host, err)
+	}
+	if b != nil && b.NextAttemptAt.After(time.Now().UTC()) {
 		log.Printf("reconciler: issuance for %q is rate-limit backed off until %s, skipping", host, b.NextAttemptAt.UTC().Format(time.RFC3339))
 		return nil, nil
 	}
@@ -259,7 +265,11 @@ func (s *CertRenewalStore) MarkRateLimited(_ context.Context, host, detail strin
 		return time.Time{}, fmt.Errorf("reading cert backoff for %q: %w", host, err)
 	}
 	attempts := 1
-	if prev != nil {
+	// Only a CONSECUTIVE limit escalates the hold: a leftover row whose hold
+	// elapsed more than a full backoff cap ago is stale (the host simply wasn't
+	// retried for a while — e.g. it lost its consumer), not evidence of an
+	// ongoing limit, so the counter restarts instead of drifting upward forever.
+	if prev != nil && time.Since(prev.NextAttemptAt) < tls.RateLimitBackoffCap {
 		attempts = prev.Attempts + 1
 	}
 	next := tls.NextRateLimitBackoff(time.Now().UTC(), attempts, retryAfter)
