@@ -328,6 +328,12 @@ type ReconfigureDeps struct {
 	// CertKey is the agent-local AES-256 key the file backend uses to encrypt cert
 	// private keys at rest (paired with CertDir). Empty stores keys as plaintext.
 	CertKey []byte
+	// Detection is the startup proxy-detection result. When a reconfigure request
+	// carries no ConfigDir override and the detected proxy matches the requested
+	// type, its resolved config dir fills the gap — this is what makes "empty =
+	// use the detected default" actually true. Optional; the file backends also
+	// fall back to their OS-default roots on an empty dir.
+	Detection *Detection
 }
 
 // ReconfigureResult is the structured outcome of a hot-switch, returned so the
@@ -447,6 +453,16 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 			deps.Health.SetError(msg)
 		}
 		return ReconfigureResult{OK: false, Message: msg}
+	}
+
+	// "Empty ConfigDir = use the detected default": fill it from the startup
+	// detection when the detected proxy matches the requested type. Without this
+	// the file backends used to derive RELATIVE sites-available/enabled paths
+	// from the empty string and every apply failed with "mkdir sites-available:
+	// read-only file system" under the systemd sandbox.
+	if req.ConfigDir == "" && deps.Detection != nil &&
+		deps.Detection.Installed && string(deps.Detection.Kind) == req.Type {
+		req.ConfigDir = deps.Detection.ConfigDir
 	}
 
 	be, err := Get(req.Type, Config{

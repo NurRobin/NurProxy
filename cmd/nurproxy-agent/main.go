@@ -158,7 +158,7 @@ func main() {
 	// which proxy is installed (+ version/paths) and which process holds :80/:443.
 	// The result rides the agent-initiated adoption + heartbeat payloads (the
 	// agent always dials out; the orchestrator never probes it inbound).
-	detection := detectProxy(ctx, cfg.ProxyConfigDir)
+	rawDetection, detection := detectProxy(ctx, cfg.ProxyConfigDir)
 	if detection != nil {
 		log.Printf("Proxy detection: installed=%t kind=%q version=%q config_dir=%q",
 			detection.Installed, detection.Kind, detection.Version, detection.ConfigDir)
@@ -362,6 +362,7 @@ func main() {
 		Env:       env,
 		CertDir:   certDir,
 		CertKey:   certKey,
+		Detection: rawDetection,
 		CaddyFactory: func() proxy.Proxy {
 			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort))
 			if certStore != nil {
@@ -447,7 +448,7 @@ func main() {
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
 	// host changes (e.g. a previously-conflicting proxy releasing :443).
-	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx, cfg.ProxyConfigDir) })
+	hb.SetDetectionFn(func() *models.ProxyDetection { _, m := detectProxy(ctx, cfg.ProxyConfigDir); return m })
 	// Re-report the capability matrix on each beat so module changes (e.g.
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
@@ -521,13 +522,13 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 // as nil (the orchestrator keeps any prior value), never fatal. configDir is the
 // operator's optional proxy-config-dir override (empty = §9 OS default), applied
 // to both the reported config dir and upstream discovery.
-func detectProxy(ctx context.Context, configDir string) *models.ProxyDetection {
+func detectProxy(ctx context.Context, configDir string) (*proxy.Detection, *models.ProxyDetection) {
 	det, err := proxy.NewDetector().WithConfigDir(configDir).Detect(ctx)
 	if err != nil {
 		log.Printf("Proxy detection failed: %v", err)
-		return nil
+		return nil, nil
 	}
-	return det.ToModel()
+	return &det, det.ToModel()
 }
 
 // toProxyPermissions maps the agent-side permcheck result + remediation into the
