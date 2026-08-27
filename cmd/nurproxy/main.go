@@ -147,6 +147,20 @@ func main() {
 	srv.SetDNSTakeover(rec)
 	// Surface sandbox state so the dashboard can show a "dry-run" banner (#93).
 	srv.SetDryRun(dnsDryRun, acmeDryRun)
+	// ACME-CA reachability probe (#91): a periodic GET of the ACME directory so
+	// an orchestrator-egress problem shows up in /health and as a dashboard
+	// banner instead of masquerading as per-domain issuance flakiness. The
+	// directory URL is resolved from settings on every probe (production vs
+	// staging switches post-boot are picked up). Skipped in ACME dry-run — the
+	// CA is never contacted there.
+	if !acmeDryRun {
+		caProber := orchtls.NewCAProber(func() string {
+			dir, _ := database.GetSetting("acme_directory")
+			return dir
+		})
+		go caProber.Start(rootCtx, orchtls.DefaultCAProbeInterval)
+		srv.SetCAStatus(caProber.Status)
+	}
 	// Wire the on-demand cert issuer so creating a central-TLS domain kicks
 	// first-issuance immediately (§7). Nil when ACME could not be set up; the
 	// periodic renewal scan remains the backstop.
