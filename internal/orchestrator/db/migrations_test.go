@@ -199,3 +199,25 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		t.Errorf("agent count = %d after second Open, want 1", agentCount)
 	}
 }
+
+func TestSchemaVersion_readOnly(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "v.db")
+	d, err := Open(dbPath, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	current, target, err := SchemaVersion(dbPath)
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if current != len(migrations) || target != len(migrations) {
+		t.Errorf("SchemaVersion = (%d, %d), want (%d, %d)", current, target, len(migrations), len(migrations))
+	}
+}

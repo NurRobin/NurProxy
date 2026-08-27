@@ -1,6 +1,10 @@
 package db
 
-import "fmt"
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+)
 
 // migrations is an ordered list of SQL statements. Each entry corresponds to a
 // schema version (1-indexed). They are executed inside a transaction when the
@@ -539,4 +543,28 @@ func (d *DB) migrate() error {
 	}
 
 	return nil
+}
+
+// SchemaVersion reports the applied schema version of the database at dbPath
+// and the target version this binary migrates to — WITHOUT running migrations
+// or requiring the encryption key. It is the read-only backing of the
+// `nurproxy db version` CLI (#75): safe against a live orchestrator's database
+// (WAL readers don't block the writer) and against a copy/backup. A database
+// with no schema_version table reports version 0.
+func SchemaVersion(dbPath string) (current, target int, err error) {
+	conn, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return 0, 0, fmt.Errorf("opening database read-only: %w", err)
+	}
+	defer conn.Close()
+	target = len(migrations)
+	row := conn.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+	if err := row.Scan(&current); err != nil {
+		// A pre-migration database (or an empty file) has no schema_version table.
+		if strings.Contains(err.Error(), "no such table") {
+			return 0, target, nil
+		}
+		return 0, target, fmt.Errorf("reading schema version: %w", err)
+	}
+	return current, target, nil
 }

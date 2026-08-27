@@ -319,3 +319,38 @@ func addFileToTar(tw *tar.Writer, srcPath, name string) error {
 	_, err = io.Copy(tw, in)
 	return err
 }
+
+// cmdDB handles the `nurproxy db` subcommands. `db version` prints the applied
+// schema version of the local database against this binary's target — the
+// visibility half of #75 (down-migrations stay out of scope; backup/restore is
+// the rollback story). Read-only: never migrates, never needs the encryption
+// key, safe against a live orchestrator.
+//
+//	nurproxy db version [--data-dir DIR]
+func cmdDB(args []string) {
+	if len(args) < 1 || args[0] != "version" {
+		fmt.Println("Usage: nurproxy db version [--data-dir DIR]")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("db version", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "Data directory (default: $NP_DATA_DIR or ./data)")
+	_ = fs.Parse(args[1:])
+
+	path := filepath.Join(resolveDataDir(*dataDir), dbFileName)
+	if _, err := os.Stat(path); err != nil {
+		fatalf("db version: %v", err)
+	}
+	current, target, err := db.SchemaVersion(path)
+	if err != nil {
+		fatalf("db version: %v", err)
+	}
+	fmt.Printf("schema version: %d (binary target: %d)\n", current, target)
+	switch {
+	case current == target:
+		fmt.Println("up to date")
+	case current < target:
+		fmt.Printf("%d migration(s) pending — applied on the next orchestrator start\n", target-current)
+	default:
+		fmt.Printf("database is AHEAD of this binary by %d version(s) — it was migrated by a newer nurproxy; run that version\n", current-target)
+	}
+}

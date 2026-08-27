@@ -56,6 +56,9 @@ func main() {
 		case "restore":
 			cmdRestore(os.Args[2:])
 			return
+		case "db":
+			cmdDB(os.Args[2:])
+			return
 		default:
 			// Management CLI subcommands (provider/zone/agent/server/domain/...).
 			// If handled, we're done. An unhandled non-flag argument is a typo'd
