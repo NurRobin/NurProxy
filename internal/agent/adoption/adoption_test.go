@@ -2,6 +2,7 @@ package adoption
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -189,5 +190,44 @@ func TestDetectPublicIPSimple_fallsThroughToValid(t *testing.T) {
 	}
 	if got != "203.0.113.7" {
 		t.Errorf("detectPublicIPSimple() = %q, want 203.0.113.7", got)
+	}
+}
+
+// TestRegister_sendsDetectedIPs unit-tests Register end to end against an
+// httptest orchestrator with stubbed IP detectors — previously impossible
+// because Register was hard-coupled to live public-IP lookups (#76).
+func TestRegister_sendsDetectedIPs(t *testing.T) {
+	var got registerRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/agents/register" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decoding register request: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	m, err := New(srv.URL, "edge.example.com", t.TempDir(), 8780)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.WithIPDetectors(
+		func(context.Context) (string, error) { return "203.0.113.9", nil },
+		func(context.Context) (string, error) { return "2001:db8::9", nil },
+	)
+
+	if err := m.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if got.FQDN != "edge.example.com" || got.PublicIP != "203.0.113.9" || got.PublicIP6 != "2001:db8::9" {
+		t.Errorf("register request = %+v, want stubbed IPs + fqdn", got)
+	}
+	if got.APIURL != "http://203.0.113.9:8780" {
+		t.Errorf("api_url = %q, want the detected-IP form", got.APIURL)
+	}
+	if got.Token == "" || got.ID == "" {
+		t.Error("register request must carry the generated token + agent id")
 	}
 }

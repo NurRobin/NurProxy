@@ -10,7 +10,7 @@ import ConfirmDialog from '../components/ConfirmDialog';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
-import { Field, Input, PasswordInput, Select } from '../components/Field';
+import { Checkbox, Field, Input, PasswordInput, Select } from '../components/Field';
 import MultiSelect from '../components/MultiSelect';
 import { useToast, errMessage } from '../components/toast-context';
 import { useUIVariant, UI_VARIANTS } from '../lib/ui-variant-context';
@@ -28,6 +28,10 @@ function Section({ title, help, action, children }: { title: string; help?: stri
     </section>
   );
 }
+
+// Let's Encrypt staging directory — issued certs are untrusted, but issuance
+// does not count against production rate limits (#76).
+const LE_STAGING_URL = 'https://acme-staging-v02.api.letsencrypt.org/directory';
 
 export default function Settings() {
   const toast = useToast();
@@ -57,6 +61,7 @@ export default function Settings() {
   const [reconcilerSaving, setReconcilerSaving] = useState(false);
 
   const [acmeEmail, setAcmeEmail] = useState('');
+  const [acmeStaging, setAcmeStaging] = useState(false);
   const [acmeSaving, setAcmeSaving] = useState(false);
 
   const [currentPassword, setCurrentPassword] = useState('');
@@ -78,6 +83,8 @@ export default function Settings() {
       if (rec) setReconcilerInterval(rec.value);
       const email = s.find((st) => st.key === 'acme_email');
       if (email) setAcmeEmail(email.value);
+      const dir = s.find((st) => st.key === 'acme_directory');
+      setAcmeStaging(!!dir && dir.value === LE_STAGING_URL);
     } catch (err) {
       toast.error(errMessage(err, t('settings.loadFailed')));
     } finally {
@@ -152,9 +159,14 @@ export default function Settings() {
     setAcmeSaving(true);
     try {
       await api.updateSetting('acme_email', acmeEmail.trim());
+      // Empty directory = Let's Encrypt production (the default); the staging
+      // toggle writes the LE staging URL so operators can test issuance
+      // without burning production rate limits.
+      await api.updateSetting('acme_directory', acmeStaging ? LE_STAGING_URL : '');
       setSettings((prev) => {
-        const next = prev.filter((s) => s.key !== 'acme_email');
+        const next = prev.filter((s) => s.key !== 'acme_email' && s.key !== 'acme_directory');
         next.push({ key: 'acme_email', value: acmeEmail.trim(), updated_at: new Date().toISOString() });
+        next.push({ key: 'acme_directory', value: acmeStaging ? LE_STAGING_URL : '', updated_at: new Date().toISOString() });
         return next;
       });
       toast.success(t('settings.acmeSaved'));
@@ -285,6 +297,10 @@ export default function Settings() {
           <Button onClick={handleSaveAcmeEmail} loading={acmeSaving} className="mb-0.5">{t('common.save')}</Button>
         </div>
         <p className="mt-2 text-xs text-fg-faint">{t('settings.acmeEmailHelp')}</p>
+        <div className="mt-3">
+          <Checkbox label={t('settings.acmeStaging')} checked={acmeStaging} onChange={(e) => setAcmeStaging(e.target.checked)} />
+          <p className="mt-1 text-xs text-fg-faint">{t('settings.acmeStagingHelp')}</p>
+        </div>
       </Section>
 
       <Section title={t('settings.authentication')}>

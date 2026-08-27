@@ -479,13 +479,27 @@
     "deleteProviderTitle": "Delete provider",
     "deleteProviderMsg": "Delete this provider? All zones and domains using it will lose DNS management.",
     "removeZoneTitle": "Remove zone",
-    "removeZoneMsg": "Remove this zone? Domains using it will lose DNS management."
+    "removeZoneMsg": "Remove this zone? Domains using it will lose DNS management.",
+    "acmeStaging": "Use Let's Encrypt staging (test issuance)",
+    "acmeStagingHelp": "Staging certificates are NOT browser-trusted, but issuance does not count against production rate limits. Turn off for real certificates."
   },
   "appearanceVariants": {
-    "classic": { "name": "Classic", "description": "A compact top-nav dashboard with a health panel, cards, and tables." },
-    "workbench": { "name": "Workbench", "description": "A live topology map of your infrastructure with a sidebar and click-to-inspect panels." },
-    "wallboard": { "name": "Wallboard", "description": "A read-only status grid for a spare monitor. Big, glanceable, auto-refreshing." },
-    "spreadsheet": { "name": "Spreadsheet", "description": "A dense, table-first view with multi-select and bulk actions for power users." }
+    "classic": {
+      "name": "Classic",
+      "description": "A compact top-nav dashboard with a health panel, cards, and tables."
+    },
+    "workbench": {
+      "name": "Workbench",
+      "description": "A live topology map of your infrastructure with a sidebar and click-to-inspect panels."
+    },
+    "wallboard": {
+      "name": "Wallboard",
+      "description": "A read-only status grid for a spare monitor. Big, glanceable, auto-refreshing."
+    },
+    "spreadsheet": {
+      "name": "Spreadsheet",
+      "description": "A dense, table-first view with multi-select and bulk actions for power users."
+    }
   },
   "topology": {
     "title": "Topology",
