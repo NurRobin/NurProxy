@@ -8,11 +8,15 @@ import (
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
-const testKey = "test-api-key"
+const testKey = "np_ak_test0123" // generated keys always carry the np_ak_ prefix; the legacy-plaintext auth branch is gated on it
+
+// hashedTestKey has the generated np_ak_ prefix, matching what real installs store hashed.
+const hashedTestKey = "np_ak_cafe0123"
 
 func testHandler(t *testing.T) (*Handler, *db.DB) {
 	t.Helper()
@@ -280,5 +284,22 @@ func TestAgentAndServerTools(t *testing.T) {
 	// missing agent → tool error
 	if isErr := callTool(t, h, "get_agent_status", map[string]any{"agent_id": "ghost"}, nil); !isErr {
 		t.Error("get_agent_status for unknown agent should report isError")
+	}
+}
+
+// TestAuthorized_hashedKey is the regression for the hashed-admin-key lockout:
+// since the API key is stored as its SHA-256 digest, comparing the raw bearer
+// against the stored value rejected EVERY valid key — MCP was unusable on any
+// install with a hashed key row.
+func TestAuthorized_hashedKey(t *testing.T) {
+	h, d := testHandler(t)
+	if err := d.SetSetting("mcp_enabled", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetSetting("admin_api_key", auth.HashToken(hashedTestKey)); err != nil {
+		t.Fatalf("SetSetting: %v", err)
+	}
+	if w, _ := rpc(t, h, hashedTestKey, "tools/list", nil); w.Code != http.StatusOK {
+		t.Fatalf("hashed-key auth: status = %d, want 200", w.Code)
 	}
 }

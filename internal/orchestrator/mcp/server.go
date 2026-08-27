@@ -9,7 +9,6 @@
 package mcp
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
@@ -64,7 +64,12 @@ func (h *Handler) authorized(r *http.Request) bool {
 		return false
 	}
 	token := strings.TrimSpace(authz[len(prefix):])
-	return subtle.ConstantTimeCompare([]byte(token), []byte(key)) == 1
+	// The stored key is the SHA-256 digest since the hashing change (a legacy
+	// plaintext row is accepted too). Comparing the raw token against the
+	// stored value locked MCP out on every hashed install — always use the
+	// shared helper.
+	ok, _ := auth.MatchesStoredAPIKey(key, token)
+	return ok
 }
 
 // mcpClientIP returns the peer IP for rate-limiting. Like the REST side it keys

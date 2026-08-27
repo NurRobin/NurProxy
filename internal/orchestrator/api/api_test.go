@@ -216,7 +216,7 @@ func TestProviderCRUD(t *testing.T) {
 	cookie := setupAdmin(t, handler)
 
 	// Set up an API key for Bearer auth testing
-	database.SetSetting("admin_api_key", "test-api-key-123")
+	database.SetSetting("admin_api_key", "np_ak_test123")
 
 	// Create provider directly in DB (Cloudflare ValidateConfig requires actual API call)
 	p := &models.Provider{
@@ -273,7 +273,7 @@ func TestProviderCRUD(t *testing.T) {
 	}
 
 	// Test Bearer auth with API key
-	w = doRequestWithAuth(t, handler, "GET", "/api/v1/providers", nil, "test-api-key-123")
+	w = doRequestWithAuth(t, handler, "GET", "/api/v1/providers", nil, "np_ak_test123")
 	if w.Code != http.StatusOK {
 		t.Fatalf("bearer auth: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -1011,7 +1011,7 @@ func TestAgentAuth(t *testing.T) {
 
 func TestAdminRoutes_RejectAgentToken(t *testing.T) {
 	const agentToken = "np_ag_adminboundary123456789012345678901234567890"
-	const apiKey = "admin-api-key-abc123"
+	const apiKey = "np_ak_adminabc123"
 
 	// seed builds a fresh server with an admin password, an admin API key and one
 	// adopted agent whose token is agentToken. A fresh instance per credential
