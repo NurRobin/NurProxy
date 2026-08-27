@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/notifier"
+	"github.com/NurRobin/NurProxy/internal/notifier/webhook"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agentclient"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
@@ -119,6 +121,33 @@ func main() {
 	// Root context canceled on shutdown signal.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
+
+	// Webhook notifier (#72 MVP): mirror a curated subset of audit events to an
+	// operator-configured webhook. Config lives in settings (webhook_url,
+	// optional webhook_secret for HMAC signing, optional webhook_events filter
+	// as comma-separated actions) and is resolved per delivery, so setting a
+	// URL post-boot enables delivery without restart. The dispatcher consumes
+	// the audit insert — the one choke point every subsystem's lifecycle events
+	// already flow through — asynchronously and best-effort.
+	webhookSink := webhook.New(func() (string, string) {
+		url, _ := database.GetSetting("webhook_url")
+		secret, _ := database.GetSetting("webhook_secret")
+		return url, secret
+	})
+	dispatcher := notifier.New(webhookSink, func() []string {
+		raw, _ := database.GetSetting("webhook_events")
+		if strings.TrimSpace(raw) == "" {
+			return nil // dispatcher falls back to its curated defaults
+		}
+		return strings.Split(raw, ",")
+	}, nil)
+	dispatcher.Start(rootCtx)
+	database.SetAuditNotify(func(e models.AuditLogEntry) {
+		dispatcher.Publish(notifier.Event{
+			Action: e.Action, EntityType: e.EntityType, EntityID: e.EntityID,
+			Actor: e.Actor, Source: e.Source, Details: e.Details, Time: e.CreatedAt,
+		})
+	})
 
 	// Live agent connection hub: agents dial out and hold a stream open, and the
 	// orchestrator pushes config down it the instant it changes (works behind NAT).
