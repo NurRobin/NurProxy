@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
@@ -725,5 +726,74 @@ func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request)
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "DNS takeover applied — the record now points at the agent and routes were re-pushed",
+	})
+}
+
+// PUT /api/v1/domains/{id}/certificate — import an operator-provided cert
+// bundle for the domain (#80). The bundle is validated (key matches leaf, leaf
+// covers the FQDN, not expired) and stored exactly like an issued cert, so the
+// next push installs it on the agent and central renewal takes over when it
+// enters the renew window — the migration path when Let's Encrypt refuses
+// duplicate issuance for a host that already has a fresh cert on disk.
+func (s *Server) handleImportDomainCertificate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid domain ID")
+		return
+	}
+	dom, err := s.db.GetDomain(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+	zone, err := s.db.GetZone(dom.ZoneID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot resolve domain zone")
+		return
+	}
+	host := dom.FQDN(zone.Name)
+
+	var req struct {
+		CertPEM string `json:"cert_pem"`
+		KeyPEM  string `json:"key_pem"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.CertPEM) == "" || strings.TrimSpace(req.KeyPEM) == "" {
+		writeError(w, http.StatusBadRequest, "cert_pem and key_pem are required")
+		return
+	}
+	names, notAfter, err := tls.ValidateImportedBundle([]byte(req.CertPEM), []byte(req.KeyPEM), host)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	cert := &models.Certificate{
+		ID:        host, // host-keyed, like issued certs (upsert on conflict)
+		Host:      host,
+		Names:     names,
+		CertPEM:   req.CertPEM,
+		KeyPEM:    req.KeyPEM,
+		ExpiresAt: notAfter,
+		IssuedAt:  time.Now().UTC(),
+	}
+	if err := s.db.UpsertCertificate(cert); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to store certificate")
+		return
+	}
+	s.audit(r, "certificate", host, "cert_imported",
+		fmt.Sprintf("operator-imported bundle, %d name(s), expires %s (central renewal takes over in the renew window)", len(names), notAfter.UTC().Format("2006-01-02")))
+
+	// Install on the serving agent immediately — the same push a renewal rides.
+	s.triggerAgentPush(dom.ServerID)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message":    "certificate imported; pushing to the serving agent",
+		"host":       host,
+		"names":      names,
+		"expires_at": notAfter.UTC(),
 	})
 }
