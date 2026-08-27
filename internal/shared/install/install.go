@@ -48,9 +48,11 @@ var AgentProxyWritePaths = []string{
 //     unit is static and cannot know the mode at install time.
 //   - CAP_CHOWN: `nginx -t` (started as root by the agent) runs ngx_create_paths,
 //     which chown()s the temp dirs (client_body_temp_path etc.) to the worker
-//     user. Without the capability that chown returns EPERM — even when the dir
-//     already has the right owner — so every config test fails ("chown(...)
-//     failed (1: Operation not permitted)") and no config can ever be applied.
+//     user. Changing a file's owner requires CAP_CHOWN; with it dropped, the
+//     process falls under the normal chown() permission check and gets EPERM —
+//     nginx attempts the chown unconditionally, even when the dir already has
+//     the right owner — so every config test fails ("chown(...) failed (1:
+//     Operation not permitted)") and no config can ever be applied.
 var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE", "CAP_DAC_OVERRIDE", "CAP_CHOWN"}
 
 // Service describes a NurProxy service to install. The same descriptor is
