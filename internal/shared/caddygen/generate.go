@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -17,16 +19,44 @@ const backendCaddy = "caddy"
 
 var slugRe = regexp.MustCompile(`[^a-zA-Z0-9-]`)
 
+// splitAddrPort splits a trailing ":port" off an upstream address, returning
+// the bare host and the parsed port (0 when the address carries none). A bare
+// IPv6 address ("::1", "fe80::1") is NOT treated as host:port — SplitHostPort
+// rejects it and the address passes through unchanged; a bracketed
+// "[::1]:8080" splits normally.
+func splitAddrPort(addr string) (string, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, 0
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return addr, 0
+	}
+	return host, port
+}
+
 // ConfigFromDomain builds a backend-neutral proxymodel.Route from a stored
 // domain, its resolved FQDN, and the upstream server address. It is the single
 // source of truth for translating a domain's proxy settings into proxy intent,
 // shared by the reconciler and the API's config preview so they never diverge.
 func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Route {
+	// Upstream.Addr is host-only by contract, but a Server.Address entered as
+	// "host:port" reaches here unvalidated — and every renderer then emits
+	// "host:port:port" (proxy_pass http://10.0.0.5:8080:8080), which real
+	// backends reject at config test. Normalize once, at this single choke
+	// point: split a trailing port off, let the domain's explicit port win,
+	// and fall back to the address's port when the domain has none.
+	addr, addrPort := splitAddrPort(upstreamAddr)
+	port := d.Port
+	if port == 0 {
+		port = addrPort
+	}
 	route := proxymodel.Route{
 		Host: fqdn,
 		Upstream: proxymodel.Upstream{
-			Addr:   upstreamAddr,
-			Port:   d.Port,
+			Addr:   addr,
+			Port:   port,
 			Scheme: proxymodel.Scheme(d.ProxyConfig.UpstreamScheme),
 		},
 		WebSocket:       d.WebSocket || d.ProxyConfig.WebSocket,
