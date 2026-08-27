@@ -175,10 +175,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
+	// Enrich the bare liveness answer with the agent's own health state (#76) —
+	// the local pendant to the orchestrator's DB check: whether the proxy path
+	// is up and the last reported problem. Status turns "degraded" (still 200 —
+	// the agent process itself is alive and reachable) when an error is pending.
+	resp := map[string]any{
 		"status":  "ok",
 		"version": version,
-	})
+	}
+	if s.health != nil {
+		caddyRunning, lastErr := s.health.Snapshot()
+		resp["proxy_running"] = caddyRunning
+		if lastErr != "" {
+			resp["status"] = "degraded"
+			resp["error"] = lastErr
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleIP responds with the agent's detected public IP.

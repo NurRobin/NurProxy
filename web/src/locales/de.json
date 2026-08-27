@@ -479,13 +479,27 @@
     "deleteProviderTitle": "Provider löschen",
     "deleteProviderMsg": "Diesen Provider löschen? Alle Zonen und Domains, die ihn nutzen, verlieren die DNS-Verwaltung.",
     "removeZoneTitle": "Zone entfernen",
-    "removeZoneMsg": "Diese Zone entfernen? Domains, die sie nutzen, verlieren die DNS-Verwaltung."
+    "removeZoneMsg": "Diese Zone entfernen? Domains, die sie nutzen, verlieren die DNS-Verwaltung.",
+    "acmeStaging": "Let's-Encrypt-Staging verwenden (Test-Ausstellung)",
+    "acmeStagingHelp": "Staging-Zertifikate sind NICHT vertrauenswürdig, zählen aber nicht gegen die Produktions-Rate-Limits. Für echte Zertifikate deaktivieren."
   },
   "appearanceVariants": {
-    "classic": { "name": "Classic", "description": "Ein kompaktes Dashboard mit oberer Navigation, Statuspanel, Karten und Tabellen." },
-    "workbench": { "name": "Workbench", "description": "Eine Live-Topologie deiner Infrastruktur mit Seitenleiste und Klick-zum-Inspizieren-Panels." },
-    "wallboard": { "name": "Wallboard", "description": "Ein schreibgeschütztes Status-Raster für einen Extra-Monitor. Groß, überblickbar, automatisch aktualisiert." },
-    "spreadsheet": { "name": "Spreadsheet", "description": "Eine dichte, tabellenorientierte Ansicht mit Mehrfachauswahl und Massenaktionen für Power-User." }
+    "classic": {
+      "name": "Classic",
+      "description": "Ein kompaktes Dashboard mit oberer Navigation, Statuspanel, Karten und Tabellen."
+    },
+    "workbench": {
+      "name": "Workbench",
+      "description": "Eine Live-Topologie deiner Infrastruktur mit Seitenleiste und Klick-zum-Inspizieren-Panels."
+    },
+    "wallboard": {
+      "name": "Wallboard",
+      "description": "Ein schreibgeschütztes Status-Raster für einen Extra-Monitor. Groß, überblickbar, automatisch aktualisiert."
+    },
+    "spreadsheet": {
+      "name": "Spreadsheet",
+      "description": "Eine dichte, tabellenorientierte Ansicht mit Mehrfachauswahl und Massenaktionen für Power-User."
+    }
   },
   "topology": {
     "title": "Topologie",
