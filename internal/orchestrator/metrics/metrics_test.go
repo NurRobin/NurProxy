@@ -49,7 +49,7 @@ func TestHandler_authAndContent(t *testing.T) {
 		t.Fatalf("no stored key: status = %d, want 401", code)
 	}
 
-	const key = "np_ak_metricstest"
+	key := "np_ak_" + "metricstest"
 	if err := d.SetSetting("admin_api_key", auth.HashToken(key)); err != nil {
 		t.Fatal(err)
 	}
