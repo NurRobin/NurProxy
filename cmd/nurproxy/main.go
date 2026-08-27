@@ -23,6 +23,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/mcp"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/metrics"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
 	orchtls "github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
@@ -212,6 +213,12 @@ func main() {
 	mcpHandler := mcp.New(database, version)
 	mux.Handle("/mcp", mcpHandler)
 	mux.Handle("/mcp/", mcpHandler)
+
+	// Prometheus metrics (#71): DB-backed gauges (agents/domains by status, cert
+	// expiry, rate-limit holds), read lazily at scrape time. Gated with the admin
+	// API key like MCP — fleet state is never world-readable; without a generated
+	// key every scrape is 401.
+	mux.Handle("/metrics", metrics.Handler(database))
 
 	if web.HasUI {
 		// Serve the embedded SPA dashboard.
