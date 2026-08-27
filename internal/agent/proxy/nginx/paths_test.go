@@ -144,3 +144,13 @@ func TestIsManagedFile_table(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveLayout_emptyDefaultsToEtcNginx(t *testing.T) {
+	// Regression: an empty config dir (existing mode with no proxy_config_dir
+	// override) must resolve to the absolute OS default, not to RELATIVE
+	// sites-available/enabled paths under the process working directory.
+	l := ResolveLayout("")
+	if l.Available != "/etc/nginx/sites-available" || l.Enabled != "/etc/nginx/sites-enabled" {
+		t.Errorf("ResolveLayout(\"\") = %+v, want the /etc/nginx Debian pair", l)
+	}
+}

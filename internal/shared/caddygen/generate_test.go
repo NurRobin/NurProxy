@@ -666,3 +666,32 @@ func TestGenerateRoute_ValidJSON(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigFromDomain_addressWithPort covers the "Server.Address entered as
+// host:port" normalization: without it every renderer emits host:port:port
+// (e.g. proxy_pass http://10.0.0.5:8080:8080) and the real backend rejects the
+// config. Found on a real existing-nginx agent.
+func TestConfigFromDomain_addressWithPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		addr     string
+		domPort  int
+		wantAddr string
+		wantPort int
+	}{
+		{name: "bare host untouched", addr: "10.0.0.4", domPort: 8080, wantAddr: "10.0.0.4", wantPort: 8080},
+		{name: "host:port split, domain port wins", addr: "10.0.0.5:9999", domPort: 8080, wantAddr: "10.0.0.5", wantPort: 8080},
+		{name: "host:port fills missing domain port", addr: "10.0.0.5:9090", domPort: 0, wantAddr: "10.0.0.5", wantPort: 9090},
+		{name: "hostname:port split", addr: "app.internal:8443", domPort: 8443, wantAddr: "app.internal", wantPort: 8443},
+		{name: "bare IPv6 untouched", addr: "fe80::1", domPort: 8080, wantAddr: "fe80::1", wantPort: 8080},
+		{name: "bracketed IPv6 with port split", addr: "[::1]:9090", domPort: 0, wantAddr: "::1", wantPort: 9090},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := ConfigFromDomain(models.Domain{Subdomain: "x", Port: tt.domPort}, "x.example.com", tt.addr)
+			if r.Upstream.Addr != tt.wantAddr || r.Upstream.Port != tt.wantPort {
+				t.Errorf("upstream = %q:%d, want %q:%d", r.Upstream.Addr, r.Upstream.Port, tt.wantAddr, tt.wantPort)
+			}
+		})
+	}
+}

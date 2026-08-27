@@ -231,7 +231,8 @@ func TestBuildRemediation_systemdRoot(t *testing.T) {
 		"-/etc/nginx/sites-available", // the failed dir is covered, optionalized
 		"-/var/log/nginx",             // plus the default proxy log/runtime trees
 		"CAP_DAC_OVERRIDE",            // root needs it to read keys / write logs
-		"AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE",
+		"CAP_CHOWN",                   // nginx -t chowns its temp dirs (#130)
+		"AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN",
 		"systemctl daemon-reload",
 		"systemctl restart nurproxy-agent.service",
 	} {

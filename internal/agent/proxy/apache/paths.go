@@ -1,6 +1,7 @@
 package apache
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -53,7 +54,19 @@ func (l Layout) IsConfD() bool { return l.Enabled == "" }
 //   - configDir is the apache2 root (contains a sites-available subdir path is
 //     not known here) → default to the Debian sites-available/enabled pair.
 //   - configDir is the httpd root → default to its conf.d.
+//   - empty → the Debian /etc/apache2 root, or /etc/httpd when only that
+//     exists on the host. filepath.Clean("") is "." and would otherwise yield
+//     RELATIVE paths the agent tries to create under its (read-only) working
+//     directory, failing every apply.
 func ResolveLayout(configDir string) Layout {
+	if strings.TrimSpace(configDir) == "" {
+		configDir = "/etc/apache2"
+		if _, err := os.Stat(configDir); os.IsNotExist(err) {
+			if _, err := os.Stat("/etc/httpd"); err == nil {
+				configDir = "/etc/httpd"
+			}
+		}
+	}
 	clean := filepath.Clean(configDir)
 	base := filepath.Base(clean)
 	parent := filepath.Dir(clean)
