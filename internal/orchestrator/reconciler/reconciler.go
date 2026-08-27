@@ -233,7 +233,7 @@ func (r *Reconciler) gatherCerts(desired map[string]desiredRoute) []proxymodel.C
 		return nil
 	}
 	bundles := make([]proxymodel.CertBundle, 0, len(desired))
-	for fqdn := range desired {
+	for fqdn, d := range desired {
 		cert, err := r.db.GetCertificate(fqdn)
 		if err != nil {
 			// No cert for this host yet (or lookup failed): skip — the host either
@@ -244,6 +244,11 @@ func (r *Reconciler) gatherCerts(desired map[string]desiredRoute) []proxymodel.C
 			Host:    cert.Host,
 			CertPEM: cert.CertPEM,
 			KeyPEM:  cert.KeyPEM,
+			// A raw vhost is rendered centrally and references the conventional
+			// <host>.key.plain directly; the backend skips CertPaths for raw routes,
+			// so the plaintext key must be (re)materialized on install or it drifts
+			// from the re-issued cert (cert/key mismatch blocking all applies).
+			MaterializeKey: d.intent.IsRaw(),
 		})
 	}
 	if len(bundles) == 0 {

@@ -143,8 +143,18 @@ func (s *Store) Install(b Bundle) (InstalledPaths, error) {
 	// Cert-only hosts (§7) have no rendered vhost to materialize the plaintext key,
 	// so write it here on install — the operator's hand-written config reads it. The
 	// documented stable path is <host>.key.plain regardless of at-rest encryption.
-	if b.MaterializePlain {
-		plainPath := filepath.Join(s.dir, base+keyMaterializedSuffix)
+	// Independently of the flag, an ALREADY-materialized plaintext key is always
+	// refreshed: some config on this host references it (raw vhost, cert-only), and
+	// a stale copy after a re-issue means cert/key mismatch — which fails the whole
+	// config test and blocks every apply on the agent.
+	plainPath := filepath.Join(s.dir, base+keyMaterializedSuffix)
+	refresh := b.MaterializePlain
+	if !refresh {
+		if _, err := os.Stat(plainPath); err == nil {
+			refresh = true
+		}
+	}
+	if refresh {
 		if err := writeAtomic(plainPath, b.KeyPEM, keyMode); err != nil {
 			return InstalledPaths{}, fmt.Errorf("certstore: materializing plaintext key for %q: %w", b.Host, err)
 		}

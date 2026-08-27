@@ -2190,3 +2190,38 @@ func TestReconcileRoutes_tickIncludesCerts(t *testing.T) {
 		t.Errorf("cert bundle = %+v, want the stored leaf for app.example.com", set.Certs[0])
 	}
 }
+
+// TestGatherCerts_rawRoute_setsMaterializeKey asserts that the cert bundle for a
+// raw-config route asks the agent to (re)materialize the plaintext key on
+// install (#131): the centrally-rendered raw vhost references <host>.key.plain
+// directly and the backend never calls CertPaths for raw routes, so without
+// this flag the plaintext key freezes at its first materialization and a
+// renewal produces a cert/key mismatch that fails the whole config test.
+func TestGatherCerts_rawRoute_setsMaterializeKey(t *testing.T) {
+	d := testDB(t)
+	rawFQDN := "raw.example.com"
+	structFQDN := "app.example.com"
+	for _, fqdn := range []string{rawFQDN, structFQDN} {
+		if err := d.UpsertCertificate(&models.Certificate{ID: "c-" + fqdn, Host: fqdn, Names: []string{fqdn}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+			t.Fatalf("UpsertCertificate: %v", err)
+		}
+	}
+
+	r := New(d, newMockAgentClient(), time.Minute)
+	desired := map[string]desiredRoute{
+		rawFQDN:    {fqdn: rawFQDN, intent: proxymodel.Route{Host: rawFQDN, Raw: proxymodel.RawConfig{Backend: "nginx", Content: "server {}"}}},
+		structFQDN: {fqdn: structFQDN, intent: proxymodel.Route{Host: structFQDN}},
+	}
+
+	bundles := r.gatherCerts(desired)
+	byHost := map[string]bool{}
+	for _, b := range bundles {
+		byHost[b.Host] = b.MaterializeKey
+	}
+	if got, ok := byHost[rawFQDN]; !ok || !got {
+		t.Errorf("raw route cert bundle: MaterializeKey = %v (present=%v), want true", got, ok)
+	}
+	if got := byHost[structFQDN]; got {
+		t.Error("structured route cert bundle must not set MaterializeKey")
+	}
+}
