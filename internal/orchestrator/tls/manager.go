@@ -90,6 +90,15 @@ type RenewalStore interface {
 	// SaveRenewed persists a freshly issued bundle, overwriting the prior cert for
 	// the host in place (the encrypted-at-rest store keys on host).
 	SaveRenewed(ctx context.Context, res *CertResult, isWildcard bool) error
+	// MarkRateLimited records that issuance for host was rate-limited by the CA:
+	// the store persists an exponentially growing hold (honoring retryAfter when
+	// the CA gave a later instant) and returns when the next attempt may run.
+	// DueForRenewal/TargetForHost must skip the host until then, so a
+	// rate-limited deployment stops thrashing against the CA on every scan (#70).
+	MarkRateLimited(ctx context.Context, host, detail string, retryAfter *time.Time) (time.Time, error)
+	// ClearBackoff removes any recorded hold for host after a successful
+	// issuance. Idempotent; a missing hold is a no-op.
+	ClearBackoff(ctx context.Context, host string) error
 }
 
 // Reloader is invoked after a certificate is renewed and saved, to re-push the
@@ -397,11 +406,33 @@ func (r *Renewer) issueAndSave(ctx context.Context, t RenewTarget) error {
 
 	res, err := r.issueWithRetry(ctx, req, t.Provider, t.Config)
 	if err != nil {
+		// A CA rate limit will not clear on the next scan — persist a hold so the
+		// scans skip this host until it plausibly can succeed, instead of burning
+		// the remaining quota every interval (#70).
+		var rl *RateLimitError
+		if asRateLimit(err, &rl) {
+			next, mErr := r.store.MarkRateLimited(ctx, t.Host, rl.Detail, rl.RetryAfter)
+			if mErr != nil {
+				r.logger.WarnContext(ctx, "tls: could not record rate-limit backoff",
+					slog.String("host", t.Host), slog.Any("error", mErr))
+			} else {
+				r.logger.WarnContext(ctx, "tls: issuance rate-limited, backing off",
+					slog.String("host", t.Host), slog.Time("next_attempt", next))
+				r.auditEvent("certificate", t.Host, "cert_rate_limited",
+					fmt.Sprintf("%s (next attempt %s)", rl.Detail, next.UTC().Format(time.RFC3339)))
+			}
+		}
 		return fmt.Errorf("re-issuing %s: %w", t.Host, err)
 	}
 
 	if err := r.store.SaveRenewed(ctx, res, t.IsWildcard); err != nil {
 		return fmt.Errorf("saving renewed %s: %w", t.Host, err)
+	}
+	// Success ends any recorded rate-limit hold. Best-effort: a leftover hold
+	// only delays a future attempt, it can not lose the stored cert.
+	if err := r.store.ClearBackoff(ctx, t.Host); err != nil {
+		r.logger.WarnContext(ctx, "tls: could not clear rate-limit backoff",
+			slog.String("host", t.Host), slog.Any("error", err))
 	}
 	r.auditEvent("certificate", t.Host, "renewed", fmt.Sprintf("re-issued %d name(s), re-pushing to serving agent", len(res.Names)))
 

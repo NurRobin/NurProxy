@@ -466,6 +466,22 @@ var migrations = []string{
 	`
 	ALTER TABLE domains ADD COLUMN cert_only INTEGER NOT NULL DEFAULT 0;
 	`,
+
+	// Migration 21: per-host issuance backoff after an ACME rate limit (#70).
+	// Keyed by host (NOT by certificate id) so first-issuance hosts — which have
+	// no certificates row yet — get backoff too. next_attempt_at gates the
+	// renewal/first-issuance scans; attempts drives the exponential step;
+	// last_error is surfaced for operators. Rows are deleted on successful
+	// issuance.
+	`
+	CREATE TABLE IF NOT EXISTS cert_backoff (
+		host            TEXT PRIMARY KEY,
+		attempts        INTEGER NOT NULL DEFAULT 0,
+		next_attempt_at TEXT NOT NULL,
+		last_error      TEXT NOT NULL DEFAULT '',
+		updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
