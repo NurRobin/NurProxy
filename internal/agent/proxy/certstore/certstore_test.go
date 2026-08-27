@@ -368,3 +368,63 @@ func TestPrune_removesOrphanHosts(t *testing.T) {
 		t.Error("orphan host cert should be pruned")
 	}
 }
+
+func TestInstall_refreshesExistingMaterializedKey(t *testing.T) {
+	// Regression for the raw-config renewal bug: once <host>.key.plain exists on
+	// disk (materialized by CertPaths or a prior MaterializePlain install), a raw
+	// vhost references it directly and the backend never calls CertPaths for raw
+	// routes. Install must therefore refresh the plaintext key on every push —
+	// even without MaterializePlain — or a re-issued cert pairs with a stale key
+	// and nginx -t fails for the whole agent.
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	s := New(dir, key)
+
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nleaf1\n-----END CERTIFICATE-----\n")
+	keyPEM1 := []byte("-----BEGIN PRIVATE KEY-----\nkey1\n-----END PRIVATE KEY-----\n")
+	if _, err := s.Install(Bundle{Host: "raw.example.com", CertPEM: certPEM, KeyPEM: keyPEM1}); err != nil {
+		t.Fatalf("Install #1: %v", err)
+	}
+	// Materialize the plaintext key like a non-raw render (or first-time raw
+	// setup) would.
+	if _, err := s.CertPaths("raw.example.com"); err != nil {
+		t.Fatalf("CertPaths: %v", err)
+	}
+
+	// Re-issue: new keypair pushed, MaterializePlain NOT set.
+	keyPEM2 := []byte("-----BEGIN PRIVATE KEY-----\nkey2\n-----END PRIVATE KEY-----\n")
+	if _, err := s.Install(Bundle{Host: "raw.example.com", CertPEM: certPEM, KeyPEM: keyPEM2}); err != nil {
+		t.Fatalf("Install #2: %v", err)
+	}
+
+	plain, err := os.ReadFile(filepath.Join(dir, "raw.example.com.key.plain"))
+	if err != nil {
+		t.Fatalf("read key.plain: %v", err)
+	}
+	if !bytes.Equal(plain, keyPEM2) {
+		t.Errorf("key.plain not refreshed on install: got %q, want new key", plain)
+	}
+}
+
+func TestInstall_noMaterializedKey_staysAbsent(t *testing.T) {
+	// Without MaterializePlain and without a pre-existing key.plain, Install must
+	// NOT write a plaintext key — that would silently negate at-rest encryption
+	// for hosts that never reference it.
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	s := New(dir, key)
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n")
+	if _, err := s.Install(Bundle{Host: "plainless.example.com", CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "plainless.example.com.key.plain")); !os.IsNotExist(err) {
+		t.Errorf("key.plain should not exist, stat err = %v", err)
+	}
+}
