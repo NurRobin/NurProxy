@@ -65,6 +65,9 @@ export interface HealthResponse {
   dry_run?: boolean;
   dns_dry_run?: boolean;
   acme_dry_run?: boolean;
+  // checks carries subsystem states; "acme_ca" is "ok" or an unreachable
+  // detail when the orchestrator cannot reach the ACME CA (#91).
+  checks?: Record<string, string>;
 }
 
 export interface TestProviderZone {

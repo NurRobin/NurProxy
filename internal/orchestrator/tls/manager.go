@@ -245,7 +245,15 @@ func (r *Renewer) RunOnce(ctx context.Context) error {
 				slog.String("host", t.Host),
 				slog.Any("error", err),
 			)
-			r.auditEvent("certificate", t.Host, "renew_failed", err.Error())
+			// A CA-unreachable failure is an orchestrator EGRESS problem (#91) —
+			// audit it distinctly so it is never mistaken for per-domain
+			// DNS/validation flakiness.
+			if IsCAUnreachable(err) {
+				r.auditEvent("certificate", t.Host, "cert_ca_unreachable",
+					fmt.Sprintf("orchestrator cannot reach the ACME CA (egress problem on the orchestrator host, not a domain/DNS issue): %v", err))
+			} else {
+				r.auditEvent("certificate", t.Host, "renew_failed", err.Error())
+			}
 			continue
 		}
 	}
@@ -286,7 +294,12 @@ func (r *Renewer) EnsureCertForHost(ctx context.Context, host string) error {
 			r.logger.InfoContext(ctx, "tls: on-demand issuance skipped — ACME contact email not configured", slog.String("host", host))
 			return nil
 		}
-		r.auditEvent("certificate", host, "issue_failed", err.Error())
+		if IsCAUnreachable(err) {
+			r.auditEvent("certificate", host, "cert_ca_unreachable",
+				fmt.Sprintf("orchestrator cannot reach the ACME CA (egress problem on the orchestrator host, not a domain/DNS issue): %v", err))
+		} else {
+			r.auditEvent("certificate", host, "issue_failed", err.Error())
+		}
 		return err
 	}
 	return nil

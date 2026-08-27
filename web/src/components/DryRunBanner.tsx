@@ -7,7 +7,7 @@ import { api } from '../lib/api';
 // dry-run instance — where DNS/ACME calls are simulated — for a live one. It
 // stays out of the way (and renders nothing) on a normal instance.
 export default function DryRunBanner() {
-  const [health, setHealth] = useState<{ dns_dry_run?: boolean; acme_dry_run?: boolean } | null>(null);
+  const [health, setHealth] = useState<{ dns_dry_run?: boolean; acme_dry_run?: boolean; checks?: Record<string, string> } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -15,22 +15,42 @@ export default function DryRunBanner() {
     return () => { active = false; };
   }, []);
 
-  if (!health || (!health.dns_dry_run && !health.acme_dry_run)) return null;
+  if (!health) return null;
 
+  // ACME-CA unreachable (#91): the orchestrator's egress to the CA is broken —
+  // every issuance/renewal fails while agents keep serving. Surfacing it here
+  // stops it from masquerading as per-domain issuance flakiness.
+  const caCheck = health.checks?.acme_ca;
+  const caBanner = caCheck && caCheck !== 'ok' ? (
+    <div
+      role="alert"
+      className="flex items-center justify-center gap-2 border-b border-destructive/60 bg-destructive/10 px-4 py-1.5 text-center text-xs font-medium text-destructive"
+    >
+      <TriangleAlert className="h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
+      <span>ACME CA unreachable from the orchestrator — certificate issuance and renewal are failing. {caCheck}</span>
+    </div>
+  ) : null;
+
+  const dryRun = health.dns_dry_run || health.acme_dry_run;
   const parts: string[] = [];
   if (health.dns_dry_run) parts.push('DNS');
   if (health.acme_dry_run) parts.push('ACME');
   const scope = parts.join(' + ');
 
   return (
-    <div
-      role="status"
-      className="flex items-center justify-center gap-2 border-b border-warning/60 bg-warning-soft px-4 py-1.5 text-center text-xs font-medium text-warning-fg"
-    >
-      <TriangleAlert className="h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
-      <span>
-        Dry-run mode — {scope} calls are simulated. No external requests leave this instance.
-      </span>
-    </div>
+    <>
+      {dryRun && (
+        <div
+          role="status"
+          className="flex items-center justify-center gap-2 border-b border-warning/60 bg-warning-soft px-4 py-1.5 text-center text-xs font-medium text-warning-fg"
+        >
+          <TriangleAlert className="h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
+          <span>
+            Dry-run mode — {scope} calls are simulated. No external requests leave this instance.
+          </span>
+        </div>
+      )}
+      {caBanner}
+    </>
   );
 }

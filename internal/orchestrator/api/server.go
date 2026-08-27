@@ -11,6 +11,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -69,6 +70,10 @@ type Server struct {
 	// the dashboard to show a "dry-run — no external calls" banner (#93).
 	dnsDryRun  bool
 	acmeDryRun bool
+
+	// caStatus reports the latest ACME-CA reachability observation (#91), wired
+	// from the tls.CAProber. Nil (never wired, or ACME dry-run) omits the check.
+	caStatus func() tls.CAStatus
 }
 
 // SetDryRun records whether the orchestrator is running in DNS/ACME sandbox mode
@@ -76,6 +81,13 @@ type Server struct {
 func (s *Server) SetDryRun(dns, acme bool) {
 	s.dnsDryRun = dns
 	s.acmeDryRun = acme
+}
+
+// SetCAStatus wires the ACME-CA reachability probe into the health endpoint
+// (#91) so a CA-egress problem on the orchestrator host is visible in the
+// dashboard instead of masquerading as per-domain issuance flakiness.
+func (s *Server) SetCAStatus(status func() tls.CAStatus) {
+	s.caStatus = status
 }
 
 // SetAgentHub wires the live agent connection hub and the route pusher into the

@@ -17,10 +17,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
+	checks := map[string]string{"database": "ok"}
+	// ACME-CA reachability (#91): a CA-egress problem on the orchestrator host
+	// is surfaced here (and as a dashboard banner) so it can never be mistaken
+	// for per-domain issuance flakiness. Absent when not wired (ACME dry-run) or
+	// before the first probe.
+	if s.caStatus != nil {
+		if st := s.caStatus(); !st.CheckedAt.IsZero() {
+			if st.OK {
+				checks["acme_ca"] = "ok"
+			} else {
+				checks["acme_ca"] = st.Detail
+			}
+		}
+	}
 	resp := map[string]any{
 		"status":       "ok",
 		"version":      s.version,
-		"checks":       map[string]string{"database": "ok"},
+		"checks":       checks,
 		"dry_run":      s.dnsDryRun || s.acmeDryRun,
 		"dns_dry_run":  s.dnsDryRun,
 		"acme_dry_run": s.acmeDryRun,
