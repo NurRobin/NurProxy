@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/NurRobin/NurProxy/internal/shared/models"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -28,6 +30,9 @@ type DB struct {
 	sql       *sql.DB // writer pool: single connection, serializes all mutations
 	read      *sql.DB // reader pool: concurrent SELECTs (WAL readers never block)
 	cryptoKey []byte
+	// auditNotify, when set, is called after every successful audit insert (the
+	// notifier dispatcher's feed, #72). Must not block.
+	auditNotify func(models.AuditLogEntry)
 }
 
 // Open opens (or creates) a SQLite database at dbPath, enables recommended
