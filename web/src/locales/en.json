@@ -23,7 +23,11 @@
     "name": "Name",
     "address": "Address",
     "notesOptional": "Notes",
-    "optional": "Optional."
+    "optional": "Optional.",
+    "cascadeTitle": "Delete with domains?",
+    "cascadeMessage": "This still has domains. Deleting with cascade tears each domain down cleanly (DNS record, certificate, proxy config) and then removes it. Affected:",
+    "cascadeConfirm": "Delete everything",
+    "cascadeScheduled": "Cascade deletion started — domains are being torn down; the parent is removed when they are gone."
   },
   "nav": {
     "overview": "Overview",
@@ -482,10 +486,22 @@
     "removeZoneMsg": "Remove this zone? Domains using it will lose DNS management."
   },
   "appearanceVariants": {
-    "classic": { "name": "Classic", "description": "A compact top-nav dashboard with a health panel, cards, and tables." },
-    "workbench": { "name": "Workbench", "description": "A live topology map of your infrastructure with a sidebar and click-to-inspect panels." },
-    "wallboard": { "name": "Wallboard", "description": "A read-only status grid for a spare monitor. Big, glanceable, auto-refreshing." },
-    "spreadsheet": { "name": "Spreadsheet", "description": "A dense, table-first view with multi-select and bulk actions for power users." }
+    "classic": {
+      "name": "Classic",
+      "description": "A compact top-nav dashboard with a health panel, cards, and tables."
+    },
+    "workbench": {
+      "name": "Workbench",
+      "description": "A live topology map of your infrastructure with a sidebar and click-to-inspect panels."
+    },
+    "wallboard": {
+      "name": "Wallboard",
+      "description": "A read-only status grid for a spare monitor. Big, glanceable, auto-refreshing."
+    },
+    "spreadsheet": {
+      "name": "Spreadsheet",
+      "description": "A dense, table-first view with multi-select and bulk actions for power users."
+    }
   },
   "topology": {
     "title": "Topology",

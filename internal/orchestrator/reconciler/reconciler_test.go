@@ -2307,3 +2307,36 @@ func TestGatherCerts_rawRoute_setsMaterializeKey(t *testing.T) {
 		t.Error("structured route cert bundle must not set MaterializeKey")
 	}
 }
+
+// TestFinalizePendingParentDeletions covers the deferred half of the opt-in
+// cascade (#104): a pending parent is left alone while domains still reference
+// it and removed (with audit) once they are gone.
+func TestFinalizePendingParentDeletions(t *testing.T) {
+	d := testDB(t)
+	_, _, agent, srv, dom := setupScenario(t, d)
+
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	if err := d.AddPendingParentDeletion(db.PendingParentDeletion{EntityType: "server", EntityID: srv.ID, Actor: "admin"}); err != nil {
+		t.Fatalf("AddPendingParentDeletion: %v", err)
+	}
+
+	// Domain still present → the parent must survive the cycle.
+	r.finalizePendingParentDeletions()
+	if _, err := d.GetServer(srv.ID); err != nil {
+		t.Fatalf("server must not be finalized while its domain exists: %v", err)
+	}
+
+	// Simulate the reconciler teardown having removed the domain row.
+	if err := d.DeleteDomain(dom.ID); err != nil {
+		t.Fatalf("DeleteDomain: %v", err)
+	}
+	r.finalizePendingParentDeletions()
+	if _, err := d.GetServer(srv.ID); err == nil {
+		t.Fatal("server should be removed once its domains are gone")
+	}
+	if pending, _ := d.ListPendingParentDeletions(); len(pending) != 0 {
+		t.Errorf("pending intent should be cleared, got %+v", pending)
+	}
+	_ = agent
+}

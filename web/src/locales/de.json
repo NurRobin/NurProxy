@@ -23,7 +23,11 @@
     "name": "Name",
     "address": "Adresse",
     "notesOptional": "Notizen",
-    "optional": "Optional."
+    "optional": "Optional.",
+    "cascadeTitle": "Mit Domains löschen?",
+    "cascadeMessage": "Hier hängen noch Domains dran. Löschen mit Cascade baut jede Domain sauber ab (DNS-Record, Zertifikat, Proxy-Config) und entfernt sie dann. Betroffen:",
+    "cascadeConfirm": "Alles löschen",
+    "cascadeScheduled": "Cascade-Löschung gestartet — die Domains werden abgebaut; das Parent wird entfernt, sobald sie weg sind."
   },
   "nav": {
     "overview": "Übersicht",
@@ -482,10 +486,22 @@
     "removeZoneMsg": "Diese Zone entfernen? Domains, die sie nutzen, verlieren die DNS-Verwaltung."
   },
   "appearanceVariants": {
-    "classic": { "name": "Classic", "description": "Ein kompaktes Dashboard mit oberer Navigation, Statuspanel, Karten und Tabellen." },
-    "workbench": { "name": "Workbench", "description": "Eine Live-Topologie deiner Infrastruktur mit Seitenleiste und Klick-zum-Inspizieren-Panels." },
-    "wallboard": { "name": "Wallboard", "description": "Ein schreibgeschütztes Status-Raster für einen Extra-Monitor. Groß, überblickbar, automatisch aktualisiert." },
-    "spreadsheet": { "name": "Spreadsheet", "description": "Eine dichte, tabellenorientierte Ansicht mit Mehrfachauswahl und Massenaktionen für Power-User." }
+    "classic": {
+      "name": "Classic",
+      "description": "Ein kompaktes Dashboard mit oberer Navigation, Statuspanel, Karten und Tabellen."
+    },
+    "workbench": {
+      "name": "Workbench",
+      "description": "Eine Live-Topologie deiner Infrastruktur mit Seitenleiste und Klick-zum-Inspizieren-Panels."
+    },
+    "wallboard": {
+      "name": "Wallboard",
+      "description": "Ein schreibgeschütztes Status-Raster für einen Extra-Monitor. Groß, überblickbar, automatisch aktualisiert."
+    },
+    "spreadsheet": {
+      "name": "Spreadsheet",
+      "description": "Eine dichte, tabellenorientierte Ansicht mit Mehrfachauswahl und Massenaktionen für Power-User."
+    }
   },
   "topology": {
     "title": "Topologie",

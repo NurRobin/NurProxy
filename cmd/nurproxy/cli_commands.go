@@ -133,16 +133,23 @@ func cmdZone(args []string) {
 		c.emit(raw, "zone created: "+gjson(raw, "id"))
 
 	case "delete":
-		c, fs := parseClient("zone delete", rest, nil)
+		var cascade *bool
+		c, fs := parseClient("zone delete", rest, func(fs *flag.FlagSet) {
+			cascade = fs.Bool("cascade", false, "also delete dependent domains (torn down through the reconciler; the zone is removed once their teardown finishes)")
+		})
 		id := requireArg(fs, "zone id")
-		raw, err := c.del("/api/v1/zones/" + id)
+		url := "/api/v1/zones/" + id
+		if *cascade {
+			url += "?cascade=true"
+		}
+		raw, err := c.del(url)
 		if err != nil {
 			fatalf("%v", err)
 		}
 		c.emit(raw, "zone deleted: "+id)
 
 	default:
-		usage("zone", "list", "add", "delete <id>")
+		usage("zone", "list", "add", "delete <id> [--cascade]")
 	}
 }
 
@@ -240,16 +247,23 @@ func cmdAgent(args []string) {
 		c.emit(raw, "agent rejected: "+id)
 
 	case "delete":
-		c, fs := parseClient("agent delete", rest, nil)
+		var cascade *bool
+		c, fs := parseClient("agent delete", rest, func(fs *flag.FlagSet) {
+			cascade = fs.Bool("cascade", false, "also delete dependent domains (torn down through the reconciler; the agent is removed once their teardown finishes)")
+		})
 		id := requireArg(fs, "agent id")
-		raw, err := c.del("/api/v1/agents/" + id)
+		url := "/api/v1/agents/" + id
+		if *cascade {
+			url += "?cascade=true"
+		}
+		raw, err := c.del(url)
 		if err != nil {
 			fatalf("%v", err)
 		}
 		c.emit(raw, "agent deleted: "+id)
 
 	default:
-		usage("agent", "list", "status <id>", "adopt <id>", "update <id>", "reject <id>", "delete <id>")
+		usage("agent", "list", "status <id>", "adopt <id>", "update <id>", "reject <id>", "delete <id> [--cascade]")
 	}
 }
 
@@ -313,16 +327,23 @@ func cmdServer(args []string) {
 		c.emit(raw, "server updated: "+id)
 
 	case "delete":
-		c, fs := parseClient("server delete", rest, nil)
+		var cascade *bool
+		c, fs := parseClient("server delete", rest, func(fs *flag.FlagSet) {
+			cascade = fs.Bool("cascade", false, "also delete dependent domains (torn down through the reconciler; the server is removed once their teardown finishes)")
+		})
 		id := requireArg(fs, "server id")
-		raw, err := c.del("/api/v1/servers/" + id)
+		url := "/api/v1/servers/" + id
+		if *cascade {
+			url += "?cascade=true"
+		}
+		raw, err := c.del(url)
 		if err != nil {
 			fatalf("%v", err)
 		}
 		c.emit(raw, "server deleted: "+id)
 
 	default:
-		usage("server", "list <agent-id>", "add <agent-id>", "update <id>", "delete <id>")
+		usage("server", "list <agent-id>", "add <agent-id>", "update <id>", "delete <id> [--cascade]")
 	}
 }
 

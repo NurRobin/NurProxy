@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation, Trans } from 'react-i18next';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 import { LANGUAGES } from '../lib/i18n';
 import type { Provider, Zone, Setting } from '../lib/types';
 import type { HealthResponse, TestProviderZone } from '../lib/api';
@@ -52,6 +52,7 @@ export default function Settings() {
 
   const [deleteProviderId, setDeleteProviderId] = useState<string | null>(null);
   const [deleteZoneId, setDeleteZoneId] = useState<string | null>(null);
+  const [zoneCascadeDomains, setZoneCascadeDomains] = useState<string[] | null>(null);
 
   const [reconcilerInterval, setReconcilerInterval] = useState('');
   const [reconcilerSaving, setReconcilerSaving] = useState(false);
@@ -138,7 +139,24 @@ export default function Settings() {
   async function handleDeleteZone() {
     if (!deleteZoneId) return;
     try { await api.deleteZone(deleteZoneId); toast.success(t('settings.zoneRemoved')); setDeleteZoneId(null); fetchData(); }
-    catch (err) { toast.error(errMessage(err, t('settings.zoneRemoveFailed'))); }
+    catch (err) {
+      // 409 = domains still reference this zone: offer the opt-in cascade (#104).
+      if (err instanceof ApiError && err.status === 409) {
+        const data = err.data as { domains?: string[] } | undefined;
+        setZoneCascadeDomains(data?.domains ?? []);
+      } else {
+        toast.error(errMessage(err, t('settings.zoneRemoveFailed')));
+      }
+    }
+  }
+
+  async function handleCascadeDeleteZone() {
+    if (!deleteZoneId) return;
+    try {
+      await api.deleteZone(deleteZoneId, true);
+      toast.success(t('common.cascadeScheduled'));
+      setZoneCascadeDomains(null); setDeleteZoneId(null); fetchData();
+    } catch (err) { toast.error(errMessage(err, t('settings.zoneRemoveFailed'))); }
   }
 
   async function handleSaveReconciler() {
@@ -370,7 +388,8 @@ export default function Settings() {
       </Modal>
 
       <ConfirmDialog open={deleteProviderId !== null} onClose={() => setDeleteProviderId(null)} onConfirm={handleDeleteProvider} title={t('settings.deleteProviderTitle')} message={t('settings.deleteProviderMsg')} confirmLabel={t('common.delete')} danger confirmText={providers.find((p) => p.id === deleteProviderId)?.name} />
-      <ConfirmDialog open={deleteZoneId !== null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title={t('settings.removeZoneTitle')} message={t('settings.removeZoneMsg')} confirmLabel={t('common.remove')} danger />
+      <ConfirmDialog open={deleteZoneId !== null && zoneCascadeDomains === null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title={t('settings.removeZoneTitle')} message={t('settings.removeZoneMsg')} confirmLabel={t('common.remove')} danger />
+      <ConfirmDialog open={zoneCascadeDomains !== null} onClose={() => { setZoneCascadeDomains(null); setDeleteZoneId(null); }} onConfirm={handleCascadeDeleteZone} title={t('common.cascadeTitle')} message={`${t('common.cascadeMessage')} ${(zoneCascadeDomains ?? []).join(', ')}`} confirmLabel={t('common.cascadeConfirm')} danger />
     </div>
   );
 }
