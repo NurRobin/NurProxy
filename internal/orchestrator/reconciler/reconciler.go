@@ -375,6 +375,12 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 		log.Printf("reconciler: deletions phase failed: %v", err)
 	}
 
+	// Finalize deferred cascade deletions (#104): a parent (server/agent/zone)
+	// whose cascade was requested is removed once every one of its domains has
+	// finished the reconciler teardown above — never before, so DNS records and
+	// certs are always cleaned up through the audited path.
+	r.finalizePendingParentDeletions()
+
 	// Reconcile routes for each adopted agent.
 	agents, err := r.db.ListAgents()
 	if err != nil {
@@ -1556,5 +1562,63 @@ func (r *Reconciler) auditWithSource(source models.AuditSource, entityType, enti
 	}
 	if err := r.db.InsertAuditLog(entry); err != nil {
 		log.Printf("reconciler: failed to insert audit log: %v", err)
+	}
+}
+
+// finalizePendingParentDeletions removes parents (server/agent/zone) whose
+// opt-in cascade (#104) was requested, once no domain references them anymore
+// — i.e. after reconcileDeletions finished tearing their domains down through
+// the audited DNS/cert/artifact path. A parent that still has domains simply
+// stays pending for the next cycle; a parent row that is already gone clears
+// the intent. Failures are logged and retried next cycle, never fatal.
+func (r *Reconciler) finalizePendingParentDeletions() {
+	pending, err := r.db.ListPendingParentDeletions()
+	if err != nil {
+		log.Printf("reconciler: cannot list pending parent deletions: %v", err)
+		return
+	}
+	for _, p := range pending {
+		var filter db.DomainFilter
+		switch p.EntityType {
+		case "server":
+			filter = db.DomainFilter{ServerID: p.EntityID}
+		case "agent":
+			filter = db.DomainFilter{AgentID: p.EntityID}
+		case "zone":
+			filter = db.DomainFilter{ZoneID: p.EntityID}
+		default:
+			log.Printf("reconciler: unknown pending deletion entity type %q; dropping", p.EntityType)
+			_ = r.db.RemovePendingParentDeletion(p.EntityType, p.EntityID)
+			continue
+		}
+		doms, err := r.db.ListDomains(filter)
+		if err != nil {
+			log.Printf("reconciler: cannot check domains for pending %s %s: %v", p.EntityType, p.EntityID, err)
+			continue
+		}
+		if len(doms) > 0 {
+			continue // teardown still in flight; try again next cycle
+		}
+
+		var delErr error
+		switch p.EntityType {
+		case "server":
+			delErr = r.db.DeleteServer(p.EntityID)
+		case "agent":
+			delErr = r.db.DeleteAgent(p.EntityID)
+		case "zone":
+			delErr = r.db.DeleteZone(p.EntityID)
+		}
+		if delErr != nil {
+			// Most likely already gone (deleted manually in the meantime) — either
+			// way the intent is fulfilled or moot; clearing it stops the retry loop.
+			log.Printf("reconciler: finalizing cascade delete of %s %s: %v (clearing intent)", p.EntityType, p.EntityID, delErr)
+		} else {
+			r.audit(p.EntityType, p.EntityID, "delete", fmt.Sprintf("cascade finalized (requested by %s)", p.Actor))
+			log.Printf("reconciler: cascade delete finalized: %s %s", p.EntityType, p.EntityID)
+		}
+		if err := r.db.RemovePendingParentDeletion(p.EntityType, p.EntityID); err != nil {
+			log.Printf("reconciler: cannot clear pending deletion for %s %s: %v", p.EntityType, p.EntityID, err)
+		}
 	}
 }

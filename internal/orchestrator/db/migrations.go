@@ -486,6 +486,21 @@ var migrations = []string{
 		updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 	);
 	`,
+
+	// Migration 22: deferred parent deletions for the opt-in cascade (#104).
+	// A cascade delete of a server/agent/zone must tear its domains down
+	// THROUGH the reconciler (DNS record, cert, artifacts) — never a raw DB
+	// cascade — so the parent row is only removed once its domains are gone.
+	// This table records that intent; the reconciler finalizes it.
+	`
+	CREATE TABLE IF NOT EXISTS pending_parent_deletions (
+		entity_type TEXT NOT NULL,
+		entity_id   TEXT NOT NULL,
+		actor       TEXT NOT NULL DEFAULT '',
+		created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+		PRIMARY KEY (entity_type, entity_id)
+	);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

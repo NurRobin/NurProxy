@@ -21,6 +21,19 @@ export class UnauthorizedError extends Error {
   }
 }
 
+// ApiError carries the HTTP status and the (JSON-parsed, when possible)
+// response body, so callers can branch on structured failures — e.g. the 409
+// a parent delete returns while domains still reference it (#104).
+export class ApiError extends Error {
+  status: number;
+  data: unknown;
+  constructor(status: number, body: string) {
+    super(`API error ${status}: ${body}`);
+    this.status = status;
+    try { this.data = JSON.parse(body); } catch { this.data = undefined; }
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...options?.headers },
@@ -39,7 +52,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       window.setTimeout(() => unauthorizedHandler?.(), 0);
       throw new UnauthorizedError(body);
     }
-    throw new Error(`API error ${res.status}: ${body}`);
+    throw new ApiError(res.status, body);
   }
   // 204 No Content (and other empty bodies) have nothing to parse — return
   // undefined rather than letting res.json() throw on the empty stream.
@@ -111,7 +124,7 @@ export const api = {
   listAllZones: () => request<Zone[]>('/zones'),
   createZonesBatch: (data: { provider_id: string; zones: Array<{ external_id: string; name: string }> }) =>
     request<Array<{ id: string; name: string }>>('/zones/batch', { method: 'POST', body: JSON.stringify(data) }),
-  deleteZone: (id: string) => request<{ message: string }>(`/zones/${id}`, { method: 'DELETE' }),
+  deleteZone: (id: string, cascade = false) => request<{ message: string }>(`/zones/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
 
   // Agents
   listAgents: () => request<Agent[]>('/agents'),
@@ -120,7 +133,7 @@ export const api = {
   adoptAgent: (id: string, data: { name?: string; fqdn?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
     request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
   rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
-  deleteAgent: (id: string) => request<{ message: string }>(`/agents/${id}`, { method: 'DELETE' }),
+  deleteAgent: (id: string, cascade = false) => request<{ message: string }>(`/agents/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
 
   // Servers
   listServers: (agentId: string) => request<Server[]>(`/agents/${agentId}/servers`),
@@ -128,7 +141,7 @@ export const api = {
     request<Server>(`/agents/${agentId}/servers`, { method: 'POST', body: JSON.stringify(data) }),
   updateServer: (id: string, data: Partial<Server>) =>
     request<Server>(`/servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  deleteServer: (id: string) => request<{ message: string }>(`/servers/${id}`, { method: 'DELETE' }),
+  deleteServer: (id: string, cascade = false) => request<{ message: string }>(`/servers/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
 
   // Domains
   listDomains: (params?: Record<string, string>) => {

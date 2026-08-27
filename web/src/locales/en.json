@@ -23,7 +23,11 @@
     "name": "Name",
     "address": "Address",
     "notesOptional": "Notes",
-    "optional": "Optional."
+    "optional": "Optional.",
+    "cascadeTitle": "Delete with domains?",
+    "cascadeMessage": "This still has domains. Deleting with cascade tears each domain down cleanly (DNS record, certificate, proxy config) and then removes it. Affected:",
+    "cascadeConfirm": "Delete everything",
+    "cascadeScheduled": "Cascade deletion started — domains are being torn down; the parent is removed when they are gone."
   },
   "nav": {
     "overview": "Overview",

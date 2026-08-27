@@ -23,7 +23,11 @@
     "name": "Name",
     "address": "Adresse",
     "notesOptional": "Notizen",
-    "optional": "Optional."
+    "optional": "Optional.",
+    "cascadeTitle": "Mit Domains löschen?",
+    "cascadeMessage": "Hier hängen noch Domains dran. Löschen mit Cascade baut jede Domain sauber ab (DNS-Record, Zertifikat, Proxy-Config) und entfernt sie dann. Betroffen:",
+    "cascadeConfirm": "Alles löschen",
+    "cascadeScheduled": "Cascade-Löschung gestartet — die Domains werden abgebaut; das Parent wird entfernt, sobald sie weg sind."
   },
   "nav": {
     "overview": "Übersicht",

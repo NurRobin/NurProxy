@@ -331,6 +331,10 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	// Refuse while domains still reference this agent's servers: the ON DELETE
 	// CASCADE (agent -> servers -> domains) would orphan their DNS records/certs
 	// ahead of the reconciler teardown (see guardChildDomains).
+	if cascadeRequested(r) {
+		s.cascadeDeleteParent(w, r, "agent", id, db.DomainFilter{AgentID: id})
+		return
+	}
 	if s.guardChildDomains(w, "agent", db.DomainFilter{AgentID: id}) {
 		return
 	}

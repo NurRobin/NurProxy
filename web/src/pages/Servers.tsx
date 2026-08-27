@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 import type { Agent, Server, Domain, DiscoveredNetwork } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
@@ -77,6 +77,7 @@ export default function Servers() {
 
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [cascadeDomains, setCascadeDomains] = useState<string[] | null>(null);
 
   const eligible = agents.filter((a) => a.status === 'adopted' || a.status === 'offline');
 
@@ -144,7 +145,28 @@ export default function Servers() {
     if (!deleteId) return;
     setDeleting(true);
     try { await api.deleteServer(deleteId); toast.success(t('servers.removed')); setDeleteId(null); fetchData(); }
-    catch (err) { toast.error(errMessage(err, t('servers.removeFailed'))); }
+    catch (err) {
+      // 409 = domains still reference the server: offer the opt-in cascade
+      // (#104) — the domains are torn down through the reconciler, then the
+      // server is removed.
+      if (err instanceof ApiError && err.status === 409) {
+        const data = err.data as { domains?: string[] } | undefined;
+        setCascadeDomains(data?.domains ?? []);
+      } else {
+        toast.error(errMessage(err, t('servers.removeFailed')));
+      }
+    }
+    finally { setDeleting(false); }
+  }
+
+  async function handleCascadeDelete() {
+    if (!deleteId) return;
+    setDeleting(true);
+    try {
+      await api.deleteServer(deleteId, true);
+      toast.success(t('common.cascadeScheduled'));
+      setCascadeDomains(null); setDeleteId(null); fetchData();
+    } catch (err) { toast.error(errMessage(err, t('servers.removeFailed'))); }
     finally { setDeleting(false); }
   }
 
@@ -295,12 +317,23 @@ export default function Servers() {
       </Modal>
 
       <ConfirmDialog
-        open={deleteId !== null}
+        open={deleteId !== null && cascadeDomains === null}
         onClose={() => setDeleteId(null)}
         onConfirm={handleDelete}
         title={t('common.remove')}
         message={t('servers.removeConfirm')}
         confirmLabel={t('common.remove')}
+        danger
+        loading={deleting}
+      />
+
+      <ConfirmDialog
+        open={cascadeDomains !== null}
+        onClose={() => { setCascadeDomains(null); setDeleteId(null); }}
+        onConfirm={handleCascadeDelete}
+        title={t('common.cascadeTitle')}
+        message={`${t('common.cascadeMessage')} ${(cascadeDomains ?? []).join(', ')}`}
+        confirmLabel={t('common.cascadeConfirm')}
         danger
         loading={deleting}
       />

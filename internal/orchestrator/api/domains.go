@@ -727,3 +727,58 @@ func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request)
 		"message": "DNS takeover applied — the record now points at the agent and routes were re-pushed",
 	})
 }
+
+// cascadeRequested reports whether the request opts into cascade deletion
+// (?cascade=true, #104).
+func cascadeRequested(r *http.Request) bool {
+	return strings.EqualFold(r.URL.Query().Get("cascade"), "true")
+}
+
+// cascadeDeleteParent implements the opt-in cascade (#104): every domain still
+// referencing the parent is soft-deleted THROUGH the reconciler (the same
+// status=deleting path a direct domain delete takes, so DNS records, certs and
+// artifacts are torn down and audited), and the parent removal itself is
+// deferred — recorded in pending_parent_deletions and finalized by the
+// reconciler once the last domain is gone. Never a raw DB cascade: that is
+// exactly the teardown leak the 409 guard exists to prevent.
+func (s *Server) cascadeDeleteParent(w http.ResponseWriter, r *http.Request, entityType, entityID string, filter db.DomainFilter) {
+	doms, err := s.db.ListDomains(filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list dependent domains")
+		return
+	}
+
+	marked := 0
+	pushTargets := map[string]bool{}
+	for i := range doms {
+		dom := &doms[i]
+		if dom.Status == models.DomainStatusDeleting {
+			continue // already on its way out
+		}
+		if err := s.db.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to mark domain for deletion")
+			return
+		}
+		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "delete", fmt.Sprintf("cascade via %s %s", entityType, entityID))
+		pushTargets[dom.ServerID] = true
+		marked++
+	}
+	if err := s.db.AddPendingParentDeletion(db.PendingParentDeletion{
+		EntityType: entityType, EntityID: entityID, Actor: actorFromCtx(r),
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to record pending deletion")
+		return
+	}
+	s.audit(r, entityType, entityID, "delete_cascade_requested", fmt.Sprintf("%d domain(s) marked for deletion; parent removal deferred to teardown", marked))
+
+	// Connected agents drop the routes immediately; DNS/cert/row cleanup and the
+	// parent removal follow in the reconciler.
+	for srvID := range pushTargets {
+		s.triggerAgentPush(srvID)
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"message": fmt.Sprintf("%s deletion deferred: %d domain(s) marked for deletion; the %s is removed once their teardown finishes", entityType, marked, entityType),
+		"domains": marked,
+	})
+}

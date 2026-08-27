@@ -121,6 +121,10 @@ func (s *Server) handleDeleteZone(w http.ResponseWriter, r *http.Request) {
 	// Refuse while domains still reference this zone: the ON DELETE CASCADE would
 	// orphan their DNS records/certs ahead of the reconciler teardown (see
 	// guardChildDomains).
+	if cascadeRequested(r) {
+		s.cascadeDeleteParent(w, r, "zone", id, db.DomainFilter{ZoneID: id})
+		return
+	}
 	if s.guardChildDomains(w, "zone", db.DomainFilter{ZoneID: id}) {
 		return
 	}

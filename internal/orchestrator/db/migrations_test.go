@@ -94,8 +94,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 21 {
-		t.Fatalf("this test pins the schema target at 21 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 22 {
+		t.Fatalf("this test pins the schema target at 22 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -154,6 +154,17 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if n != 0 {
 			t.Errorf("cert_backoff should start empty, has %d rows", n)
+		}
+	})
+
+	// migration 22: pending_parent_deletions table exists and is empty.
+	t.Run("pending_parent_deletions_table", func(t *testing.T) {
+		var n int
+		if err := d.sql.QueryRow("SELECT COUNT(*) FROM pending_parent_deletions").Scan(&n); err != nil {
+			t.Fatalf("select from pending_parent_deletions: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("pending_parent_deletions should start empty, has %d rows", n)
 		}
 	})
 

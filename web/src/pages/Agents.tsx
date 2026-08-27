@@ -4,7 +4,7 @@ import { usePolling } from '../lib/usePolling';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, Check, X } from 'lucide-react';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv, RemediationStep } from '../lib/types';
 import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
@@ -61,6 +61,7 @@ export default function Agents() {
 
   const [deleteAgent, setDeleteAgent] = useState<Agent | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [cascadeDomains, setCascadeDomains] = useState<string[] | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -176,10 +177,30 @@ export default function Agents() {
       setDeleteAgent(null);
       fetchData();
     } catch (err) {
-      toast.error(errMessage(err, t('agents.deleteFailed')));
+      // 409 = domains still reference this agent's servers: offer the opt-in
+      // cascade (#104).
+      if (err instanceof ApiError && err.status === 409) {
+        const data = err.data as { domains?: string[] } | undefined;
+        setCascadeDomains(data?.domains ?? []);
+      } else {
+        toast.error(errMessage(err, t('agents.deleteFailed')));
+      }
     } finally {
       setDeleteLoading(false);
     }
+  }
+
+  async function handleCascadeDelete() {
+    if (!deleteAgent) return;
+    setDeleteLoading(true);
+    try {
+      await api.deleteAgent(deleteAgent.id, true);
+      toast.success(t('common.cascadeScheduled'));
+      if (selectedId === deleteAgent.id) setSelectedId(null);
+      setCascadeDomains(null); setDeleteAgent(null);
+      fetchData();
+    } catch (err) { toast.error(errMessage(err, t('agents.deleteFailed'))); }
+    finally { setDeleteLoading(false); }
   }
 
   const pendingAgents = agents.filter((a) => a.status === 'pending');
@@ -485,7 +506,7 @@ export default function Agents() {
       </Modal>
 
       <ConfirmDialog
-        open={deleteAgent !== null}
+        open={deleteAgent !== null && cascadeDomains === null}
         onClose={() => setDeleteAgent(null)}
         onConfirm={handleDelete}
         title={t('agents.deleteAgent')}
@@ -494,6 +515,17 @@ export default function Agents() {
         danger
         loading={deleteLoading}
         confirmText={deleteAgent?.name}
+      />
+
+      <ConfirmDialog
+        open={cascadeDomains !== null}
+        onClose={() => { setCascadeDomains(null); setDeleteAgent(null); }}
+        onConfirm={handleCascadeDelete}
+        title={t('common.cascadeTitle')}
+        message={`${t('common.cascadeMessage')} ${(cascadeDomains ?? []).join(', ')}`}
+        confirmLabel={t('common.cascadeConfirm')}
+        danger
+        loading={deleteLoading}
       />
     </div>
   );
