@@ -245,7 +245,7 @@
 - **Pass — agent unit specifics:**
   - `ExecStart=<bin> --data-dir <data-dir>` (`cmd/nurproxy-agent/install.go:30`).
   - `ReadWritePaths` = data dir + `AgentProxyWritePaths`: `-/etc/nginx -/var/log/nginx -/var/lib/nginx -/var/cache/nginx -/etc/apache2 -/etc/httpd -/var/log/apache2 -/var/log/httpd -/etc/caddy -/var/lib/caddy -/var/log/caddy -/run` (`install.go:30-35`, `install.go:33` ref `AgentProxyWritePaths`). The `-` prefix makes systemd ignore a path absent on the host instead of failing to start (`install.go:22-29`).
-  - `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE` and the same `CapabilityBoundingSet` (`install.go:49`, rendered at `install.go:132-136`). `CAP_NET_BIND_SERVICE` lets the bundled Caddy bind :80/:443; `CAP_DAC_OVERRIDE` lets existing-mode `nginx -t` read 0600 TLS keys + write logs.
+  - `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN` and the same `CapabilityBoundingSet` (`install.go:49`, rendered at `install.go:132-136`). `CAP_NET_BIND_SERVICE` lets the bundled Caddy bind :80/:443; `CAP_DAC_OVERRIDE` lets existing-mode `nginx -t` read 0600 TLS keys + write logs; `CAP_CHOWN` lets `nginx -t` chown its temp dirs (client_body_temp_path etc.) to the worker user (#130).
   - Agent config lives in `agent.yaml` (mode 0640), written by `ensureDataDir` (`manager.go:80`).
 - **Pass — orchestrator unit specifics:** `EnvironmentFile=/etc/nurproxy/nurproxy.env` with `NP_PORT` + `NP_DATA_DIR`; `ReadWritePaths=/var/lib/nurproxy`; **no** capabilities or proxy write-paths (`cmd/nurproxy/install.go:14-27`).
 - **Coverage:** D for the rendered text (`RenderUnit` is pure + unit-tested, `install_test.go`); R for an installed, running unit.
@@ -328,7 +328,7 @@
 
 ### Real run (before final)
 - [ ] `sudo nurproxy install` writes `/etc/systemd/system/nurproxy.service` + `/etc/nurproxy/nurproxy.env` and starts; `uninstall --purge --yes` removes it.
-- [ ] `sudo nurproxy-agent install --orchestrator … --fqdn …` writes `agent.yaml` (0640) + a unit with the proxy `ReadWritePaths` + `CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE`; service starts and registers.
+- [ ] `sudo nurproxy-agent install --orchestrator … --fqdn …` writes `agent.yaml` (0640) + a unit with the proxy `ReadWritePaths` + `CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN`; service starts and registers.
 - [ ] `sudo nurproxy-agent setup` reaches the orchestrator from the host and starts the service (configures an existing packaged unit if present).
 - [ ] `nurproxy-agent apply <CODE>` (after a pending `set_proxy_mode`) persists to `agent.yaml`, hot-applies, and acks; bad code → exit 1.
 - [ ] Backup/restore round-trip against the **real** production DB, verified by booting **dry** on the restored copy (never a second live orchestrator on the tailnet).

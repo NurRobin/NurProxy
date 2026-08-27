@@ -46,7 +46,12 @@ var AgentProxyWritePaths = []string{
 //     ReadWritePaths already made the mount writable (DAC and the read-only
 //     mount are independent). The bundled-Caddy path does not need it, but the
 //     unit is static and cannot know the mode at install time.
-var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE", "CAP_DAC_OVERRIDE"}
+//   - CAP_CHOWN: `nginx -t` (started as root by the agent) runs ngx_create_paths,
+//     which chown()s the temp dirs (client_body_temp_path etc.) to the worker
+//     user. Without the capability that chown returns EPERM — even when the dir
+//     already has the right owner — so every config test fails ("chown(...)
+//     failed (1: Operation not permitted)") and no config can ever be applied.
+var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE", "CAP_DAC_OVERRIDE", "CAP_CHOWN"}
 
 // Service describes a NurProxy service to install. The same descriptor is
 // consumed by every Manager; fields without meaning on a given OS are ignored.
