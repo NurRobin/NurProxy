@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -361,13 +362,16 @@ func TestApplyIntents_selfACMEPolicyFlowsToBackend(t *testing.T) {
 // atomically). It records whether AddRoute was (wrongly) used so the test can
 // prove file artifacts go through Apply, not the admin-API no-op.
 type fileBackend struct {
-	path        string
-	content     string
-	addRouteHit bool
-	applyHit    bool
-	applyErr    error
-	pruneKeep   []proxy.Target // records the keep set Prune was last called with
-	pruneHit    bool
+	path            string
+	content         string
+	addRouteHit     bool
+	applyHit        bool
+	applyErr        error
+	applyNeedsPrune bool
+	managedPaths    []string
+	prunedPaths     []string
+	pruneKeep       []proxy.Target // records the keep set Prune was last called with
+	pruneHit        bool
 }
 
 func (f *fileBackend) EnsureServer(ctx context.Context) error { return nil }
@@ -378,6 +382,9 @@ func (f *fileBackend) AddRoute(ctx context.Context, route json.RawMessage) error
 }
 func (f *fileBackend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 	f.applyHit = true
+	if f.applyNeedsPrune && len(f.prunedPaths) == 0 {
+		return errors.New("stale orphan still makes proxy validation fail")
+	}
 	if f.applyErr != nil {
 		return f.applyErr
 	}
@@ -387,6 +394,41 @@ func (f *fileBackend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 		}
 	}
 	return nil
+}
+
+func TestApplyIntents_prunesStaleFileBeforeBatchValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/app.conf"
+	driftedPath := dir + "/drifted.conf"
+	stalePath := dir + "/deleted.conf"
+	be := &fileBackend{
+		path:            path,
+		content:         "server { listen 80; }",
+		applyNeedsPrune: true,
+		managedPaths:    []string{path, driftedPath, stalePath},
+	}
+	c := New("http://unused", "agent-1", "tok", be, health.New())
+
+	c.applyIntents(context.Background(), proxymodel.IntentSet{
+		Intents: []proxymodel.RouteIntent{{
+			ArtifactID: "dom-1", Backend: "nginx",
+			Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.1", Port: 80}},
+		}},
+		Keep: []string{driftedPath},
+	})
+
+	if !be.pruneHit {
+		t.Fatal("stale managed vhosts were not pruned")
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != be.content {
+		t.Fatalf("batch apply stayed blocked by the stale vhost: content=%q err=%v", got, err)
+	}
+	if len(be.prunedPaths) != 1 || be.prunedPaths[0] != stalePath {
+		t.Fatalf("pruned paths = %v, want only stale path %q", be.prunedPaths, stalePath)
+	}
+	if len(be.pruneKeep) != 2 {
+		t.Fatalf("prune keep set = %+v, want desired and drifted paths", be.pruneKeep)
+	}
 }
 func (f *fileBackend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
 	return proxy.Artifact{
@@ -402,7 +444,16 @@ func (f *fileBackend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIn
 func (f *fileBackend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 	f.pruneHit = true
 	f.pruneKeep = keep
-	return 0, nil
+	wanted := make(map[string]bool, len(keep))
+	for _, target := range keep {
+		wanted[target.Path] = true
+	}
+	for _, path := range f.managedPaths {
+		if !wanted[path] {
+			f.prunedPaths = append(f.prunedPaths, path)
+		}
+	}
+	return len(f.prunedPaths), nil
 }
 
 // TestApplyIntents_fileBackendWritesViaApply proves a file backend applies config

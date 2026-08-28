@@ -611,6 +611,26 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		}
 	}
 
+	// Prune file-backed orphans before validating the desired batch. A deleted
+	// TLS vhost can otherwise keep referencing a certificate that deletion has
+	// already scrubbed; nginx -t then fails before the post-apply prune can remove
+	// that same vhost, leaving the agent permanently wedged.
+	fileKeep := make([]proxy.Target, 0, len(fileArts)+len(set.Keep))
+	for _, fa := range fileArts {
+		fileKeep = append(fileKeep, fa.art.Target)
+	}
+	for _, p := range set.Keep {
+		fileKeep = append(fileKeep, proxy.Target{Kind: proxy.TargetKindFile, Path: p})
+	}
+	if len(fileArts) > 0 {
+		if n, err := c.caddy.Prune(ctx, fileKeep); err != nil {
+			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
+			clean = false
+		} else if n > 0 {
+			log.Printf("Stream: pruned %d orphaned vhost(s)", n)
+		}
+	}
+
 	// Apply the file-backed artifacts as one atomic batch (write → validate →
 	// reload). On failure the backend rolls back to the prior on-disk state, so we
 	// attribute the error to every artifact in the batch and track none as live (no
@@ -649,23 +669,11 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		}
 	}
 
-	// Prune ghost vhosts: any NurProxy-generated file on disk that is NOT in this
-	// (authoritative) desired set is a deleted domain's leftover. The backend removes
-	// it and reloads — over the dial-out stream, never an inbound probe (§3,
-	// invariant #2). Caddy is a no-op (ClearRoutes already handled it). Skipped when
-	// the file apply rolled back, so we never disturb the restored prior state.
-	if fileApplyOK {
-		keep := make([]proxy.Target, 0, len(fileArts)+len(set.Keep))
-		for _, fa := range fileArts {
-			keep = append(keep, fa.art.Target)
-		}
-		// set.Keep carries generated files the orchestrator deliberately did NOT push
-		// this round but the agent must retain — currently drifted artifacts awaiting
-		// review. Including them stops the prune from clobbering a drifted file
-		// (invariant #3, no overwrite while drifted).
-		for _, p := range set.Keep {
-			keep = append(keep, proxy.Target{Kind: proxy.TargetKindFile, Path: p})
-		}
+	// The built-in Caddy path still prunes after AddRoute, because its live route
+	// targets are only known once the additions above have succeeded. File-backed
+	// agents were already pruned before batch validation.
+	if len(fileArts) == 0 && fileApplyOK {
+		keep := append([]proxy.Target(nil), fileKeep...)
 		// Built-in-Caddy routes applied above are admin-API targets, not files; include
 		// them so Prune retains their (still-wanted) cert material instead of scrubbing it.
 		keep = append(keep, caddyKept...)
