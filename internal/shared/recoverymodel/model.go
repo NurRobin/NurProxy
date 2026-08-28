@@ -290,11 +290,28 @@ func (d Diagnostic) Validate() error {
 	if d.Occurrences < 1 {
 		return fmt.Errorf("diagnostic occurrences must be positive")
 	}
+	if d.FirstSeenAt.IsZero() || d.LastSeenAt.IsZero() {
+		return fmt.Errorf("diagnostic timestamps are required")
+	}
+	if d.LastSeenAt.Before(d.FirstSeenAt) {
+		return fmt.Errorf("diagnostic last-seen time precedes first-seen time")
+	}
+	if err := validateBoundedSanitized("diagnostic evidence", d.Evidence); err != nil {
+		return err
+	}
 	if d.ProposedAction != "" && !d.ProposedAction.Valid() {
 		return fmt.Errorf("invalid proposed recovery action %q", d.ProposedAction)
 	}
-	if d.AutoRepairEligible && d.ProposedAction == "" {
-		return fmt.Errorf("auto-repair eligible diagnostic requires an action")
+	if d.AutoRepairEligible {
+		if d.Ownership != OwnershipNurProxy {
+			return fmt.Errorf("auto-repair eligible diagnostic must be NurProxy-owned")
+		}
+		if d.HardChange {
+			return fmt.Errorf("hard-change diagnostic cannot be auto-repair eligible")
+		}
+		if !d.ProposedAction.Valid() {
+			return fmt.Errorf("auto-repair eligible diagnostic requires a valid action")
+		}
 	}
 	return nil
 }
@@ -361,6 +378,19 @@ func (r OperationReport) Validate() error {
 	if r.FinishedAt != nil && r.FinishedAt.Before(r.StartedAt) {
 		return fmt.Errorf("repair operation finish time precedes start time")
 	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"repair operation error", r.Error},
+		{"repair operation validation outcome", r.ValidationOutcome},
+		{"repair operation rollback outcome", r.RollbackOutcome},
+	} {
+		if err := validateBoundedSanitized(field.name, field.value); err != nil {
+			return err
+		}
+	}
+	var previousStepAt time.Time
 	for i, step := range r.Steps {
 		if strings.TrimSpace(step.Name) == "" {
 			return fmt.Errorf("repair step %d name is required", i)
@@ -368,10 +398,39 @@ func (r OperationReport) Validate() error {
 		if !step.State.Valid() {
 			return fmt.Errorf("repair step %d has invalid state %q", i, step.State)
 		}
+		if step.At.IsZero() {
+			return fmt.Errorf("repair step %d time is required", i)
+		}
+		if step.At.Before(r.StartedAt) {
+			return fmt.Errorf("repair step %d precedes operation start", i)
+		}
+		if r.FinishedAt != nil && step.At.After(*r.FinishedAt) {
+			return fmt.Errorf("repair step %d follows operation finish", i)
+		}
+		if !previousStepAt.IsZero() && step.At.Before(previousStepAt) {
+			return fmt.Errorf("repair step %d precedes the previous step", i)
+		}
+		if err := validateBoundedSanitized(fmt.Sprintf("repair step %d summary", i), step.Summary); err != nil {
+			return err
+		}
+		previousStepAt = step.At
 	}
 	return nil
 }
 
+func validateBoundedSanitized(name, value string) error {
+	if len(value) > MaxEvidenceBytes {
+		return fmt.Errorf("%s exceeds %d bytes", name, MaxEvidenceBytes)
+	}
+	if SanitizeEvidence(value) != value {
+		return fmt.Errorf("%s is not sanitized", name)
+	}
+	return nil
+}
+
+// DecodeStrict must be used at JSON trust boundaries. Unlike encoding/json's
+// default decoder, it rejects unknown fields, trailing values, and invalid
+// recovery shapes instead of silently broadening the accepted control plane.
 func DecodeStrict(data []byte, dst any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -403,10 +462,9 @@ func StableDiagnosticID(agentID string, code Code, resourceFingerprint string) s
 }
 
 var (
-	privateKeyPattern    = regexp.MustCompile(`(?is)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\z)`)
-	nginxAuthPattern     = regexp.MustCompile(`(?i)(\bproxy_set_header\s+authorization\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\r\n]+)`)
-	authorizationPattern = regexp.MustCompile(`(?i)(\bauthorization\b\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;]+)`)
-	secretPattern        = regexp.MustCompile(`(?i)((?:"(?:[a-z][a-z0-9]*_)*(?:api_?key|token|password|secret|private_?key)"|(?:[a-z][a-z0-9]*_)*(?:api_?key|token|password|secret|private_?key))\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}]+)`)
+	privateKeyPattern = regexp.MustCompile(`(?is)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\z)`)
+	nginxAuthPattern  = regexp.MustCompile(`(?im)(\bproxy_set_header[ \t]+authorization[ \t]+)[^\n]*`)
+	assignmentPattern = regexp.MustCompile(`(?i)(?:\\?")?([a-z][a-z0-9_-]*)(?:\\?")?\s*[:=]\s*`)
 )
 
 func SanitizeEvidence(evidence string) string {
@@ -420,8 +478,7 @@ func SanitizeEvidence(evidence string) string {
 	}, evidence)
 	evidence = privateKeyPattern.ReplaceAllString(evidence, "[REDACTED]")
 	evidence = nginxAuthPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
-	evidence = authorizationPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
-	evidence = secretPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
+	evidence = redactSensitiveAssignments(evidence)
 	if len(evidence) <= MaxEvidenceBytes {
 		return evidence
 	}
@@ -430,4 +487,82 @@ func SanitizeEvidence(evidence string) string {
 		end--
 	}
 	return evidence[:end]
+}
+
+func redactSensitiveAssignments(value string) string {
+	var out strings.Builder
+	for cursor := 0; cursor < len(value); {
+		location := assignmentPattern.FindStringSubmatchIndex(value[cursor:])
+		if location == nil {
+			out.WriteString(value[cursor:])
+			break
+		}
+		matchEnd := cursor + location[1]
+		keyStart := cursor + location[2]
+		keyEnd := cursor + location[3]
+		key := normalizeSensitiveKey(value[keyStart:keyEnd])
+		if !isSensitiveKey(key) {
+			out.WriteString(value[cursor:matchEnd])
+			cursor = matchEnd
+			continue
+		}
+		out.WriteString(value[cursor:matchEnd])
+		end := sensitiveValueEnd(value, matchEnd, strings.HasSuffix(key, "authorization"))
+		out.WriteString("[REDACTED]")
+		cursor = end
+	}
+	return out.String()
+}
+
+func normalizeSensitiveKey(key string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '_' || r == '-' {
+			return -1
+		}
+		return unicode.ToLower(r)
+	}, key)
+}
+
+func isSensitiveKey(key string) bool {
+	for _, suffix := range []string{"authorization", "apikey", "privatekey", "clientsecret", "secretkey", "password", "token"} {
+		if strings.HasSuffix(key, suffix) {
+			return true
+		}
+	}
+	return key == "secret"
+}
+
+func sensitiveValueEnd(value string, start int, throughLine bool) int {
+	if throughLine {
+		if newline := strings.IndexByte(value[start:], '\n'); newline >= 0 {
+			return start + newline
+		}
+		return len(value)
+	}
+	if strings.HasPrefix(value[start:], `\"`) {
+		if end := strings.Index(value[start+2:], `\"`); end >= 0 {
+			return start + 2 + end + 2
+		}
+		return len(value)
+	}
+	if start < len(value) && (value[start] == '"' || value[start] == '\'') {
+		quote := value[start]
+		for i := start + 1; i < len(value); i++ {
+			if value[i] == '\\' {
+				i++
+				continue
+			}
+			if value[i] == quote {
+				return i + 1
+			}
+		}
+		return len(value)
+	}
+	for i := start; i < len(value); i++ {
+		switch value[i] {
+		case ' ', '\t', '\n', ',', ';', '}':
+			return i
+		}
+	}
+	return len(value)
 }

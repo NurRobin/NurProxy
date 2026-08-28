@@ -161,6 +161,16 @@ func TestSanitizeEvidenceRedactsRealisticSecrets(t *testing.T) {
 		{"nginx authorization", `proxy_set_header Authorization "Bearer upstream-secret";`, []string{"upstream-secret"}},
 		{"complete private key", "-----BEGIN PRIVATE KEY-----\nsecret material\n-----END PRIVATE KEY-----", []string{"secret material"}},
 		{"truncated private key", "-----BEGIN RSA PRIVATE KEY-----\nleaked-to-eof", []string{"leaked-to-eof"}},
+		{"hyphenated API key", `api-key=hyphen-api-secret`, []string{"hyphen-api-secret"}},
+		{"hyphenated private key", `private-key="hyphen private secret"`, []string{"hyphen private secret"}},
+		{"API key header", `X-API-Key: header-secret`, []string{"header-secret"}},
+		{"camel API key", `apiKey="camel-api-secret"`, []string{"camel-api-secret"}},
+		{"camel client secret", `clientSecret='camel client secret'`, []string{"camel client secret"}},
+		{"secret key environment", `SECRET_KEY=environment-secret`, []string{"environment-secret"}},
+		{"authorization environment", `HTTP_AUTHORIZATION="Digest username=admin, response=digest-secret, nonce=also-secret"`, []string{"admin", "digest-secret", "also-secret"}},
+		{"escaped JSON token", `{"token":"escaped-json-secret"}`, []string{"escaped-json-secret"}},
+		{"escaped JSON camel secret", `{"clientSecret":"escaped client secret"}`, []string{"escaped client secret"}},
+		{"digest authorization with commas", "Authorization: Digest username=admin, realm=private, response=digest-response\nnext=safe", []string{"admin", "private", "digest-response"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -250,6 +260,30 @@ func TestShapeValidation(t *testing.T) {
 		{"diagnostic unknown ownership", func() error { v := validDiagnostic; v.Ownership = "shared"; return v.Validate() }},
 		{"diagnostic zero occurrences", func() error { v := validDiagnostic; v.Occurrences = 0; return v.Validate() }},
 		{"diagnostic unknown proposed action", func() error { v := validDiagnostic; v.ProposedAction = "shell"; return v.Validate() }},
+		{"diagnostic zero first seen", func() error { v := validDiagnostic; v.FirstSeenAt = time.Time{}; return v.Validate() }},
+		{"diagnostic zero last seen", func() error { v := validDiagnostic; v.LastSeenAt = time.Time{}; return v.Validate() }},
+		{"diagnostic reversed timestamps", func() error { v := validDiagnostic; v.LastSeenAt = now.Add(-time.Second); return v.Validate() }},
+		{"diagnostic unsanitized evidence", func() error { v := validDiagnostic; v.Evidence = `token="secret"`; return v.Validate() }},
+		{"diagnostic overlong evidence", func() error {
+			v := validDiagnostic
+			v.Evidence = strings.Repeat("x", MaxEvidenceBytes+1)
+			return v.Validate()
+		}},
+		{"auto repair owned by operator", func() error {
+			v := validDiagnostic
+			v.AutoRepairEligible = true
+			v.Ownership = OwnershipOperator
+			v.ProposedAction = ActionRemoveManagedTemp
+			return v.Validate()
+		}},
+		{"auto repair is hard change", func() error {
+			v := validDiagnostic
+			v.AutoRepairEligible = true
+			v.HardChange = true
+			v.ProposedAction = ActionRemoveManagedTemp
+			return v.Validate()
+		}},
+		{"auto repair has no action", func() error { v := validDiagnostic; v.AutoRepairEligible = true; return v.Validate() }},
 		{"capability zero stage", func() error { v := validCapability; v.Stage = 0; return v.Validate() }},
 		{"capability unknown action", func() error { v := validCapability; v.Actions = []Action{"shell"}; return v.Validate() }},
 		{"capability duplicate action", func() error {
@@ -266,6 +300,46 @@ func TestShapeValidation(t *testing.T) {
 		{"report empty action", func() error { v := validReport; v.Action = ""; return v.Validate() }},
 		{"report unknown source", func() error { v := validReport; v.Source = "api"; return v.Validate() }},
 		{"report empty state", func() error { v := validReport; v.State = ""; return v.Validate() }},
+		{"report unsanitized error", func() error { v := validReport; v.Error = `apiKey="secret"`; return v.Validate() }},
+		{"report overlong error", func() error { v := validReport; v.Error = strings.Repeat("x", MaxEvidenceBytes+1); return v.Validate() }},
+		{"report unsanitized validation outcome", func() error {
+			v := validReport
+			v.ValidationOutcome = `Authorization: Basic secret`
+			return v.Validate()
+		}},
+		{"report unsanitized rollback outcome", func() error { v := validReport; v.RollbackOutcome = `token=secret`; return v.Validate() }},
+		{"report step zero time", func() error {
+			v := validReport
+			v.Steps = []Step{{Name: "apply", State: OperationStateApplying}}
+			return v.Validate()
+		}},
+		{"report step before operation", func() error {
+			v := validReport
+			v.Steps = []Step{{Name: "apply", State: OperationStateApplying, At: now.Add(-time.Second)}}
+			return v.Validate()
+		}},
+		{"report step after finish", func() error {
+			finished := now.Add(time.Second)
+			v := validReport
+			v.FinishedAt = &finished
+			v.Steps = []Step{{Name: "done", State: OperationStateSucceeded, At: finished.Add(time.Second)}}
+			return v.Validate()
+		}},
+		{"report reversed step order", func() error {
+			v := validReport
+			v.Steps = []Step{{Name: "apply", State: OperationStateApplying, At: now.Add(2 * time.Second)}, {Name: "validate", State: OperationStateValidating, At: now.Add(time.Second)}}
+			return v.Validate()
+		}},
+		{"report unsanitized step summary", func() error {
+			v := validReport
+			v.Steps = []Step{{Name: "apply", Summary: `SECRET_KEY=secret`, State: OperationStateApplying, At: now}}
+			return v.Validate()
+		}},
+		{"report overlong step summary", func() error {
+			v := validReport
+			v.Steps = []Step{{Name: "apply", Summary: strings.Repeat("x", MaxEvidenceBytes+1), State: OperationStateApplying, At: now}}
+			return v.Validate()
+		}},
 	}
 	for _, tt := range invalid {
 		t.Run(tt.name, func(t *testing.T) {
@@ -307,5 +381,20 @@ func TestDecodeStrictRejectsUnknownFieldsAndTrailingJSON(t *testing.T) {
 	var got payload
 	if err := DecodeStrict([]byte(`{"id":"one"}`), &got); err != nil || got.ID != "one" {
 		t.Fatal(fmt.Errorf("valid strict JSON: got %#v: %w", got, err))
+	}
+}
+
+func TestDecodeStrictIsRequiredAtJSONTrustBoundaries(t *testing.T) {
+	type payload struct {
+		ID string `json:"id"`
+	}
+	raw := []byte(`{"id":"one","command":"not-allowed"}`)
+	var permissive payload
+	if err := json.Unmarshal(raw, &permissive); err != nil {
+		t.Fatal(err)
+	}
+	var strict payload
+	if err := DecodeStrict(raw, &strict); err == nil {
+		t.Fatal("DecodeStrict accepted a field silently ignored by encoding/json")
 	}
 }
