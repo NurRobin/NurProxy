@@ -51,6 +51,24 @@ func TestAttributeNginxTestError_table(t *testing.T) {
 			wantLine:    15,
 		},
 		{
+			name:        "same basename in foreign root is not ours",
+			out:         `nginx: [emerg] unknown directive "x" in /tmp/nurproxy-app.example.com.conf:8`,
+			ourFile:     ourFile,
+			wantLocated: true,
+			wantOurs:    false,
+			wantFile:    "/tmp/nurproxy-app.example.com.conf",
+			wantLine:    8,
+		},
+		{
+			name:        "case mismatch is not ours",
+			out:         `nginx: [emerg] unknown directive "x" in /etc/nginx/sites-enabled/NURPROXY-app.example.com.conf:8`,
+			ourFile:     ourFile,
+			wantLocated: true,
+			wantOurs:    false,
+			wantFile:    "/etc/nginx/sites-enabled/NURPROXY-app.example.com.conf",
+			wantLine:    8,
+		},
+		{
 			name: "chained context lines attribute to the innermost (last) frame",
 			out: `nginx: [emerg] invalid parameter in /etc/nginx/nginx.conf:9
 nginx: configuration file test failed in /etc/nginx/sites-enabled/nurproxy-app.example.com.conf:5`,
@@ -121,5 +139,24 @@ nginx: configuration file /etc/nginx/nginx.conf test failed`,
 				t.Errorf("Raw = %q, want verbatim output %q", got.Raw, tt.out)
 			}
 		})
+	}
+}
+
+func TestAttributeNginxTestErrorMatchesAnyArtifactInBatch(t *testing.T) {
+	first := "/etc/nginx/sites-available/nurproxy-one.example.com.conf"
+	second := "/etc/nginx/sites-available/nurproxy-two.example.com.conf"
+	out := `nginx: [emerg] unknown directive "bad" in /etc/nginx/sites-enabled/nurproxy-two.example.com.conf:6`
+	got := AttributeNginxTestError(out, first, second)
+	if !got.Ours || !got.Located {
+		t.Fatalf("attribution = %#v, want second batch artifact", got)
+	}
+}
+
+func TestAttributeNginxTestErrorPermissionRequiresCommandLineShape(t *testing.T) {
+	if got := AttributeNginxTestError("documentation mentions permission denied handling"); got.Permission {
+		t.Fatalf("prose gained Permission: %#v", got)
+	}
+	if got := AttributeNginxTestError("sudo: a password is required"); !got.Permission {
+		t.Fatalf("sudo denial lacked Permission: %#v", got)
 	}
 }

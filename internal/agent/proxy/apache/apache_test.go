@@ -307,6 +307,20 @@ func TestApply_reloadFails_rollsBack(t *testing.T) {
 	}
 }
 
+func TestApply_reloadSudoDenialReturnsPermissionFailure(t *testing.T) {
+	r := &fakeRunner{reloadErr: errors.New("exit status 1: sudo: a password is required")}
+	b, _ := newDebianBackend(t, r)
+	art := sampleArtifact(b, "app.example.com", "<VirtualHost *:80></VirtualHost>\n")
+	err := b.Apply(context.Background(), []proxy.Artifact{art})
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.Permission || failure.Phase != proxy.FailurePhaseReload {
+		t.Fatalf("failure = %#v, want reload permission failure", failure)
+	}
+}
+
 func TestValidate_binaryMissingReturnsTypedFailure(t *testing.T) {
 	b, _ := newDebianBackend(t, &fakeRunner{testErr: exec.ErrNotFound})
 	err := b.Validate(context.Background())
@@ -371,6 +385,39 @@ func TestApply_configtestFails_returnsAttributedError(t *testing.T) {
 	}
 	if failure.Line != 9 {
 		t.Errorf("line = %d, want 9", failure.Line)
+	}
+}
+
+func TestApply_configtestFailureInSecondArtifactHasManagedHint(t *testing.T) {
+	r := &fakeRunner{testErr: errors.New("exit 1")}
+	b, _ := newDebianBackend(t, r)
+	first := sampleArtifact(b, "one.example.com", "<VirtualHost *:80></VirtualHost>\n")
+	second := sampleArtifact(b, "two.example.com", "<VirtualHost *:80>Bad</VirtualHost>\n")
+	r.testOut = "Syntax error on line 1 of " + second.Target.Path + ":"
+
+	err := b.Apply(context.Background(), []proxy.Artifact{first, second})
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.ManagedHint || failure.File != second.Target.Path {
+		t.Fatalf("failure = %#v, want managed hint for second artifact", failure)
+	}
+}
+
+func TestExecRunnerTestBoundsCombinedOutput(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	script := filepath.Join(t.TempDir(), "noisy-apache-test")
+	body := "#!/bin/sh\nprintf 'apache-test-stdout\\n'\nprintf 'apache-test-stderr\\n' >&2\nhead -c 4194304 /dev/zero | tr '\\000' x\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := (&execRunner{testCmd: script}).Test(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) > proxy.MaxFailureCaptureBytes || !strings.Contains(out, proxy.FailureOutputTruncated) {
+		t.Fatalf("captured bytes=%d marker=%v", len(out), strings.Contains(out, proxy.FailureOutputTruncated))
 	}
 }
 

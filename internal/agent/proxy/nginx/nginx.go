@@ -381,7 +381,7 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 
 	out, err := b.runner.Test(ctx)
 	if err != nil {
-		attr := AttributeNginxTestError(out, primaryTarget(arts))
+		attr := AttributeNginxTestError(out, artifactTargets(arts)...)
 		rollback()
 		return validationFailure(out, err, attr)
 	}
@@ -560,11 +560,10 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 
 func validationFailure(output string, err error, attr ErrAttribution) *proxy.Failure {
 	failure := proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, output, err)
-	failure.File = attr.File
-	failure.Line = attr.Line
-	failure.Located = attr.Located
-	failure.ManagedHint = attr.Ours
-	failure.Permission = attr.Permission
+	if attr.Located {
+		failure.SetLocation(attr.File, attr.Line, attr.Ours)
+	}
+	failure.Permission = failure.Permission || attr.Permission
 	return failure
 }
 
@@ -656,15 +655,14 @@ func (b *Backend) ResolvedCommands() (test string, reload string) {
 	return bin + " -t", bin + " -s reload"
 }
 
-// primaryTarget returns the first artifact's target path, used as "our file" for
-// error attribution. A single-domain apply has exactly one; for a multi-file
-// apply the first is a reasonable anchor (the attribution still compares the
-// blamed file against it by base name).
-func primaryTarget(arts []proxy.Artifact) string {
-	if len(arts) == 0 {
-		return ""
+func artifactTargets(arts []proxy.Artifact) []string {
+	targets := make([]string, 0, len(arts))
+	for _, art := range arts {
+		if art.Target.Path != "" {
+			targets = append(targets, art.Target.Path)
+		}
 	}
-	return arts[0].Target.Path
+	return targets
 }
 
 // execRunner is the default Runner: it shells out to the nginx binary for -t and
@@ -680,14 +678,13 @@ type execRunner struct {
 // Test runs nginx -t (or the configured override) and returns combined output.
 func (r *execRunner) Test(ctx context.Context) (string, error) {
 	cmd := r.command(ctx, r.testCmd, "-t")
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return proxy.RunCombinedOutput(cmd)
 }
 
 // Reload runs nginx -s reload (or the configured override).
 func (r *execRunner) Reload(ctx context.Context) error {
 	cmd := r.command(ctx, r.reloadCmd, "-s", "reload")
-	out, err := cmd.CombinedOutput()
+	out, err := proxy.RunCombinedOutput(cmd)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}

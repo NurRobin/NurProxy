@@ -276,30 +276,38 @@
     step, so a symlink clash still restores prior content (`apache.go:358-364`).
   - `ensureSymlink` refuses to replace a non-symlink (an operator's own copied
     activation) and surfaces an error rather than clobbering it (`fileops.go:72-84`).
-  - A reload failure *after* a passing configtest is unexpected and rolls back with
-    `apache reload failed after passing configtest: …` (`apache.go:394-396`).
+  - A reload failure *after* a passing configtest is unexpected, rolls back, and
+    surfaces as a typed `apache reload failed: …` failure.
 
 ### Error attribution (ours vs operator's existing config)
 
 - **Must:** `apachectl configtest` validates the WHOLE config, so a pre-existing
   operator error elsewhere can trip our apply. The error must distinguish "we broke
   it" from "your existing config at file:line".
-- **Access:** surfaced in the apply error / health message (`commandError.Error()`,
-  `apache.go:71-80`); `AttributeConfigtestError` parses it (`attribution.go:58-77`).
+- **Access:** `AttributeConfigtestError(out, ourFiles...)` parses it; the backend
+  surfaces an `errors.As`-compatible `*proxy.Failure` in the apply error / health
+  message.
 - **Steps (D, unit):** `go test ./internal/agent/proxy/apache/ -run Attribut -v`.
 - **Pass:**
   - Located + ours → `apachectl configtest failed in the generated config at
     <file>:<line>` (`apache.go:76-77`).
   - Located + not ours → `apachectl configtest failed: error in your existing config
     at <file>:<line>` (`apache.go:79`).
-  - Not located (e.g. a permission error, no parseable `on line N of file`) → raw
-    output unattributed (`apache.go:73-74`, `attribution.go:67-69`).
-  - Attribution is by BASE NAME so the sites-available source and its sites-enabled
-    symlink attribute to the same managed file; the LAST `on line N of file` clause
-    (innermost frame) wins (`attribution.go:58-77,84-92`).
+  - Permission denied and a missing proxy binary retain concise, distinct
+    messages; an unknown unlocated failure retains one short sanitized line.
+  - Exact clean paths match directly. A sites-enabled path aliases its
+    sites-available sibling only under the same parent layout with the same
+    case-sensitive basename. Foreign roots and same basenames elsewhere do not
+    count as ours.
+  - Batch apply compares the blamed path with every staged artifact. The LAST `on
+    line N of file` clause (innermost frame) wins.
+  - Combined stdout/stderr and exposed evidence are bounded to 8 KiB. Locations
+    must be absolute, clean, valid UTF-8, control-free, sanitized, and within the
+    separate path-size limit.
 - **Coverage:** D.
-- **Pitfalls:** an empty `ourFile` is never "ours" (`attribution.go:85-87`) — used by
-  `Validate` which passes `""` (`apache.go:502`).
+- **Pitfalls:** standalone `Validate` supplies no managed artifact candidates, so
+  a located error is never treated as generated-config evidence. `ManagedHint`
+  is evidence only, not an ownership decision.
 
 ### Rate limit NOT supported (the key Apache divergence)
 

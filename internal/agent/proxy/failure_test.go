@@ -2,10 +2,13 @@ package proxy
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
@@ -42,13 +45,13 @@ func TestNewFailureRecognizesOnlyKnownBackendMessages(t *testing.T) {
 		{
 			name:            "apache missing certificate",
 			backend:         KindApache,
-			output:          `AH00526: Syntax error on line 12 of /etc/apache2/sites-enabled/app.conf: SSLCertificateFile: file '/var/lib/nurproxy/certs/app.crt' does not exist or is empty`,
+			output:          "AH00526: Syntax error on line 12 of /etc/apache2/sites-enabled/app.conf:\nSSLCertificateFile: file '/var/lib/nurproxy/certs/app.crt' does not exist or is empty",
 			wantMissingCert: true,
 		},
 		{
 			name:                  "apache missing runtime key",
 			backend:               KindApache,
-			output:                `AH00526: Syntax error on line 13 of /etc/apache2/sites-enabled/app.conf: SSLCertificateKeyFile: file '/var/lib/nurproxy/certs/app.key.plain' does not exist or is empty`,
+			output:                "AH00526: Syntax error on line 13 of /etc/apache2/sites-enabled/app.conf:\nSSLCertificateKeyFile: file '/var/lib/nurproxy/certs/app.key.plain' does not exist or is empty",
 			wantMissingRuntimeKey: true,
 		},
 		{
@@ -68,6 +71,21 @@ func TestNewFailureRecognizesOnlyKnownBackendMessages(t *testing.T) {
 			backend: KindNginx,
 			output:  `nginx: [emerg] something entirely new happened`,
 		},
+		{
+			name:    "near miss without nginx error prefix",
+			backend: KindNginx,
+			output:  `operator note: cannot load certificate "/tmp/app.crt": No such file or directory`,
+		},
+		{
+			name:    "near miss without apache error code",
+			backend: KindApache,
+			output:  `operator note: Certificate and private key app.crt and app.key do not match`,
+		},
+		{
+			name:    "orphan apache directive line is not enough",
+			backend: KindApache,
+			output:  `SSLCertificateFile: file '/tmp/app.crt' does not exist or is empty`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -84,6 +102,10 @@ func TestNewFailureRecognizesOnlyKnownBackendMessages(t *testing.T) {
 			}
 			if got.BinaryMissing != tt.wantBinaryMissing {
 				t.Errorf("BinaryMissing = %v, want %v", got.BinaryMissing, tt.wantBinaryMissing)
+			}
+			if !tt.wantMissingCert && !tt.wantMissingRuntimeKey && !tt.wantRuntimeKeyMismatch && !tt.wantBinaryMissing &&
+				(got.Permission || got.ManagedHint) {
+				t.Errorf("unknown/near-miss output gained a repair hint: %#v", got)
 			}
 		})
 	}
@@ -105,11 +127,9 @@ func TestNewFailureSanitizesAndBoundsOutput(t *testing.T) {
 func TestFailureErrorIsConciseAndUnwraps(t *testing.T) {
 	cause := errors.New("exit status 1 with token=do-not-render")
 	failure := NewFailure(KindApache, FailurePhaseReload, "reload output", cause)
-	failure.File = "/etc/apache2/sites-enabled/app.conf"
-	failure.Line = 7
-	failure.Located = true
+	failure.SetLocation("/etc/apache2/sites-enabled/app.conf", 7, false)
 
-	if got, want := failure.Error(), "apache reload failed at /etc/apache2/sites-enabled/app.conf:7"; got != want {
+	if got, want := failure.Error(), "apache reload failed: error in your existing config at /etc/apache2/sites-enabled/app.conf:7"; got != want {
 		t.Fatalf("Error() = %q, want %q", got, want)
 	}
 	if strings.Contains(failure.Error(), "token") {
@@ -124,5 +144,221 @@ func TestNewFailureDoesNotCallMissingCertFileABinaryFailure(t *testing.T) {
 	failure := NewFailure(KindNginx, FailurePhaseCertInstall, "writing cert", os.ErrNotExist)
 	if failure.BinaryMissing {
 		t.Fatal("BinaryMissing = true for a cert-install filesystem error")
+	}
+}
+
+func TestFailureSetLocationRejectsUnsafePathsAndClearsAttribution(t *testing.T) {
+	tooLong := "/" + strings.Repeat("x", MaxFailurePathBytes)
+	tests := []struct {
+		name string
+		path string
+		line int
+	}{
+		{name: "invalid UTF-8", path: string([]byte{'/', 'x', 0xff}), line: 1},
+		{name: "newline control", path: "/etc/nginx/a\n.conf", line: 1},
+		{name: "carriage return", path: "/etc/nginx/a\r.conf", line: 1},
+		{name: "bidi formatting", path: "/etc/nginx/a\u202e.conf", line: 1},
+		{name: "secret assignment", path: "/etc/nginx/token=super-secret", line: 1},
+		{name: "relative", path: "etc/nginx/app.conf", line: 1},
+		{name: "unclean", path: "/etc/nginx/../nginx/app.conf", line: 1},
+		{name: "over byte limit", path: tooLong, line: 1},
+		{name: "invalid line", path: "/etc/nginx/app.conf", line: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			failure := NewFailure(KindNginx, FailurePhaseValidate, "failure", errors.New("exit 1"))
+			failure.SetLocation("/etc/nginx/sites-enabled/nurproxy-good.conf", 2, true)
+			failure.SetLocation(tt.path, tt.line, true)
+			if failure.Located || failure.File != "" || failure.Line != 0 || failure.ManagedHint {
+				t.Fatalf("unsafe location was retained: %#v", failure)
+			}
+			if strings.Contains(failure.Error(), "super-secret") {
+				t.Fatalf("Error leaked rejected path: %q", failure.Error())
+			}
+		})
+	}
+}
+
+func TestFailureSetLocationAcceptsCleanAbsolutePath(t *testing.T) {
+	failure := NewFailure(KindNginx, FailurePhaseValidate, "failure", errors.New("exit 1"))
+	failure.SetLocation("/etc/nginx/sites-enabled/nurproxy-app.conf", 12, true)
+	if !failure.Located || failure.File != "/etc/nginx/sites-enabled/nurproxy-app.conf" || failure.Line != 12 || !failure.ManagedHint {
+		t.Fatalf("location = %#v", failure)
+	}
+}
+
+func TestFailureErrorRevalidatesExportedLocationFields(t *testing.T) {
+	failure := NewFailure(KindNginx, FailurePhaseValidate, "safe fallback", errors.New("exit 1"))
+	failure.File = "/etc/nginx/token=super-secret"
+	failure.Line = 1
+	failure.Located = true
+	failure.ManagedHint = true
+	if got := failure.Error(); strings.Contains(got, "super-secret") || strings.Contains(got, "generated config") {
+		t.Fatalf("Error trusted unsafe exported location: %q", got)
+	}
+}
+
+func TestFailureErrorKeepsVisibleDiagnosticCategories(t *testing.T) {
+	tests := []struct {
+		name string
+		make func() *Failure
+		want string
+	}{
+		{
+			name: "generated config",
+			make: func() *Failure {
+				f := NewFailure(KindNginx, FailurePhaseValidate, "raw", errors.New("exit 1"))
+				f.SetLocation("/etc/nginx/sites-enabled/nurproxy-app.conf", 4, true)
+				return f
+			},
+			want: "nginx -t failed in the generated config at /etc/nginx/sites-enabled/nurproxy-app.conf:4",
+		},
+		{
+			name: "existing config",
+			make: func() *Failure {
+				f := NewFailure(KindApache, FailurePhaseValidate, "raw", errors.New("exit 1"))
+				f.SetLocation("/etc/apache2/sites-enabled/operator.conf", 9, false)
+				return f
+			},
+			want: "apachectl configtest failed: error in your existing config at /etc/apache2/sites-enabled/operator.conf:9",
+		},
+		{
+			name: "permission",
+			make: func() *Failure {
+				return NewFailure(KindNginx, FailurePhaseValidate, "sudo: a password is required", errors.New("exit 1"))
+			},
+			want: "nginx -t could not complete: permission denied",
+		},
+		{
+			name: "binary missing",
+			make: func() *Failure {
+				return NewFailure(KindApache, FailurePhaseValidate, "", &exec.Error{Name: "apachectl", Err: exec.ErrNotFound})
+			},
+			want: "apachectl configtest failed: proxy binary missing",
+		},
+		{
+			name: "safe useful fallback",
+			make: func() *Failure {
+				return NewFailure(KindNginx, FailurePhaseValidate, "unexpected failure\nsecond line token=secret", errors.New("exit 1"))
+			},
+			want: "nginx -t failed: unexpected failure",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.make().Error(); got != tt.want {
+				t.Fatalf("Error() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewFailureBinaryMissingRequiresExecutionEvidence(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "exec sentinel", err: exec.ErrNotFound, want: true},
+		{name: "exec error", err: &exec.Error{Name: "nginx", Err: exec.ErrNotFound}, want: true},
+		{name: "fork exec path error", err: &os.PathError{Op: "fork/exec", Path: "/missing/nginx", Err: os.ErrNotExist}, want: true},
+		{name: "plain not exist", err: os.ErrNotExist},
+		{name: "wrapped plain not exist", err: fmt.Errorf("config vanished: %w", os.ErrNotExist)},
+		{name: "open path error", err: &os.PathError{Op: "open", Path: "/etc/nginx/nginx.conf", Err: os.ErrNotExist}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewFailure(KindNginx, FailurePhaseValidate, "", tt.err)
+			if got.BinaryMissing != tt.want {
+				t.Fatalf("BinaryMissing = %v, want %v for %T", got.BinaryMissing, tt.want, tt.err)
+			}
+		})
+	}
+}
+
+func TestNewFailurePermissionDetectionAcrossPhases(t *testing.T) {
+	tests := []struct {
+		name   string
+		phase  FailurePhase
+		output string
+		err    error
+		want   bool
+	}{
+		{name: "wrapped permission on reload", phase: FailurePhaseReload, err: fmt.Errorf("reload: %w", os.ErrPermission), want: true},
+		{name: "sudo password", phase: FailurePhaseValidate, output: "sudo: a password is required", want: true},
+		{name: "sudo no tty", phase: FailurePhaseReload, output: "sudo: no tty present and no askpass program specified", want: true},
+		{name: "sudo denied", phase: FailurePhaseValidate, output: "sudo: main is not allowed to execute '/usr/sbin/nginx -t' as root on host", want: true},
+		{name: "command permission denied", phase: FailurePhaseValidate, output: "nginx: [emerg] open() failed (13: Permission denied)", want: true},
+		{name: "near miss prose", phase: FailurePhaseValidate, output: "documentation mentions permission denied handling", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewFailure(KindNginx, tt.phase, tt.output, tt.err)
+			if got.Permission != tt.want {
+				t.Fatalf("Permission = %v, want %v", got.Permission, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewFailureBoundsBeforeClassificationAndKeepsTruncationMarker(t *testing.T) {
+	secret := "cutoff-secret"
+	prefix := strings.Repeat("x", MaxFailureCaptureBytes-40)
+	raw := prefix + "\ntoken=" + secret + strings.Repeat("z", 2<<20)
+	failure := NewFailure(KindNginx, FailurePhaseValidate, raw, errors.New("exit 1"))
+	if len(failure.Output) > recoverymodel.MaxEvidenceBytes || !utf8.ValidString(failure.Output) {
+		t.Fatalf("unsafe bounded output: bytes=%d valid=%v", len(failure.Output), utf8.ValidString(failure.Output))
+	}
+	if strings.Contains(failure.Output, secret) {
+		t.Fatalf("Output leaked cutoff secret: %q", failure.Output)
+	}
+	if !strings.Contains(failure.Output, FailureOutputTruncated) {
+		t.Fatalf("Output lacks truncation marker: %q", failure.Output[len(failure.Output)-80:])
+	}
+}
+
+func TestNewFailureKeepsOutputThatFitsHardLimit(t *testing.T) {
+	raw := strings.Repeat("x", MaxFailureCaptureBytes-1)
+	failure := NewFailure(KindNginx, FailurePhaseValidate, raw, errors.New("exit 1"))
+	if failure.Output != raw || strings.Contains(failure.Output, FailureOutputTruncated) {
+		t.Fatalf("in-limit output was truncated: bytes=%d marker=%v", len(failure.Output), strings.Contains(failure.Output, FailureOutputTruncated))
+	}
+}
+
+func TestBoundedOutputWriterKeepsMemoryAndUTF8Bounded(t *testing.T) {
+	w := newBoundedOutputWriter()
+	chunk := []byte(strings.Repeat("€", 400_000))
+	for i := 0; i < 4; i++ {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cap(w.buf) > MaxFailureCaptureBytes {
+		t.Fatalf("capture capacity = %d, want <= %d", cap(w.buf), MaxFailureCaptureBytes)
+	}
+	got := w.String()
+	if len(got) > MaxFailureCaptureBytes || !utf8.ValidString(got) || !strings.Contains(got, FailureOutputTruncated) {
+		t.Fatalf("bounded output bytes=%d valid=%v marker=%v", len(got), utf8.ValidString(got), strings.Contains(got, FailureOutputTruncated))
+	}
+}
+
+func TestRunCombinedOutputBoundsMultiMegabyteCommand(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh unavailable")
+	}
+	cmd := exec.Command(sh, "-c", "printf 'stdout-line\\n'; printf 'stderr-line\\n' >&2; head -c 4194304 /dev/zero | tr '\\000' x")
+	out, err := RunCombinedOutput(cmd)
+	if err != nil {
+		t.Fatalf("RunCombinedOutput: %v", err)
+	}
+	if len(out) > MaxFailureCaptureBytes || !utf8.ValidString(out) || !strings.Contains(out, FailureOutputTruncated) {
+		t.Fatalf("combined output bytes=%d valid=%v marker=%v", len(out), utf8.ValidString(out), strings.Contains(out, FailureOutputTruncated))
+	}
+	if !strings.Contains(out, "stdout-line") || !strings.Contains(out, "stderr-line") {
+		t.Fatalf("combined output did not capture both streams: %q", out[:80])
+	}
+	if filepath.Base(cmd.Path) != "sh" {
+		t.Fatalf("unexpected command path %q", cmd.Path)
 	}
 }

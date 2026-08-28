@@ -22,7 +22,7 @@ var nginxErrRe = regexp.MustCompile(`in (\S+):(\d+)`)
 // unprivileged) cannot read files nginx -t touches, e.g. other vhosts' TLS
 // private keys or the error log. That is NOT a config error in any file; it means
 // the agent needs privilege to run nginx -t / reload (§12).
-var permDeniedRe = regexp.MustCompile(`(?i)permission denied`)
+var permDeniedRe = regexp.MustCompile(`(?im)^(?:(?:nginx: \[(?:emerg|alert)\]|[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]+ \[(?:emerg|alert)\] [0-9]+#[0-9]+:).*(?:permission denied|operation not permitted)|sudo: .*(?:a password is required|no tty present and no askpass program specified| is not allowed to execute .*))$`)
 
 // ErrAttribution classifies an nginx -t failure as either ours (the file this
 // apply wrote) or the operator's pre-existing config elsewhere in the managed
@@ -53,16 +53,14 @@ type ErrAttribution struct {
 }
 
 // AttributeNginxTestError parses nginx -t output and attributes the failure
-// relative to ourFile (the file this apply wrote, e.g.
-// sites-available/nurproxy-app.example.com.conf). It is a pure function — no
-// host, no filesystem — so it is table-driven testable against captured nginx
-// output (§14). nginx may reference a file via its sites-available path, its
-// sites-enabled symlink, or an absolute include; we compare by base name so the
-// symlink and its target attribute to the same managed file.
+// relative to the files this apply wrote. It is a pure function — no host, no
+// filesystem — so it is table-driven testable against captured nginx output
+// (§14). Exact clean paths match directly; a sites-enabled path may match its
+// sites-available sibling only under the same parent with the same basename.
 //
 // When several "in file:line" clauses appear (nginx can chain context lines),
 // the LAST one is the innermost frame nginx blames, so we attribute to it.
-func AttributeNginxTestError(out, ourFile string) ErrAttribution {
+func AttributeNginxTestError(out string, ourFiles ...string) ErrAttribution {
 	a := ErrAttribution{Raw: out}
 	a.Permission = permDeniedRe.MatchString(out)
 
@@ -90,21 +88,41 @@ func AttributeNginxTestError(out, ourFile string) ErrAttribution {
 		a.Line = n
 	}
 	a.Located = true
-	a.Ours = sameManagedFile(a.File, ourFile)
+	for _, ourFile := range ourFiles {
+		if sameManagedFile(a.File, ourFile) {
+			a.Ours = true
+			break
+		}
+	}
 	return a
 }
 
 // sameManagedFile reports whether the file nginx blamed is the file we wrote.
-// nginx may name the sites-available source or the sites-enabled symlink; both
-// share the base name nurproxy-<domain>.conf, so a base-name comparison treats
-// the symlink and its target as the same managed artifact. An empty ourFile
-// (we wrote nothing identifiable) is never "ours".
+// nginx may name the sites-available source or its sites-enabled symlink. A
+// basename alone is insufficient because an operator file in another root may
+// share it. An empty path is never ours.
 func sameManagedFile(blamed, ourFile string) bool {
-	if ourFile == "" || blamed == "" {
+	if ourFile == "" || blamed == "" || !filepath.IsAbs(blamed) || !filepath.IsAbs(ourFile) {
 		return false
 	}
-	if blamed == ourFile {
+	blamedClean := filepath.Clean(blamed)
+	ourClean := filepath.Clean(ourFile)
+	if blamedClean != blamed || ourClean != ourFile {
+		return false
+	}
+	if blamedClean == ourClean {
 		return true
 	}
-	return strings.EqualFold(filepath.Base(blamed), filepath.Base(ourFile))
+	if filepath.Base(blamedClean) != filepath.Base(ourClean) {
+		return false
+	}
+	blamedDir := filepath.Dir(blamedClean)
+	ourDir := filepath.Dir(ourClean)
+	if filepath.Dir(blamedDir) != filepath.Dir(ourDir) {
+		return false
+	}
+	blamedRole := filepath.Base(blamedDir)
+	ourRole := filepath.Base(ourDir)
+	return (blamedRole == "sites-enabled" && ourRole == "sites-available") ||
+		(blamedRole == "sites-available" && ourRole == "sites-enabled")
 }

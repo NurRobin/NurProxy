@@ -3,6 +3,7 @@ package nginx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -346,6 +347,23 @@ func TestApply_testFails_rollsBackNewFile_andAttributesOurError(t *testing.T) {
 	}
 }
 
+func TestApply_testFailureInSecondArtifactHasManagedHint(t *testing.T) {
+	r := &fakeRunner{testErr: errors.New("exit 1")}
+	b, _ := newBackend(t, r)
+	first := sampleArtifact(b, "one.example.com", "server {}\n")
+	second := sampleArtifact(b, "two.example.com", "server { bad; }\n")
+	r.testOut = `nginx: [emerg] unknown directive "bad" in ` + second.Target.Path + ":1"
+
+	err := b.Apply(context.Background(), []proxy.Artifact{first, second})
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.ManagedHint || failure.File != second.Target.Path {
+		t.Fatalf("failure = %#v, want managed hint for second artifact", failure)
+	}
+}
+
 func TestApply_testFails_restoresPriorContent(t *testing.T) {
 	r := &fakeRunner{testErr: errors.New("exit 1"), testOut: "nginx: [emerg] error in /etc/nginx/sites-enabled/other:5"}
 	b, _ := newBackend(t, r)
@@ -429,7 +447,7 @@ func TestApply_symlinkFails_restoresPriorContent(t *testing.T) {
 }
 
 func TestApply_reloadFails_rollsBack(t *testing.T) {
-	r := &fakeRunner{reloadErr: errors.New("reload boom")}
+	r := &fakeRunner{reloadErr: fmt.Errorf("reload boom: %w", os.ErrPermission)}
 	b, _ := newBackend(t, r)
 	art := sampleArtifact(b, "app.example.com", "server { listen 80; }\n")
 
@@ -441,12 +459,31 @@ func TestApply_reloadFails_rollsBack(t *testing.T) {
 	if !errors.As(err, &failure) || failure.Backend != proxy.KindNginx || failure.Phase != proxy.FailurePhaseReload {
 		t.Fatalf("reload error = %#v, want typed nginx reload failure", err)
 	}
+	if !failure.Permission {
+		t.Fatalf("reload failure = %#v, want permission detection from wrapped error", failure)
+	}
 	// New file rolled back even though nginx -t passed.
 	if _, statErr := os.Stat(art.Target.Path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("file should be rolled back on reload failure, stat err = %v", statErr)
 	}
 	if r.tests != 1 || r.reloads != 1 {
 		t.Errorf("tests=%d reloads=%d, want 1 and 1", r.tests, r.reloads)
+	}
+}
+
+func TestExecRunnerTestBoundsCombinedOutput(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	script := filepath.Join(t.TempDir(), "noisy-nginx-test")
+	body := "#!/bin/sh\nprintf 'nginx-test-stdout\\n'\nprintf 'nginx-test-stderr\\n' >&2\nhead -c 4194304 /dev/zero | tr '\\000' x\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := (&execRunner{testCmd: script}).Test(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) > proxy.MaxFailureCaptureBytes || !strings.Contains(out, proxy.FailureOutputTruncated) {
+		t.Fatalf("captured bytes=%d marker=%v", len(out), strings.Contains(out, proxy.FailureOutputTruncated))
 	}
 }
 
@@ -459,6 +496,18 @@ func TestValidate_binaryMissingReturnsTypedFailure(t *testing.T) {
 	}
 	if !failure.BinaryMissing || failure.Phase != proxy.FailurePhaseValidate {
 		t.Fatalf("failure = %#v, want binary-missing validation failure", failure)
+	}
+}
+
+func TestValidate_permissionErrorReturnsTypedFailure(t *testing.T) {
+	b, _ := newBackend(t, &fakeRunner{testErr: fmt.Errorf("validate: %w", os.ErrPermission)})
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.Permission {
+		t.Fatalf("failure = %#v, want permission detection from wrapped error", failure)
 	}
 }
 

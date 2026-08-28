@@ -21,7 +21,7 @@ import (
 // is in a file we manage or in the operator's pre-existing config (§10).
 var apacheErrRe = regexp.MustCompile(`on line (\d+) of (\S+?):?$`)
 
-var permDeniedRe = regexp.MustCompile(`(?i)permission denied`)
+var permDeniedRe = regexp.MustCompile(`(?im)^(?:(?:httpd|apache2|apachectl):.*(?:permission denied|operation not permitted)|sudo: .*(?:a password is required|no tty present and no askpass program specified| is not allowed to execute .*))$`)
 
 // ErrAttribution classifies an apachectl configtest failure as either ours (the
 // file this apply wrote) or the operator's pre-existing config elsewhere in the
@@ -51,16 +51,14 @@ type ErrAttribution struct {
 }
 
 // AttributeConfigtestError parses apachectl configtest output and attributes the
-// failure relative to ourFile (the file this apply wrote, e.g.
-// sites-available/nurproxy-app.example.com.conf). It is a pure function — no
+// failure relative to the files this apply wrote. It is a pure function — no
 // host, no filesystem — so it is table-driven testable against captured output
-// (§14). Apache may reference a file via its sites-available path, its
-// sites-enabled symlink, or an absolute include; we compare by base name so the
-// symlink and its target attribute to the same managed file.
+// (§14). Exact clean paths match directly; a sites-enabled path may match its
+// sites-available sibling only under the same parent with the same basename.
 //
 // When several "on line N of file" clauses appear, the LAST one is the innermost
 // frame Apache blames, so we attribute to it.
-func AttributeConfigtestError(out, ourFile string) ErrAttribution {
+func AttributeConfigtestError(out string, ourFiles ...string) ErrAttribution {
 	a := ErrAttribution{Raw: out}
 	a.Permission = permDeniedRe.MatchString(out)
 
@@ -78,21 +76,41 @@ func AttributeConfigtestError(out, ourFile string) ErrAttribution {
 	}
 	a.File = last[2]
 	a.Located = true
-	a.Ours = sameManagedFile(a.File, ourFile)
+	for _, ourFile := range ourFiles {
+		if sameManagedFile(a.File, ourFile) {
+			a.Ours = true
+			break
+		}
+	}
 	return a
 }
 
 // sameManagedFile reports whether the file Apache blamed is the file we wrote.
-// Apache may name the sites-available source or the sites-enabled symlink; both
-// share the base name nurproxy-<domain>.conf, so a base-name comparison treats
-// the symlink and its target as the same managed artifact. An empty ourFile
-// (we wrote nothing identifiable) is never "ours".
+// Apache may name the sites-available source or its sites-enabled symlink. A
+// basename alone is insufficient because an operator file in another root may
+// share it. An empty path is never ours.
 func sameManagedFile(blamed, ourFile string) bool {
-	if ourFile == "" || blamed == "" {
+	if ourFile == "" || blamed == "" || !filepath.IsAbs(blamed) || !filepath.IsAbs(ourFile) {
 		return false
 	}
-	if blamed == ourFile {
+	blamedClean := filepath.Clean(blamed)
+	ourClean := filepath.Clean(ourFile)
+	if blamedClean != blamed || ourClean != ourFile {
+		return false
+	}
+	if blamedClean == ourClean {
 		return true
 	}
-	return strings.EqualFold(filepath.Base(blamed), filepath.Base(ourFile))
+	if filepath.Base(blamedClean) != filepath.Base(ourClean) {
+		return false
+	}
+	blamedDir := filepath.Dir(blamedClean)
+	ourDir := filepath.Dir(ourClean)
+	if filepath.Dir(blamedDir) != filepath.Dir(ourDir) {
+		return false
+	}
+	blamedRole := filepath.Base(blamedDir)
+	ourRole := filepath.Base(ourDir)
+	return (blamedRole == "sites-enabled" && ourRole == "sites-available") ||
+		(blamedRole == "sites-available" && ourRole == "sites-enabled")
 }

@@ -118,16 +118,28 @@
 
 ### Error attribution (our config vs operator's pre-broken config)
 - **Must:** `nginx -t` validates the WHOLE config, so a pre-existing operator error can trip our apply. The agent must distinguish "we broke it" from "your existing config at X:N was already broken", and detect a permission-denied failure as a privilege problem, not a config error.
-- **Access:** `AttributeNginxTestError(out, ourFile)` (`attribution.go:65-95`); surfaced via `commandError.Error()` (`nginx.go:62-79`) into the apply error / health message.
+- **Access:** `AttributeNginxTestError(out, ourFiles...)` parses the backend output;
+  the backend returns an `errors.As`-compatible `*proxy.Failure` into the apply
+  error / health stream.
 - **Steps (D):** `make test` covers `AttributeNginxTestError` against captured nginx `-t` output (`attribution_test.go`).
 - **Pass:**
   - Fault in our file → `nginx -t failed in the generated config at <file>:<line>` (`Ours==true`, `nginx.go:75-76`).
   - Fault elsewhere → `nginx -t failed: error in your existing config at <file>:<line>` (`Ours==false`, `nginx.go:78`).
-  - Permission denied with no parseable location → the "could not complete with the agent's privileges — permission denied … Grant the agent privilege to run 'nginx -t' / 'nginx -s reload'" message (`nginx.go:69-72`, `permDeniedRe` at `attribution.go:25`).
-  - Comparison is by **base name** so a sites-enabled symlink and its sites-available target attribute to the same managed file (`attribution.go:97-110`).
+  - Permission denied and a missing proxy binary retain concise, distinct messages;
+    unknown unlocated failures retain one short sanitized output line.
+  - Exact clean paths match directly. A sites-enabled path may alias its
+    sites-available sibling only when both have the same case-sensitive basename
+    and parent layout; a foreign root or same basename elsewhere is not ours.
+  - Batch apply compares the blamed path with every artifact staged in that batch,
+    not only the first artifact.
+  - Captured stdout/stderr and exposed evidence are bounded to 8 KiB. Locations
+    are accepted only when absolute, clean, valid UTF-8, control-free, sanitized,
+    and within the separate path-size limit.
   - When several `in file:line` clauses appear, the **last** (innermost) frame is used; `[warn]`/`[alert]` lines are skipped so a benign warning's line never gets blamed (`attribution.go:65-95`).
 - **Coverage:** D.
-- **Pitfalls:** an empty `ourFile` is never "ours" (`attribution.go:102-105`) — `Validate` (standalone) passes `""` so it always attributes to the operator side (`nginx.go:506`).
+- **Pitfalls:** standalone `Validate` supplies no managed artifact candidates, so
+  a located error is never treated as generated-config evidence. `ManagedHint`
+  remains evidence only; recovery must prove ownership separately.
 
 ### Overridable commands + sudo elevation
 - **Must:** operators can override the test and reload commands; an unprivileged agent elevates exactly those two commands via `sudo -n` (scoped sudoers), not by running the whole agent as root.
