@@ -385,6 +385,7 @@ func (r OperationReport) Validate() error {
 		{"repair operation error", r.Error},
 		{"repair operation validation outcome", r.ValidationOutcome},
 		{"repair operation rollback outcome", r.RollbackOutcome},
+		{"repair operation snapshot reference", r.SnapshotReference},
 	} {
 		if err := validateBoundedSanitized(field.name, field.value); err != nil {
 			return err
@@ -394,6 +395,9 @@ func (r OperationReport) Validate() error {
 	for i, step := range r.Steps {
 		if strings.TrimSpace(step.Name) == "" {
 			return fmt.Errorf("repair step %d name is required", i)
+		}
+		if err := validateBoundedSanitized(fmt.Sprintf("repair step %d name", i), step.Name); err != nil {
+			return err
 		}
 		if !step.State.Valid() {
 			return fmt.Errorf("repair step %d has invalid state %q", i, step.State)
@@ -462,9 +466,9 @@ func StableDiagnosticID(agentID string, code Code, resourceFingerprint string) s
 }
 
 var (
-	privateKeyPattern = regexp.MustCompile(`(?is)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\z)`)
-	nginxAuthPattern  = regexp.MustCompile(`(?im)(\bproxy_set_header[ \t]+authorization[ \t]+)[^\n]*`)
-	assignmentPattern = regexp.MustCompile(`(?i)(?:\\?")?([a-z][a-z0-9_-]*)(?:\\?")?\s*[:=]\s*`)
+	privateKeyPattern      = regexp.MustCompile(`(?is)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\z)`)
+	headerDirectivePattern = regexp.MustCompile(`(?i)\b(?:proxy_set_header[ \t]+|requestheader[ \t]+(?:set|add|append)[ \t]+)([a-z][a-z0-9_-]*)[ \t]+`)
+	assignmentPattern      = regexp.MustCompile(`(?i)(?:\\?")?([a-z][a-z0-9_-]*)(?:\\?")?\s*[:=]\s*`)
 )
 
 func SanitizeEvidence(evidence string) string {
@@ -477,7 +481,7 @@ func SanitizeEvidence(evidence string) string {
 		return r
 	}, evidence)
 	evidence = privateKeyPattern.ReplaceAllString(evidence, "[REDACTED]")
-	evidence = nginxAuthPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
+	evidence = redactSensitiveHeaderDirectives(evidence)
 	evidence = redactSensitiveAssignments(evidence)
 	if len(evidence) <= MaxEvidenceBytes {
 		return evidence
@@ -487,6 +491,26 @@ func SanitizeEvidence(evidence string) string {
 		end--
 	}
 	return evidence[:end]
+}
+
+func redactSensitiveHeaderDirectives(value string) string {
+	lines := strings.SplitAfter(value, "\n")
+	for i, line := range lines {
+		location := headerDirectivePattern.FindStringSubmatchIndex(line)
+		if location == nil {
+			continue
+		}
+		header := normalizeSensitiveKey(line[location[2]:location[3]])
+		if !isSensitiveKey(header) {
+			continue
+		}
+		newline := ""
+		if strings.HasSuffix(line, "\n") {
+			newline = "\n"
+		}
+		lines[i] = line[:location[1]] + "[REDACTED]" + newline
+	}
+	return strings.Join(lines, "")
 }
 
 func redactSensitiveAssignments(value string) string {
@@ -540,8 +564,17 @@ func sensitiveValueEnd(value string, start int, throughLine bool) int {
 		return len(value)
 	}
 	if strings.HasPrefix(value[start:], `\"`) {
-		if end := strings.Index(value[start+2:], `\"`); end >= 0 {
-			return start + 2 + end + 2
+		for i := start + 2; i < len(value); i++ {
+			if value[i] != '"' {
+				continue
+			}
+			backslashes := 0
+			for j := i - 1; j >= start && value[j] == '\\'; j-- {
+				backslashes++
+			}
+			if backslashes == 1 {
+				return i + 1
+			}
 		}
 		return len(value)
 	}

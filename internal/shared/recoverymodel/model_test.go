@@ -171,6 +171,11 @@ func TestSanitizeEvidenceRedactsRealisticSecrets(t *testing.T) {
 		{"escaped JSON token", `{"token":"escaped-json-secret"}`, []string{"escaped-json-secret"}},
 		{"escaped JSON camel secret", `{"clientSecret":"escaped client secret"}`, []string{"escaped client secret"}},
 		{"digest authorization with commas", "Authorization: Digest username=admin, realm=private, response=digest-response\nnext=safe", []string{"admin", "private", "digest-response"}},
+		{"log escaped JSON with escaped quote", `{\"password\":\"prefix\\\"still-secret\"}`, []string{"prefix", "still-secret"}},
+		{"apache set authorization", `RequestHeader set Authorization "Bearer apache-secret"`, []string{"apache-secret"}},
+		{"apache add API key", `RequestHeader add X-API-Key "apache-add-secret"`, []string{"apache-add-secret"}},
+		{"apache append authorization", `RequestHeader append Authorization "Digest response=apache-append-secret, nonce=also-secret"`, []string{"apache-append-secret", "also-secret"}},
+		{"nginx API key", `proxy_set_header X-API-Key nginx-secret;`, []string{"nginx-secret"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -184,6 +189,18 @@ func TestSanitizeEvidenceRedactsRealisticSecrets(t *testing.T) {
 				t.Fatalf("sanitized evidence lacks redaction marker: %q", got)
 			}
 		})
+	}
+}
+
+func TestSanitizeEvidencePreservesNonSensitiveHeaderDirectives(t *testing.T) {
+	for _, input := range []string{
+		`RequestHeader set X-Trace-ID "visible"`,
+		`RequestHeader append Cache-Control "private"`,
+		`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`,
+	} {
+		if got := SanitizeEvidence(input); got != input {
+			t.Errorf("non-sensitive header changed:\n got: %q\nwant: %q", got, input)
+		}
 	}
 }
 
@@ -338,6 +355,26 @@ func TestShapeValidation(t *testing.T) {
 		{"report overlong step summary", func() error {
 			v := validReport
 			v.Steps = []Step{{Name: "apply", Summary: strings.Repeat("x", MaxEvidenceBytes+1), State: OperationStateApplying, At: now}}
+			return v.Validate()
+		}},
+		{"report unsafe step name", func() error {
+			v := validReport
+			v.Steps = []Step{{Name: "apply\x00hidden", State: OperationStateApplying, At: now}}
+			return v.Validate()
+		}},
+		{"report overlong step name", func() error {
+			v := validReport
+			v.Steps = []Step{{Name: strings.Repeat("x", MaxEvidenceBytes+1), State: OperationStateApplying, At: now}}
+			return v.Validate()
+		}},
+		{"report unsafe snapshot reference", func() error {
+			v := validReport
+			v.SnapshotReference = "recovery/op\x1bhidden"
+			return v.Validate()
+		}},
+		{"report overlong snapshot reference", func() error {
+			v := validReport
+			v.SnapshotReference = strings.Repeat("x", MaxEvidenceBytes+1)
 			return v.Validate()
 		}},
 	}
