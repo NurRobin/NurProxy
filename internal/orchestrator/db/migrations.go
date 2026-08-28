@@ -510,50 +510,71 @@ var migrations = []string{
 
 	CREATE TABLE recovery_diagnostics (
 		id TEXT PRIMARY KEY,
-		agent_id TEXT NOT NULL,
-		code TEXT NOT NULL,
+		agent_id TEXT NOT NULL REFERENCES agents(id),
+		code TEXT NOT NULL CHECK (code IN (
+			'managed_orphan_config', 'managed_stale_temp', 'managed_cert_file_missing',
+			'managed_runtime_key_missing', 'managed_runtime_key_mismatch',
+			'generated_config_invalid', 'operator_config_invalid', 'permission_denied',
+			'systemd_sandbox_denied', 'proxy_reload_failed', 'proxy_not_running',
+			'port_conflict', 'proxy_binary_missing', 'unknown_proxy_error'
+		)),
 		subsystem TEXT NOT NULL,
-		severity TEXT NOT NULL,
-		ownership TEXT NOT NULL,
+		severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+		ownership TEXT NOT NULL CHECK (ownership IN ('nurproxy', 'operator', 'system', 'unknown')),
 		summary TEXT NOT NULL,
 		evidence TEXT NOT NULL DEFAULT '',
 		affected_paths TEXT NOT NULL DEFAULT '[]',
 		resource_fingerprint TEXT NOT NULL,
-		proposed_action TEXT NOT NULL DEFAULT '',
-		auto_repair_eligible INTEGER NOT NULL DEFAULT 0,
-		hard_change INTEGER NOT NULL DEFAULT 0,
-		first_seen_at TEXT NOT NULL,
-		last_seen_at TEXT NOT NULL,
-		occurrences INTEGER NOT NULL DEFAULT 1,
-		resolved_at TEXT
+		proposed_action TEXT NOT NULL DEFAULT '' CHECK (proposed_action IN (
+			'', 'prune_managed_orphan', 'remove_managed_temp', 'rematerialize_cert_bundle',
+			'rematerialize_runtime_key', 'restore_last_live_artifact'
+		)),
+		auto_repair_eligible INTEGER NOT NULL DEFAULT 0 CHECK (auto_repair_eligible IN (0, 1)),
+		hard_change INTEGER NOT NULL DEFAULT 0 CHECK (hard_change IN (0, 1)),
+		first_seen_at INTEGER NOT NULL,
+		last_seen_at INTEGER NOT NULL,
+		occurrences INTEGER NOT NULL DEFAULT 1 CHECK (occurrences >= 1),
+		resolved_at INTEGER,
+		UNIQUE(agent_id, id)
 	);
 	CREATE UNIQUE INDEX idx_recovery_diagnostics_identity
 		ON recovery_diagnostics(agent_id, code, resource_fingerprint);
 	CREATE INDEX idx_recovery_diagnostics_agent_active
-		ON recovery_diagnostics(agent_id, resolved_at, severity);
+		ON recovery_diagnostics(agent_id, resolved_at, last_seen_at DESC, id);
+	CREATE INDEX idx_recovery_diagnostics_agent_seen
+		ON recovery_diagnostics(agent_id, last_seen_at DESC, id);
 
 	CREATE TABLE recovery_operations (
 		id TEXT PRIMARY KEY,
-		agent_id TEXT NOT NULL,
+		agent_id TEXT NOT NULL REFERENCES agents(id),
 		diagnostic_id TEXT NOT NULL,
-		action TEXT NOT NULL,
+		action TEXT NOT NULL CHECK (action IN (
+			'prune_managed_orphan', 'remove_managed_temp', 'rematerialize_cert_bundle',
+			'rematerialize_runtime_key', 'restore_last_live_artifact'
+		)),
 		resource_fingerprint TEXT NOT NULL,
-		risk TEXT NOT NULL DEFAULT 'safe',
-		request_source TEXT NOT NULL,
-		state TEXT NOT NULL,
+		risk TEXT NOT NULL DEFAULT 'safe' CHECK (risk = 'safe'),
+		request_source TEXT NOT NULL CHECK (request_source IN ('automatic', 'user')),
+		state TEXT NOT NULL CHECK (state IN (
+			'detected', 'diagnosis_only', 'planned', 'snapshotted', 'applying',
+			'validating', 'succeeded', 'rolling_back', 'rolled_back',
+			'rollback_failed', 'suppressed'
+		)),
 		step_summaries TEXT NOT NULL DEFAULT '[]',
 		snapshot_reference TEXT NOT NULL DEFAULT '',
 		validation_outcome TEXT NOT NULL DEFAULT '',
 		rollback_outcome TEXT NOT NULL DEFAULT '',
 		error TEXT NOT NULL DEFAULT '',
-		started_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL,
-		finished_at TEXT
+		started_at INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		received_at INTEGER NOT NULL,
+		finished_at INTEGER,
+		FOREIGN KEY (agent_id, diagnostic_id) REFERENCES recovery_diagnostics(agent_id, id)
 	);
-	CREATE INDEX idx_recovery_operations_agent_started
-		ON recovery_operations(agent_id, started_at DESC);
+	CREATE INDEX idx_recovery_operations_agent_created
+		ON recovery_operations(agent_id, created_at DESC, id DESC);
 	CREATE INDEX idx_recovery_operations_breaker
-		ON recovery_operations(agent_id, action, resource_fingerprint, state, started_at);
+		ON recovery_operations(agent_id, action, resource_fingerprint, state, created_at);
 	`,
 }
 

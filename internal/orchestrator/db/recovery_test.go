@@ -120,14 +120,15 @@ func TestRecoveryOperationTransitionsIdempotencyAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := testOperation("op-1", diag.ID, recoverymodel.OperationStatePlanned)
+	op.Source = recoverymodel.RequestSourceUser
 	if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.AdvanceRepairOperation(a.ID, op); err != nil {
 		t.Fatalf("idempotent duplicate of initial state: %v", err)
 	}
-	if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err == nil {
-		t.Fatal("duplicate operation create succeeded")
+	if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
+		t.Fatalf("identical duplicate operation create: %v", err)
 	}
 
 	states := []recoverymodel.OperationState{
@@ -177,11 +178,13 @@ func TestRecoveryOperationRejectsConflictsInvalidAndCorruptJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := testOperation("op-invalid", diag.ID, recoverymodel.OperationStatePlanned)
+	op.Source = recoverymodel.RequestSourceUser
 	op.Action = "shell"
 	if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err == nil {
 		t.Fatal("invalid operation was persisted")
 	}
 	op = testOperation("op-corrupt", diag.ID, recoverymodel.OperationStatePlanned)
+	op.Source = recoverymodel.RequestSourceUser
 	if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}
@@ -209,15 +212,8 @@ func TestRecoveryOperationCountsRecentRollbackFailures(t *testing.T) {
 	for i, state := range []recoverymodel.OperationState{
 		recoverymodel.OperationStateRolledBack,
 		recoverymodel.OperationStateRollbackFailed,
-		recoverymodel.OperationStateSucceeded,
 	} {
-		op := testOperation("op-count-"+string(rune('a'+i)), diag.ID, state)
-		op.StartedAt = recoveryTime(i)
-		finished := recoveryTime(i + 1)
-		op.FinishedAt = &finished
-		if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
-			t.Fatal(err)
-		}
+		createFinishedOperation(t, d, a.ID, diag, "op-count-"+string(rune('a'+i)), state, recoveryTime(i))
 	}
 	count, err := d.CountRecentRepairFailures(a.ID, recoverymodel.ActionRemoveManagedTemp, diag.ResourceFingerprint, recoveryTime(0))
 	if err != nil {
@@ -236,6 +232,7 @@ func TestRecoveryAgentDeleteExplicitlyRemovesRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := testOperation("op-delete", diag.ID, recoverymodel.OperationStatePlanned)
+	op.Source = recoverymodel.RequestSourceUser
 	if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}

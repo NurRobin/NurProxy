@@ -406,11 +406,6 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		detectedAt = &s
 	}
 	caps := encodeCapabilities(a.ProxyCapabilities)
-	recoveryCapability, err := encodeRecoveryCapability(a.RecoveryCapability)
-	if err != nil {
-		return err
-	}
-
 	res, err := d.sql.Exec(`
 		UPDATE agents
 		SET name = ?, fqdn = ?, api_url = ?, token_hash = ?,
@@ -423,7 +418,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 			detected_log_paths = ?, detected_port_conflicts = ?,
 			detected_upstreams = ?, detected_networks = ?,
 			detected_installed = ?, detected_at = ?, detected_capabilities = ?,
-			auto_reconcile_config = ?, safe_auto_repair_override = ?, recovery_capability = ?,
+			auto_reconcile_config = ?,
 			updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.FQDN, a.APIURL, a.TokenHash,
@@ -433,7 +428,6 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		det.kind, det.version, det.binaryPath, det.configDir,
 		det.logPaths, det.portConflicts, det.upstreams, det.networks, det.installed, detectedAt, caps,
 		boolToInt(a.AutoReconcileConfig),
-		nullableBoolValue(a.SafeAutoRepairOverride), recoveryCapability,
 		a.UpdatedAt.Format(time.RFC3339),
 		a.ID,
 	)

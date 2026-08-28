@@ -153,4 +153,35 @@ func TestAgentSafeAutoRepairOverrideRejectsCorruptStoredBoolean(t *testing.T) {
 	}
 }
 
+func TestAgentGenericUpdateDoesNotClobberNarrowRecoveryFields(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	stale, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled := false
+	capability := &recoverymodel.Capability{Stage: 1, Actions: []recoverymodel.Action{recoverymodel.ActionRemoveManagedTemp}}
+	if err := d.SetAgentSafeAutoRepairOverride(a.ID, &disabled); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateAgentRecoveryCapability(a.ID, capability); err != nil {
+		t.Fatal(err)
+	}
+	stale.Name = "ordinary edit from stale representation"
+	if err := d.UpdateAgent(stale); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetAgent(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SafeAutoRepairOverride == nil || *got.SafeAutoRepairOverride {
+		t.Fatalf("generic update clobbered override: %v", got.SafeAutoRepairOverride)
+	}
+	if got.RecoveryCapability == nil || got.RecoveryCapability.Stage != 1 {
+		t.Fatalf("generic update clobbered capability: %#v", got.RecoveryCapability)
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }
