@@ -233,6 +233,7 @@ func TestFailureErrorKeepsVisibleDiagnosticCategories(t *testing.T) {
 			make: func() *Failure {
 				return NewFailure(KindApache, FailurePhaseValidate, "", &ExecutionError{
 					Executable: "/usr/sbin/apachectl",
+					Role:       ExecutionRoleBackend,
 					Err:        &exec.Error{Name: "apachectl", Err: exec.ErrNotFound},
 				})
 			},
@@ -262,14 +263,16 @@ func TestNewFailureBinaryMissingRequiresExecutionEvidence(t *testing.T) {
 		err     error
 		want    bool
 	}{
-		{name: "typed nginx executable", backend: KindNginx, err: &ExecutionError{Executable: "/usr/sbin/nginx", Err: &os.PathError{Op: "fork/exec", Path: "/usr/sbin/nginx", Err: os.ErrNotExist}}, want: true},
-		{name: "typed apachectl executable", backend: KindApache, err: &ExecutionError{Executable: "/usr/sbin/apachectl", Err: &exec.Error{Name: "apachectl", Err: exec.ErrNotFound}}, want: true},
-		{name: "typed apache2 alias", backend: KindApache, err: &ExecutionError{Executable: "/usr/sbin/apache2", Err: exec.ErrNotFound}, want: true},
-		{name: "nested typed identity", backend: KindNginx, err: fmt.Errorf("validate: %w", &ExecutionError{Executable: "nginx", Err: exec.ErrNotFound}), want: true},
-		{name: "missing sudo is not backend", backend: KindNginx, err: &ExecutionError{Executable: "/usr/bin/sudo", Err: exec.ErrNotFound}},
-		{name: "missing custom wrapper is not backend", backend: KindNginx, err: &ExecutionError{Executable: "/opt/bin/nginx-wrapper", Err: exec.ErrNotFound}},
-		{name: "other backend executable", backend: KindNginx, err: &ExecutionError{Executable: "/usr/sbin/apachectl", Err: exec.ErrNotFound}},
-		{name: "typed ordinary file miss", backend: KindNginx, err: &ExecutionError{Executable: "nginx", Err: os.ErrNotExist}},
+		{name: "typed nginx executable", backend: KindNginx, err: &ExecutionError{Executable: "/usr/sbin/nginx", Role: ExecutionRoleBackend, Err: &os.PathError{Op: "fork/exec", Path: "/usr/sbin/nginx", Err: os.ErrNotExist}}, want: true},
+		{name: "typed apachectl executable", backend: KindApache, err: &ExecutionError{Executable: "/usr/sbin/apachectl", Role: ExecutionRoleBackend, Err: &exec.Error{Name: "apachectl", Err: exec.ErrNotFound}}, want: true},
+		{name: "typed apache2 alias", backend: KindApache, err: &ExecutionError{Executable: "/usr/sbin/apache2", Role: ExecutionRoleBackend, Err: exec.ErrNotFound}, want: true},
+		{name: "nested typed identity", backend: KindNginx, err: fmt.Errorf("validate: %w", &ExecutionError{Executable: "nginx", Role: ExecutionRoleBackend, Err: exec.ErrNotFound}), want: true},
+		{name: "same-name override", backend: KindNginx, err: &ExecutionError{Executable: "/tmp/nginx", Role: ExecutionRoleOverride, Err: exec.ErrNotFound}},
+		{name: "same-name system wrapper", backend: KindApache, err: &ExecutionError{Executable: "/tmp/httpd", Role: ExecutionRoleSystem, Err: exec.ErrNotFound}},
+		{name: "missing sudo is not backend", backend: KindNginx, err: &ExecutionError{Executable: "/usr/bin/sudo", Role: ExecutionRoleSystem, Err: exec.ErrNotFound}},
+		{name: "missing custom wrapper is not backend", backend: KindNginx, err: &ExecutionError{Executable: "/opt/bin/nginx-wrapper", Role: ExecutionRoleOverride, Err: exec.ErrNotFound}},
+		{name: "other backend executable", backend: KindNginx, err: &ExecutionError{Executable: "/usr/sbin/apachectl", Role: ExecutionRoleBackend, Err: exec.ErrNotFound}},
+		{name: "typed ordinary file miss", backend: KindNginx, err: &ExecutionError{Executable: "nginx", Role: ExecutionRoleBackend, Err: os.ErrNotExist}},
 		{name: "untyped exec sentinel", backend: KindNginx, err: exec.ErrNotFound},
 		{name: "untyped exec error", backend: KindNginx, err: &exec.Error{Name: "nginx", Err: exec.ErrNotFound}},
 		{name: "untyped fork exec path error", backend: KindNginx, err: &os.PathError{Op: "fork/exec", Path: "/missing/nginx", Err: os.ErrNotExist}},
@@ -348,16 +351,28 @@ func TestRunCombinedOutputWrapsOnlyStartErrorsWithExecutableIdentity(t *testing.
 	if executionErr.Executable != missingNginx {
 		t.Fatalf("Executable = %q, want %q", executionErr.Executable, missingNginx)
 	}
+	if executionErr.Role != ExecutionRoleSystem {
+		t.Fatalf("generic execution role = %q, want system", executionErr.Role)
+	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("ExecutionError does not unwrap to the original missing-file cause")
 	}
 	failure := NewFailure(KindNginx, FailurePhaseValidate, "", fmt.Errorf("nested: %w", err))
-	if !failure.BinaryMissing || !errors.Is(failure, os.ErrNotExist) {
-		t.Fatalf("failure = %#v, want verified nested missing nginx", failure)
+	if failure.BinaryMissing || !errors.Is(failure, os.ErrNotExist) {
+		t.Fatalf("failure = %#v, want generic execution to remain unknown", failure)
 	}
 	var nestedExecution *ExecutionError
-	if !errors.As(failure, &nestedExecution) || nestedExecution.Executable != missingNginx {
+	if !errors.As(failure, &nestedExecution) || nestedExecution.Executable != missingNginx || nestedExecution.Role != ExecutionRoleSystem {
 		t.Fatalf("Failure did not preserve typed execution identity: %#v", nestedExecution)
+	}
+
+	_, backendErr := RunBackendCombinedOutput(exec.Command(missingNginx, "-t"))
+	backendFailure := NewFailure(KindNginx, FailurePhaseValidate, "", fmt.Errorf("nested: %w", backendErr))
+	if !backendFailure.BinaryMissing || !errors.Is(backendFailure, os.ErrNotExist) {
+		t.Fatalf("failure = %#v, want verified backend execution", backendFailure)
+	}
+	if !errors.As(backendFailure, &nestedExecution) || nestedExecution.Role != ExecutionRoleBackend {
+		t.Fatalf("backend execution role not preserved: %#v", nestedExecution)
 	}
 	for _, name := range []string{"sudo", "nginx-wrapper"} {
 		missingWrapper := filepath.Join(t.TempDir(), name)

@@ -53,8 +53,17 @@ type Failure struct {
 
 type ExecutionError struct {
 	Executable string
+	Role       ExecutionRole
 	Err        error
 }
+
+type ExecutionRole string
+
+const (
+	ExecutionRoleBackend  ExecutionRole = "backend"
+	ExecutionRoleOverride ExecutionRole = "override"
+	ExecutionRoleSystem   ExecutionRole = "system"
+)
 
 func (e *ExecutionError) Error() string {
 	return "starting proxy executable failed"
@@ -191,7 +200,7 @@ func apacheMissingDirectiveLine(line, directive string) bool {
 
 func isBinaryMissing(backend Kind, err error) bool {
 	var executionErr *ExecutionError
-	if !errors.As(err, &executionErr) || !backendExecutable(backend, executionErr.Executable) {
+	if !errors.As(err, &executionErr) || executionErr.Role != ExecutionRoleBackend || !backendExecutable(backend, executionErr.Executable) {
 		return false
 	}
 	return missingExecutionCause(executionErr.Err)
@@ -341,6 +350,18 @@ func (w *boundedOutputWriter) String() string {
 }
 
 func RunCombinedOutput(cmd *exec.Cmd) (string, error) {
+	return runCombinedOutput(cmd, ExecutionRoleSystem)
+}
+
+func RunBackendCombinedOutput(cmd *exec.Cmd) (string, error) {
+	return runCombinedOutput(cmd, ExecutionRoleBackend)
+}
+
+func RunOverrideCombinedOutput(cmd *exec.Cmd) (string, error) {
+	return runCombinedOutput(cmd, ExecutionRoleOverride)
+}
+
+func runCombinedOutput(cmd *exec.Cmd, role ExecutionRole) (string, error) {
 	w := newBoundedOutputWriter()
 	cmd.Stdout = w
 	cmd.Stderr = w
@@ -348,7 +369,7 @@ func RunCombinedOutput(cmd *exec.Cmd) (string, error) {
 	if err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
-			err = &ExecutionError{Executable: cmd.Path, Err: err}
+			err = &ExecutionError{Executable: cmd.Path, Role: role, Err: err}
 		}
 	}
 	return w.String(), err

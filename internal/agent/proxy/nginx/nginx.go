@@ -678,17 +678,27 @@ type execRunner struct {
 // Test runs nginx -t (or the configured override) and returns combined output.
 func (r *execRunner) Test(ctx context.Context) (string, error) {
 	cmd := r.command(ctx, r.testCmd, "-t")
-	return proxy.RunCombinedOutput(cmd)
+	return runCombinedOutput(cmd, r.testCmd)
 }
 
 // Reload runs nginx -s reload (or the configured override).
 func (r *execRunner) Reload(ctx context.Context) error {
 	cmd := r.command(ctx, r.reloadCmd, "-s", "reload")
-	out, err := proxy.RunCombinedOutput(cmd)
+	out, err := runCombinedOutput(cmd, r.reloadCmd)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func runCombinedOutput(cmd *exec.Cmd, override string) (string, error) {
+	if override != "" {
+		return proxy.RunOverrideCombinedOutput(cmd)
+	}
+	if filepath.Base(cmd.Path) == "sudo" {
+		return proxy.RunCombinedOutput(cmd)
+	}
+	return proxy.RunBackendCombinedOutput(cmd)
 }
 
 // command builds the exec.Cmd for a step. It resolves the privileged command

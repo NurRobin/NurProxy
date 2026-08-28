@@ -511,6 +511,36 @@ func TestValidate_missingNginxExecutableReturnsBinaryFailure(t *testing.T) {
 	if !failure.BinaryMissing {
 		t.Fatalf("failure = %#v, want verified missing nginx", failure)
 	}
+	var executionErr *proxy.ExecutionError
+	if !errors.As(failure, &executionErr) || executionErr.Role != proxy.ExecutionRoleBackend {
+		t.Fatalf("execution error = %#v, want backend role", executionErr)
+	}
+}
+
+func TestExecRunnerSameNameOverridesAreNotBackendBinaryFailures(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	for _, step := range []string{"test", "reload"} {
+		t.Run(step, func(t *testing.T) {
+			missing := filepath.Join(t.TempDir(), "nginx")
+			r := &execRunner{binary: "/usr/sbin/nginx"}
+			var err error
+			if step == "test" {
+				r.testCmd = missing
+				_, err = r.Test(context.Background())
+			} else {
+				r.reloadCmd = missing
+				err = r.Reload(context.Background())
+			}
+			failure := proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, "", err)
+			if failure.BinaryMissing {
+				t.Fatalf("same-name %s override was mistaken for backend binary: %#v", step, failure)
+			}
+			var executionErr *proxy.ExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Role != proxy.ExecutionRoleOverride {
+				t.Fatalf("execution error = %#v, want override role", executionErr)
+			}
+		})
+	}
 }
 
 func TestValidate_permissionErrorReturnsTypedFailure(t *testing.T) {
