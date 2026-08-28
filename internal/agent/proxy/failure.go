@@ -51,6 +51,22 @@ type Failure struct {
 	Err                error
 }
 
+type ExecutionError struct {
+	Executable string
+	Err        error
+}
+
+func (e *ExecutionError) Error() string {
+	return "starting proxy executable failed"
+}
+
+func (e *ExecutionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 func NewFailure(backend Kind, phase FailurePhase, output string, err error) *Failure {
 	f := &Failure{
 		Backend: backend,
@@ -58,7 +74,7 @@ func NewFailure(backend Kind, phase FailurePhase, output string, err error) *Fai
 		Output:  boundedFailureOutput(output, len(output) > MaxFailureCaptureBytes),
 		Err:     err,
 	}
-	f.BinaryMissing = isBinaryMissing(err)
+	f.BinaryMissing = isBinaryMissing(backend, err)
 	f.Permission = errors.Is(err, os.ErrPermission) || permissionOutput(f.Output)
 	f.classifyKnownOutput(f.Output)
 	return f
@@ -109,29 +125,32 @@ func (f *Failure) Unwrap() error {
 }
 
 func (f *Failure) commandLabel() string {
-	if f.Phase == FailurePhaseValidate {
-		switch f.Backend {
-		case KindNginx:
+	switch f.Backend {
+	case KindNginx:
+		switch f.Phase {
+		case FailurePhaseValidate:
 			return "nginx -t"
-		case KindApache:
+		case FailurePhaseReload:
+			return "nginx reload"
+		case FailurePhaseCertInstall:
+			return "nginx certificate installation"
+		}
+	case KindApache:
+		switch f.Phase {
+		case FailurePhaseValidate:
 			return "apachectl configtest"
+		case FailurePhaseReload:
+			return "apache reload"
+		case FailurePhaseCertInstall:
+			return "apache certificate installation"
 		}
 	}
-	backend := strings.TrimSpace(string(f.Backend))
-	if backend == "" {
-		backend = "proxy"
-	}
-	switch f.Phase {
-	case FailurePhaseReload:
-		return backend + " reload"
-	case FailurePhaseCertInstall:
-		return backend + " certificate installation"
-	default:
-		return backend + " operation"
-	}
+	return "proxy operation"
 }
 
 var nginxEmergLine = regexp.MustCompile(`(?i)^(?:nginx: \[emerg\]|[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]+ \[emerg\] [0-9]+#[0-9]+:) `)
+var nginxPermissionLine = regexp.MustCompile(`(?i)^(?:nginx: \[(?:emerg|alert)\]|[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]+ \[(?:emerg|alert)\] [0-9]+#[0-9]+:) `)
+var apachePermissionLine = regexp.MustCompile(`(?i)^\([0-9]+\)(?:permission denied|operation not permitted): ah00091: (?:apache2|httpd): .+$`)
 var wrappedCommandOutputLine = regexp.MustCompile(`(?i)^exit status [0-9]+: (.+)$`)
 
 func (f *Failure) classifyKnownOutput(output string) {
@@ -170,11 +189,30 @@ func apacheMissingDirectiveLine(line, directive string) bool {
 	return strings.HasPrefix(line, directive) && strings.HasSuffix(line, "' does not exist or is empty")
 }
 
-func isBinaryMissing(err error) bool {
-	if err == nil {
+func isBinaryMissing(backend Kind, err error) bool {
+	var executionErr *ExecutionError
+	if !errors.As(err, &executionErr) || !backendExecutable(backend, executionErr.Executable) {
 		return false
 	}
-	if errors.Is(err, exec.ErrNotFound) {
+	return missingExecutionCause(executionErr.Err)
+}
+
+func backendExecutable(backend Kind, executable string) bool {
+	name := filepath.Base(filepath.Clean(executable))
+	switch backend {
+	case KindNginx:
+		return name == "nginx"
+	case KindApache:
+		switch name {
+		case "apachectl", "apache2ctl", "httpd", "apache2":
+			return true
+		}
+	}
+	return false
+}
+
+func missingExecutionCause(err error) bool {
+	if err == exec.ErrNotFound {
 		return true
 	}
 	var execErr *exec.Error
@@ -199,7 +237,7 @@ func permissionOutput(output string) bool {
 			return true
 		case strings.HasPrefix(line, "sudo: ") && strings.Contains(line, " is not allowed to execute "):
 			return true
-		case (nginxEmergLine.MatchString(rawLine) || strings.HasPrefix(line, "httpd:") || strings.HasPrefix(line, "apache2:")) &&
+		case (nginxPermissionLine.MatchString(rawLine) || strings.HasPrefix(line, "httpd:") || strings.HasPrefix(line, "apache2:") || apachePermissionLine.MatchString(line)) &&
 			(strings.Contains(line, "permission denied") || strings.Contains(line, "operation not permitted")):
 			return true
 		}
@@ -307,5 +345,11 @@ func RunCombinedOutput(cmd *exec.Cmd) (string, error) {
 	cmd.Stdout = w
 	cmd.Stderr = w
 	err := cmd.Run()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			err = &ExecutionError{Executable: cmd.Path, Err: err}
+		}
+	}
 	return w.String(), err
 }

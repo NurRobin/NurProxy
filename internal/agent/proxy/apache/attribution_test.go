@@ -131,6 +131,17 @@ func TestAttributeConfigtestErrorPermissionRequiresCommandLineShape(t *testing.T
 	if got := AttributeConfigtestError("sudo: a password is required"); !got.Permission {
 		t.Fatalf("sudo denial lacked Permission: %#v", got)
 	}
+	for _, out := range []string{
+		`(13)Permission denied: AH00091: apache2: could not open error log file /var/log/apache2/error.log.`,
+		`(1)Operation not permitted: AH00091: httpd: could not open error log file /var/log/httpd/error_log.`,
+	} {
+		if got := AttributeConfigtestError(out); !got.Permission {
+			t.Fatalf("real AH00091 denial lacked Permission: %#v", got)
+		}
+	}
+	if got := AttributeConfigtestError("guide: (13)Permission denied: AH00091: apache2"); got.Permission {
+		t.Fatalf("prefixed prose gained Permission: %#v", got)
+	}
 }
 
 func TestAttributeConfigtestErrorDetectsPermissionDenied(t *testing.T) {

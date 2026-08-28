@@ -159,4 +159,12 @@ func TestAttributeNginxTestErrorPermissionRequiresCommandLineShape(t *testing.T)
 	if got := AttributeNginxTestError("sudo: a password is required"); !got.Permission {
 		t.Fatalf("sudo denial lacked Permission: %#v", got)
 	}
+	for _, out := range []string{
+		`nginx: [alert] open() "/run/nginx.pid" failed (1: Operation not permitted)`,
+		`2026/08/29 01:20:31 [alert] 4242#4242: open() "/run/nginx.pid" failed (1: Operation not permitted)`,
+	} {
+		if got := AttributeNginxTestError(out); !got.Permission {
+			t.Fatalf("real alert denial lacked Permission: %#v", got)
+		}
+	}
 }

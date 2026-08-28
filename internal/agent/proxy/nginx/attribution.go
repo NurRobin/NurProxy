@@ -22,7 +22,7 @@ var nginxErrRe = regexp.MustCompile(`in (\S+):(\d+)`)
 // unprivileged) cannot read files nginx -t touches, e.g. other vhosts' TLS
 // private keys or the error log. That is NOT a config error in any file; it means
 // the agent needs privilege to run nginx -t / reload (§12).
-var permDeniedRe = regexp.MustCompile(`(?im)^(?:(?:nginx: \[(?:emerg|alert)\]|[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]+ \[(?:emerg|alert)\] [0-9]+#[0-9]+:).*(?:permission denied|operation not permitted)|sudo: .*(?:a password is required|no tty present and no askpass program specified| is not allowed to execute .*))$`)
+var permDeniedRe = regexp.MustCompile(`(?im)^(?:(?:nginx: \[(?:emerg|alert)\]|[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]+ \[(?:emerg|alert)\] [0-9]+#[0-9]+:).*(?:permission denied|operation not permitted).*|sudo: .*(?:a password is required|no tty present and no askpass program specified| is not allowed to execute .*))$`)
 
 // ErrAttribution classifies an nginx -t failure as either ours (the file this
 // apply wrote) or the operator's pre-existing config elsewhere in the managed

@@ -127,6 +127,9 @@
   - Fault elsewhere → `nginx -t failed: error in your existing config at <file>:<line>` (`Ours==false`, `nginx.go:78`).
   - Permission denied and a missing proxy binary retain concise, distinct messages;
     unknown unlocated failures retain one short sanitized output line.
+  - `proxy_binary_missing` evidence requires a typed process-start failure whose
+    attempted executable is exactly nginx. A missing `sudo` binary or custom
+    wrapper remains unknown rather than blaming nginx itself.
   - Exact clean paths match directly. A sites-enabled path may alias its
     sites-available sibling only when both have the same case-sensitive basename
     and parent layout; a foreign root or same basename elsewhere is not ours.

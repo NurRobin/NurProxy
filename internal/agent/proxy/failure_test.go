@@ -61,10 +61,9 @@ func TestNewFailureRecognizesOnlyKnownBackendMessages(t *testing.T) {
 			wantRuntimeKeyMismatch: true,
 		},
 		{
-			name:              "binary missing",
-			backend:           KindNginx,
-			err:               exec.ErrNotFound,
-			wantBinaryMissing: true,
+			name:    "untyped binary error has no identity",
+			backend: KindNginx,
+			err:     exec.ErrNotFound,
 		},
 		{
 			name:    "unknown output has no repair hint",
@@ -232,7 +231,10 @@ func TestFailureErrorKeepsVisibleDiagnosticCategories(t *testing.T) {
 		{
 			name: "binary missing",
 			make: func() *Failure {
-				return NewFailure(KindApache, FailurePhaseValidate, "", &exec.Error{Name: "apachectl", Err: exec.ErrNotFound})
+				return NewFailure(KindApache, FailurePhaseValidate, "", &ExecutionError{
+					Executable: "/usr/sbin/apachectl",
+					Err:        &exec.Error{Name: "apachectl", Err: exec.ErrNotFound},
+				})
 			},
 			want: "apachectl configtest failed: proxy binary missing",
 		},
@@ -255,20 +257,29 @@ func TestFailureErrorKeepsVisibleDiagnosticCategories(t *testing.T) {
 
 func TestNewFailureBinaryMissingRequiresExecutionEvidence(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		want bool
+		name    string
+		backend Kind
+		err     error
+		want    bool
 	}{
-		{name: "exec sentinel", err: exec.ErrNotFound, want: true},
-		{name: "exec error", err: &exec.Error{Name: "nginx", Err: exec.ErrNotFound}, want: true},
-		{name: "fork exec path error", err: &os.PathError{Op: "fork/exec", Path: "/missing/nginx", Err: os.ErrNotExist}, want: true},
-		{name: "plain not exist", err: os.ErrNotExist},
-		{name: "wrapped plain not exist", err: fmt.Errorf("config vanished: %w", os.ErrNotExist)},
-		{name: "open path error", err: &os.PathError{Op: "open", Path: "/etc/nginx/nginx.conf", Err: os.ErrNotExist}},
+		{name: "typed nginx executable", backend: KindNginx, err: &ExecutionError{Executable: "/usr/sbin/nginx", Err: &os.PathError{Op: "fork/exec", Path: "/usr/sbin/nginx", Err: os.ErrNotExist}}, want: true},
+		{name: "typed apachectl executable", backend: KindApache, err: &ExecutionError{Executable: "/usr/sbin/apachectl", Err: &exec.Error{Name: "apachectl", Err: exec.ErrNotFound}}, want: true},
+		{name: "typed apache2 alias", backend: KindApache, err: &ExecutionError{Executable: "/usr/sbin/apache2", Err: exec.ErrNotFound}, want: true},
+		{name: "nested typed identity", backend: KindNginx, err: fmt.Errorf("validate: %w", &ExecutionError{Executable: "nginx", Err: exec.ErrNotFound}), want: true},
+		{name: "missing sudo is not backend", backend: KindNginx, err: &ExecutionError{Executable: "/usr/bin/sudo", Err: exec.ErrNotFound}},
+		{name: "missing custom wrapper is not backend", backend: KindNginx, err: &ExecutionError{Executable: "/opt/bin/nginx-wrapper", Err: exec.ErrNotFound}},
+		{name: "other backend executable", backend: KindNginx, err: &ExecutionError{Executable: "/usr/sbin/apachectl", Err: exec.ErrNotFound}},
+		{name: "typed ordinary file miss", backend: KindNginx, err: &ExecutionError{Executable: "nginx", Err: os.ErrNotExist}},
+		{name: "untyped exec sentinel", backend: KindNginx, err: exec.ErrNotFound},
+		{name: "untyped exec error", backend: KindNginx, err: &exec.Error{Name: "nginx", Err: exec.ErrNotFound}},
+		{name: "untyped fork exec path error", backend: KindNginx, err: &os.PathError{Op: "fork/exec", Path: "/missing/nginx", Err: os.ErrNotExist}},
+		{name: "plain not exist", backend: KindNginx, err: os.ErrNotExist},
+		{name: "wrapped plain not exist", backend: KindNginx, err: fmt.Errorf("config vanished: %w", os.ErrNotExist)},
+		{name: "open path error", backend: KindNginx, err: &os.PathError{Op: "open", Path: "/etc/nginx/nginx.conf", Err: os.ErrNotExist}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := NewFailure(KindNginx, FailurePhaseValidate, "", tt.err)
+			got := NewFailure(tt.backend, FailurePhaseValidate, "", tt.err)
 			if got.BinaryMissing != tt.want {
 				t.Fatalf("BinaryMissing = %v, want %v for %T", got.BinaryMissing, tt.want, tt.err)
 			}
@@ -289,13 +300,101 @@ func TestNewFailurePermissionDetectionAcrossPhases(t *testing.T) {
 		{name: "sudo no tty", phase: FailurePhaseReload, output: "sudo: no tty present and no askpass program specified", want: true},
 		{name: "sudo denied", phase: FailurePhaseValidate, output: "sudo: main is not allowed to execute '/usr/sbin/nginx -t' as root on host", want: true},
 		{name: "command permission denied", phase: FailurePhaseValidate, output: "nginx: [emerg] open() failed (13: Permission denied)", want: true},
+		{name: "nginx alert operation denied", phase: FailurePhaseValidate, output: `nginx: [alert] open() "/var/log/nginx/error.log" failed (1: Operation not permitted)`, want: true},
+		{name: "timestamped nginx alert operation denied", phase: FailurePhaseReload, output: `2026/08/29 01:20:31 [alert] 4242#4242: open() "/run/nginx.pid" failed (1: Operation not permitted)`, want: true},
+		{name: "apache numeric permission prefix", phase: FailurePhaseValidate, output: `(13)Permission denied: AH00091: apache2: could not open error log file /var/log/apache2/error.log.`, want: true},
+		{name: "httpd numeric operation prefix", phase: FailurePhaseReload, output: `(1)Operation not permitted: AH00091: httpd: could not open error log file /var/log/httpd/error_log.`, want: true},
 		{name: "near miss prose", phase: FailurePhaseValidate, output: "documentation mentions permission denied handling", want: false},
+		{name: "near miss nginx alert prose", phase: FailurePhaseValidate, output: "guide: nginx: [alert] means Operation not permitted", want: false},
+		{name: "near miss apache numeric prose", phase: FailurePhaseValidate, output: "guide: (13)Permission denied: AH00091: apache2", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := NewFailure(KindNginx, tt.phase, tt.output, tt.err)
 			if got.Permission != tt.want {
 				t.Fatalf("Permission = %v, want %v", got.Permission, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewFailureRecognizesPermissionFromReloadExitError(t *testing.T) {
+	sh, lookupErr := exec.LookPath("sh")
+	if lookupErr != nil {
+		t.Skip("sh unavailable")
+	}
+	exitErr := exec.Command(sh, "-c", "exit 1").Run()
+	var typedExit *exec.ExitError
+	if !errors.As(exitErr, &typedExit) {
+		t.Fatalf("setup error = %T, want *exec.ExitError", exitErr)
+	}
+	out := `exit status 1: 2026/08/29 01:20:31 [alert] 4242#4242: open() "/run/nginx.pid" failed (1: Operation not permitted)`
+	failure := NewFailure(KindNginx, FailurePhaseReload, out, exitErr)
+	if !failure.Permission || failure.BinaryMissing {
+		t.Fatalf("failure = %#v, want permission-only reload failure", failure)
+	}
+	if !errors.Is(failure, exitErr) {
+		t.Fatal("Failure did not preserve the original ExitError")
+	}
+}
+
+func TestRunCombinedOutputWrapsOnlyStartErrorsWithExecutableIdentity(t *testing.T) {
+	missingNginx := filepath.Join(t.TempDir(), "nginx")
+	_, err := RunCombinedOutput(exec.Command(missingNginx, "-t"))
+	var executionErr *ExecutionError
+	if !errors.As(err, &executionErr) {
+		t.Fatalf("start error = %T, want *ExecutionError", err)
+	}
+	if executionErr.Executable != missingNginx {
+		t.Fatalf("Executable = %q, want %q", executionErr.Executable, missingNginx)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("ExecutionError does not unwrap to the original missing-file cause")
+	}
+	failure := NewFailure(KindNginx, FailurePhaseValidate, "", fmt.Errorf("nested: %w", err))
+	if !failure.BinaryMissing || !errors.Is(failure, os.ErrNotExist) {
+		t.Fatalf("failure = %#v, want verified nested missing nginx", failure)
+	}
+	var nestedExecution *ExecutionError
+	if !errors.As(failure, &nestedExecution) || nestedExecution.Executable != missingNginx {
+		t.Fatalf("Failure did not preserve typed execution identity: %#v", nestedExecution)
+	}
+	for _, name := range []string{"sudo", "nginx-wrapper"} {
+		missingWrapper := filepath.Join(t.TempDir(), name)
+		_, wrapperErr := RunCombinedOutput(exec.Command(missingWrapper))
+		wrapperFailure := NewFailure(KindNginx, FailurePhaseValidate, "", wrapperErr)
+		if wrapperFailure.BinaryMissing {
+			t.Fatalf("missing %s was mistaken for missing nginx: %#v", name, wrapperFailure)
+		}
+	}
+
+	sh, lookupErr := exec.LookPath("sh")
+	if lookupErr != nil {
+		t.Skip("sh unavailable")
+	}
+	_, exitErr := RunCombinedOutput(exec.Command(sh, "-c", "exit 7"))
+	if errors.As(exitErr, &executionErr) {
+		t.Fatalf("started command exit was wrapped as start error: %#v", executionErr)
+	}
+}
+
+func TestFailureCommandLabelRejectsUnknownEnums(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend Kind
+		phase   FailurePhase
+	}{
+		{name: "unknown backend", backend: Kind("token=backend-secret"), phase: FailurePhaseReload},
+		{name: "control backend", backend: Kind("nginx\nsecret"), phase: FailurePhaseValidate},
+		{name: "overlong backend", backend: Kind(strings.Repeat("x", MaxFailureCaptureBytes)), phase: FailurePhaseCertInstall},
+		{name: "unknown phase", backend: KindNginx, phase: FailurePhase("token=phase-secret")},
+		{name: "control phase", backend: KindApache, phase: FailurePhase("reload\nsecret")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			failure := &Failure{Backend: tt.backend, Phase: tt.phase}
+			if got := failure.Error(); got != "proxy operation failed" {
+				t.Fatalf("Error() = %q, want fail-closed label", got)
 			}
 		})
 	}

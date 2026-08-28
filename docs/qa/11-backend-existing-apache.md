@@ -295,6 +295,9 @@
     at <file>:<line>` (`apache.go:79`).
   - Permission denied and a missing proxy binary retain concise, distinct
     messages; an unknown unlocated failure retains one short sanitized line.
+  - Missing-binary evidence requires a typed process-start failure for one of the
+    Apache executable names (`apachectl`, `apache2ctl`, `httpd`, `apache2`). A
+    missing `sudo` or custom wrapper remains unknown.
   - Exact clean paths match directly. A sites-enabled path aliases its
     sites-available sibling only under the same parent layout with the same
     case-sensitive basename. Foreign roots and same basenames elsewhere do not

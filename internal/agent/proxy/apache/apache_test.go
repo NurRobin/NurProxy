@@ -321,15 +321,29 @@ func TestApply_reloadSudoDenialReturnsPermissionFailure(t *testing.T) {
 	}
 }
 
-func TestValidate_binaryMissingReturnsTypedFailure(t *testing.T) {
+func TestValidate_untypedBinaryMissingIsUnknown(t *testing.T) {
 	b, _ := newDebianBackend(t, &fakeRunner{testErr: exec.ErrNotFound})
 	err := b.Validate(context.Background())
 	var failure *proxy.Failure
 	if !errors.As(err, &failure) {
 		t.Fatalf("error type = %T, want *proxy.Failure", err)
 	}
-	if !failure.BinaryMissing || failure.Phase != proxy.FailurePhaseValidate {
-		t.Fatalf("failure = %#v, want binary-missing validation failure", failure)
+	if failure.BinaryMissing || failure.Phase != proxy.FailurePhaseValidate {
+		t.Fatalf("failure = %#v, want unverified binary error to stay unknown", failure)
+	}
+}
+
+func TestValidate_missingApacheExecutableReturnsBinaryFailure(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	missing := filepath.Join(t.TempDir(), "apachectl")
+	b, _ := newDebianBackend(t, &execRunner{binary: missing})
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.BinaryMissing {
+		t.Fatalf("failure = %#v, want verified missing apachectl", failure)
 	}
 }
 

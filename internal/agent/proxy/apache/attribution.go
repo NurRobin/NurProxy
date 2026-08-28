@@ -21,7 +21,7 @@ import (
 // is in a file we manage or in the operator's pre-existing config (§10).
 var apacheErrRe = regexp.MustCompile(`on line (\d+) of (\S+?):?$`)
 
-var permDeniedRe = regexp.MustCompile(`(?im)^(?:(?:httpd|apache2|apachectl):.*(?:permission denied|operation not permitted)|sudo: .*(?:a password is required|no tty present and no askpass program specified| is not allowed to execute .*))$`)
+var permDeniedRe = regexp.MustCompile(`(?im)^(?:(?:httpd|apache2|apachectl):.*(?:permission denied|operation not permitted)|\([0-9]+\)(?:permission denied|operation not permitted): ah00091: (?:apache2|httpd): .+|sudo: .*(?:a password is required|no tty present and no askpass program specified| is not allowed to execute .*))$`)
 
 // ErrAttribution classifies an apachectl configtest failure as either ours (the
 // file this apply wrote) or the operator's pre-existing config elsewhere in the
