@@ -290,6 +290,103 @@ func TestNewFailureBinaryMissingRequiresExecutionEvidence(t *testing.T) {
 	}
 }
 
+func TestNewFailureBinaryMissingThroughSudoRequiresExactBackendTarget(t *testing.T) {
+	sh, lookupErr := exec.LookPath("sh")
+	if lookupErr != nil {
+		t.Skip("sh unavailable")
+	}
+	exitErr := exec.Command(sh, "-c", "exit 1").Run()
+	var typedExit *exec.ExitError
+	if !errors.As(exitErr, &typedExit) {
+		t.Fatalf("setup error = %T, want *exec.ExitError", exitErr)
+	}
+	target := "/opt/nurproxy/bin/nginx"
+	tests := []struct {
+		name       string
+		backend    Kind
+		launcher   string
+		target     string
+		targetRole ExecutionRole
+		output     string
+		cause      error
+		want       bool
+	}{
+		{name: "exact nginx backend target", backend: KindNginx, launcher: "/usr/bin/sudo", target: target, targetRole: ExecutionRoleBackend, output: "sudo: unable to execute /opt/nurproxy/bin/nginx: No such file or directory\n", cause: exitErr, want: true},
+		{name: "exact apache backend target", backend: KindApache, launcher: "/usr/bin/sudo", target: "/opt/nurproxy/bin/apachectl", targetRole: ExecutionRoleBackend, output: "sudo: unable to execute /opt/nurproxy/bin/apachectl: No such file or directory\n", cause: exitErr, want: true},
+		{name: "same-name override", backend: KindNginx, launcher: "/usr/bin/sudo", target: target, targetRole: ExecutionRoleOverride, output: "sudo: unable to execute /opt/nurproxy/bin/nginx: No such file or directory\n", cause: exitErr},
+		{name: "different target", backend: KindNginx, launcher: "/usr/bin/sudo", target: target, targetRole: ExecutionRoleBackend, output: "sudo: unable to execute /tmp/nginx: No such file or directory\n", cause: exitErr},
+		{name: "prose near miss", backend: KindNginx, launcher: "/usr/bin/sudo", target: target, targetRole: ExecutionRoleBackend, output: "notice: sudo: unable to execute /opt/nurproxy/bin/nginx: No such file or directory\n", cause: exitErr},
+		{name: "indented near miss", backend: KindNginx, launcher: "/usr/bin/sudo", target: target, targetRole: ExecutionRoleBackend, output: "  sudo: unable to execute /opt/nurproxy/bin/nginx: No such file or directory\n", cause: exitErr},
+		{name: "wrong backend", backend: KindNginx, launcher: "/usr/bin/sudo", target: "/opt/nurproxy/bin/apachectl", targetRole: ExecutionRoleBackend, output: "sudo: unable to execute /opt/nurproxy/bin/apachectl: No such file or directory\n", cause: exitErr},
+		{name: "missing sudo launcher", backend: KindNginx, launcher: "/missing/sudo", target: target, targetRole: ExecutionRoleBackend, cause: &os.PathError{Op: "fork/exec", Path: "/missing/sudo", Err: os.ErrNotExist}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &ExecutionError{
+				Executable:       tt.launcher,
+				Role:             ExecutionRoleSystem,
+				TargetExecutable: tt.target,
+				TargetRole:       tt.targetRole,
+				output:           tt.output,
+				Err:              tt.cause,
+			}
+			failure := NewFailure(tt.backend, FailurePhaseValidate, tt.output, err)
+			if failure.BinaryMissing != tt.want {
+				t.Fatalf("BinaryMissing = %v, want %v", failure.BinaryMissing, tt.want)
+			}
+			if tt.cause == exitErr && (!errors.As(failure, &typedExit) || !errors.Is(failure, exitErr)) {
+				t.Fatal("wrapped sudo ExitError chain was not preserved")
+			}
+		})
+	}
+}
+
+func TestRunTargetCombinedOutputPreservesSudoBackendIdentity(t *testing.T) {
+	fakeSudo := filepath.Join(t.TempDir(), "sudo")
+	script := "#!/bin/sh\nprintf 'sudo: unable to execute %s: No such file or directory\\n' \"$1\" >&2\nexit 1\n"
+	if err := os.WriteFile(fakeSudo, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		backend Kind
+		phase   FailurePhase
+		target  string
+	}{
+		{name: "nginx validate", backend: KindNginx, phase: FailurePhaseValidate, target: "/opt/nurproxy/bin/nginx"},
+		{name: "nginx reload", backend: KindNginx, phase: FailurePhaseReload, target: "/opt/nurproxy/bin/nginx"},
+		{name: "apache validate", backend: KindApache, phase: FailurePhaseValidate, target: "/opt/nurproxy/bin/apachectl"},
+		{name: "apache reload", backend: KindApache, phase: FailurePhaseReload, target: "/opt/nurproxy/bin/httpd"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := RunTargetCombinedOutput(exec.Command(fakeSudo, tt.target), tt.target, ExecutionRoleBackend)
+			var executionErr *ExecutionError
+			if !errors.As(err, &executionErr) {
+				t.Fatalf("error = %T, want *ExecutionError", err)
+			}
+			if executionErr.Executable != fakeSudo || executionErr.Role != ExecutionRoleSystem || executionErr.TargetExecutable != tt.target || executionErr.TargetRole != ExecutionRoleBackend || executionErr.output != out {
+				t.Fatalf("execution metadata = %#v, output %q", executionErr, out)
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatal("wrapped process exit did not preserve *exec.ExitError")
+			}
+			failure := NewFailure(tt.backend, tt.phase, out, err)
+			if !failure.BinaryMissing || !errors.As(failure, &exitErr) {
+				t.Fatalf("failure = %#v, want verified missing sudo target", failure)
+			}
+		})
+	}
+
+	missingSudo := filepath.Join(t.TempDir(), "sudo")
+	target := "/opt/nurproxy/bin/nginx"
+	out, err := RunTargetCombinedOutput(exec.Command(missingSudo, target), target, ExecutionRoleBackend)
+	if failure := NewFailure(KindNginx, FailurePhaseValidate, out, err); failure.BinaryMissing {
+		t.Fatalf("missing sudo launcher was mistaken for missing target: %#v", failure)
+	}
+}
+
 func TestNewFailurePermissionDetectionAcrossPhases(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -341,7 +438,7 @@ func TestNewFailureRecognizesPermissionFromReloadExitError(t *testing.T) {
 	}
 }
 
-func TestRunCombinedOutputWrapsOnlyStartErrorsWithExecutableIdentity(t *testing.T) {
+func TestRunCombinedOutputPreservesExecutionIdentityAndCauses(t *testing.T) {
 	missingNginx := filepath.Join(t.TempDir(), "nginx")
 	_, err := RunCombinedOutput(exec.Command(missingNginx, "-t"))
 	var executionErr *ExecutionError
@@ -353,6 +450,9 @@ func TestRunCombinedOutputWrapsOnlyStartErrorsWithExecutableIdentity(t *testing.
 	}
 	if executionErr.Role != ExecutionRoleSystem {
 		t.Fatalf("generic execution role = %q, want system", executionErr.Role)
+	}
+	if executionErr.TargetExecutable != missingNginx || executionErr.TargetRole != ExecutionRoleSystem {
+		t.Fatalf("generic target metadata = %#v, want system target %q", executionErr, missingNginx)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("ExecutionError does not unwrap to the original missing-file cause")
@@ -374,6 +474,9 @@ func TestRunCombinedOutputWrapsOnlyStartErrorsWithExecutableIdentity(t *testing.
 	if !errors.As(backendFailure, &nestedExecution) || nestedExecution.Role != ExecutionRoleBackend {
 		t.Fatalf("backend execution role not preserved: %#v", nestedExecution)
 	}
+	if nestedExecution.TargetExecutable != missingNginx || nestedExecution.TargetRole != ExecutionRoleBackend {
+		t.Fatalf("backend target metadata not preserved: %#v", nestedExecution)
+	}
 	for _, name := range []string{"sudo", "nginx-wrapper"} {
 		missingWrapper := filepath.Join(t.TempDir(), name)
 		_, wrapperErr := RunCombinedOutput(exec.Command(missingWrapper))
@@ -388,8 +491,12 @@ func TestRunCombinedOutputWrapsOnlyStartErrorsWithExecutableIdentity(t *testing.
 		t.Skip("sh unavailable")
 	}
 	_, exitErr := RunCombinedOutput(exec.Command(sh, "-c", "exit 7"))
-	if errors.As(exitErr, &executionErr) {
-		t.Fatalf("started command exit was wrapped as start error: %#v", executionErr)
+	if !errors.As(exitErr, &executionErr) {
+		t.Fatalf("started command exit = %T, want metadata-preserving ExecutionError", exitErr)
+	}
+	var typedExit *exec.ExitError
+	if !errors.As(exitErr, &typedExit) || !errors.Is(exitErr, typedExit) {
+		t.Fatalf("ExecutionError did not preserve ExitError chain: %#v", executionErr)
 	}
 }
 

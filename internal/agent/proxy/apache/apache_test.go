@@ -381,6 +381,34 @@ func TestExecRunnerSameNameOverridesAreNotBackendBinaryFailures(t *testing.T) {
 	}
 }
 
+func TestExecRunnerExecutionMetadataDistinguishesBackendAndOverrides(t *testing.T) {
+	r := &execRunner{
+		binary:    "/tmp/configured/apachectl",
+		testCmd:   "/tmp/override/apachectl configtest",
+		reloadCmd: "/tmp/override/httpd graceful",
+	}
+	tests := []struct {
+		name     string
+		override string
+		args     []string
+		wantPath string
+		wantRole proxy.ExecutionRole
+	}{
+		{name: "backend test", args: []string{"configtest"}, wantPath: r.binary, wantRole: proxy.ExecutionRoleBackend},
+		{name: "backend reload", args: []string{"graceful"}, wantPath: r.binary, wantRole: proxy.ExecutionRoleBackend},
+		{name: "override test", override: r.testCmd, args: []string{"configtest"}, wantPath: "/tmp/override/apachectl", wantRole: proxy.ExecutionRoleOverride},
+		{name: "override reload", override: r.reloadCmd, args: []string{"graceful"}, wantPath: "/tmp/override/httpd", wantRole: proxy.ExecutionRoleOverride},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, target, role := r.execution(context.Background(), tt.override, tt.args...)
+			if target != tt.wantPath || role != tt.wantRole {
+				t.Fatalf("target/role = %q/%q, want %q/%q", target, role, tt.wantPath, tt.wantRole)
+			}
+		})
+	}
+}
+
 func TestValidate_permissionDeniedReturnsTypedFailure(t *testing.T) {
 	r := &fakeRunner{
 		testErr: errors.New("exit status 1"),

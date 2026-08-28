@@ -52,9 +52,12 @@ type Failure struct {
 }
 
 type ExecutionError struct {
-	Executable string
-	Role       ExecutionRole
-	Err        error
+	Executable       string
+	Role             ExecutionRole
+	TargetExecutable string
+	TargetRole       ExecutionRole
+	output           string
+	Err              error
 }
 
 type ExecutionRole string
@@ -83,7 +86,7 @@ func NewFailure(backend Kind, phase FailurePhase, output string, err error) *Fai
 		Output:  boundedFailureOutput(output, len(output) > MaxFailureCaptureBytes),
 		Err:     err,
 	}
-	f.BinaryMissing = isBinaryMissing(backend, err)
+	f.BinaryMissing = isBinaryMissing(backend, f.Output, err)
 	f.Permission = errors.Is(err, os.ErrPermission) || permissionOutput(f.Output)
 	f.classifyKnownOutput(f.Output)
 	return f
@@ -198,12 +201,41 @@ func apacheMissingDirectiveLine(line, directive string) bool {
 	return strings.HasPrefix(line, directive) && strings.HasSuffix(line, "' does not exist or is empty")
 }
 
-func isBinaryMissing(backend Kind, err error) bool {
+func isBinaryMissing(backend Kind, output string, err error) bool {
 	var executionErr *ExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Role != ExecutionRoleBackend || !backendExecutable(backend, executionErr.Executable) {
+	if !errors.As(err, &executionErr) {
 		return false
 	}
-	return missingExecutionCause(executionErr.Err)
+	target, targetRole := executionErr.TargetExecutable, executionErr.TargetRole
+	if target == "" {
+		target, targetRole = executionErr.Executable, executionErr.Role
+	}
+	if targetRole != ExecutionRoleBackend || !backendExecutable(backend, target) {
+		return false
+	}
+	if executionErr.Executable == target && executionErr.Role == ExecutionRoleBackend {
+		return missingExecutionCause(executionErr.Err)
+	}
+	var exitErr *exec.ExitError
+	if executionErr.Role != ExecutionRoleSystem || filepath.Base(executionErr.Executable) != "sudo" || !errors.As(executionErr.Err, &exitErr) {
+		return false
+	}
+	if executionErr.output != "" {
+		output = boundedFailureOutput(executionErr.output, len(executionErr.output) > MaxFailureCaptureBytes)
+	}
+	return sudoMissingTarget(output, target)
+}
+
+func sudoMissingTarget(output, target string) bool {
+	const prefix = "sudo: unable to execute "
+	const suffix = ": No such file or directory"
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSuffix(rawLine, "\r")
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, suffix) && strings.TrimSuffix(strings.TrimPrefix(line, prefix), suffix) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func backendExecutable(backend Kind, executable string) bool {
@@ -350,27 +382,37 @@ func (w *boundedOutputWriter) String() string {
 }
 
 func RunCombinedOutput(cmd *exec.Cmd) (string, error) {
-	return runCombinedOutput(cmd, ExecutionRoleSystem)
+	return RunTargetCombinedOutput(cmd, cmd.Path, ExecutionRoleSystem)
 }
 
 func RunBackendCombinedOutput(cmd *exec.Cmd) (string, error) {
-	return runCombinedOutput(cmd, ExecutionRoleBackend)
+	return RunTargetCombinedOutput(cmd, cmd.Path, ExecutionRoleBackend)
 }
 
 func RunOverrideCombinedOutput(cmd *exec.Cmd) (string, error) {
-	return runCombinedOutput(cmd, ExecutionRoleOverride)
+	return RunTargetCombinedOutput(cmd, cmd.Path, ExecutionRoleOverride)
 }
 
-func runCombinedOutput(cmd *exec.Cmd, role ExecutionRole) (string, error) {
+func RunTargetCombinedOutput(cmd *exec.Cmd, target string, targetRole ExecutionRole) (string, error) {
 	w := newBoundedOutputWriter()
 	cmd.Stdout = w
 	cmd.Stderr = w
 	err := cmd.Run()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			err = &ExecutionError{Executable: cmd.Path, Role: role, Err: err}
+		role := ExecutionRoleSystem
+		if cmd.Path == target {
+			role = targetRole
 		}
+		output := w.String()
+		err = &ExecutionError{
+			Executable:       cmd.Path,
+			Role:             role,
+			TargetExecutable: target,
+			TargetRole:       targetRole,
+			output:           output,
+			Err:              err,
+		}
+		return output, err
 	}
 	return w.String(), err
 }

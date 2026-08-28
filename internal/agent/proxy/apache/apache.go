@@ -654,29 +654,19 @@ type execRunner struct {
 // Test runs apachectl configtest (or the configured override) and returns
 // combined output.
 func (r *execRunner) Test(ctx context.Context) (string, error) {
-	cmd := r.command(ctx, r.testCmd, "configtest")
-	return runCombinedOutput(cmd, r.testCmd)
+	cmd, target, role := r.execution(ctx, r.testCmd, "configtest")
+	return proxy.RunTargetCombinedOutput(cmd, target, role)
 }
 
 // Reload runs apachectl graceful (or the configured override). A graceful reload
 // re-reads config without dropping active connections.
 func (r *execRunner) Reload(ctx context.Context) error {
-	cmd := r.command(ctx, r.reloadCmd, "graceful")
-	out, err := runCombinedOutput(cmd, r.reloadCmd)
+	cmd, target, role := r.execution(ctx, r.reloadCmd, "graceful")
+	out, err := proxy.RunTargetCombinedOutput(cmd, target, role)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
-}
-
-func runCombinedOutput(cmd *exec.Cmd, override string) (string, error) {
-	if override != "" {
-		return proxy.RunOverrideCombinedOutput(cmd)
-	}
-	if filepath.Base(cmd.Path) == "sudo" {
-		return proxy.RunCombinedOutput(cmd)
-	}
-	return proxy.RunBackendCombinedOutput(cmd)
 }
 
 // command builds the exec.Cmd for a step. It resolves the privileged command
@@ -684,12 +674,22 @@ func runCombinedOutput(cmd *exec.Cmd, override string) (string, error) {
 // so a scoped, passwordless sudoers entry (the §12 remediation) grants exactly
 // these commands instead of requiring the whole agent to run as root.
 func (r *execRunner) command(ctx context.Context, override string, defaultArgs ...string) *exec.Cmd {
+	cmd, _, _ := r.execution(ctx, override, defaultArgs...)
+	return cmd
+}
+
+func (r *execRunner) execution(ctx context.Context, override string, defaultArgs ...string) (*exec.Cmd, string, proxy.ExecutionRole) {
 	name, args := r.spec(override, defaultArgs)
+	target := name
+	targetRole := proxy.ExecutionRoleBackend
+	if override != "" {
+		targetRole = proxy.ExecutionRoleOverride
+	}
 	if elevateNeeded() && filepath.Base(name) != "sudo" {
 		args = append([]string{"-n", name}, args...)
 		name = "sudo"
 	}
-	return exec.CommandContext(ctx, name, args...)
+	return exec.CommandContext(ctx, name, args...), target, targetRole
 }
 
 // spec resolves a step to its (name, args) WITHOUT sudo: a per-agent override

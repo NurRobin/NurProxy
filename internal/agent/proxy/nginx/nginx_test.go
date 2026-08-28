@@ -543,6 +543,34 @@ func TestExecRunnerSameNameOverridesAreNotBackendBinaryFailures(t *testing.T) {
 	}
 }
 
+func TestExecRunnerExecutionMetadataDistinguishesBackendAndOverrides(t *testing.T) {
+	r := &execRunner{
+		binary:    "/tmp/configured/nginx",
+		testCmd:   "/tmp/override/nginx -t",
+		reloadCmd: "/tmp/override/nginx -s reload",
+	}
+	tests := []struct {
+		name     string
+		override string
+		args     []string
+		wantPath string
+		wantRole proxy.ExecutionRole
+	}{
+		{name: "backend test", args: []string{"-t"}, wantPath: r.binary, wantRole: proxy.ExecutionRoleBackend},
+		{name: "backend reload", args: []string{"-s", "reload"}, wantPath: r.binary, wantRole: proxy.ExecutionRoleBackend},
+		{name: "override test", override: r.testCmd, args: []string{"-t"}, wantPath: "/tmp/override/nginx", wantRole: proxy.ExecutionRoleOverride},
+		{name: "override reload", override: r.reloadCmd, args: []string{"-s", "reload"}, wantPath: "/tmp/override/nginx", wantRole: proxy.ExecutionRoleOverride},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, target, role := r.execution(context.Background(), tt.override, tt.args...)
+			if target != tt.wantPath || role != tt.wantRole {
+				t.Fatalf("target/role = %q/%q, want %q/%q", target, role, tt.wantPath, tt.wantRole)
+			}
+		})
+	}
+}
+
 func TestValidate_permissionErrorReturnsTypedFailure(t *testing.T) {
 	b, _ := newBackend(t, &fakeRunner{testErr: fmt.Errorf("validate: %w", os.ErrPermission)})
 	err := b.Validate(context.Background())
