@@ -1,6 +1,6 @@
 # Safe Agent Recovery — Stage 1 Design
 
-Status: approved in conversation; written specification awaiting final review
+Status: approved by the user on 2026-08-28
 
 Ledger: REQ-228
 
