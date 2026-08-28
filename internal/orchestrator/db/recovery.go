@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -26,6 +27,14 @@ func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnosti
 	paths, err := encodeStringSlice(diagnostic.AffectedPaths)
 	if err != nil {
 		return fmt.Errorf("encoding diagnostic paths: %w", err)
+	}
+	firstSeenAt, err := recoveryUnixNano(diagnostic.FirstSeenAt)
+	if err != nil {
+		return fmt.Errorf("encoding diagnostic first-seen time: %w", err)
+	}
+	lastSeenAt, err := recoveryUnixNano(diagnostic.LastSeenAt)
+	if err != nil {
+		return fmt.Errorf("encoding diagnostic last-seen time: %w", err)
 	}
 	_, err = d.sql.Exec(`
 		INSERT INTO recovery_diagnostics (
@@ -52,8 +61,7 @@ func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnosti
 		string(diagnostic.Severity), string(diagnostic.Ownership), diagnostic.Summary,
 		diagnostic.Evidence, paths, diagnostic.ResourceFingerprint,
 		string(diagnostic.ProposedAction), boolToInt(diagnostic.AutoRepairEligible),
-		boolToInt(diagnostic.HardChange), recoveryUnixNano(diagnostic.FirstSeenAt),
-		recoveryUnixNano(diagnostic.LastSeenAt), diagnostic.Occurrences,
+		boolToInt(diagnostic.HardChange), firstSeenAt, lastSeenAt, diagnostic.Occurrences,
 	)
 	if err != nil {
 		return fmt.Errorf("upserting recovery diagnostic: %w", err)
@@ -79,7 +87,10 @@ func (d *DB) ResolveMissingDiagnostics(agentID string, activeIDs []string, at ti
 		seen[id] = struct{}{}
 	}
 	query := `UPDATE recovery_diagnostics SET resolved_at = ? WHERE agent_id = ? AND resolved_at IS NULL AND last_seen_at <= ?`
-	resolvedAt := recoveryUnixNano(at)
+	resolvedAt, err := recoveryUnixNano(at)
+	if err != nil {
+		return fmt.Errorf("encoding diagnostic resolution time: %w", err)
+	}
 	args := []any{resolvedAt, agentID, resolvedAt}
 	if len(activeIDs) > 0 {
 		query += ` AND id NOT IN (` + strings.TrimRight(strings.Repeat("?,", len(activeIDs)), ",") + `)`
@@ -158,8 +169,18 @@ func scanDiagnostic(scanner interface{ Scan(...any) error }) (recoverymodel.Diag
 	if err := recoverymodel.DecodeStrict([]byte(pathsJSON), &diagnostic.AffectedPaths); err != nil {
 		return diagnostic, fmt.Errorf("decoding diagnostic paths: %w", err)
 	}
-	diagnostic.FirstSeenAt = time.Unix(0, firstSeen).UTC()
-	diagnostic.LastSeenAt = time.Unix(0, lastSeen).UTC()
+	var err error
+	if diagnostic.FirstSeenAt, err = recoveryTimeFromUnixNano(firstSeen); err != nil {
+		return diagnostic, fmt.Errorf("decoding diagnostic first-seen time: %w", err)
+	}
+	if diagnostic.LastSeenAt, err = recoveryTimeFromUnixNano(lastSeen); err != nil {
+		return diagnostic, fmt.Errorf("decoding diagnostic last-seen time: %w", err)
+	}
+	if resolvedAt.Valid {
+		if _, err := recoveryTimeFromUnixNano(resolvedAt.Int64); err != nil {
+			return diagnostic, fmt.Errorf("decoding diagnostic resolution time: %w", err)
+		}
+	}
 	if err := diagnostic.Validate(); err != nil {
 		return diagnostic, fmt.Errorf("validating stored diagnostic: %w", err)
 	}
@@ -173,7 +194,7 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 	if err := report.Validate(); err != nil {
 		return fmt.Errorf("validating repair operation: %w", err)
 	}
-	if err := validateOperationLifecycle(report); err != nil {
+	if err := validatePersistedOperation(report); err != nil {
 		return err
 	}
 	if report.Source == recoverymodel.RequestSourceAutomatic && report.State != recoverymodel.OperationStateDetected {
@@ -181,6 +202,17 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 	}
 	if report.Source == recoverymodel.RequestSourceUser && report.State != recoverymodel.OperationStatePlanned {
 		return fmt.Errorf("user repair operation must start planned")
+	}
+	if len(report.Steps) != 1 || report.Steps[0].State != report.State {
+		return fmt.Errorf("initial repair operation requires exactly one step matching state %q", report.State)
+	}
+	startedAt, err := recoveryUnixNano(report.StartedAt)
+	if err != nil {
+		return fmt.Errorf("encoding repair operation start time: %w", err)
+	}
+	finishedAt, err := nullableRecoveryTime(report.FinishedAt)
+	if err != nil {
+		return fmt.Errorf("encoding repair operation finish time: %w", err)
 	}
 	steps, err := encodeSteps(report.Steps)
 	if err != nil {
@@ -201,7 +233,8 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 		if scanErr != nil {
 			return fmt.Errorf("querying duplicate repair operation: %w", scanErr)
 		}
-		if existingFingerprint != fingerprint || !operationReportsEqual(existing, report) {
+		if existingFingerprint != fingerprint ||
+			(!operationReportsEqual(existing, report) && !historicalReplayCompatible(report, existing)) {
 			return fmt.Errorf("conflicting duplicate repair operation create")
 		}
 		return nil
@@ -228,7 +261,7 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 	if proposedAction != string(report.Action) {
 		return fmt.Errorf("repair operation action does not match diagnostic")
 	}
-	createdAt, err := nextRecoveryCreatedAt(tx)
+	createdAt, err := nextRecoveryCreatedAt(tx, agentID)
 	if err != nil {
 		return err
 	}
@@ -241,7 +274,7 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 		report.OperationID, agentID, report.DiagnosticID, string(report.Action), fingerprint,
 		string(report.Source), string(report.State), steps, report.SnapshotReference,
 		report.ValidationOutcome, report.RollbackOutcome, report.Error,
-		recoveryUnixNano(report.StartedAt), createdAt, createdAt, nullableRecoveryTime(report.FinishedAt),
+		startedAt, createdAt, createdAt, finishedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("creating repair operation: %w", err)
@@ -256,8 +289,15 @@ func (d *DB) AdvanceRepairOperation(agentID string, report recoverymodel.Operati
 	if err := report.Validate(); err != nil {
 		return fmt.Errorf("validating repair operation: %w", err)
 	}
-	if err := validateOperationLifecycle(report); err != nil {
+	if err := validatePersistedOperation(report); err != nil {
 		return err
+	}
+	if _, err := recoveryUnixNano(report.StartedAt); err != nil {
+		return fmt.Errorf("encoding repair operation start time: %w", err)
+	}
+	finishedAt, err := nullableRecoveryTime(report.FinishedAt)
+	if err != nil {
+		return fmt.Errorf("encoding repair operation finish time: %w", err)
 	}
 	tx, err := d.sql.Begin()
 	if err != nil {
@@ -280,6 +320,12 @@ func (d *DB) AdvanceRepairOperation(agentID string, report recoverymodel.Operati
 	if stored.DiagnosticID != report.DiagnosticID || stored.Action != report.Action ||
 		stored.Source != report.Source || !stored.StartedAt.Equal(report.StartedAt) {
 		return fmt.Errorf("repair operation identity changed during transition")
+	}
+	if operationStateReachable(report.State, stored.State) {
+		if historicalReplayCompatible(report, stored) {
+			return nil
+		}
+		return fmt.Errorf("conflicting historical repair operation replay")
 	}
 	if !legalOperationTransition(stored.State, report.State) {
 		return fmt.Errorf("illegal repair operation transition %q -> %q", stored.State, report.State)
@@ -304,14 +350,17 @@ func (d *DB) AdvanceRepairOperation(agentID string, report recoverymodel.Operati
 	if err != nil {
 		return err
 	}
-	receivedAt := time.Now().UTC().UnixNano()
+	receivedAt, err := recoveryUnixNano(time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("encoding repair operation receipt time: %w", err)
+	}
 	res, err := tx.Exec(`UPDATE recovery_operations SET state = ?, step_summaries = ?,
 		snapshot_reference = ?, validation_outcome = ?, rollback_outcome = ?, error = ?,
 		received_at = CASE WHEN received_at >= ? THEN received_at + 1 ELSE ? END,
 		finished_at = ? WHERE agent_id = ? AND id = ? AND state = ?`,
 		string(report.State), steps, report.SnapshotReference, report.ValidationOutcome,
 		report.RollbackOutcome, report.Error, receivedAt, receivedAt,
-		nullableRecoveryTime(report.FinishedAt), agentID, report.OperationID, string(stored.State),
+		finishedAt, agentID, report.OperationID, string(stored.State),
 	)
 	if err != nil {
 		return fmt.Errorf("advancing repair operation: %w", err)
@@ -347,7 +396,68 @@ func operationReportsEqual(left, right recoverymodel.OperationReport) bool {
 	return true
 }
 
-func validateOperationLifecycle(report recoverymodel.OperationReport) error {
+func historicalReplayCompatible(submitted, stored recoverymodel.OperationReport) bool {
+	if submitted.State == stored.State || !operationStateReachable(submitted.State, stored.State) {
+		return false
+	}
+	if submitted.OperationID != stored.OperationID || submitted.DiagnosticID != stored.DiagnosticID ||
+		submitted.Action != stored.Action || submitted.Source != stored.Source ||
+		!submitted.StartedAt.Equal(stored.StartedAt) || !stepsArePrefix(submitted.Steps, stored.Steps) {
+		return false
+	}
+	for _, values := range [][2]string{
+		{submitted.SnapshotReference, stored.SnapshotReference},
+		{submitted.ValidationOutcome, stored.ValidationOutcome},
+		{submitted.RollbackOutcome, stored.RollbackOutcome},
+		{submitted.Error, stored.Error},
+	} {
+		if values[0] != "" && values[0] != values[1] {
+			return false
+		}
+	}
+	if submitted.FinishedAt != nil &&
+		(stored.FinishedAt == nil || !submitted.FinishedAt.Equal(*stored.FinishedAt)) {
+		return false
+	}
+	return true
+}
+
+func stepsArePrefix(prefix, complete []recoverymodel.Step) bool {
+	if len(prefix) > len(complete) {
+		return false
+	}
+	for i := range prefix {
+		if prefix[i].Name != complete[i].Name || prefix[i].Summary != complete[i].Summary ||
+			prefix[i].State != complete[i].State || !prefix[i].At.Equal(complete[i].At) {
+			return false
+		}
+	}
+	return true
+}
+
+func operationStateReachable(from, target recoverymodel.OperationState) bool {
+	if from == target {
+		return true
+	}
+	seen := map[recoverymodel.OperationState]bool{from: true}
+	queue := []recoverymodel.OperationState{from}
+	for len(queue) > 0 {
+		state := queue[0]
+		queue = queue[1:]
+		for _, candidate := range operationSuccessors(state) {
+			if candidate == target {
+				return true
+			}
+			if !seen[candidate] {
+				seen[candidate] = true
+				queue = append(queue, candidate)
+			}
+		}
+	}
+	return false
+}
+
+func validatePersistedOperation(report recoverymodel.OperationReport) error {
 	terminal := report.State == recoverymodel.OperationStateDiagnosisOnly ||
 		report.State == recoverymodel.OperationStateSucceeded ||
 		report.State == recoverymodel.OperationStateRolledBack ||
@@ -359,12 +469,18 @@ func validateOperationLifecycle(report recoverymodel.OperationReport) error {
 	if !terminal && report.FinishedAt != nil {
 		return fmt.Errorf("nonterminal repair operation state %q cannot set finished_at", report.State)
 	}
+	if operationRequiresSnapshot(report.State) && strings.TrimSpace(report.SnapshotReference) == "" {
+		return fmt.Errorf("repair operation state %q requires a snapshot reference", report.State)
+	}
+	if err := validateOperationHistory(report); err != nil {
+		return err
+	}
 	return nil
 }
 
 func validateAppendOnlySteps(previous, next []recoverymodel.Step) error {
-	if len(next) <= len(previous) {
-		return fmt.Errorf("repair operation transition must append a step")
+	if len(next) != len(previous)+1 {
+		return fmt.Errorf("repair operation transition must append exactly one step")
 	}
 	for i := range previous {
 		if previous[i].Name != next[i].Name || previous[i].Summary != next[i].Summary ||
@@ -375,13 +491,53 @@ func validateAppendOnlySteps(previous, next []recoverymodel.Step) error {
 	return nil
 }
 
-func nextRecoveryCreatedAt(tx *sql.Tx) (int64, error) {
+func validateOperationHistory(report recoverymodel.OperationReport) error {
+	if len(report.Steps) == 0 {
+		return fmt.Errorf("repair operation history requires an initial step")
+	}
+	initial := recoverymodel.OperationStateDetected
+	if report.Source == recoverymodel.RequestSourceUser {
+		initial = recoverymodel.OperationStatePlanned
+	}
+	if report.Steps[0].State != initial {
+		return fmt.Errorf("repair operation initial step state %q does not match source %q", report.Steps[0].State, report.Source)
+	}
+	for i := 1; i < len(report.Steps); i++ {
+		if !legalOperationTransition(report.Steps[i-1].State, report.Steps[i].State) {
+			return fmt.Errorf("repair operation step %d is not a legal successor", i)
+		}
+	}
+	if report.Steps[len(report.Steps)-1].State != report.State {
+		return fmt.Errorf("repair operation final step does not match state %q", report.State)
+	}
+	return nil
+}
+
+func operationRequiresSnapshot(state recoverymodel.OperationState) bool {
+	switch state {
+	case recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateApplying,
+		recoverymodel.OperationStateValidating, recoverymodel.OperationStateSucceeded,
+		recoverymodel.OperationStateRollingBack, recoverymodel.OperationStateRolledBack,
+		recoverymodel.OperationStateRollbackFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func nextRecoveryCreatedAt(tx *sql.Tx, agentID string) (int64, error) {
 	var latest int64
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(created_at), 0) FROM recovery_operations`).Scan(&latest); err != nil {
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(created_at), 0) FROM recovery_operations WHERE agent_id = ?`, agentID).Scan(&latest); err != nil {
 		return 0, fmt.Errorf("reading recovery operation chronology: %w", err)
 	}
-	now := time.Now().UTC().UnixNano()
+	now, err := recoveryUnixNano(time.Now().UTC())
+	if err != nil {
+		return 0, fmt.Errorf("encoding recovery operation creation time: %w", err)
+	}
 	if now <= latest {
+		if latest == math.MaxInt64 {
+			return 0, fmt.Errorf("recovery operation creation chronology exhausted")
+		}
 		now = latest + 1
 	}
 	return now, nil
@@ -414,17 +570,21 @@ func (d *DB) CountRecentRepairFailures(agentID string, action recoverymodel.Acti
 	if !action.Valid() || since.IsZero() || strings.TrimSpace(fingerprint) == "" {
 		return 0, fmt.Errorf("valid action, fingerprint, and since time are required")
 	}
+	sinceUnixNano, err := recoveryUnixNano(since)
+	if err != nil {
+		return 0, fmt.Errorf("encoding repair failure boundary: %w", err)
+	}
 	var count int
-	err := d.read.QueryRow(`SELECT COUNT(*) FROM recovery_operations
+	err = d.read.QueryRow(`SELECT COUNT(*) FROM recovery_operations
 		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
-		AND state IN (?, ?) AND created_at >= ?
-		AND created_at > COALESCE((
-			SELECT MAX(succeeded.created_at) FROM recovery_operations AS succeeded
+		AND state IN (?, ?) AND received_at >= ?
+		AND received_at > COALESCE((
+			SELECT MAX(succeeded.received_at) FROM recovery_operations AS succeeded
 			WHERE succeeded.agent_id = ? AND succeeded.action = ?
 				AND succeeded.resource_fingerprint = ? AND succeeded.state = ?
 		), -9223372036854775808)`,
 		agentID, string(action), fingerprint, string(recoverymodel.OperationStateRolledBack),
-		string(recoverymodel.OperationStateRollbackFailed), recoveryUnixNano(since),
+		string(recoverymodel.OperationStateRollbackFailed), sinceUnixNano,
 		agentID, string(action), fingerprint, string(recoverymodel.OperationStateSucceeded),
 	).Scan(&count)
 	if err != nil {
@@ -455,21 +615,36 @@ func scanRepairOperation(scanner interface{ Scan(...any) error }) (recoverymodel
 	if err := recoverymodel.DecodeStrict([]byte(stepsJSON), &report.Steps); err != nil {
 		return report, "", fmt.Errorf("decoding repair steps: %w", err)
 	}
-	report.StartedAt = time.Unix(0, startedAt).UTC()
+	var err error
+	if report.StartedAt, err = recoveryTimeFromUnixNano(startedAt); err != nil {
+		return report, "", fmt.Errorf("decoding repair start time: %w", err)
+	}
 	if finishedAt.Valid {
-		finished := time.Unix(0, finishedAt.Int64).UTC()
+		finished, err := recoveryTimeFromUnixNano(finishedAt.Int64)
+		if err != nil {
+			return report, "", fmt.Errorf("decoding repair finish time: %w", err)
+		}
 		report.FinishedAt = &finished
 	}
 	if err := report.Validate(); err != nil {
 		return report, "", fmt.Errorf("validating stored repair operation: %w", err)
 	}
-	if err := validateOperationLifecycle(report); err != nil {
+	if err := validatePersistedOperation(report); err != nil {
 		return report, "", fmt.Errorf("validating stored repair operation lifecycle: %w", err)
 	}
 	return report, fingerprint, nil
 }
 
 func legalOperationTransition(from, to recoverymodel.OperationState) bool {
+	for _, candidate := range operationSuccessors(from) {
+		if candidate == to {
+			return true
+		}
+	}
+	return false
+}
+
+func operationSuccessors(state recoverymodel.OperationState) []recoverymodel.OperationState {
 	allowed := map[recoverymodel.OperationState][]recoverymodel.OperationState{
 		recoverymodel.OperationStateDetected:    {recoverymodel.OperationStateDiagnosisOnly, recoverymodel.OperationStatePlanned, recoverymodel.OperationStateSuppressed},
 		recoverymodel.OperationStatePlanned:     {recoverymodel.OperationStateSnapshotted},
@@ -478,12 +653,7 @@ func legalOperationTransition(from, to recoverymodel.OperationState) bool {
 		recoverymodel.OperationStateValidating:  {recoverymodel.OperationStateSucceeded, recoverymodel.OperationStateRollingBack},
 		recoverymodel.OperationStateRollingBack: {recoverymodel.OperationStateRolledBack, recoverymodel.OperationStateRollbackFailed},
 	}
-	for _, candidate := range allowed[from] {
-		if candidate == to {
-			return true
-		}
-	}
-	return false
+	return allowed[state]
 }
 
 func encodeStringSlice(values []string) (string, error) {
@@ -505,13 +675,27 @@ func encodeSteps(steps []recoverymodel.Step) (string, error) {
 	return string(b), nil
 }
 
-func recoveryUnixNano(value time.Time) int64 {
-	return value.UTC().UnixNano()
+func recoveryUnixNano(value time.Time) (int64, error) {
+	value = value.UTC()
+	nanos := value.UnixNano()
+	if !time.Unix(0, nanos).UTC().Equal(value) {
+		return 0, fmt.Errorf("timestamp %s is outside signed Unix-nanosecond range", value.Format(time.RFC3339Nano))
+	}
+	return nanos, nil
 }
 
-func nullableRecoveryTime(value *time.Time) any {
+func recoveryTimeFromUnixNano(nanos int64) (time.Time, error) {
+	value := time.Unix(0, nanos).UTC()
+	roundTrip, err := recoveryUnixNano(value)
+	if err != nil || roundTrip != nanos {
+		return time.Time{}, fmt.Errorf("stored Unix-nanosecond timestamp %d does not round trip", nanos)
+	}
+	return value, nil
+}
+
+func nullableRecoveryTime(value *time.Time) (any, error) {
 	if value == nil {
-		return nil
+		return nil, nil
 	}
 	return recoveryUnixNano(*value)
 }

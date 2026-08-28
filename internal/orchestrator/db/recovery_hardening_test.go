@@ -67,6 +67,13 @@ func TestRecoverySchemaUsesIntegerChronologyForeignKeysAndChecks(t *testing.T) {
 			t.Errorf("recovery index %s missing: %v", index, err)
 		}
 	}
+	var breakerSQL string
+	if err := d.sql.QueryRow(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_recovery_operations_breaker'`).Scan(&breakerSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(breakerSQL, "received_at") {
+		t.Errorf("breaker index does not use terminal receipt chronology: %s", breakerSQL)
+	}
 }
 
 func TestRecoveryDiagnosticRejectsUnstableIDAndStaleGenerations(t *testing.T) {
@@ -467,6 +474,7 @@ func createFinishedOperation(t *testing.T, d *DB, agentID string, diag recoverym
 	op := testOperation(id, diag.ID, recoverymodel.OperationStatePlanned)
 	op.Source = recoverymodel.RequestSourceUser
 	op.StartedAt = started
+	op.Steps = []recoverymodel.Step{{Name: string(op.State), Summary: "started", State: op.State, At: started}}
 	if err := d.CreateRepairOperation(agentID, op, diag.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}
@@ -478,6 +486,9 @@ func createFinishedOperation(t *testing.T, d *DB, agentID string, diag recoverym
 	}
 	for i, state := range path {
 		op.State = state
+		if state == recoverymodel.OperationStateSnapshotted {
+			op.SnapshotReference = "recovery/" + id
+		}
 		op.Steps = append(op.Steps, recoverymodel.Step{Name: string(state), Summary: "completed", State: state, At: started.Add(time.Duration(i+1) * time.Second)})
 		if state == recoverymodel.OperationStateSucceeded || state == recoverymodel.OperationStateRolledBack || state == recoverymodel.OperationStateRollbackFailed {
 			finished := started.Add(time.Duration(i+1) * time.Second)

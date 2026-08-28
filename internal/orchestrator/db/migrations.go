@@ -574,7 +574,7 @@ var migrations = []string{
 	CREATE INDEX idx_recovery_operations_agent_created
 		ON recovery_operations(agent_id, created_at DESC, id DESC);
 	CREATE INDEX idx_recovery_operations_breaker
-		ON recovery_operations(agent_id, action, resource_fingerprint, state, created_at);
+		ON recovery_operations(agent_id, action, resource_fingerprint, state, received_at);
 	`,
 }
 

@@ -27,11 +27,13 @@ func testDiagnostic(agentID, fingerprint string) recoverymodel.Diagnostic {
 }
 
 func testOperation(id, diagnosticID string, state recoverymodel.OperationState) recoverymodel.OperationReport {
-	return recoverymodel.OperationReport{
+	report := recoverymodel.OperationReport{
 		OperationID: id, DiagnosticID: diagnosticID,
 		Action: recoverymodel.ActionRemoveManagedTemp, Source: recoverymodel.RequestSourceAutomatic,
 		State: state, StartedAt: recoveryTime(0),
 	}
+	report.Steps = []recoverymodel.Step{{Name: string(state), Summary: "started", State: state, At: report.StartedAt}}
+	return report
 }
 
 func TestRecoveryDiagnosticUpsertResolveAndList(t *testing.T) {
@@ -139,6 +141,9 @@ func TestRecoveryOperationTransitionsIdempotencyAndHistory(t *testing.T) {
 	}
 	for i, state := range states {
 		op.State = state
+		if state == recoverymodel.OperationStateSnapshotted {
+			op.SnapshotReference = "recovery/op-1"
+		}
 		op.Steps = append(op.Steps, recoverymodel.Step{
 			Name: string(state), Summary: "completed", State: state, At: recoveryTime(i + 1),
 		})
@@ -158,13 +163,17 @@ func TestRecoveryOperationTransitionsIdempotencyAndHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(history) != 1 || history[0].State != recoverymodel.OperationStateSucceeded || len(history[0].Steps) != len(states) {
+	if len(history) != 1 || history[0].State != recoverymodel.OperationStateSucceeded || len(history[0].Steps) != len(states)+1 {
 		t.Fatalf("operation history = %#v", history)
 	}
 
 	illegal := op
-	illegal.State = recoverymodel.OperationStateApplying
+	illegal.State = recoverymodel.OperationStateRollingBack
 	illegal.FinishedAt = nil
+	illegal.Steps = append([]recoverymodel.Step(nil), op.Steps[:3]...)
+	illegal.Steps = append(illegal.Steps, recoverymodel.Step{
+		Name: string(illegal.State), Summary: "conflicting branch", State: illegal.State, At: recoveryTime(3),
+	})
 	if err := d.AdvanceRepairOperation(a.ID, illegal); err == nil || !strings.Contains(err.Error(), "illegal") {
 		t.Fatalf("terminal regression error = %v, want illegal transition", err)
 	}
