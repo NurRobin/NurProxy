@@ -1,5 +1,7 @@
 package proxymodel
 
+import "github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+
 // This file defines the agent↔orchestrator wire format for config sync (§3, B1).
 //
 // The flip (Phase 3): the orchestrator no longer pushes pre-rendered Caddy JSON.
@@ -13,6 +15,28 @@ package proxymodel
 //
 // Bandwidth is a non-issue: configs are KB-sized — full content rides the ACK on
 // change, checksums ride the heartbeat.
+
+type RecoveryPolicy struct {
+	SafeAutoRepair bool `json:"safe_auto_repair"`
+}
+
+type RecoveryReport struct {
+	Capability  *recoverymodel.Capability       `json:"capability,omitempty"`
+	Diagnostics []recoverymodel.Diagnostic      `json:"diagnostics"`
+	Operations  []recoverymodel.OperationReport `json:"operations"`
+}
+
+type RecoveryPolicyEnvelope struct {
+	Policy RecoveryPolicy `json:"policy"`
+}
+
+type RepairRequestEnvelope struct {
+	Request recoverymodel.RepairRequest `json:"request"`
+}
+
+type RecoveryReportEnvelope struct {
+	Report RecoveryReport `json:"report"`
+}
 
 // RouteIntent is one unit of desired state pushed to an agent: a stable artifact
 // identity plus the backend-neutral Route the agent must render natively. The
