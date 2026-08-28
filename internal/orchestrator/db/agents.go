@@ -8,6 +8,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // CreateAgent inserts a new agent record.
@@ -29,8 +30,12 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 		detectedAt = &s
 	}
 	caps := encodeCapabilities(a.ProxyCapabilities)
+	recoveryCapability, err := encodeRecoveryCapability(a.RecoveryCapability)
+	if err != nil {
+		return err
+	}
 
-	_, err := d.sql.Exec(`
+	_, err = d.sql.Exec(`
 		INSERT INTO agents (id, name, fqdn, api_url, token_hash, dns_mode,
 			ddns_interval, public_ip, public_ip6, dns_record_id, dns_record_id6,
 			status, last_seen, version,
@@ -39,9 +44,9 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 			detected_config_dir, detected_log_paths, detected_port_conflicts,
 			detected_upstreams, detected_networks,
 			detected_installed, detected_at, detected_capabilities,
-			auto_reconcile_config,
+			auto_reconcile_config, safe_auto_repair_override, recovery_capability,
 			created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.PublicIP6, a.DNSRecordID, a.DNSRecordID6,
 		string(a.Status), lastSeen, a.Version,
@@ -49,6 +54,7 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 		det.kind, det.version, det.binaryPath, det.configDir,
 		det.logPaths, det.portConflicts, det.upstreams, det.networks, det.installed, detectedAt, caps,
 		boolToInt(a.AutoReconcileConfig),
+		nullableBoolValue(a.SafeAutoRepairOverride), recoveryCapability,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 	)
 	if err != nil {
@@ -180,6 +186,41 @@ func decodeCapabilities(s sql.NullString) *models.ProxyCapabilities {
 	return &c
 }
 
+func encodeRecoveryCapability(c *recoverymodel.Capability) (any, error) {
+	if c == nil {
+		return nil, nil
+	}
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("validating recovery capability: %w", err)
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("encoding recovery capability: %w", err)
+	}
+	return string(b), nil
+}
+
+func decodeRecoveryCapability(s sql.NullString) (*recoverymodel.Capability, error) {
+	if !s.Valid || s.String == "" {
+		return nil, nil
+	}
+	var capability recoverymodel.Capability
+	if err := recoverymodel.DecodeStrict([]byte(s.String), &capability); err != nil {
+		return nil, fmt.Errorf("decoding recovery capability: %w", err)
+	}
+	if err := capability.Validate(); err != nil {
+		return nil, fmt.Errorf("validating recovery capability: %w", err)
+	}
+	return &capability, nil
+}
+
+func nullableBoolValue(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return boolToInt(*value)
+}
+
 // encodePermissions flattens the agent's §12 permission self-test to a JSON
 // string column value, or nil (SQL NULL) when there is nothing to store (built-in
 // mode). decodePermissions is its inverse.
@@ -217,6 +258,8 @@ func scanAgent(sc interface {
 	var capabilities sql.NullString
 	var autoReconcile int
 	var permissions sql.NullString
+	var safeAutoRepairOverride sql.NullInt64
+	var recoveryCapability sql.NullString
 
 	err := sc.Scan(
 		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
@@ -227,6 +270,7 @@ func scanAgent(sc interface {
 		&det.logPaths, &det.portConflicts, &det.upstreams, &det.networks, &det.installed, &detectedAt,
 		&capabilities,
 		&autoReconcile,
+		&safeAutoRepairOverride, &recoveryCapability,
 		&a.ProxyMode, &permissions,
 		&createdAt, &updatedAt,
 	)
@@ -238,6 +282,18 @@ func scanAgent(sc interface {
 	a.ProxyDetection, a.ProxyDetectedAt = decodeDetection(det, detectedAt)
 	a.ProxyCapabilities = decodeCapabilities(capabilities)
 	a.ProxyPermissions = decodePermissions(permissions)
+	if safeAutoRepairOverride.Valid {
+		if safeAutoRepairOverride.Int64 != 0 && safeAutoRepairOverride.Int64 != 1 {
+			return nil, fmt.Errorf("invalid stored safe auto-repair override %d", safeAutoRepairOverride.Int64)
+		}
+		enabled := safeAutoRepairOverride.Int64 != 0
+		a.SafeAutoRepairOverride = &enabled
+	}
+	var decodeErr error
+	a.RecoveryCapability, decodeErr = decodeRecoveryCapability(recoveryCapability)
+	if decodeErr != nil {
+		return nil, decodeErr
+	}
 
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -256,7 +312,7 @@ const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
 	detected_upstreams, detected_networks,
 	detected_installed, detected_at, detected_capabilities,
-	auto_reconcile_config,
+	auto_reconcile_config, safe_auto_repair_override, recovery_capability,
 	proxy_mode, proxy_permissions,
 	created_at, updated_at`
 
@@ -270,6 +326,10 @@ func boolToInt(b bool) int {
 
 // GetAgent retrieves an agent by ID.
 func (d *DB) GetAgent(id string) (*models.Agent, error) {
+	global, err := d.safeAutoRepairSetting()
+	if err != nil {
+		return nil, err
+	}
 	row := d.read.QueryRow(
 		"SELECT "+agentColumns+" FROM agents WHERE id = ?", id)
 
@@ -280,11 +340,16 @@ func (d *DB) GetAgent(id string) (*models.Agent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("querying agent: %w", err)
 	}
+	a.SafeAutoRepairEffective = EffectiveSafeAutoRepair(global, a.SafeAutoRepairOverride)
 	return a, nil
 }
 
 // GetAgentByFQDN retrieves an agent by its unique FQDN.
 func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
+	global, err := d.safeAutoRepairSetting()
+	if err != nil {
+		return nil, err
+	}
 	row := d.read.QueryRow(
 		"SELECT "+agentColumns+" FROM agents WHERE fqdn = ?", fqdn)
 
@@ -295,11 +360,16 @@ func (d *DB) GetAgentByFQDN(fqdn string) (*models.Agent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("querying agent by fqdn: %w", err)
 	}
+	a.SafeAutoRepairEffective = EffectiveSafeAutoRepair(global, a.SafeAutoRepairOverride)
 	return a, nil
 }
 
 // ListAgents returns all agents ordered by creation time.
 func (d *DB) ListAgents() ([]models.Agent, error) {
+	global, err := d.safeAutoRepairSetting()
+	if err != nil {
+		return nil, err
+	}
 	rows, err := d.read.Query(
 		"SELECT " + agentColumns + " FROM agents ORDER BY created_at")
 	if err != nil {
@@ -313,6 +383,7 @@ func (d *DB) ListAgents() ([]models.Agent, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scanning agent: %w", err)
 		}
+		a.SafeAutoRepairEffective = EffectiveSafeAutoRepair(global, a.SafeAutoRepairOverride)
 		agents = append(agents, *a)
 	}
 	return agents, rows.Err()
@@ -335,6 +406,10 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		detectedAt = &s
 	}
 	caps := encodeCapabilities(a.ProxyCapabilities)
+	recoveryCapability, err := encodeRecoveryCapability(a.RecoveryCapability)
+	if err != nil {
+		return err
+	}
 
 	res, err := d.sql.Exec(`
 		UPDATE agents
@@ -348,7 +423,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 			detected_log_paths = ?, detected_port_conflicts = ?,
 			detected_upstreams = ?, detected_networks = ?,
 			detected_installed = ?, detected_at = ?, detected_capabilities = ?,
-			auto_reconcile_config = ?,
+			auto_reconcile_config = ?, safe_auto_repair_override = ?, recovery_capability = ?,
 			updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.FQDN, a.APIURL, a.TokenHash,
@@ -358,6 +433,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		det.kind, det.version, det.binaryPath, det.configDir,
 		det.logPaths, det.portConflicts, det.upstreams, det.networks, det.installed, detectedAt, caps,
 		boolToInt(a.AutoReconcileConfig),
+		nullableBoolValue(a.SafeAutoRepairOverride), recoveryCapability,
 		a.UpdatedAt.Format(time.RFC3339),
 		a.ID,
 	)
@@ -374,7 +450,18 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 
 // DeleteAgent removes an agent by ID. Cascades to servers and their domains.
 func (d *DB) DeleteAgent(id string) error {
-	res, err := d.sql.Exec("DELETE FROM agents WHERE id = ?", id)
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning agent deletion: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM recovery_operations WHERE agent_id = ?", id); err != nil {
+		return fmt.Errorf("deleting agent recovery operations: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM recovery_diagnostics WHERE agent_id = ?", id); err != nil {
+		return fmt.Errorf("deleting agent recovery diagnostics: %w", err)
+	}
+	res, err := tx.Exec("DELETE FROM agents WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("deleting agent: %w", err)
 	}
@@ -382,6 +469,9 @@ func (d *DB) DeleteAgent(id string) error {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("agent not found: %s", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing agent deletion: %w", err)
 	}
 	return nil
 }
@@ -596,6 +686,64 @@ func (d *DB) SetAgentAutoReconcileConfig(id string, enabled bool) error {
 	return nil
 }
 
+func (d *DB) SetAgentSafeAutoRepairOverride(id string, enabled *bool) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET safe_auto_repair_override = ?, updated_at = ? WHERE id = ?`,
+		nullableBoolValue(enabled), now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent safe auto-repair override: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+func (d *DB) UpdateAgentRecoveryCapability(id string, capability *recoverymodel.Capability) error {
+	encoded, err := encodeRecoveryCapability(capability)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE agents SET recovery_capability = ?, updated_at = ? WHERE id = ?`,
+		encoded, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating agent recovery capability: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
+func EffectiveSafeAutoRepair(global string, override *bool) bool {
+	if global != "true" && global != "false" {
+		return false
+	}
+	if override != nil {
+		return *override
+	}
+	return global == "true"
+}
+
+func (d *DB) safeAutoRepairSetting() (string, error) {
+	var value string
+	err := d.read.QueryRow(`SELECT value FROM settings WHERE key = 'safe_auto_repair'`).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading safe auto-repair setting: %w", err)
+	}
+	return value, nil
+}
+
 // SetAgentDNSError records an orchestrator-side DNS/config error about an agent
 // (e.g. its FQDN is outside every assigned zone). Passing an empty string
 // clears it. It touches only dns_error (not last_seen or last_error), so it
@@ -661,6 +809,10 @@ func (d *DB) GetAgentToken(id string) (string, error) {
 
 // ListPendingAgents returns all agents with status "pending".
 func (d *DB) ListPendingAgents() ([]models.Agent, error) {
+	global, err := d.safeAutoRepairSetting()
+	if err != nil {
+		return nil, err
+	}
 	rows, err := d.read.Query(
 		"SELECT "+agentColumns+" FROM agents WHERE status = ? ORDER BY created_at",
 		string(models.AgentStatusPending))
@@ -675,6 +827,7 @@ func (d *DB) ListPendingAgents() ([]models.Agent, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scanning agent: %w", err)
 		}
+		a.SafeAutoRepairEffective = EffectiveSafeAutoRepair(global, a.SafeAutoRepairOverride)
 		agents = append(agents, *a)
 	}
 	return agents, rows.Err()

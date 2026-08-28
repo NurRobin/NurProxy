@@ -3,6 +3,8 @@ package models
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // AgentStatus represents the lifecycle state of an agent.
@@ -295,9 +297,12 @@ type Agent struct {
 	// re-applies generated artifacts over on-disk drift instead of flagging it for
 	// review. Off by default — drift is a review, not a bulldoze. DNS
 	// reconciliation stays automatic regardless of this flag.
-	AutoReconcileConfig bool      `json:"auto_reconcile_config"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	AutoReconcileConfig     bool                      `json:"auto_reconcile_config"`
+	SafeAutoRepairOverride  *bool                     `json:"safe_auto_repair_override"`
+	SafeAutoRepairEffective bool                      `json:"safe_auto_repair_effective"`
+	RecoveryCapability      *recoverymodel.Capability `json:"recovery_capability,omitempty"`
+	CreatedAt               time.Time                 `json:"created_at"`
+	UpdatedAt               time.Time                 `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.

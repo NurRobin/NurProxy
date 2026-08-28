@@ -501,6 +501,60 @@ var migrations = []string{
 		PRIMARY KEY (entity_type, entity_id)
 	);
 	`,
+
+	// Migration 23: structured recovery state and nullable per-agent policy.
+	`
+	ALTER TABLE agents ADD COLUMN safe_auto_repair_override INTEGER;
+	ALTER TABLE agents ADD COLUMN recovery_capability TEXT;
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('safe_auto_repair', 'true');
+
+	CREATE TABLE recovery_diagnostics (
+		id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		code TEXT NOT NULL,
+		subsystem TEXT NOT NULL,
+		severity TEXT NOT NULL,
+		ownership TEXT NOT NULL,
+		summary TEXT NOT NULL,
+		evidence TEXT NOT NULL DEFAULT '',
+		affected_paths TEXT NOT NULL DEFAULT '[]',
+		resource_fingerprint TEXT NOT NULL,
+		proposed_action TEXT NOT NULL DEFAULT '',
+		auto_repair_eligible INTEGER NOT NULL DEFAULT 0,
+		hard_change INTEGER NOT NULL DEFAULT 0,
+		first_seen_at TEXT NOT NULL,
+		last_seen_at TEXT NOT NULL,
+		occurrences INTEGER NOT NULL DEFAULT 1,
+		resolved_at TEXT
+	);
+	CREATE UNIQUE INDEX idx_recovery_diagnostics_identity
+		ON recovery_diagnostics(agent_id, code, resource_fingerprint);
+	CREATE INDEX idx_recovery_diagnostics_agent_active
+		ON recovery_diagnostics(agent_id, resolved_at, severity);
+
+	CREATE TABLE recovery_operations (
+		id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		diagnostic_id TEXT NOT NULL,
+		action TEXT NOT NULL,
+		resource_fingerprint TEXT NOT NULL,
+		risk TEXT NOT NULL DEFAULT 'safe',
+		request_source TEXT NOT NULL,
+		state TEXT NOT NULL,
+		step_summaries TEXT NOT NULL DEFAULT '[]',
+		snapshot_reference TEXT NOT NULL DEFAULT '',
+		validation_outcome TEXT NOT NULL DEFAULT '',
+		rollback_outcome TEXT NOT NULL DEFAULT '',
+		error TEXT NOT NULL DEFAULT '',
+		started_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		finished_at TEXT
+	);
+	CREATE INDEX idx_recovery_operations_agent_started
+		ON recovery_operations(agent_id, started_at DESC);
+	CREATE INDEX idx_recovery_operations_breaker
+		ON recovery_operations(agent_id, action, resource_fingerprint, state, started_at);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

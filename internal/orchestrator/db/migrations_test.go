@@ -94,8 +94,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 22 {
-		t.Fatalf("this test pins the schema target at 22 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 23 {
+		t.Fatalf("this test pins the schema target at 23 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -165,6 +165,35 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if n != 0 {
 			t.Errorf("pending_parent_deletions should start empty, has %d rows", n)
+		}
+	})
+
+	// migration 23: recovery policy defaults to enabled globally while the
+	// per-agent override remains NULL (inherit), and recovery history starts empty.
+	t.Run("recovery_defaults", func(t *testing.T) {
+		var global string
+		if err := d.sql.QueryRow("SELECT value FROM settings WHERE key='safe_auto_repair'").Scan(&global); err != nil {
+			t.Fatalf("select safe_auto_repair: %v", err)
+		}
+		if global != "true" {
+			t.Errorf("safe_auto_repair = %q, want true", global)
+		}
+		var override, capability sql.NullString
+		if err := d.sql.QueryRow(`SELECT safe_auto_repair_override, recovery_capability FROM agents WHERE id='agent1'`).
+			Scan(&override, &capability); err != nil {
+			t.Fatalf("select recovery agent columns: %v", err)
+		}
+		if override.Valid || capability.Valid {
+			t.Errorf("legacy agent recovery columns = (%v, %v), want (NULL, NULL)", override, capability)
+		}
+		for _, table := range []string{"recovery_diagnostics", "recovery_operations"} {
+			var n int
+			if err := d.sql.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+				t.Fatalf("select from %s: %v", table, err)
+			}
+			if n != 0 {
+				t.Errorf("%s should start empty, has %d rows", table, n)
+			}
 		}
 	})
 
