@@ -886,6 +886,7 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 		Type:    "CNAME",
 		Name:    "app.example.com",
 		Content: "old-agent.example.com", // Wrong target.
+		Proxied: true,
 	}
 	mp.mu.Unlock()
 
@@ -908,6 +909,9 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 	}
 	if rec.Content != "agent1.example.com" {
 		t.Errorf("record content: got %q, want agent1.example.com", rec.Content)
+	}
+	if !rec.Proxied {
+		t.Error("DNS drift correction changed a proxied record to DNS-only")
 	}
 
 	// Audit log should reflect the update.
@@ -1241,6 +1245,10 @@ func TestReconcileAgentDNS_CreateAndDDNSUpdate(t *testing.T) {
 	if !ok || rec.Type != "A" || rec.Content != "203.0.113.10" || rec.Name != "agent1.example.com" {
 		t.Fatalf("unexpected A record: %+v (ok=%v)", rec, ok)
 	}
+	rec.Proxied = true
+	mp.mu.Lock()
+	mp.records[got.DNSRecordID] = rec
+	mp.mu.Unlock()
 
 	// IP changes — a DDNS cycle should update the record.
 	got.PublicIP = "203.0.113.99"
@@ -1253,6 +1261,9 @@ func TestReconcileAgentDNS_CreateAndDDNSUpdate(t *testing.T) {
 	rec, _ = mp.getRecord(got.DNSRecordID)
 	if rec.Content != "203.0.113.99" {
 		t.Errorf("DDNS did not update record: got %q, want 203.0.113.99", rec.Content)
+	}
+	if !rec.Proxied {
+		t.Error("DDNS update changed a proxied record to DNS-only")
 	}
 
 	entries, _, _ := d.ListAuditLog(20, 0)
@@ -1306,6 +1317,10 @@ func TestReconcileAgentDNS_CreatesAAAAForIPv6(t *testing.T) {
 	if !ok || a6.Type != "AAAA" || a6.Content != "2001:db8::10" || a6.Name != "agent1.example.com" {
 		t.Fatalf("AAAA record: %+v (ok=%v)", a6, ok)
 	}
+	a6.Proxied = true
+	mp.mu.Lock()
+	mp.records[got.DNSRecordID6] = a6
+	mp.mu.Unlock()
 
 	// A v6 change updates only the AAAA record.
 	got.PublicIP6 = "2001:db8::99"
@@ -1318,6 +1333,9 @@ func TestReconcileAgentDNS_CreatesAAAAForIPv6(t *testing.T) {
 	a6, _ = mp.getRecord(got.DNSRecordID6)
 	if a6.Content != "2001:db8::99" {
 		t.Errorf("DDNS did not update AAAA: got %q, want 2001:db8::99", a6.Content)
+	}
+	if !a6.Proxied {
+		t.Error("AAAA DDNS update changed a proxied record to DNS-only")
 	}
 }
 
@@ -1721,7 +1739,7 @@ func TestTakeoverDomainDNS(t *testing.T) {
 	_, _, agent, _, dom := setupScenario(t, d)
 
 	// Seed a conflicting A record on the same name (the pre-NurProxy DNS).
-	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99"})
+	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99", Proxied: true})
 
 	r := New(d, newMockAgentClient(), time.Minute)
 	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
@@ -1740,6 +1758,9 @@ func TestTakeoverDomainDNS(t *testing.T) {
 	}
 	if !strings.EqualFold(recs[0].Type, "CNAME") || recs[0].Content != agent.FQDN {
 		t.Errorf("expected CNAME -> %s, got %s -> %s", agent.FQDN, recs[0].Type, recs[0].Content)
+	}
+	if !recs[0].Proxied {
+		t.Error("takeover changed a proxied record to DNS-only")
 	}
 
 	// The domain now owns a managed record and the conflict error is cleared.

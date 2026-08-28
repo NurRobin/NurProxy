@@ -825,6 +825,7 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 				Name:    fqdn,
 				Content: expectedTarget,
 				TTL:     0,
+				Proxied: rec.Proxied,
 			}); uErr != nil {
 				log.Printf("reconciler: failed to update DNS record for %s: %v", fqdn, uErr)
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", uErr)); dErr != nil {
@@ -961,12 +962,14 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
 		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s", fqdn, target))
 	} else {
 		// Delete every conflicting record at this name, then create the CNAME.
+		wasProxied := false
 		for i := range existing {
+			wasProxied = wasProxied || existing[i].Proxied
 			if dErr := dnsProvider.DeleteRecord(ctx, provConfig, existing[i].ID); dErr != nil {
 				return fmt.Errorf("deleting conflicting record %s (%s): %w", existing[i].ID, existing[i].Type, dErr)
 			}
 		}
-		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0})
+		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: wasProxied})
 		if cErr != nil {
 			return fmt.Errorf("creating CNAME for %s: %w", fqdn, cErr)
 		}
@@ -1200,6 +1203,7 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 	if existing.Content == ip {
 		return // already up to date — avoid an unnecessary API call
 	}
+	rec.Proxied = existing.Proxied
 	if uErr := dnsProvider.UpdateRecord(ctx, provConfig, recordID, rec); uErr != nil {
 		log.Printf("reconciler: failed to update %s record for agent %s: %v", recordType, a.ID, uErr)
 		r.auditDNS("agent", a.ID, action+"_update_failed", uErr.Error())
