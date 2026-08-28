@@ -144,12 +144,6 @@ func (p *mockProvider) getRecord(id string) (*provider.Record, bool) {
 	return &r, true
 }
 
-func (p *mockProvider) recordCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return len(p.records)
-}
-
 // ---------------------------------------------------------------------------
 // Mock Agent Client for reconciler
 // ---------------------------------------------------------------------------
@@ -340,7 +334,7 @@ func setupTestOrchestrator(t *testing.T) (url string, database *db.DB, cleanup f
 	return ts.URL, database, cleanup
 }
 
-func setupTestAgent(t *testing.T, orchestratorURL string) (agentURL string, agentID string, rawToken string, tokenHash string, cleanup func()) {
+func setupTestAgent(t *testing.T, orchestratorURL string) (agentURL string, agentID string, rawToken string, cleanup func()) {
 	t.Helper()
 
 	// Generate a token for the agent.
@@ -348,10 +342,6 @@ func setupTestAgent(t *testing.T, orchestratorURL string) (agentURL string, agen
 	if err != nil {
 		t.Fatalf("generating agent token: %v", err)
 	}
-
-	// The token hash is what the orchestrator stores and what the reconciler's
-	// agent client sends as the Bearer token to the agent API.
-	tokenHash = auth.HashToken(rawToken)
 
 	agentID = "e2e-agent-1"
 
@@ -366,10 +356,7 @@ func setupTestAgent(t *testing.T, orchestratorURL string) (agentURL string, agen
 	agentPort := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
 
-	// The agent API is configured with the token hash so that it accepts
-	// Bearer tokens sent by the orchestrator's agent client (which sends
-	// the hash stored in the DB).
-	agentSrv := agentapi.New(agentPort, caddyClient, tokenHash)
+	agentSrv := agentapi.New(agentPort, caddyClient, rawToken)
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := agentSrv.Start(ctx); err != nil {
 		cancel()
@@ -394,7 +381,7 @@ func setupTestAgent(t *testing.T, orchestratorURL string) (agentURL string, agen
 		cancel()
 	}
 
-	return agentURL, agentID, rawToken, tokenHash, cleanup
+	return agentURL, agentID, rawToken, cleanup
 }
 
 func httpDo(t *testing.T, method, url string, body interface{}, cookie *http.Cookie) *http.Response {
@@ -404,7 +391,7 @@ func httpDo(t *testing.T, method, url string, body interface{}, cookie *http.Coo
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			t.Fatalf("marshalling request body: %v", err)
+			t.Fatalf("marshaling request body: %v", err)
 		}
 		bodyReader = bytes.NewReader(data)
 	}
@@ -441,7 +428,7 @@ func httpDoWithBearer(t *testing.T, method, url string, body interface{}, bearer
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			t.Fatalf("marshalling request body: %v", err)
+			t.Fatalf("marshaling request body: %v", err)
 		}
 		bodyReader = bytes.NewReader(data)
 	}
@@ -510,7 +497,7 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 	orchURL, database, orchCleanup := setupTestOrchestrator(t)
 	defer orchCleanup()
 
-	agentURL, agentID, agentRawToken, agentTokenHash, agentCleanup := setupTestAgent(t, orchURL)
+	agentURL, agentID, agentRawToken, agentCleanup := setupTestAgent(t, orchURL)
 	defer agentCleanup()
 
 	agentFQDN := "edge1.testzone.com"
@@ -628,9 +615,9 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 
 	// Admin adopts the agent.
 	resp = httpDo(t, http.MethodPut, orchURL+"/api/v1/agents/"+agentID+"/adopt", map[string]interface{}{
-		"name":        "E2E Agent",
-		"provider_id": providerID,
-		"dns_mode":    "static",
+		"name":     "E2E Agent",
+		"zone_ids": []string{zoneID},
+		"dns_mode": "static",
 	}, sessionCookie)
 	var adoptResp map[string]interface{}
 	decodeJSON(t, resp, &adoptResp)
@@ -684,6 +671,7 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 		"server_id": serverID,
 		"port":      8080,
 		"websocket": true,
+		"ssl_mode":  "off",
 	}, sessionCookie)
 	var domainResp map[string]interface{}
 	decodeJSON(t, resp, &domainResp)
@@ -716,10 +704,6 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 	// 7. Run reconciler
 	// -----------------------------------------------------------------------
 
-	// The reconciler passes agent.TokenHash (from the DB) to its AgentClient
-	// methods. The orchestrator stored auth.HashToken(rawToken) which equals
-	// agentTokenHash. The agent API was started with agentTokenHash as its
-	// accepted Bearer token. So the reconciler will authenticate successfully.
 	// Heartbeat first so the agent stays adopted: the reconciler's staleness sweep
 	// marks a never-heartbeating agent offline, and route reconciliation skips
 	// offline agents. A real agent heartbeats continuously; the test does it once.
@@ -784,8 +768,7 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 	// 8. Verify route on agent
 	// -----------------------------------------------------------------------
 
-	// Use the token hash to authenticate with the agent API (that's what it was started with).
-	resp = httpDoWithBearer(t, http.MethodGet, agentURL+"/routes", nil, agentTokenHash)
+	resp = httpDoWithBearer(t, http.MethodGet, agentURL+"/routes", nil, agentRawToken)
 	var routeMap map[string]json.RawMessage
 	decodeJSON(t, resp, &routeMap)
 	if len(routeMap) == 0 {
@@ -876,7 +859,7 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 	// Verify the config is valid JSON with expected structure.
 	configBytes, err := json.Marshal(configResp["config"])
 	if err != nil {
-		t.Fatalf("marshalling config: %v", err)
+		t.Fatalf("marshaling config: %v", err)
 	}
 	var routeConfig map[string]interface{}
 	if err := json.Unmarshal(configBytes, &routeConfig); err != nil {
@@ -956,15 +939,19 @@ func TestE2E_FullAdoptionAndDomainFlow(t *testing.T) {
 		t.Errorf("expected domain status 'deleting', got %q", dom.Status)
 	}
 
-	// The DNS record should still exist at this point (reconciler hasn't cleaned up yet).
-	_, dnsFound := mockDNS.getRecord(dnsRecordID)
-	if !dnsFound {
-		t.Log("DNS record already removed (acceptable: reconciler skips 'deleting' domains)")
-	} else {
-		t.Logf("DNS record %s still exists after domain delete (pending reconciler cleanup)", dnsRecordID)
+	if _, dnsFound := mockDNS.getRecord(dnsRecordID); !dnsFound {
+		t.Fatal("managed DNS record disappeared before reconciler teardown")
+	}
+	if err := rec.RunOnce(context.Background()); err != nil {
+		t.Fatalf("reconciler teardown RunOnce: %v", err)
+	}
+	if _, err := database.GetDomain(domainID); err == nil {
+		t.Fatal("domain row still exists after reconciler teardown")
+	}
+	if _, dnsFound := mockDNS.getRecord(dnsRecordID); dnsFound {
+		t.Fatalf("managed DNS record %s still exists after reconciler teardown", dnsRecordID)
 	}
 
-	// DELETE agent -> cascades to servers (and domains via FK cascade).
 	resp = httpDo(t, http.MethodDelete, orchURL+"/api/v1/agents/"+agentID, nil, sessionCookie)
 	decodeJSON(t, resp, &deleteResp)
 	if resp.StatusCode != http.StatusOK {
