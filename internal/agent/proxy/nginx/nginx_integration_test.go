@@ -406,18 +406,18 @@ func TestIntegration_errorAttribution_existingConfig(t *testing.T) {
 		t.Fatal("expected Apply to fail because the operator's existing config is broken")
 	}
 
-	var ce *commandError
-	if !errors.As(err, &ce) {
-		t.Fatalf("error type = %T, want *commandError carrying attribution", err)
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure carrying attribution", err)
 	}
-	if !ce.Attribution.Located {
-		t.Fatalf("attribution should be located from real nginx -t output; raw:\n%s", ce.Attribution.Raw)
+	if !failure.Located {
+		t.Fatalf("attribution should be located from real nginx -t output; raw:\n%s", failure.Output)
 	}
-	if ce.Attribution.Ours {
+	if failure.ManagedHint {
 		t.Errorf("attribution blamed our file, but the fault is the operator's existing config; blamed %q\nraw:\n%s",
-			ce.Attribution.File, ce.Attribution.Raw)
+			failure.File, failure.Output)
 	}
-	if !strings.Contains(filepath.Base(ce.Attribution.File), "operator-site") {
-		t.Errorf("expected blame on operator-site, got %q", ce.Attribution.File)
+	if !strings.Contains(filepath.Base(failure.File), "operator-site") {
+		t.Errorf("expected blame on operator-site, got %q", failure.File)
 	}
 }

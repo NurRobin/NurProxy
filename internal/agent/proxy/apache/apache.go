@@ -59,26 +59,6 @@ func init() {
 	})
 }
 
-// commandError carries an apachectl configtest failure with its attribution so
-// Apply can surface "we broke it" distinctly from "your existing config was
-// already broken" (§10). Its Error() yields a human-readable message with the
-// jump-to-file location.
-type commandError struct {
-	// Attribution classifies the failure (ours vs the operator's config).
-	Attribution ErrAttribution
-}
-
-func (e *commandError) Error() string {
-	a := e.Attribution
-	if !a.Located {
-		return fmt.Sprintf("apachectl configtest failed: %s", strings.TrimSpace(a.Raw))
-	}
-	if a.Ours {
-		return fmt.Sprintf("apachectl configtest failed in the generated config at %s:%d", a.File, a.Line)
-	}
-	return fmt.Sprintf("apachectl configtest failed: error in your existing config at %s:%d", a.File, a.Line)
-}
-
 // Runner abstracts the two privileged host commands the backend needs (§12):
 // validate (apachectl configtest) and reload (apachectl graceful / systemctl
 // reload). It is an interface so Apply's orchestration is testable without a real
@@ -388,12 +368,12 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 	if err != nil {
 		attr := AttributeConfigtestError(out, primaryTarget(arts))
 		rollback()
-		return &commandError{Attribution: attr}
+		return validationFailure(out, err, attr)
 	}
 
 	if err := b.runner.Reload(ctx); err != nil {
 		rollback()
-		return fmt.Errorf("apache reload failed after passing configtest: %w", err)
+		return proxy.NewFailure(proxy.KindApache, proxy.FailurePhaseReload, err.Error(), err)
 	}
 
 	// Commit: the staged content is live and valid; drop the temps and mark
@@ -434,7 +414,7 @@ func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {
 	b.removeCerts(ctx, target.Path)
 	if b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
-			return fmt.Errorf("apache reload after remove failed: %w", err)
+			return proxy.NewFailure(proxy.KindApache, proxy.FailurePhaseReload, err.Error(), err)
 		}
 	}
 	return nil
@@ -511,7 +491,7 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 	}
 	if removed > 0 && b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
-			return removed, fmt.Errorf("apache reload after prune failed: %w", err)
+			return removed, proxy.NewFailure(proxy.KindApache, proxy.FailurePhaseReload, err.Error(), err)
 		}
 	}
 	return removed, nil
@@ -526,7 +506,7 @@ func (b *Backend) Validate(ctx context.Context) error {
 	}
 	out, err := b.runner.Test(ctx)
 	if err != nil {
-		return &commandError{Attribution: AttributeConfigtestError(out, "")}
+		return validationFailure(out, err, AttributeConfigtestError(out, ""))
 	}
 	return nil
 }
@@ -549,7 +529,7 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 	for _, c := range certs {
 		paths, err := b.certs.Install(certstore.Bundle{Host: c.Host, CertPEM: c.CertPEM, KeyPEM: c.KeyPEM, MaterializePlain: c.MaterializeKey})
 		if err != nil {
-			return fmt.Errorf("installing cert for %q: %w", c.Host, err)
+			return proxy.NewFailure(proxy.KindApache, proxy.FailurePhaseCertInstall, err.Error(), err)
 		}
 		slog.InfoContext(ctx, "apache: installed central cert bundle",
 			slog.String("host", c.Host),
@@ -557,6 +537,16 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 			slog.Bool("key_encrypted_at_rest", paths.Encrypted))
 	}
 	return nil
+}
+
+func validationFailure(output string, err error, attr ErrAttribution) *proxy.Failure {
+	failure := proxy.NewFailure(proxy.KindApache, proxy.FailurePhaseValidate, output, err)
+	failure.File = attr.File
+	failure.Line = attr.Line
+	failure.Located = attr.Located
+	failure.ManagedHint = attr.Ours
+	failure.Permission = attr.Permission
+	return failure
 }
 
 // enabledLinkFor returns the sites-enabled symlink path for a config file: same

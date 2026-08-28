@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -290,14 +291,59 @@ func TestApply_reloadFails_rollsBack(t *testing.T) {
 	b, layout := newDebianBackend(t, r)
 	art := sampleArtifact(b, "app.example.com", "<VirtualHost *:80></VirtualHost>\n")
 
-	if err := b.Apply(context.Background(), []proxy.Artifact{art}); err == nil {
+	err := b.Apply(context.Background(), []proxy.Artifact{art})
+	if err == nil {
 		t.Fatal("expected Apply to fail on reload error")
+	}
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) || failure.Backend != proxy.KindApache || failure.Phase != proxy.FailurePhaseReload {
+		t.Fatalf("reload error = %#v, want typed apache reload failure", err)
 	}
 	if _, statErr := os.Stat(art.Target.Path); !os.IsNotExist(statErr) {
 		t.Errorf("file should be removed on rollback after reload failure")
 	}
 	if symlinkPresent(layout.EnabledPath("app.example.com")) {
 		t.Errorf("symlink should not survive rollback after reload failure")
+	}
+}
+
+func TestValidate_binaryMissingReturnsTypedFailure(t *testing.T) {
+	b, _ := newDebianBackend(t, &fakeRunner{testErr: exec.ErrNotFound})
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.BinaryMissing || failure.Phase != proxy.FailurePhaseValidate {
+		t.Fatalf("failure = %#v, want binary-missing validation failure", failure)
+	}
+}
+
+func TestValidate_permissionDeniedReturnsTypedFailure(t *testing.T) {
+	r := &fakeRunner{
+		testErr: errors.New("exit status 1"),
+		testOut: "httpd: could not open error log file /var/log/httpd/error_log. Permission denied",
+	}
+	b, _ := newDebianBackend(t, r)
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.Permission || failure.Located || failure.ManagedHint {
+		t.Fatalf("failure = %#v, want unlocated permission failure without managed hint", failure)
+	}
+}
+
+func TestInstallCerts_failureReturnsTypedFailure(t *testing.T) {
+	b := New(proxy.Config{Type: "apache", ConfigDir: t.TempDir(), CertDir: t.TempDir()})
+	err := b.InstallCerts(context.Background(), []proxy.CertBundle{{Host: "app.example.com"}})
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if failure.Backend != proxy.KindApache || failure.Phase != proxy.FailurePhaseCertInstall {
+		t.Fatalf("failure = %#v, want apache cert_install failure", failure)
 	}
 }
 
@@ -310,18 +356,21 @@ func TestApply_configtestFails_returnsAttributedError(t *testing.T) {
 	art := sampleArtifact(b, "app.example.com", "<VirtualHost *:80></VirtualHost>\n")
 
 	err := b.Apply(context.Background(), []proxy.Artifact{art})
-	var ce *commandError
-	if !errors.As(err, &ce) {
-		t.Fatalf("error type = %T, want *commandError", err)
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
 	}
-	if !ce.Attribution.Located {
+	if failure.Backend != proxy.KindApache || failure.Phase != proxy.FailurePhaseValidate {
+		t.Errorf("backend/phase = %s/%s, want apache/validate", failure.Backend, failure.Phase)
+	}
+	if !failure.Located {
 		t.Fatalf("attribution should be located")
 	}
-	if ce.Attribution.Ours {
+	if failure.ManagedHint {
 		t.Errorf("blame should be the operator's file, not ours")
 	}
-	if ce.Attribution.Line != 9 {
-		t.Errorf("line = %d, want 9", ce.Attribution.Line)
+	if failure.Line != 9 {
+		t.Errorf("line = %d, want 9", failure.Line)
 	}
 }
 

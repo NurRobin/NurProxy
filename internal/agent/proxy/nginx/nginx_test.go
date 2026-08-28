@@ -319,12 +319,15 @@ func TestApply_testFails_rollsBackNewFile_andAttributesOurError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on failing nginx -t")
 	}
-	var ce *commandError
-	if !errors.As(err, &ce) {
-		t.Fatalf("error type = %T, want *commandError", err)
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
 	}
-	if !ce.Attribution.Ours {
-		t.Errorf("Attribution.Ours = false, want true (error in our generated file)")
+	if failure.Backend != proxy.KindNginx || failure.Phase != proxy.FailurePhaseValidate || !failure.ManagedHint {
+		t.Errorf("failure = %#v, want nginx validate failure with managed hint", failure)
+	}
+	if !failure.Located || failure.File != art.Target.Path || failure.Line != 1 {
+		t.Errorf("failure location = %q:%d (located=%v), want %q:1", failure.File, failure.Line, failure.Located, art.Target.Path)
 	}
 	// New file removed on rollback (it did not exist before).
 	if _, statErr := os.Stat(art.Target.Path); !errors.Is(statErr, os.ErrNotExist) {
@@ -362,12 +365,12 @@ func TestApply_testFails_restoresPriorContent(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	var ce *commandError
-	if !errors.As(err, &ce) {
-		t.Fatalf("want *commandError, got %T", err)
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("want *proxy.Failure, got %T", err)
 	}
-	if ce.Attribution.Ours {
-		t.Errorf("Ours = true, want false (the blamed file is the operator's other vhost)")
+	if failure.ManagedHint {
+		t.Errorf("ManagedHint = true, want false (the blamed file is the operator's other vhost)")
 	}
 	// Prior content restored.
 	got, readErr := os.ReadFile(dest)
@@ -434,12 +437,40 @@ func TestApply_reloadFails_rollsBack(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on reload failure")
 	}
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) || failure.Backend != proxy.KindNginx || failure.Phase != proxy.FailurePhaseReload {
+		t.Fatalf("reload error = %#v, want typed nginx reload failure", err)
+	}
 	// New file rolled back even though nginx -t passed.
 	if _, statErr := os.Stat(art.Target.Path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("file should be rolled back on reload failure, stat err = %v", statErr)
 	}
 	if r.tests != 1 || r.reloads != 1 {
 		t.Errorf("tests=%d reloads=%d, want 1 and 1", r.tests, r.reloads)
+	}
+}
+
+func TestValidate_binaryMissingReturnsTypedFailure(t *testing.T) {
+	b, _ := newBackend(t, &fakeRunner{testErr: exec.ErrNotFound})
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.BinaryMissing || failure.Phase != proxy.FailurePhaseValidate {
+		t.Fatalf("failure = %#v, want binary-missing validation failure", failure)
+	}
+}
+
+func TestInstallCerts_failureReturnsTypedFailure(t *testing.T) {
+	b := New(proxy.Config{Type: "nginx", ConfigDir: t.TempDir(), CertDir: t.TempDir()})
+	err := b.InstallCerts(context.Background(), []proxy.CertBundle{{Host: "app.example.com"}})
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if failure.Backend != proxy.KindNginx || failure.Phase != proxy.FailurePhaseCertInstall {
+		t.Fatalf("failure = %#v, want nginx cert_install failure", failure)
 	}
 }
 

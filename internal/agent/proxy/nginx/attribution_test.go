@@ -123,35 +123,3 @@ nginx: configuration file /etc/nginx/nginx.conf test failed`,
 		})
 	}
 }
-
-func TestCommandError_message(t *testing.T) {
-	tests := []struct {
-		name string
-		attr ErrAttribution
-		want string
-	}{
-		{
-			name: "ours names the generated config",
-			attr: ErrAttribution{Located: true, Ours: true, File: "/x/nurproxy-a.conf", Line: 4},
-			want: "nginx -t failed in the generated config at /x/nurproxy-a.conf:4",
-		},
-		{
-			name: "theirs names the existing config with jump location",
-			attr: ErrAttribution{Located: true, Ours: false, File: "/etc/nginx/sites-enabled/legacy", Line: 9},
-			want: "nginx -t failed: error in your existing config at /etc/nginx/sites-enabled/legacy:9",
-		},
-		{
-			name: "unlocated surfaces raw output",
-			attr: ErrAttribution{Located: false, Raw: "nginx: [emerg] permission denied"},
-			want: "nginx -t failed: nginx: [emerg] permission denied",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := (&commandError{Attribution: tt.attr}).Error()
-			if got != tt.want {
-				t.Errorf("Error() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}

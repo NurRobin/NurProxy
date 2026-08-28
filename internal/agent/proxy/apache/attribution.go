@@ -21,6 +21,8 @@ import (
 // is in a file we manage or in the operator's pre-existing config (§10).
 var apacheErrRe = regexp.MustCompile(`on line (\d+) of (\S+?):?$`)
 
+var permDeniedRe = regexp.MustCompile(`(?i)permission denied`)
+
 // ErrAttribution classifies an apachectl configtest failure as either ours (the
 // file this apply wrote) or the operator's pre-existing config elsewhere in the
 // managed dir (§10). configtest validates the WHOLE config, so a long-standing
@@ -40,6 +42,9 @@ type ErrAttribution struct {
 	// parseable location (e.g. a permission error) yields Located=false, and the
 	// caller surfaces the raw output unattributed.
 	Located bool
+	// Permission reports that configtest could not read a required file rather
+	// than finding invalid configuration syntax.
+	Permission bool
 	// Raw is the verbatim configtest output, always carried so the caller can show
 	// the operator the exact message.
 	Raw string
@@ -57,6 +62,7 @@ type ErrAttribution struct {
 // frame Apache blames, so we attribute to it.
 func AttributeConfigtestError(out, ourFile string) ErrAttribution {
 	a := ErrAttribution{Raw: out}
+	a.Permission = permDeniedRe.MatchString(out)
 
 	var last []string
 	for _, line := range strings.Split(out, "\n") {

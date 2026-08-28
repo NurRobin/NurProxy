@@ -54,30 +54,6 @@ func init() {
 	})
 }
 
-// commandError carries an nginx -t failure with its attribution so Apply can
-// surface "we broke it" distinctly from "your existing config was already
-// broken" (§10). It is returned by Validate's internal test step and unwrapped by
-// callers that want the structured attribution; its Error() yields a
-// human-readable message with the jump-to-file location.
-type commandError struct {
-	// Attribution classifies the failure (ours vs the operator's config).
-	Attribution ErrAttribution
-}
-
-func (e *commandError) Error() string {
-	a := e.Attribution
-	if !a.Located {
-		if a.Permission {
-			return fmt.Sprintf("nginx -t could not complete with the agent's privileges — permission denied reading nginx files (e.g. other vhosts' TLS keys or the error log). Grant the agent privilege to run 'nginx -t' / 'nginx -s reload' (see the agent's permission remediation). nginx output: %s", strings.TrimSpace(a.Raw))
-		}
-		return fmt.Sprintf("nginx -t failed: %s", strings.TrimSpace(a.Raw))
-	}
-	if a.Ours {
-		return fmt.Sprintf("nginx -t failed in the generated config at %s:%d", a.File, a.Line)
-	}
-	return fmt.Sprintf("nginx -t failed: error in your existing config at %s:%d", a.File, a.Line)
-}
-
 // Runner abstracts the two privileged host commands the backend needs (§12):
 // validate (nginx -t) and reload (nginx -s reload). It is an interface so Apply's
 // orchestration is testable without a real nginx, and so the agent can wire a
@@ -407,12 +383,12 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 	if err != nil {
 		attr := AttributeNginxTestError(out, primaryTarget(arts))
 		rollback()
-		return &commandError{Attribution: attr}
+		return validationFailure(out, err, attr)
 	}
 
 	if err := b.runner.Reload(ctx); err != nil {
 		rollback()
-		return fmt.Errorf("nginx -s reload failed after passing nginx -t: %w", err)
+		return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
 	}
 
 	// Commit: the staged content is live and valid; drop the temps and mark
@@ -456,7 +432,7 @@ func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {
 	b.removeCerts(ctx, target.Path)
 	if b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
-			return fmt.Errorf("nginx -s reload after remove failed: %w", err)
+			return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
 		}
 	}
 	return nil
@@ -535,7 +511,7 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 	}
 	if removed > 0 && b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
-			return removed, fmt.Errorf("nginx -s reload after prune failed: %w", err)
+			return removed, proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
 		}
 	}
 	return removed, nil
@@ -550,7 +526,7 @@ func (b *Backend) Validate(ctx context.Context) error {
 	}
 	out, err := b.runner.Test(ctx)
 	if err != nil {
-		return &commandError{Attribution: AttributeNginxTestError(out, "")}
+		return validationFailure(out, err, AttributeNginxTestError(out, ""))
 	}
 	return nil
 }
@@ -572,7 +548,7 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 	for _, c := range certs {
 		paths, err := b.certs.Install(certstore.Bundle{Host: c.Host, CertPEM: c.CertPEM, KeyPEM: c.KeyPEM, MaterializePlain: c.MaterializeKey})
 		if err != nil {
-			return fmt.Errorf("installing cert for %q: %w", c.Host, err)
+			return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseCertInstall, err.Error(), err)
 		}
 		slog.InfoContext(ctx, "nginx: installed central cert bundle",
 			slog.String("host", c.Host),
@@ -580,6 +556,16 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 			slog.Bool("key_encrypted_at_rest", paths.Encrypted))
 	}
 	return nil
+}
+
+func validationFailure(output string, err error, attr ErrAttribution) *proxy.Failure {
+	failure := proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, output, err)
+	failure.File = attr.File
+	failure.Line = attr.Line
+	failure.Located = attr.Located
+	failure.ManagedHint = attr.Ours
+	failure.Permission = attr.Permission
+	return failure
 }
 
 // enabledLinkFor returns the sites-enabled symlink path for a sites-available

@@ -95,3 +95,11 @@ func TestAttributeConfigtestError(t *testing.T) {
 		})
 	}
 }
+
+func TestAttributeConfigtestErrorDetectsPermissionDenied(t *testing.T) {
+	out := "httpd: could not open error log file /var/log/httpd/error_log. Permission denied"
+	got := AttributeConfigtestError(out, "/etc/apache2/sites-available/nurproxy-app.conf")
+	if !got.Permission {
+		t.Fatal("Permission = false, want true")
+	}
+}
