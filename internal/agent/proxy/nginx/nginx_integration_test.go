@@ -182,6 +182,9 @@ func waitNginxReady(t *testing.T, container string) {
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		out, err := exec.CommandContext(ctx, "docker", "exec", container, "nginx", "-t").CombinedOutput()
+		if err == nil {
+			_, err = exec.CommandContext(ctx, "docker", "exec", container, "sh", "-c", `test -s /run/nginx.pid && kill -0 "$(cat /run/nginx.pid)"`).CombinedOutput()
+		}
 		cancel()
 		last = string(out)
 		if err == nil {
