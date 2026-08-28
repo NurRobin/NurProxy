@@ -60,6 +60,7 @@ func TestRecoverySchemaUsesIntegerChronologyForeignKeysAndChecks(t *testing.T) {
 		"idx_recovery_diagnostics_agent_active",
 		"idx_recovery_diagnostics_agent_seen",
 		"idx_recovery_operations_agent_created",
+		"idx_recovery_operations_agent_received",
 		"idx_recovery_operations_breaker",
 	} {
 		var found string

@@ -265,6 +265,10 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 	if err != nil {
 		return err
 	}
+	receivedAt, err := nextRecoveryReceivedAt(tx, agentID)
+	if err != nil {
+		return err
+	}
 	_, err = tx.Exec(`
 		INSERT INTO recovery_operations (
 			id, agent_id, diagnostic_id, action, resource_fingerprint, risk,
@@ -274,7 +278,7 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 		report.OperationID, agentID, report.DiagnosticID, string(report.Action), fingerprint,
 		string(report.Source), string(report.State), steps, report.SnapshotReference,
 		report.ValidationOutcome, report.RollbackOutcome, report.Error,
-		startedAt, createdAt, createdAt, finishedAt,
+		startedAt, createdAt, receivedAt, finishedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("creating repair operation: %w", err)
@@ -350,16 +354,16 @@ func (d *DB) AdvanceRepairOperation(agentID string, report recoverymodel.Operati
 	if err != nil {
 		return err
 	}
-	receivedAt, err := recoveryUnixNano(time.Now().UTC())
+	receivedAt, err := nextRecoveryReceivedAt(tx, agentID)
 	if err != nil {
-		return fmt.Errorf("encoding repair operation receipt time: %w", err)
+		return err
 	}
 	res, err := tx.Exec(`UPDATE recovery_operations SET state = ?, step_summaries = ?,
 		snapshot_reference = ?, validation_outcome = ?, rollback_outcome = ?, error = ?,
-		received_at = CASE WHEN received_at >= ? THEN received_at + 1 ELSE ? END,
+		received_at = ?,
 		finished_at = ? WHERE agent_id = ? AND id = ? AND state = ?`,
 		string(report.State), steps, report.SnapshotReference, report.ValidationOutcome,
-		report.RollbackOutcome, report.Error, receivedAt, receivedAt,
+		report.RollbackOutcome, report.Error, receivedAt,
 		finishedAt, agentID, report.OperationID, string(stored.State),
 	)
 	if err != nil {
@@ -469,8 +473,12 @@ func validatePersistedOperation(report recoverymodel.OperationReport) error {
 	if !terminal && report.FinishedAt != nil {
 		return fmt.Errorf("nonterminal repair operation state %q cannot set finished_at", report.State)
 	}
-	if operationRequiresSnapshot(report.State) && strings.TrimSpace(report.SnapshotReference) == "" {
-		return fmt.Errorf("repair operation state %q requires a snapshot reference", report.State)
+	if operationRequiresSnapshot(report.State) {
+		if strings.TrimSpace(report.SnapshotReference) == "" {
+			return fmt.Errorf("repair operation state %q requires a snapshot reference", report.State)
+		}
+	} else if report.SnapshotReference != "" {
+		return fmt.Errorf("repair operation state %q cannot set a snapshot reference", report.State)
 	}
 	if err := validateOperationHistory(report); err != nil {
 		return err
@@ -537,6 +545,24 @@ func nextRecoveryCreatedAt(tx *sql.Tx, agentID string) (int64, error) {
 	if now <= latest {
 		if latest == math.MaxInt64 {
 			return 0, fmt.Errorf("recovery operation creation chronology exhausted")
+		}
+		now = latest + 1
+	}
+	return now, nil
+}
+
+func nextRecoveryReceivedAt(tx *sql.Tx, agentID string) (int64, error) {
+	var latest int64
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(received_at), 0) FROM recovery_operations WHERE agent_id = ?`, agentID).Scan(&latest); err != nil {
+		return 0, fmt.Errorf("reading recovery operation receipt chronology: %w", err)
+	}
+	now, err := recoveryUnixNano(time.Now().UTC())
+	if err != nil {
+		return 0, fmt.Errorf("encoding recovery operation receipt time: %w", err)
+	}
+	if now <= latest {
+		if latest == math.MaxInt64 {
+			return 0, fmt.Errorf("recovery operation receipt chronology exhausted")
 		}
 		now = latest + 1
 	}

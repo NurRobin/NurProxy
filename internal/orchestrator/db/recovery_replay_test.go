@@ -222,6 +222,65 @@ func TestRepairHistoryBindsInitialStepAdvanceAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestRepairOperationSnapshotReferenceMatchesLifecycle(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diag := testDiagnostic(a.ID, "fp-snapshot-lifecycle")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+
+	automatic := testOperation("op-auto-snapshot", diag.ID, recoverymodel.OperationStateDetected)
+	automatic.SnapshotReference = "recovery/too-early-auto"
+	if err := d.CreateRepairOperation(a.ID, automatic, diag.ResourceFingerprint); err == nil {
+		t.Fatal("automatic detected create accepted a snapshot reference")
+	}
+	user := newUserOperation("op-user-snapshot", diag, recoveryTime(0))
+	user.SnapshotReference = "recovery/too-early-user"
+	if err := d.CreateRepairOperation(a.ID, user, diag.ResourceFingerprint); err == nil {
+		t.Fatal("user planned create accepted a snapshot reference")
+	}
+
+	for _, terminal := range []recoverymodel.OperationState{
+		recoverymodel.OperationStateDiagnosisOnly,
+		recoverymodel.OperationStateSuppressed,
+	} {
+		op := testOperation("op-early-"+string(terminal), diag.ID, recoverymodel.OperationStateDetected)
+		if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		op.State = terminal
+		op.SnapshotReference = "recovery/too-early-" + string(terminal)
+		op.Steps = appendStepAt(op.Steps, terminal, recoveryTime(1))
+		finished := recoveryTime(1)
+		op.FinishedAt = &finished
+		if err := d.AdvanceRepairOperation(a.ID, op); err == nil {
+			t.Fatalf("%s transition accepted a snapshot reference", terminal)
+		}
+	}
+
+	automatic = testOperation("op-auto-snapshot-flow", diag.ID, recoverymodel.OperationStateDetected)
+	if err := d.CreateRepairOperation(a.ID, automatic, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	automatic.State = recoverymodel.OperationStatePlanned
+	automatic.Steps = appendStepAt(automatic.Steps, automatic.State, recoveryTime(1))
+	if err := d.AdvanceRepairOperation(a.ID, automatic); err != nil {
+		t.Fatal(err)
+	}
+	tooEarly := automatic
+	tooEarly.SnapshotReference = "recovery/planned-too-early"
+	if err := d.AdvanceRepairOperation(a.ID, tooEarly); err == nil {
+		t.Fatal("planned replay accepted a snapshot reference")
+	}
+	automatic.State = recoverymodel.OperationStateSnapshotted
+	automatic.SnapshotReference = "recovery/op-auto-snapshot-flow"
+	automatic.Steps = appendStepAt(automatic.Steps, automatic.State, recoveryTime(2))
+	if err := d.AdvanceRepairOperation(a.ID, automatic); err != nil {
+		t.Fatalf("snapshotted transition did not accept its first snapshot reference: %v", err)
+	}
+}
+
 func TestRecoveryCreatedChronologyIsAgentScoped(t *testing.T) {
 	d := testDB(t)
 	a1 := createTestAgent(t, d)
@@ -302,6 +361,117 @@ func TestRecoveryReceivedChronologyIsMonotonePerOperation(t *testing.T) {
 	if received != future+1 {
 		t.Fatalf("received chronology = %d, want %d", received, future+1)
 	}
+}
+
+func TestRecoveryReceivedChronologyIsSerializedPerAgent(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diag := testDiagnostic(a.ID, "fp-agent-receipts")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+	first := newUserOperation("op-agent-receipt-first", diag, recoveryTime(0))
+	if err := d.CreateRepairOperation(a.ID, first, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour).UnixNano()
+	if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, future, first.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	second := newUserOperation("op-agent-receipt-second", diag, recoveryTime(1))
+	if err := d.CreateRepairOperation(a.ID, second, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	var received int64
+	if err := d.sql.QueryRow(`SELECT received_at FROM recovery_operations WHERE id = ?`, second.OperationID).Scan(&received); err != nil {
+		t.Fatal(err)
+	}
+	if received != future+1 {
+		t.Fatalf("second operation receipt = %d, want %d", received, future+1)
+	}
+
+	first = advanceOperation(t, d, a.ID, first, recoverymodel.OperationStateSnapshotted)
+	if err := d.sql.QueryRow(`SELECT received_at FROM recovery_operations WHERE id = ?`, first.OperationID).Scan(&received); err != nil {
+		t.Fatal(err)
+	}
+	if received != future+2 {
+		t.Fatalf("cross-operation advance receipt = %d, want %d", received, future+2)
+	}
+}
+
+func TestRepairBreakerOrdersTerminalACKsBySerializedAgentReceipt(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diag := testDiagnostic(a.ID, "fp-serialized-terminal-order")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+	success := newUserOperation("op-serialized-success", diag, recoveryTime(0))
+	failure := newUserOperation("op-serialized-failure", diag, recoveryTime(1))
+	if err := d.CreateRepairOperation(a.ID, success, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CreateRepairOperation(a.ID, failure, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour).UnixNano()
+	if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, future, success.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	success = advanceOperationToTerminal(t, d, a.ID, success, recoverymodel.OperationStateSucceeded)
+	failure = advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRolledBack)
+
+	count, err := d.CountRecentRepairFailures(a.ID, diag.ProposedAction, diag.ResourceFingerprint, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("failure ACK received after success = %d, want 1", count)
+	}
+}
+
+func TestRecoveryReceivedChronologyRejectsIntegerOverflow(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		d := testDB(t)
+		a := createTestAgent(t, d)
+		diag := testDiagnostic(a.ID, "fp-receipt-create-overflow")
+		if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+			t.Fatal(err)
+		}
+		first := newUserOperation("op-receipt-create-max", diag, recoveryTime(0))
+		if err := d.CreateRepairOperation(a.ID, first, diag.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, int64(math.MaxInt64), first.OperationID); err != nil {
+			t.Fatal(err)
+		}
+		second := newUserOperation("op-receipt-create-overflow", diag, recoveryTime(1))
+		if err := d.CreateRepairOperation(a.ID, second, diag.ResourceFingerprint); err == nil {
+			t.Fatal("operation receipt chronology wrapped during create")
+		}
+	})
+
+	t.Run("advance", func(t *testing.T) {
+		d := testDB(t)
+		a := createTestAgent(t, d)
+		diag := testDiagnostic(a.ID, "fp-receipt-advance-overflow")
+		if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+			t.Fatal(err)
+		}
+		op := newUserOperation("op-receipt-advance-max", diag, recoveryTime(0))
+		if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, int64(math.MaxInt64), op.OperationID); err != nil {
+			t.Fatal(err)
+		}
+		op.State = recoverymodel.OperationStateSnapshotted
+		op.SnapshotReference = "recovery/receipt-advance-max"
+		op.Steps = appendStepAt(op.Steps, op.State, recoveryTime(1))
+		if err := d.AdvanceRepairOperation(a.ID, op); err == nil {
+			t.Fatal("operation receipt chronology wrapped during advance")
+		}
+	})
 }
 
 func newUserOperation(id string, diag recoverymodel.Diagnostic, started time.Time) recoverymodel.OperationReport {

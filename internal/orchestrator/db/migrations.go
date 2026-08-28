@@ -573,6 +573,8 @@ var migrations = []string{
 	);
 	CREATE INDEX idx_recovery_operations_agent_created
 		ON recovery_operations(agent_id, created_at DESC, id DESC);
+	CREATE INDEX idx_recovery_operations_agent_received
+		ON recovery_operations(agent_id, received_at);
 	CREATE INDEX idx_recovery_operations_breaker
 		ON recovery_operations(agent_id, action, resource_fingerprint, state, received_at);
 	`,
