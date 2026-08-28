@@ -1,11 +1,13 @@
 package recoverymodel
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -49,6 +51,15 @@ func (v Code) Valid() bool {
 	}
 }
 
+func (v *Code) UnmarshalJSON(data []byte) error {
+	raw, err := unmarshalClosedString(data, "diagnostic code", false, func(value string) bool { return Code(value).Valid() })
+	if err != nil {
+		return err
+	}
+	*v = Code(raw)
+	return nil
+}
+
 type Severity string
 
 const (
@@ -67,6 +78,15 @@ func (v Severity) Valid() bool {
 	}
 }
 
+func (v *Severity) UnmarshalJSON(data []byte) error {
+	raw, err := unmarshalClosedString(data, "diagnostic severity", false, func(value string) bool { return Severity(value).Valid() })
+	if err != nil {
+		return err
+	}
+	*v = Severity(raw)
+	return nil
+}
+
 type Ownership string
 
 const (
@@ -83,6 +103,15 @@ func (v Ownership) Valid() bool {
 	default:
 		return false
 	}
+}
+
+func (v *Ownership) UnmarshalJSON(data []byte) error {
+	raw, err := unmarshalClosedString(data, "diagnostic ownership", false, func(value string) bool { return Ownership(value).Valid() })
+	if err != nil {
+		return err
+	}
+	*v = Ownership(raw)
+	return nil
 }
 
 type Action string
@@ -107,15 +136,11 @@ func (v Action) Valid() bool {
 }
 
 func (v *Action) UnmarshalJSON(data []byte) error {
-	var raw string
-	if err := json.Unmarshal(data, &raw); err != nil {
+	raw, err := unmarshalClosedString(data, "recovery action", true, func(value string) bool { return Action(value).Valid() })
+	if err != nil {
 		return err
 	}
-	action := Action(raw)
-	if action != "" && !action.Valid() {
-		return fmt.Errorf("unknown recovery action %q", raw)
-	}
-	*v = action
+	*v = Action(raw)
 	return nil
 }
 
@@ -150,15 +175,11 @@ func (v OperationState) Valid() bool {
 }
 
 func (v *OperationState) UnmarshalJSON(data []byte) error {
-	var raw string
-	if err := json.Unmarshal(data, &raw); err != nil {
+	raw, err := unmarshalClosedString(data, "recovery operation state", false, func(value string) bool { return OperationState(value).Valid() })
+	if err != nil {
 		return err
 	}
-	state := OperationState(raw)
-	if !state.Valid() {
-		return fmt.Errorf("unknown recovery operation state %q", raw)
-	}
-	*v = state
+	*v = OperationState(raw)
 	return nil
 }
 
@@ -171,6 +192,29 @@ const (
 
 func (v RequestSource) Valid() bool {
 	return v == RequestSourceAutomatic || v == RequestSourceUser
+}
+
+func (v *RequestSource) UnmarshalJSON(data []byte) error {
+	raw, err := unmarshalClosedString(data, "recovery request source", false, func(value string) bool { return RequestSource(value).Valid() })
+	if err != nil {
+		return err
+	}
+	*v = RequestSource(raw)
+	return nil
+}
+
+func unmarshalClosedString(data []byte, name string, allowEmpty bool, valid func(string) bool) (string, error) {
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "", err
+	}
+	if raw == "" && allowEmpty {
+		return "", nil
+	}
+	if !valid(raw) {
+		return "", fmt.Errorf("unknown %s %q", name, raw)
+	}
+	return raw, nil
 }
 
 type Diagnostic struct {
@@ -224,6 +268,129 @@ type OperationReport struct {
 	FinishedAt        *time.Time     `json:"finished_at"`
 }
 
+func (d Diagnostic) Validate() error {
+	if strings.TrimSpace(d.ID) == "" {
+		return fmt.Errorf("diagnostic ID is required")
+	}
+	if !d.Code.Valid() {
+		return fmt.Errorf("invalid diagnostic code %q", d.Code)
+	}
+	if strings.TrimSpace(d.Subsystem) == "" {
+		return fmt.Errorf("diagnostic subsystem is required")
+	}
+	if !d.Severity.Valid() {
+		return fmt.Errorf("invalid diagnostic severity %q", d.Severity)
+	}
+	if !d.Ownership.Valid() {
+		return fmt.Errorf("invalid diagnostic ownership %q", d.Ownership)
+	}
+	if strings.TrimSpace(d.ResourceFingerprint) == "" {
+		return fmt.Errorf("diagnostic resource fingerprint is required")
+	}
+	if d.Occurrences < 1 {
+		return fmt.Errorf("diagnostic occurrences must be positive")
+	}
+	if d.ProposedAction != "" && !d.ProposedAction.Valid() {
+		return fmt.Errorf("invalid proposed recovery action %q", d.ProposedAction)
+	}
+	if d.AutoRepairEligible && d.ProposedAction == "" {
+		return fmt.Errorf("auto-repair eligible diagnostic requires an action")
+	}
+	return nil
+}
+
+func (c Capability) Validate() error {
+	if c.Stage < 1 {
+		return fmt.Errorf("recovery capability stage must be positive")
+	}
+	seen := make(map[Action]struct{}, len(c.Actions))
+	for _, action := range c.Actions {
+		if !action.Valid() {
+			return fmt.Errorf("invalid recovery capability action %q", action)
+		}
+		if _, exists := seen[action]; exists {
+			return fmt.Errorf("duplicate recovery capability action %q", action)
+		}
+		seen[action] = struct{}{}
+	}
+	return nil
+}
+
+func (r RepairRequest) Validate() error {
+	if strings.TrimSpace(r.OperationID) == "" {
+		return fmt.Errorf("repair operation ID is required")
+	}
+	if strings.TrimSpace(r.DiagnosticID) == "" {
+		return fmt.Errorf("repair diagnostic ID is required")
+	}
+	if !r.Action.Valid() {
+		return fmt.Errorf("invalid repair action %q", r.Action)
+	}
+	return nil
+}
+
+func (r *RepairRequest) UnmarshalJSON(data []byte) error {
+	type plain RepairRequest
+	var decoded plain
+	if err := DecodeStrict(data, &decoded); err != nil {
+		return err
+	}
+	*r = RepairRequest(decoded)
+	return r.Validate()
+}
+
+func (r OperationReport) Validate() error {
+	if strings.TrimSpace(r.OperationID) == "" {
+		return fmt.Errorf("repair operation ID is required")
+	}
+	if strings.TrimSpace(r.DiagnosticID) == "" {
+		return fmt.Errorf("repair diagnostic ID is required")
+	}
+	if !r.Action.Valid() {
+		return fmt.Errorf("invalid repair action %q", r.Action)
+	}
+	if !r.Source.Valid() {
+		return fmt.Errorf("invalid repair request source %q", r.Source)
+	}
+	if !r.State.Valid() {
+		return fmt.Errorf("invalid repair operation state %q", r.State)
+	}
+	if r.StartedAt.IsZero() {
+		return fmt.Errorf("repair operation start time is required")
+	}
+	if r.FinishedAt != nil && r.FinishedAt.Before(r.StartedAt) {
+		return fmt.Errorf("repair operation finish time precedes start time")
+	}
+	for i, step := range r.Steps {
+		if strings.TrimSpace(step.Name) == "" {
+			return fmt.Errorf("repair step %d name is required", i)
+		}
+		if !step.State.Valid() {
+			return fmt.Errorf("repair step %d has invalid state %q", i, step.State)
+		}
+	}
+	return nil
+}
+
+func DecodeStrict(data []byte, dst any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values are not allowed")
+		}
+		return fmt.Errorf("invalid trailing JSON: %w", err)
+	}
+	if validator, ok := dst.(interface{ Validate() error }); ok {
+		return validator.Validate()
+	}
+	return nil
+}
+
 func StableDiagnosticID(agentID string, code Code, resourceFingerprint string) string {
 	h := sha256.New()
 	for _, value := range []string{agentID, string(code), resourceFingerprint} {
@@ -236,22 +403,25 @@ func StableDiagnosticID(agentID string, code Code, resourceFingerprint string) s
 }
 
 var (
-	privateKeyPattern = regexp.MustCompile(`(?is)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`)
-	bearerPattern     = regexp.MustCompile(`(?i)(authorization\s*:\s*bearer\s+)[^\s]+`)
-	secretPattern     = regexp.MustCompile(`(?i)(\b(?:api[_-]?key|token|password|secret|private[_-]?key)\b\s*[:=]\s*)[^\s,;]+`)
+	privateKeyPattern    = regexp.MustCompile(`(?is)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\z)`)
+	nginxAuthPattern     = regexp.MustCompile(`(?i)(\bproxy_set_header\s+authorization\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\r\n]+)`)
+	authorizationPattern = regexp.MustCompile(`(?i)(\bauthorization\b\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;]+)`)
+	secretPattern        = regexp.MustCompile(`(?i)((?:"(?:[a-z][a-z0-9]*_)*(?:api_?key|token|password|secret|private_?key)"|(?:[a-z][a-z0-9]*_)*(?:api_?key|token|password|secret|private_?key))\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}]+)`)
 )
 
 func SanitizeEvidence(evidence string) string {
 	evidence = strings.ToValidUTF8(evidence, "�")
-	evidence = privateKeyPattern.ReplaceAllString(evidence, "[REDACTED]")
-	evidence = bearerPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
-	evidence = secretPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
+	evidence = strings.ReplaceAll(evidence, "\r\n", "\n")
 	evidence = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+		if r == '\r' || unicode.Is(unicode.Cf, r) || (unicode.IsControl(r) && r != '\n' && r != '\t') {
 			return -1
 		}
 		return r
 	}, evidence)
+	evidence = privateKeyPattern.ReplaceAllString(evidence, "[REDACTED]")
+	evidence = nginxAuthPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
+	evidence = authorizationPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
+	evidence = secretPattern.ReplaceAllString(evidence, "${1}[REDACTED]")
 	if len(evidence) <= MaxEvidenceBytes {
 		return evidence
 	}

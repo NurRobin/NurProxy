@@ -1,6 +1,10 @@
 package proxymodel
 
-import "github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+import (
+	"fmt"
+
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+)
 
 // This file defines the agent↔orchestrator wire format for config sync (§3, B1).
 //
@@ -30,12 +34,35 @@ type RecoveryPolicyEnvelope struct {
 	Policy RecoveryPolicy `json:"policy"`
 }
 
+func (e RecoveryPolicyEnvelope) Validate() error { return nil }
+
 type RepairRequestEnvelope struct {
 	Request recoverymodel.RepairRequest `json:"request"`
 }
 
+func (e RepairRequestEnvelope) Validate() error { return e.Request.Validate() }
+
 type RecoveryReportEnvelope struct {
 	Report RecoveryReport `json:"report"`
+}
+
+func (e RecoveryReportEnvelope) Validate() error {
+	if e.Report.Capability != nil {
+		if err := e.Report.Capability.Validate(); err != nil {
+			return err
+		}
+	}
+	for i, diagnostic := range e.Report.Diagnostics {
+		if err := diagnostic.Validate(); err != nil {
+			return fmt.Errorf("diagnostic %d: %w", i, err)
+		}
+	}
+	for i, operation := range e.Report.Operations {
+		if err := operation.Validate(); err != nil {
+			return fmt.Errorf("operation %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // RouteIntent is one unit of desired state pushed to an agent: a stable artifact

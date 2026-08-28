@@ -33,6 +33,7 @@ func TestRecoveryWireRoundTrips(t *testing.T) {
 			in: RecoveryReportEnvelope{Report: RecoveryReport{
 				Diagnostics: []recoverymodel.Diagnostic{{
 					ID: "diag-1", Code: recoverymodel.CodeManagedStaleTemp,
+					Subsystem: "nginx", ResourceFingerprint: "fingerprint-1",
 					Severity: recoverymodel.SeverityWarning, Ownership: recoverymodel.OwnershipNurProxy,
 					ProposedAction: recoverymodel.ActionRemoveManagedTemp,
 					FirstSeenAt:    now, LastSeenAt: now, Occurrences: 1,
@@ -53,7 +54,7 @@ func TestRecoveryWireRoundTrips(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := json.Unmarshal(b, tt.out); err != nil {
+			if err := recoverymodel.DecodeStrict(b, tt.out); err != nil {
 				t.Fatal(err)
 			}
 			got := reflect.ValueOf(tt.out).Elem().Interface()
@@ -82,6 +83,16 @@ func TestRepairRequestWireHasNoPathOrCommand(t *testing.T) {
 	for _, forbidden := range []string{"path", "paths", "command", "environment", "service"} {
 		if _, exists := request[forbidden]; exists {
 			t.Errorf("request contains forbidden field %q", forbidden)
+		}
+	}
+}
+
+func TestRepairRequestWireStrictlyRejectsInjectedFields(t *testing.T) {
+	for _, field := range []string{"command", "path"} {
+		raw := `{"request":{"operation_id":"op-1","diagnostic_id":"diag-1","action":"remove_managed_temp","` + field + `":"attacker-controlled"}}`
+		var envelope RepairRequestEnvelope
+		if err := recoverymodel.DecodeStrict([]byte(raw), &envelope); err == nil {
+			t.Fatalf("strict decoder accepted %q", field)
 		}
 	}
 }
