@@ -571,6 +571,38 @@ func TestExecRunnerExecutionMetadataDistinguishesBackendAndOverrides(t *testing.
 	}
 }
 
+func TestExecRunnerReloadCanonicalCaptureClassifiesRealOutput(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{name: "nginx alert", output: `nginx: [alert] open() "/run/nginx.pid" failed (1: Operation not permitted)`},
+		{name: "sudo denial", output: "sudo: a password is required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "reload-check")
+			body := "#!/bin/sh\nprintf '%s\\n' '" + tt.output + "' >&2\nexit 1\n"
+			if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err := (&execRunner{binary: "/usr/sbin/nginx", reloadCmd: script}).Reload(context.Background())
+			failure := proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
+			if !failure.Permission || failure.Output != tt.output+"\n" {
+				t.Fatalf("failure = %#v, want canonical permission output %q", failure, tt.output+"\n")
+			}
+			if strings.Contains(failure.Output, "starting proxy executable failed") {
+				t.Fatalf("Failure.Output used wrapper text: %q", failure.Output)
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(failure, &exitErr) {
+				t.Fatal("reload ExitError chain was not preserved")
+			}
+		})
+	}
+}
+
 func TestValidate_permissionErrorReturnsTypedFailure(t *testing.T) {
 	b, _ := newBackend(t, &fakeRunner{testErr: fmt.Errorf("validate: %w", os.ErrPermission)})
 	err := b.Validate(context.Background())

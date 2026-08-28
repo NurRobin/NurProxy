@@ -80,10 +80,15 @@ func (e *ExecutionError) Unwrap() error {
 }
 
 func NewFailure(backend Kind, phase FailurePhase, output string, err error) *Failure {
+	canonicalOutput := output
+	var executionErr *ExecutionError
+	if errors.As(err, &executionErr) && executionErr.output != "" {
+		canonicalOutput = executionErr.output
+	}
 	f := &Failure{
 		Backend: backend,
 		Phase:   phase,
-		Output:  boundedFailureOutput(output, len(output) > MaxFailureCaptureBytes),
+		Output:  boundedFailureOutput(canonicalOutput, len(canonicalOutput) > MaxFailureCaptureBytes),
 		Err:     err,
 	}
 	f.BinaryMissing = isBinaryMissing(backend, f.Output, err)
@@ -219,9 +224,6 @@ func isBinaryMissing(backend Kind, output string, err error) bool {
 	var exitErr *exec.ExitError
 	if executionErr.Role != ExecutionRoleSystem || filepath.Base(executionErr.Executable) != "sudo" || !errors.As(executionErr.Err, &exitErr) {
 		return false
-	}
-	if executionErr.output != "" {
-		output = boundedFailureOutput(executionErr.output, len(executionErr.output) > MaxFailureCaptureBytes)
 	}
 	return sudoMissingTarget(output, target)
 }

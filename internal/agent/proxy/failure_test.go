@@ -387,6 +387,38 @@ func TestRunTargetCombinedOutputPreservesSudoBackendIdentity(t *testing.T) {
 	}
 }
 
+func TestNewFailureUsesCanonicalCapturedExecutionOutput(t *testing.T) {
+	sh, lookupErr := exec.LookPath("sh")
+	if lookupErr != nil {
+		t.Skip("sh unavailable")
+	}
+	script := "printf 'nginx: [alert] open() failed (1: Operation not permitted)\\n' >&2; " +
+		"printf 'token=canonical-secret\\n' >&2; head -c 4194304 /dev/zero | tr '\\000' x >&2; exit 1"
+	out, err := RunTargetCombinedOutput(exec.Command(sh, "-c", script), "/usr/sbin/nginx", ExecutionRoleBackend)
+	if err == nil {
+		t.Fatal("command unexpectedly succeeded")
+	}
+	failure := NewFailure(KindNginx, FailurePhaseReload, "starting proxy executable failed: unrelated prose token=argument-secret", fmt.Errorf("reload wrapper: %w", err))
+	if failure.Output != out {
+		t.Fatalf("Failure.Output did not use canonical capture\n got: %q\nwant: %q", failure.Output, out)
+	}
+	if !failure.Permission {
+		t.Fatalf("failure = %#v, want canonical nginx permission classification", failure)
+	}
+	if len(failure.Output) > MaxFailureCaptureBytes || !strings.Contains(failure.Output, FailureOutputTruncated) {
+		t.Fatalf("canonical output bytes=%d, truncated=%v", len(failure.Output), strings.Contains(failure.Output, FailureOutputTruncated))
+	}
+	for _, leaked := range []string{"canonical-secret", "argument-secret", "starting proxy executable failed"} {
+		if strings.Contains(failure.Output, leaked) || strings.Contains(failure.Error(), leaked) {
+			t.Fatalf("failure leaked %q: output=%q error=%q", leaked, failure.Output, failure.Error())
+		}
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(failure, &exitErr) || !errors.Is(failure, exitErr) {
+		t.Fatal("canonical output selection changed the execution error chain")
+	}
+}
+
 func TestNewFailurePermissionDetectionAcrossPhases(t *testing.T) {
 	tests := []struct {
 		name   string

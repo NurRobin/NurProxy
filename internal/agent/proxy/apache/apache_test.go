@@ -409,6 +409,28 @@ func TestExecRunnerExecutionMetadataDistinguishesBackendAndOverrides(t *testing.
 	}
 }
 
+func TestExecRunnerReloadCanonicalCaptureClassifiesRealAH00091(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	output := `(13)Permission denied: AH00091: apache2: could not open error log file /var/log/apache2/error.log.`
+	script := filepath.Join(t.TempDir(), "reload-check")
+	body := "#!/bin/sh\nprintf '%s\\n' '" + output + "' >&2\nexit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := (&execRunner{binary: "/usr/sbin/apachectl", reloadCmd: script}).Reload(context.Background())
+	failure := proxy.NewFailure(proxy.KindApache, proxy.FailurePhaseReload, err.Error(), err)
+	if !failure.Permission || failure.Output != output+"\n" {
+		t.Fatalf("failure = %#v, want canonical AH00091 output %q", failure, output+"\n")
+	}
+	if strings.Contains(failure.Output, "starting proxy executable failed") {
+		t.Fatalf("Failure.Output used wrapper text: %q", failure.Output)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(failure, &exitErr) {
+		t.Fatal("reload ExitError chain was not preserved")
+	}
+}
+
 func TestValidate_permissionDeniedReturnsTypedFailure(t *testing.T) {
 	r := &fakeRunner{
 		testErr: errors.New("exit status 1"),
