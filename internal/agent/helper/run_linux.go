@@ -52,7 +52,7 @@ func RunRootHelper(ctx context.Context, buildID string) error {
 }
 
 func compiledRootActions(config RootConfig, journal *Journal, proxyHost proxyServiceHost) (map[helperprotocol.Action]ActionHandler, error) {
-	actions := make(map[helperprotocol.Action]ActionHandler, 3)
+	actions := make(map[helperprotocol.Action]ActionHandler, 4)
 	for _, action := range []helperprotocol.Action{
 		helperprotocol.ActionValidateReloadProxy,
 		helperprotocol.ActionStartProxy,
@@ -64,5 +64,10 @@ func compiledRootActions(config RootConfig, journal *Journal, proxyHost proxySer
 		}
 		actions[action] = handler
 	}
+	packageHandler, err := newPackageInstallAction(config.ProxyTarget, config.PackageTarget, journal, systemPackageHost{})
+	if err != nil {
+		return nil, err
+	}
+	actions[helperprotocol.ActionInstallSupportedPackage] = packageHandler
 	return actions, nil
 }

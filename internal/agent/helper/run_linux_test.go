@@ -19,7 +19,7 @@ func TestRunRootHelperRejectsMutableBuildIdentity(t *testing.T) {
 
 func TestCompiledRootActionsExposeOnlyPinnedProxyServiceMutations(t *testing.T) {
 	handler, host, journal := newProxyActionTest(t, helperprotocol.ActionStartProxy, false)
-	actions, err := compiledRootActions(RootConfig{ProxyTarget: handler.target}, journal, host)
+	actions, err := compiledRootActions(RootConfig{ProxyTarget: handler.target, PackageTarget: PackageTargetConfig{Manager: "/usr/bin/apt-get", Package: "nginx"}}, journal, host)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestCompiledRootActionsExposeOnlyPinnedProxyServiceMutations(t *testing.T) 
 			t.Fatalf("compiled action %s is missing", action)
 		}
 	}
-	if len(actions) != 3 {
+	if actions[helperprotocol.ActionInstallSupportedPackage] == nil || len(actions) != 4 {
 		t.Fatalf("unexpected compiled actions: %v", actions)
 	}
 	if _, ok := actions[helperprotocol.ActionApplyManagedProxyState]; ok {

@@ -17,17 +17,23 @@ import (
 const MaxRootConfigBytes = 64 << 10
 
 type RootConfig struct {
-	AgentID                   string            `json:"agent_id"`
-	HelperInstanceID          string            `json:"helper_instance_id"`
-	ExpectedBuildID           string            `json:"expected_build_id"`
-	AgentUser                 string            `json:"agent_user"`
-	AgentUID                  uint32            `json:"agent_uid"`
-	OrchestratorKeyID         string            `json:"orchestrator_key_id"`
-	OrchestratorPublicKeyText string            `json:"orchestrator_public_key"`
-	AttestationKeyID          string            `json:"attestation_key_id"`
-	AttestationPrivateKeyFile string            `json:"attestation_private_key_file"`
-	StoreDir                  string            `json:"store_dir"`
-	ProxyTarget               ProxyTargetConfig `json:"proxy_target"`
+	AgentID                   string              `json:"agent_id"`
+	HelperInstanceID          string              `json:"helper_instance_id"`
+	ExpectedBuildID           string              `json:"expected_build_id"`
+	AgentUser                 string              `json:"agent_user"`
+	AgentUID                  uint32              `json:"agent_uid"`
+	OrchestratorKeyID         string              `json:"orchestrator_key_id"`
+	OrchestratorPublicKeyText string              `json:"orchestrator_public_key"`
+	AttestationKeyID          string              `json:"attestation_key_id"`
+	AttestationPrivateKeyFile string              `json:"attestation_private_key_file"`
+	StoreDir                  string              `json:"store_dir"`
+	ProxyTarget               ProxyTargetConfig   `json:"proxy_target"`
+	PackageTarget             PackageTargetConfig `json:"package_target"`
+}
+
+type PackageTargetConfig struct {
+	Manager string `json:"manager"`
+	Package string `json:"package"`
 }
 
 type ProxyTargetConfig struct {
@@ -56,6 +62,23 @@ func (c RootConfig) Validate() error {
 	}
 	if err := c.ProxyTarget.Validate(); err != nil {
 		return fmt.Errorf("invalid proxy target: %w", err)
+	}
+	if err := c.PackageTarget.Validate(c.ProxyTarget.Kind); err != nil {
+		return fmt.Errorf("invalid package target: %w", err)
+	}
+	return nil
+}
+
+func (c PackageTargetConfig) Validate(proxyKind string) error {
+	if !trustedExecutableLocation(c.Manager) {
+		return fmt.Errorf("package manager path is not allowed")
+	}
+	allowed := map[string]map[string]string{
+		"/usr/bin/apt-get": {"nginx": "nginx", "apache": "apache2", "caddy": "caddy"},
+	}
+	packages, ok := allowed[c.Manager]
+	if !ok || packages[proxyKind] != c.Package {
+		return fmt.Errorf("package manager, backend, and package are not a compiled mapping")
 	}
 	return nil
 }
