@@ -78,6 +78,41 @@ func TestBackupRestore_roundTripPreservesDBAndKeys(t *testing.T) {
 	}
 }
 
+func TestBackupReadsLiveWALDatabaseThroughBoundDirectory(t *testing.T) {
+	src := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(filepath.Join(src, dbFileName), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.SetSetting("live_wal_marker", "present"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, encryptionKeyName), key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := backupDataDir(src, archive); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "restored")
+	if _, err := restoreArchive(archive, dst, false); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := db.Open(filepath.Join(dst, dbFileName), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if got, err := restored.GetSetting("live_wal_marker"); err != nil || got != "present" {
+		t.Fatalf("marker = %q, %v", got, err)
+	}
+}
+
 func TestRestore_refusesToClobberWithoutForce(t *testing.T) {
 	src, _ := seedDataDir(t)
 	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
@@ -138,6 +173,54 @@ func TestBackupRejectsLinkedOutputFile(t *testing.T) {
 		t.Fatalf("outside file changed: %q", got)
 	}
 	assertFileMode(t, outside, 0o644)
+}
+
+func TestBackupRejectsHardlinkedOutputFile(t *testing.T) {
+	src, _ := seedDataDir(t)
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("do not overwrite"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := os.Link(outside, linked); err != nil {
+		t.Fatal(err)
+	}
+	if err := backupDataDir(src, linked); err == nil {
+		t.Fatal("backup accepted a hardlinked output")
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "do not overwrite" {
+		t.Fatalf("outside file changed: %q", got)
+	}
+	assertFileMode(t, outside, 0o644)
+}
+
+func TestBackupRejectsSymlinkedDatabaseAndKey(t *testing.T) {
+	for _, name := range []string{dbFileName, encryptionKeyName} {
+		t.Run(name, func(t *testing.T) {
+			src, _ := seedDataDir(t)
+			outside := filepath.Join(t.TempDir(), "outside")
+			if err := os.WriteFile(outside, []byte("external secret"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(filepath.Join(src, name)); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(src, name)); err != nil {
+				t.Fatal(err)
+			}
+			archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+			if err := backupDataDir(src, archive); err == nil {
+				t.Fatal("backup accepted symlinked source")
+			}
+			if _, err := os.Stat(archive); !os.IsNotExist(err) {
+				t.Fatalf("archive created from unsafe source: %v", err)
+			}
+		})
+	}
 }
 
 func TestRestoreRestrictsExistingDataDirAndFinalFiles(t *testing.T) {
@@ -417,7 +500,7 @@ func assertFileMode(t *testing.T, path string, want os.FileMode) {
 
 func globRestoreTemps(t *testing.T, dir string) []string {
 	t.Helper()
-	m, err := filepath.Glob(filepath.Join(dir, ".*.restore-*"))
+	m, err := filepath.Glob(filepath.Join(dir, ".nurproxy-restore-*"))
 	if err != nil {
 		t.Fatal(err)
 	}

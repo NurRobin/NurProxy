@@ -50,6 +50,10 @@ func TestHardenRestrictsOnlyAllowedRegularEntries(t *testing.T) {
 	if err := syscall.Mkfifo(filepath.Join(dataDir, ".nurproxy.db.restore-foreign"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	foreignStage := filepath.Join(dataDir, ".encryption.key.restore-attacker")
+	if err := os.WriteFile(foreignStage, []byte("foreign"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	report, err := Harden(dataDir)
 	if err == nil {
@@ -66,6 +70,7 @@ func TestHardenRestrictsOnlyAllowedRegularEntries(t *testing.T) {
 	assertMode(t, nested, 0o755)
 	assertMode(t, nestedFile, 0o644)
 	assertMode(t, outside, 0o644)
+	assertMode(t, foreignStage, 0o644)
 	if err := os.Remove(filepath.Join(dataDir, "acme-account.key")); err != nil {
 		t.Fatal(err)
 	}
@@ -96,6 +101,88 @@ func TestHardenRejectsLinkedDataDirectory(t *testing.T) {
 	}
 	assertMode(t, realDir, 0o755)
 	assertMode(t, dbPath, 0o644)
+}
+
+func TestEnsureRejectsIntermediateAndTrailingSlashSymlinks(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(root, "link", "child"), filepath.Join(root, "link") + string(os.PathSeparator)} {
+		if _, err := Ensure(path); err == nil {
+			t.Errorf("Ensure accepted symlink component %q", path)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(target, "child")); !os.IsNotExist(err) {
+		t.Fatalf("created through intermediate symlink: %v", err)
+	}
+	assertMode(t, target, 0o755)
+}
+
+func TestHardenRejectsManagedHardlinkWithoutChangingExternalInode(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside")
+	if err := os.WriteFile(outside, []byte("external"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, filepath.Join(dataDir, "encryption.key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Harden(dataDir); err == nil {
+		t.Fatal("Harden accepted managed hardlink")
+	}
+	assertMode(t, outside, 0o644)
+}
+
+func TestBoundDirSurvivesPathReplacement(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := OpenDir(dataDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	original := filepath.Join(root, "original")
+	if err := os.Rename(dataDir, original); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, dataDir); err != nil {
+		t.Fatal(err)
+	}
+	f, tempName, err := dir.CreateTemp("restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("bound"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.Rename(tempName, "nurproxy.db"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(original, "nurproxy.db")); err != nil || string(got) != "bound" {
+		t.Fatalf("original got %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "nurproxy.db")); !os.IsNotExist(err) {
+		t.Fatalf("replacement target changed: %v", err)
+	}
 }
 
 func TestPrivateUmaskRestrictsNewFiles(t *testing.T) {
@@ -129,6 +216,7 @@ func TestAllowedNameAcceptsOnlyExplicitSafeDatabaseBackupBasenames(t *testing.T)
 		"nurproxy.db.backup-../../outside",
 		"nurproxy.db.backup-bad\nname",
 		"other.db.backup-20260828",
+		".nurproxy.db.restore-attacker",
 	} {
 		if allowedName(name) {
 			t.Errorf("allowedName(%q) = true", name)
@@ -170,7 +258,12 @@ func TestSQLiteDatabaseAndLiveSidecarsConvergeToPrivateModes(t *testing.T) {
 	if err := crypto.SaveKey(key, filepath.Join(dataDir, "encryption.key")); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(filepath.Join(dataDir, "nurproxy.db"), key)
+	dir, err := OpenDir(dataDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	database, err := db.Open(dir.BoundPath("nurproxy.db"), key)
 	if err != nil {
 		t.Fatal(err)
 	}

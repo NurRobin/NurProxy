@@ -107,23 +107,28 @@ func main() {
 	}
 
 	// Ensure data dir exists
-	if _, err := dataperms.Ensure(*dataDir); err != nil {
+	dataRoot, err := dataperms.OpenDir(*dataDir, true)
+	if err != nil {
 		log.Fatalf("failed to create data directory: %v", err)
+	}
+	defer dataRoot.Close()
+	if _, err := dataRoot.Harden(); err != nil {
+		log.Fatalf("failed to harden data directory: %v", err)
 	}
 
 	// Load or generate encryption key
-	cryptoKey, err := crypto.LoadOrGenerateKey(filepath.Join(*dataDir, "encryption.key"))
+	cryptoKey, err := crypto.LoadOrGenerateKey(dataRoot.BoundPath("encryption.key"))
 	if err != nil {
 		log.Fatalf("failed to load encryption key: %v", err)
 	}
 
 	// Open database
-	database, err := db.Open(filepath.Join(*dataDir, "nurproxy.db"), cryptoKey)
+	database, err := db.Open(dataRoot.BoundPath("nurproxy.db"), cryptoKey)
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer database.Close()
-	if _, err := dataperms.Harden(*dataDir); err != nil {
+	if _, err := dataRoot.Harden(); err != nil {
 		log.Fatalf("failed to harden runtime data files: %v", err)
 	}
 
@@ -176,7 +181,7 @@ func main() {
 	// inbound; certs ride the agent-initiated stream (§7). Started only when an
 	// ACME account can be constructed; failures here are non-fatal (the built-in
 	// Caddy self-ACME fallback keeps hosts served).
-	renewer := startRenewer(rootCtx, database, rec, *dataDir, dryRunConfig{dns: dnsDryRun, acme: acmeDryRun, failMode: acmeFailMode})
+	renewer := startRenewer(rootCtx, database, rec, dataRoot.BoundPath(""), dryRunConfig{dns: dnsDryRun, acme: acmeDryRun, failMode: acmeFailMode})
 
 	// Create API server, wiring in the hub + reconciler so the stream endpoint
 	// works and domain changes push to connected agents immediately.

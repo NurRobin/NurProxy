@@ -1,11 +1,13 @@
 //go:build unix
 
-// Package dataperms enforces the private on-disk boundary of an orchestrator.
 package dataperms
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -16,46 +18,215 @@ const (
 	FileMode = 0o600
 )
 
-// Report names entries deliberately left untouched. Harden never recurses.
 type Report struct {
 	Hardened []string
 	Skipped  []string
 }
-
-// SetPrivateUmask makes subsequently created runtime files owner-only.
-func SetPrivateUmask() { unix.Umask(0o077) }
-
-// Ensure creates dataDir when absent, then applies Harden's descriptor-based
-// checks. A symlink in the final data-directory component is rejected.
-func Ensure(dataDir string) (Report, error) {
-	if err := os.MkdirAll(dataDir, DirMode); err != nil {
-		return Report{}, fmt.Errorf("creating data directory %s: %w", dataDir, err)
-	}
-	return Harden(dataDir)
+type Dir struct {
+	fd   int
+	path string
 }
 
-// Harden restricts the data directory and the small, explicit set of private
-// orchestrator files. It opens the directory and children without following
-// the final symlink component, operates through descriptors, and never walks
-// nested directories.
+func SetPrivateUmask() { unix.Umask(0o077) }
+
+func OpenDir(path string, create bool) (*Dir, error) {
+	if path == "" {
+		return nil, fmt.Errorf("data directory is empty")
+	}
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' }) {
+		if part == ".." {
+			return nil, fmt.Errorf("data directory must not contain .. components")
+		}
+	}
+	start := "."
+	if filepath.IsAbs(path) {
+		start = "/"
+	}
+	fd, err := unix.Open(start, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening data-directory anchor: %w", err)
+	}
+	parts := strings.FieldsFunc(filepath.Clean(path), func(r rune) bool { return r == '/' })
+	for _, part := range parts {
+		if part == "." || part == "" {
+			continue
+		}
+		next, openErr := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if openErr == unix.ENOENT && create {
+			if mkdirErr := unix.Mkdirat(fd, part, DirMode); mkdirErr != nil && mkdirErr != unix.EEXIST {
+				_ = unix.Close(fd)
+				return nil, fmt.Errorf("creating data-directory component %q: %w", part, mkdirErr)
+			}
+			next, openErr = unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		}
+		if openErr != nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("opening data-directory component %q without following links: %w", part, openErr)
+		}
+		_ = unix.Close(fd)
+		fd = next
+	}
+	return &Dir{fd: fd, path: path}, nil
+}
+
+func (d *Dir) Close() error {
+	if d == nil || d.fd < 0 {
+		return nil
+	}
+	err := unix.Close(d.fd)
+	d.fd = -1
+	return err
+}
+func (d *Dir) BoundPath(name string) string {
+	root := "/proc/self/fd"
+	if _, err := os.Stat(root); err != nil {
+		root = "/dev/fd"
+	}
+	return fmt.Sprintf("%s/%d/%s", root, d.fd, name)
+}
+
+func (d *Dir) OpenRegular(name string) (*os.File, error) {
+	fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		_ = unix.Close(fd)
+		return nil, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("%s is not a unique regular file", name)
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func (d *Dir) SameFile(name string, opened *os.File) (bool, error) {
+	var held, current unix.Stat_t
+	if err := unix.Fstat(int(opened.Fd()), &held); err != nil {
+		return false, err
+	}
+	fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return false, err
+	}
+	defer unix.Close(fd)
+	if err := unix.Fstat(fd, &current); err != nil {
+		return false, err
+	}
+	return held.Dev == current.Dev && held.Ino == current.Ino && current.Nlink == 1, nil
+}
+
+func (d *Dir) Exists(name string) (bool, error) {
+	var st unix.Stat_t
+	err := unix.Fstatat(d.fd, name, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if err == unix.ENOENT {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (d *Dir) ValidateReplace(name string) error {
+	var st unix.Stat_t
+	err := unix.Fstatat(d.fd, name, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if err == unix.ENOENT {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return fmt.Errorf("destination %s is not a unique regular file", name)
+	}
+	return nil
+}
+
+func (d *Dir) CreateTemp(label string) (*os.File, string, error) {
+	for i := 0; i < 100; i++ {
+		var random [12]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return nil, "", err
+		}
+		name := ".nurproxy-" + label + "-" + hex.EncodeToString(random[:])
+		fd, err := unix.Openat(d.fd, name, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, FileMode)
+		if err == unix.EEXIST {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		if err := unix.Fchmod(fd, FileMode); err != nil {
+			_ = unix.Close(fd)
+			_ = unix.Unlinkat(d.fd, name, 0)
+			return nil, "", err
+		}
+		return os.NewFile(uintptr(fd), name), name, nil
+	}
+	return nil, "", fmt.Errorf("could not allocate a unique staging file")
+}
+
+func (d *Dir) Rename(oldName, newName string) error {
+	return unix.Renameat(d.fd, oldName, d.fd, newName)
+}
+func (d *Dir) Remove(name string) error {
+	err := unix.Unlinkat(d.fd, name, 0)
+	if err == unix.ENOENT {
+		return nil
+	}
+	return err
+}
+
+func Ensure(dataDir string) (Report, error) {
+	d, err := OpenDir(dataDir, true)
+	if err != nil {
+		return Report{}, err
+	}
+	defer d.Close()
+	return d.Harden()
+}
 func Harden(dataDir string) (Report, error) {
+	d, err := OpenDir(dataDir, false)
+	if err != nil {
+		return Report{}, err
+	}
+	defer d.Close()
+	return d.Harden()
+}
+
+func (d *Dir) Harden() (Report, error) {
+	return d.harden(nil)
+}
+
+func (d *Dir) HardenOwned(uid, gid int) (Report, error) {
+	owner := [2]int{uid, gid}
+	return d.harden(&owner)
+}
+
+func (d *Dir) harden(owner *[2]int) (Report, error) {
 	var report Report
 	var unsafe []string
-	fd, err := unix.Open(dataDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return report, fmt.Errorf("opening data directory without following links: %w", err)
+	if clean := filepath.Clean(d.path); clean == "." || clean == string(filepath.Separator) {
+		return report, fmt.Errorf("refusing to harden broad data directory %q", d.path)
 	}
-	dir := os.NewFile(uintptr(fd), dataDir)
-	defer dir.Close()
-
-	if err := unix.Fchmod(fd, DirMode); err != nil {
-		return report, fmt.Errorf("restricting data directory %s: %w", dataDir, err)
+	if err := unix.Fchmod(d.fd, DirMode); err != nil {
+		return report, fmt.Errorf("restricting data directory %s: %w", d.path, err)
+	}
+	if owner != nil {
+		if err := unix.Fchown(d.fd, owner[0], owner[1]); err != nil {
+			return report, fmt.Errorf("owning data directory %s: %w", d.path, err)
+		}
 	}
 	report.Hardened = append(report.Hardened, ".")
-
-	entries, err := dir.ReadDir(-1)
+	dup, err := unix.Dup(d.fd)
 	if err != nil {
-		return report, fmt.Errorf("reading data directory %s: %w", dataDir, err)
+		return report, err
+	}
+	reader := os.NewFile(uintptr(dup), d.path)
+	entries, err := reader.ReadDir(-1)
+	_ = reader.Close()
+	if err != nil {
+		return report, fmt.Errorf("reading data directory %s: %w", d.path, err)
 	}
 	for _, entry := range entries {
 		name := entry.Name()
@@ -63,38 +234,29 @@ func Harden(dataDir string) (Report, error) {
 			report.Skipped = append(report.Skipped, name+": not managed")
 			continue
 		}
-		var before unix.Stat_t
-		if err := unix.Fstatat(fd, name, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			report.Skipped = append(report.Skipped, name+": stat failed: "+err.Error())
-			if err != unix.ENOENT {
-				unsafe = append(unsafe, name)
-			}
+		fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+		if err == unix.ENOENT {
 			continue
 		}
-		if before.Mode&unix.S_IFMT != unix.S_IFREG {
-			report.Skipped = append(report.Skipped, name+": not a regular file")
+		if err != nil {
+			report.Skipped = append(report.Skipped, name+": open failed: "+err.Error())
 			unsafe = append(unsafe, name)
 			continue
 		}
-		childFD, err := unix.Openat(fd, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-		if err != nil {
-			report.Skipped = append(report.Skipped, name+": open failed: "+err.Error())
-			if err != unix.ENOENT {
-				unsafe = append(unsafe, name)
-			}
-			continue
+		var st unix.Stat_t
+		entryErr := unix.Fstat(fd, &st)
+		if entryErr == nil && (st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1) {
+			entryErr = fmt.Errorf("not a unique regular file")
 		}
-		var opened unix.Stat_t
-		statErr := unix.Fstat(childFD, &opened)
-		if statErr == nil && opened.Mode&unix.S_IFMT != unix.S_IFREG {
-			statErr = fmt.Errorf("entry changed to a non-regular file")
+		if entryErr == nil {
+			entryErr = unix.Fchmod(fd, FileMode)
 		}
-		if statErr == nil {
-			statErr = unix.Fchmod(childFD, FileMode)
+		if entryErr == nil && owner != nil {
+			entryErr = unix.Fchown(fd, owner[0], owner[1])
 		}
-		_ = unix.Close(childFD)
-		if statErr != nil {
-			report.Skipped = append(report.Skipped, name+": not hardened: "+statErr.Error())
+		_ = unix.Close(fd)
+		if entryErr != nil {
+			report.Skipped = append(report.Skipped, name+": not hardened: "+entryErr.Error())
 			unsafe = append(unsafe, name)
 			continue
 		}
@@ -110,22 +272,15 @@ func allowedName(name string) bool {
 	switch name {
 	case "nurproxy.db", "nurproxy.db-wal", "nurproxy.db-shm", "encryption.key", "acme-account.key":
 		return true
-	default:
-		return strings.HasPrefix(name, ".nurproxy.db.restore-") ||
-			strings.HasPrefix(name, ".encryption.key.restore-") ||
-			strings.HasPrefix(name, ".acme-account.key.restore-") ||
-			safeBackupName(name, "nurproxy.db.backup-") ||
-			safeBackupName(name, "nurproxy.db.bak-")
 	}
+	return safeBackupName(name, "nurproxy.db.backup-") || safeBackupName(name, "nurproxy.db.bak-")
 }
-
 func safeBackupName(name, prefix string) bool {
 	if !strings.HasPrefix(name, prefix) || len(name) == len(prefix) {
 		return false
 	}
 	for _, r := range name[len(prefix):] {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
 			continue
 		}
 		return false

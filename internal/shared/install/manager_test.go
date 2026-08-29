@@ -59,6 +59,13 @@ func TestEnsureDataDirPrivateModeIsRestrictiveAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := Service{DataDir: dataDir, PrivateData: true}
+	dbPath := filepath.Join(dataDir, "nurproxy.db")
+	if err := os.WriteFile(dbPath, []byte("db"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dbPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 2; i++ {
 		if err := ensureDataDir(s, io.Discard); err != nil {
 			t.Fatalf("ensureDataDir pass %d: %v", i+1, err)
@@ -70,6 +77,13 @@ func TestEnsureDataDirPrivateModeIsRestrictiveAndIdempotent(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o700 {
 		t.Fatalf("private data dir mode = %04o, want 0700", got)
+	}
+	fileInfo, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("private database mode = %04o, want 0600", got)
 	}
 }
 

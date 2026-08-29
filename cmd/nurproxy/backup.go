@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/dataperms"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
-	"golang.org/x/sys/unix"
 )
 
 // backupFiles are the data-dir entries a backup captures. nurproxy.db is written
@@ -66,9 +66,35 @@ func cmdBackup(args []string) {
 // backupDataDir writes a gzipped tar of a consistent DB snapshot plus the key
 // files from dataDir to outPath. Missing key files are skipped with a warning.
 func backupDataDir(dataDir, outPath string) error {
-	dbPath := filepath.Join(dataDir, dbFileName)
-	if _, err := os.Stat(dbPath); err != nil {
-		return fmt.Errorf("no database at %s (is the data dir correct?): %w", dbPath, err)
+	source, err := dataperms.OpenDir(dataDir, false)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	if _, err := source.Harden(); err != nil {
+		return err
+	}
+	dbFile, err := source.OpenRegular(dbFileName)
+	if err != nil {
+		return fmt.Errorf("no safe database at %s (is the data dir correct?): %w", filepath.Join(dataDir, dbFileName), err)
+	}
+	defer dbFile.Close()
+	keys := map[string]*os.File{}
+	defer func() {
+		for _, f := range keys {
+			_ = f.Close()
+		}
+	}()
+	for _, name := range []string{encryptionKeyName, acmeAccountKeyName} {
+		f, openErr := source.OpenRegular(name)
+		if errors.Is(openErr, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "backup: warning: %s not found, omitting from archive\n", name)
+			continue
+		}
+		if openErr != nil {
+			return fmt.Errorf("opening safe %s: %w", name, openErr)
+		}
+		keys[name] = f
 	}
 
 	// Snapshot the DB to a temp file so we archive a consistent image even while
@@ -80,19 +106,41 @@ func backupDataDir(dataDir, outPath string) error {
 	}
 	defer func() { _ = os.RemoveAll(snapDir) }()
 	snapPath := filepath.Join(snapDir, dbFileName)
-	if err := db.SnapshotTo(dbPath, snapPath); err != nil {
+	if err := db.SnapshotTo(source.BoundPath(dbFileName), snapPath); err != nil {
 		return err
 	}
+	if same, err := source.SameFile(dbFileName, dbFile); err != nil || !same {
+		return fmt.Errorf("database changed while snapshotting")
+	}
+	for name, held := range keys {
+		if same, err := source.SameFile(name, held); err != nil || !same {
+			return fmt.Errorf("%s changed while backing up", name)
+		}
+	}
 
-	fd, err := unix.Open(outPath, unix.O_CREAT|unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, dataperms.FileMode)
+	outDir, err := dataperms.OpenDir(filepath.Dir(outPath), false)
 	if err != nil {
-		return fmt.Errorf("creating %s: %w", outPath, err)
+		return fmt.Errorf("opening backup output directory: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), outPath)
-	defer f.Close()
-	if err := unix.Fchmod(fd, dataperms.FileMode); err != nil {
-		return fmt.Errorf("restricting %s: %w", outPath, err)
+	defer outDir.Close()
+	outName := filepath.Base(outPath)
+	if outName == "." || outName == string(filepath.Separator) {
+		return fmt.Errorf("invalid backup output path")
 	}
+	if err := outDir.ValidateReplace(outName); err != nil {
+		return err
+	}
+	f, tempName, err := outDir.CreateTemp("backup")
+	if err != nil {
+		return fmt.Errorf("creating staged backup: %w", err)
+	}
+	committed := false
+	defer func() {
+		_ = f.Close()
+		if !committed {
+			_ = outDir.Remove(tempName)
+		}
+	}()
 
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
@@ -100,16 +148,12 @@ func backupDataDir(dataDir, outPath string) error {
 	if err := addFileToTar(tw, snapPath, dbFileName); err != nil {
 		return fmt.Errorf("archiving database: %w", err)
 	}
-	// The key files, copied verbatim. Missing keys are skipped (a fresh install
-	// that never generated them yet), but we warn since a keyless backup is of
-	// limited use.
 	for _, name := range []string{encryptionKeyName, acmeAccountKeyName} {
-		p := filepath.Join(dataDir, name)
-		if _, err := os.Stat(p); err != nil {
-			fmt.Fprintf(os.Stderr, "backup: warning: %s not found, omitting from archive\n", name)
+		in, ok := keys[name]
+		if !ok {
 			continue
 		}
-		if err := addFileToTar(tw, p, name); err != nil {
+		if err := addOpenFileToTar(tw, in, name); err != nil {
 			return fmt.Errorf("archiving %s: %w", name, err)
 		}
 	}
@@ -120,6 +164,16 @@ func backupDataDir(dataDir, outPath string) error {
 	if err := gz.Close(); err != nil {
 		return fmt.Errorf("finalizing gzip: %w", err)
 	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("syncing backup: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing backup: %w", err)
+	}
+	if err := outDir.Rename(tempName, outName); err != nil {
+		return fmt.Errorf("installing backup: %w", err)
+	}
+	committed = true
 	return nil
 }
 
@@ -167,10 +221,6 @@ func cmdRestore(args []string) {
 // On any error before the commit, the temp files are removed and the existing
 // data dir is left byte-for-byte untouched.
 func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
-	if _, err := os.Stat(filepath.Join(dataDir, dbFileName)); err == nil && !force {
-		return 0, fmt.Errorf("%s already has a %s — refusing to overwrite (pass --force to replace it)", dataDir, dbFileName)
-	}
-
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return 0, fmt.Errorf("opening %s: %w", archivePath, err)
@@ -183,8 +233,18 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	}
 	defer gz.Close()
 
-	if _, err := dataperms.Ensure(dataDir); err != nil {
+	dir, err := dataperms.OpenDir(dataDir, true)
+	if err != nil {
 		return 0, err
+	}
+	defer dir.Close()
+	if _, err := dir.Harden(); err != nil {
+		return 0, err
+	}
+	if exists, err := dir.Exists(dbFileName); err != nil {
+		return 0, err
+	} else if exists && !force {
+		return 0, fmt.Errorf("%s already has a %s — refusing to overwrite (pass --force to replace it)", dataDir, dbFileName)
 	}
 
 	allowed := map[string]bool{dbFileName: true, encryptionKeyName: true, acmeAccountKeyName: true}
@@ -197,7 +257,7 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	defer func() {
 		if !committed {
 			for _, tmp := range staged {
-				_ = os.Remove(tmp)
+				_ = dir.Remove(tmp)
 			}
 		}
 	}()
@@ -220,7 +280,10 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 			fmt.Fprintf(os.Stderr, "restore: skipping unexpected entry %q\n", hdr.Name)
 			continue
 		}
-		tmp, err := extractToTemp(dataDir, name, tr)
+		if _, duplicate := staged[name]; duplicate {
+			return 0, fmt.Errorf("archive contains duplicate %s", name)
+		}
+		tmp, err := extractToTemp(dir, name, tr)
 		if err != nil {
 			return 0, fmt.Errorf("staging %s: %w", name, err)
 		}
@@ -237,9 +300,12 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	// silently leave a DB that cannot read its own secrets.
 	if _, bringsKey := staged[encryptionKeyName]; !bringsKey {
 		if _, bringsDB := staged[dbFileName]; bringsDB {
-			existingKey := filepath.Join(dataDir, encryptionKeyName)
-			if _, err := os.Stat(existingKey); err == nil {
-				return 0, fmt.Errorf("archive has no %s but %s already exists — the existing key may not match the restored %s; restore from a backup that includes the key, or remove the stale key deliberately first", encryptionKeyName, existingKey, dbFileName)
+			exists, err := dir.Exists(encryptionKeyName)
+			if err != nil {
+				return 0, err
+			}
+			if exists {
+				return 0, fmt.Errorf("archive has no %s but %s already exists — the existing key may not match the restored %s; restore from a backup that includes the key, or remove the stale key deliberately first", encryptionKeyName, filepath.Join(dataDir, encryptionKeyName), dbFileName)
 			}
 		}
 	}
@@ -249,8 +315,7 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	// journal that belonged to the previous database.
 	restored := 0
 	commit := func(name string) error {
-		dest := filepath.Join(dataDir, name)
-		if err := os.Rename(staged[name], dest); err != nil {
+		if err := dir.Rename(staged[name], name); err != nil {
 			return fmt.Errorf("installing %s: %w", name, err)
 		}
 		delete(staged, name)
@@ -262,7 +327,7 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 			return restored, err
 		}
 		for _, sidecar := range []string{dbFileName + "-wal", dbFileName + "-shm"} {
-			if err := os.Remove(filepath.Join(dataDir, sidecar)); err != nil && !os.IsNotExist(err) {
+			if err := dir.Remove(sidecar); err != nil {
 				return restored, fmt.Errorf("removing stale %s: %w", sidecar, err)
 			}
 		}
@@ -274,7 +339,7 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	}
 
 	committed = true
-	if _, err := dataperms.Harden(dataDir); err != nil {
+	if _, err := dir.Harden(); err != nil {
 		return restored, fmt.Errorf("restricting restored files: %w", err)
 	}
 	return restored, nil
@@ -283,26 +348,21 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 // extractToTemp writes the current tar entry to a temp file in dataDir (same
 // filesystem as the destination, so the later rename is atomic) and returns its
 // path. The temp is named after the target so a crash leaves it obviously stray.
-func extractToTemp(dataDir, name string, tr io.Reader) (string, error) {
-	tmp, err := os.CreateTemp(dataDir, "."+name+".restore-*")
+func extractToTemp(dir *dataperms.Dir, name string, tr io.Reader) (string, error) {
+	tmp, tempName, err := dir.CreateTemp("restore-" + name)
 	if err != nil {
-		return "", err
-	}
-	if err := tmp.Chmod(0600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
 		return "", err
 	}
 	if _, err := io.Copy(tmp, tr); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
+		_ = dir.Remove(tempName)
 		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
+		_ = dir.Remove(tempName)
 		return "", err
 	}
-	return tmp.Name(), nil
+	return tempName, nil
 }
 
 // addFileToTar writes the file at srcPath into the tar under name with mode 0600.
@@ -313,6 +373,13 @@ func addFileToTar(tw *tar.Writer, srcPath, name string) error {
 	}
 	defer in.Close()
 
+	return addOpenFileToTar(tw, in, name)
+}
+
+func addOpenFileToTar(tw *tar.Writer, in *os.File, name string) error {
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	info, err := in.Stat()
 	if err != nil {
 		return err

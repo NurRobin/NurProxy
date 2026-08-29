@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/sys/unix"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/dataperms"
 )
 
 // Manager installs and removes a Service using a host's native service system.
@@ -79,15 +79,32 @@ func ensureDataDir(s Service, out io.Writer) error {
 		if s.PrivateData {
 			mode = 0o700
 		}
-		if err := os.MkdirAll(s.DataDir, mode); err != nil {
-			return fmt.Errorf("creating data dir %s: %w", s.DataDir, err)
-		}
 		if s.PrivateData {
-			if err := restrictPrivateDataDir(s, s.DataDir); err != nil {
+			dir, err := dataperms.OpenDir(s.DataDir, true)
+			if err != nil {
 				return fmt.Errorf("restricting data dir %s: %w", s.DataDir, err)
 			}
-		} else if err := chownForServiceUser(s, s.DataDir); err != nil {
-			return err
+			uid, gid, change, idErr := serviceUserIDs(s)
+			if idErr != nil {
+				_ = dir.Close()
+				return idErr
+			}
+			if change {
+				_, err = dir.HardenOwned(uid, gid)
+			} else {
+				_, err = dir.Harden()
+			}
+			_ = dir.Close()
+			if err != nil {
+				return fmt.Errorf("restricting data dir %s: %w", s.DataDir, err)
+			}
+		} else {
+			if err := os.MkdirAll(s.DataDir, mode); err != nil {
+				return fmt.Errorf("creating data dir %s: %w", s.DataDir, err)
+			}
+			if err := chownForServiceUser(s, s.DataDir); err != nil {
+				return err
+			}
 		}
 		fprintf(out, "• data dir %s\n", s.DataDir)
 	}
@@ -112,27 +129,6 @@ func ensureDataDir(s Service, out io.Writer) error {
 			return err
 		}
 		fprintf(out, "• config %s\n", s.ConfigFile)
-	}
-	return nil
-}
-
-func restrictPrivateDataDir(s Service, path string) error {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("opening without following links: %w", err)
-	}
-	defer unix.Close(fd)
-	if err := unix.Fchmod(fd, 0o700); err != nil {
-		return err
-	}
-	uid, gid, change, err := serviceUserIDs(s)
-	if err != nil {
-		return err
-	}
-	if change {
-		if err := unix.Fchown(fd, uid, gid); err != nil {
-			return fmt.Errorf("chowning %s to %s: %w", path, s.User, err)
-		}
 	}
 	return nil
 }
