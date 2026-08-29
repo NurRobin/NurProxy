@@ -1,24 +1,42 @@
 # Safe recovery QA
 
-## Sandbox limitation
+## Sandbox recovery assertions
 
-The `sandbox` build runs the agent with the in-memory Caddy backend. It does not
-create native nginx or Apache configuration files, temporary managed files, or
-invoke a native proxy validator. With no certificate store configured, its
-Caddy recovery inspector also returns no file-recovery candidates.
+The sandbox keeps DNS and ACME in dry-run mode but runs its agent in existing
+nginx mode against a temporary `conf.d`. A build-tagged, hermetic executable
+implements only the fixed nginx version, config-test, and reload argument
+shapes. It requires no installed proxy package, shell, privileged write, bound
+proxy port, or service manager.
 
-Consequently, the sandbox harness cannot legitimately inject and heal a stale
-managed temporary file, and it cannot prove `nginx -t`, `apachectl -t`, reload,
-snapshot, or rollback behavior. The Task 11 sandbox stale-temp criterion remains
-open until the harness gains a recovery-aware dry backend or an equivalent
-native fixture. A broad advertised capability must not be treated as evidence
-that this dry backend actually inspected or repaired a file.
+The harness writes an exact-marker NurProxy temporary file, triggers a normal
+intent push, and requires an automatic `remove_managed_temp` operation to record
+the detected, planned, snapshotted, applying, validating, and succeeded states.
+It also requires a snapshot reference, a valid post-check, removal of the
+temporary file, and a resolved structured diagnostic.
 
-The sandbox test currently proves only that a preclassified, diagnosis-only
-diagnostic can cross the authenticated agent report endpoint and be read back
-without gaining an action or automatic-repair eligibility. Classification and
-repair execution are covered by the agent recovery and native integration
-tests, not by that report round-trip.
+A second push makes the fixture validator return an unclassified error. The
+agent must classify it as `unknown_proxy_error` with unknown ownership, no
+proposed action, and no automatic-repair eligibility. No additional repair
+operation may be created, and both an operator-owned file and the previous
+managed bytes must remain identical after the ordinary apply rollback.
+
+The fixture does not parse nginx syntax or operate a native service. Therefore
+these assertions prove control-plane delivery, real file-backend inspection,
+classification, snapshots, guarded mutation, validation/reload sequencing,
+rollback, and reporting, but they do not prove native `nginx -t`, Apache
+validation, or live traffic behavior. Tagged native integration tests and the
+hardware canary provide that separate evidence.
+
+## Hardware canary
+
+On `hlpvpngw` (`10.42.0.2`), a native nginx canary detected and automatically
+removed one exact-marker owned stale temporary file. The recorded operation
+included a snapshot and a successful native nginx config test before reaching
+`succeeded`. A separate unmarked invalid `conf.d` file produced
+`unknown_proxy_error` with unknown ownership and automatic repair disabled; no
+repair operation was created. After the operator-style fixture was removed, the
+diagnostic resolved. No secret material or machine-local certificate paths are
+part of this record.
 
 ## API E2E assertions
 

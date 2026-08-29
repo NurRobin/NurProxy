@@ -601,6 +601,12 @@ var migrations = []string{
 		WHERE state IN ('diagnosis_only', 'succeeded', 'rolled_back', 'rollback_failed', 'suppressed')
 		GROUP BY action, state, request_source;
 	`,
+
+	// Migration 25: support bounded latest-outcome breaker projection lookups.
+	`
+	CREATE INDEX idx_recovery_operations_breaker_source
+		ON recovery_operations(agent_id, action, resource_fingerprint, state, request_source, received_at DESC);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

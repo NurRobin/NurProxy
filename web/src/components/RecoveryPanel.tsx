@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../lib/types';
 import { api } from '../lib/api';
 import { formatRelativeTime } from '../lib/utils';
-import { diagnosticActionVisible, diagnosticBreaker, diagnosticLocation, recoveryErrorCode, recoveryHistory, recoveryOperationDetails, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
+import { diagnosticActionVisible, diagnosticBreaker, diagnosticLocation, recoveryErrorCode, recoveryHistory, RecoveryHistoryCardSummary, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
 import { usePolling } from '../lib/usePolling';
 import { useToast, errMessage } from './toast-context';
 import Button from './Button';
@@ -21,7 +21,7 @@ const severityTone = (severity: RecoveryDiagnostic['severity']) =>
 
 function OperationDetails({ operation }: { operation: RecoveryOperation }) {
   const { t } = useTranslation();
-  const details = recoveryOperationDetails(operation);
+  const details = operation;
   return (
     <div className="mt-2 pl-3">
       <dl className="grid gap-2 text-xs sm:grid-cols-2">
@@ -229,12 +229,12 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                     <div className="mt-2 space-y-2">
                       {related.map((operation, index) => index === 0 ? (
                         <div key={operation.operation_id} className="rounded border border-border bg-surface p-3">
-                          <p className="text-sm font-medium text-fg">{t(`recovery.states.${operation.state}`)} · {t(`recovery.sources.${operation.source}`)}</p>
+                          <p className="text-sm font-medium text-fg"><RecoveryHistoryCardSummary operation={operation} translate={(key) => t(key)} formatTime={formatRelativeTime} /></p>
                           <OperationDetails operation={operation} />
                         </div>
                       ) : (
                         <details key={operation.operation_id} className="rounded border border-border bg-surface p-3">
-                          <summary className="cursor-pointer text-sm font-medium text-fg-muted">{t(`recovery.states.${operation.state}`)} · {t(`recovery.actions.${operation.action}`)} · {formatRelativeTime(operation.started_at)}</summary>
+                          <summary className="cursor-pointer text-sm font-medium text-fg-muted"><RecoveryHistoryCardSummary operation={operation} translate={(key) => t(key)} formatTime={formatRelativeTime} /></summary>
                           <OperationDetails operation={operation} />
                         </details>
                       ))}

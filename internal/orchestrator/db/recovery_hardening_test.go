@@ -62,6 +62,7 @@ func TestRecoverySchemaUsesIntegerChronologyForeignKeysAndChecks(t *testing.T) {
 		"idx_recovery_operations_agent_created",
 		"idx_recovery_operations_agent_received",
 		"idx_recovery_operations_breaker",
+		"idx_recovery_operations_breaker_source",
 	} {
 		var found string
 		if err := d.sql.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&found); err != nil {

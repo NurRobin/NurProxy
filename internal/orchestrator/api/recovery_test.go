@@ -230,6 +230,26 @@ func TestRecoveryDiagnosticHistoryIsExplicitlyBounded(t *testing.T) {
 	}
 }
 
+func TestRecoveryDiagnosticProjectionRemainsAvailableAboveNominalActiveLimit(t *testing.T) {
+	_, database, h, cookie := recoveryFixture(t)
+	for i := 0; i < 701; i++ {
+		diagnostic := recoveryDiagnostic("agent-1")
+		diagnostic.ResourceFingerprint = fmt.Sprintf("fp-api-oversized-active-%03d", i)
+		diagnostic.ID = recoverymodel.StableDiagnosticID("agent-1", diagnostic.Code, diagnostic.ResourceFingerprint)
+		if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := doRequest(t, h, http.MethodGet, "/api/v1/agents/agent-1/diagnostics?include_resolved=false", nil, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("oversized active projection = %d: %s", w.Code, w.Body.String())
+	}
+	var got []json.RawMessage
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil || len(got) != 701 {
+		t.Fatalf("oversized active projection count = %d, err=%v, want 701", len(got), err)
+	}
+}
+
 func TestManualRepairPersistsBeforeTypedPublishAndRejectsInjectedFields(t *testing.T) {
 	srv, database, h, cookie := recoveryFixture(t)
 	d := recoveryDiagnostic("agent-1")

@@ -943,14 +943,67 @@ type RepairBreakerKey struct {
 	ResourceFingerprint string
 }
 
+type repairBreakerBatchQueries struct {
+	metadataSQL  string
+	metadataArgs []any
+	failuresSQL  string
+	failuresArgs []any
+}
+
+func buildRepairBreakerBatchQueries(agentID string, keys []RepairBreakerKey, oldest int64) repairBreakerBatchQueries {
+	values := make([]string, 0, len(keys))
+	metadataArgs := make([]any, 0, 2*len(keys)+7)
+	for _, key := range keys {
+		values = append(values, `(?, ?)`)
+		metadataArgs = append(metadataArgs, string(key.Action), key.ResourceFingerprint)
+	}
+	metadataArgs = append(metadataArgs,
+		agentID, string(recoverymodel.OperationStateRollbackFailed),
+		agentID, string(recoverymodel.OperationStateSucceeded), string(recoverymodel.RequestSourceUser),
+		agentID, string(recoverymodel.OperationStateSucceeded),
+	)
+	metadataSQL := `WITH requested(action, resource_fingerprint) AS (VALUES ` + strings.Join(values, `,`) + `)
+		SELECT action, resource_fingerprint,
+			COALESCE((SELECT MAX(received_at) FROM recovery_operations
+				WHERE agent_id = ? AND action = requested.action AND resource_fingerprint = requested.resource_fingerprint AND state = ?), -9223372036854775808),
+			COALESCE((SELECT MAX(received_at) FROM recovery_operations
+				WHERE agent_id = ? AND action = requested.action AND resource_fingerprint = requested.resource_fingerprint AND state = ? AND request_source = ?), -9223372036854775808),
+			COALESCE((SELECT MAX(received_at) FROM recovery_operations
+				WHERE agent_id = ? AND action = requested.action AND resource_fingerprint = requested.resource_fingerprint AND state = ?), -9223372036854775808)
+		FROM requested`
+
+	failureBranches := make([]string, 0, len(keys))
+	failureArgs := make([]any, 0, 12*len(keys))
+	for _, key := range keys {
+		failureBranches = append(failureBranches, `SELECT * FROM (
+			SELECT * FROM (
+				SELECT action, resource_fingerprint, received_at FROM recovery_operations
+				WHERE agent_id = ? AND action = ? AND resource_fingerprint = ? AND state = ? AND received_at > ?
+				ORDER BY received_at DESC LIMIT ?
+			) UNION ALL SELECT * FROM (
+				SELECT action, resource_fingerprint, received_at FROM recovery_operations
+				WHERE agent_id = ? AND action = ? AND resource_fingerprint = ? AND state = ? AND received_at > ?
+				ORDER BY received_at DESC LIMIT ?
+			) ORDER BY received_at DESC LIMIT 256
+		)`)
+		failureArgs = append(failureArgs,
+			agentID, string(key.Action), key.ResourceFingerprint, string(recoverymodel.OperationStateRolledBack), oldest, 256,
+			agentID, string(key.Action), key.ResourceFingerprint, string(recoverymodel.OperationStateRollbackFailed), oldest, 256,
+		)
+	}
+	return repairBreakerBatchQueries{
+		metadataSQL: metadataSQL, metadataArgs: metadataArgs,
+		failuresSQL: strings.Join(failureBranches, ` UNION ALL `), failuresArgs: failureArgs,
+	}
+}
+
 func (d *DB) GetRepairBreakerStatus(agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (RepairBreakerStatus, error) {
 	return repairBreakerStatus(d.read, agentID, action, fingerprint, now)
 }
 
 func (d *DB) GetRepairBreakerStatuses(agentID string, diagnostics []recoverymodel.Diagnostic, now time.Time) (map[RepairBreakerKey]RepairBreakerStatus, error) {
-	const maxProjectedDiagnostics = maxActiveDiagnosticIDs + 200
-	if strings.TrimSpace(agentID) == "" || now.IsZero() || len(diagnostics) > maxProjectedDiagnostics {
-		return nil, fmt.Errorf("agent, current time, and at most %d diagnostics are required", maxProjectedDiagnostics)
+	if strings.TrimSpace(agentID) == "" || now.IsZero() {
+		return nil, fmt.Errorf("agent and current time are required")
 	}
 	nowNanos, err := recoveryUnixNano(now)
 	if err != nil {
@@ -980,48 +1033,21 @@ func (d *DB) GetRepairBreakerStatuses(agentID string, diagnostics []recoverymode
 	for _, key := range keys {
 		histories[key] = &history{latestSuccess: math.MinInt64}
 	}
-	const batchSize = 250
+	const batchSize = 80
 	oldest := subtractRecoveryDuration(nowNanos, int64(75*time.Minute))
 	for start := 0; start < len(keys); start += batchSize {
 		end := min(start+batchSize, len(keys))
-		predicates := make([]string, 0, end-start)
-		args := make([]any, 0, 2*(end-start)+8)
-		args = append(args, agentID)
-		for _, key := range keys[start:end] {
-			predicates = append(predicates, `(action = ? AND resource_fingerprint = ?)`)
-			args = append(args, string(key.Action), key.ResourceFingerprint)
-		}
-		args = append(args,
-			string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed), oldest,
-			string(recoverymodel.OperationStateRollbackFailed), string(recoverymodel.OperationStateSucceeded), string(recoverymodel.RequestSourceUser),
-			string(recoverymodel.OperationStateSucceeded),
-		)
-		query := `WITH selected AS (
-			SELECT action, resource_fingerprint, state, request_source, received_at
-			FROM recovery_operations WHERE agent_id = ? AND (` + strings.Join(predicates, ` OR `) + `)
-		), recent_ranked AS (
-			SELECT *, ROW_NUMBER() OVER (PARTITION BY action, resource_fingerprint ORDER BY received_at DESC) AS rn
-			FROM selected WHERE state IN (?, ?) AND received_at > ?
-		), latch_ranked AS (
-			SELECT *, ROW_NUMBER() OVER (PARTITION BY action, resource_fingerprint ORDER BY received_at DESC) AS rn
-			FROM selected WHERE state = ? OR (state = ? AND request_source = ?)
-		), success_ranked AS (
-			SELECT *, ROW_NUMBER() OVER (PARTITION BY action, resource_fingerprint ORDER BY received_at DESC) AS rn
-			FROM selected WHERE state = ?
-		)
-		SELECT action, resource_fingerprint, state, request_source, received_at, 'failure' FROM recent_ranked WHERE rn <= 256
-		UNION ALL SELECT action, resource_fingerprint, state, request_source, received_at, 'latch' FROM latch_ranked WHERE rn = 1
-		UNION ALL SELECT action, resource_fingerprint, state, request_source, received_at, 'success' FROM success_ranked WHERE rn = 1`
-		rows, err := d.read.Query(query, args...)
+		queries := buildRepairBreakerBatchQueries(agentID, keys[start:end], oldest)
+		rows, err := d.read.Query(queries.metadataSQL, queries.metadataArgs...)
 		if err != nil {
-			return nil, fmt.Errorf("reading batch repair breaker history: %w", err)
+			return nil, fmt.Errorf("reading batch repair breaker metadata: %w", err)
 		}
 		for rows.Next() {
-			var action, fingerprint, state, source, kind string
-			var receipt int64
-			if err := rows.Scan(&action, &fingerprint, &state, &source, &receipt, &kind); err != nil {
+			var action, fingerprint string
+			var rollbackFailedAt, manualSuccessAt, latestSuccess int64
+			if err := rows.Scan(&action, &fingerprint, &rollbackFailedAt, &manualSuccessAt, &latestSuccess); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("scanning batch repair breaker history: %w", err)
+				return nil, fmt.Errorf("scanning batch repair breaker metadata: %w", err)
 			}
 			key := RepairBreakerKey{Action: recoverymodel.Action(action), ResourceFingerprint: fingerprint}
 			h := histories[key]
@@ -1029,23 +1055,40 @@ func (d *DB) GetRepairBreakerStatuses(agentID string, diagnostics []recoverymode
 				rows.Close()
 				return nil, fmt.Errorf("batch repair breaker returned an unknown key")
 			}
-			switch kind {
-			case "failure":
-				h.failures = append(h.failures, receipt)
-			case "latch":
-				h.latched = state == string(recoverymodel.OperationStateRollbackFailed)
-			case "success":
-				h.latestSuccess = receipt
-			default:
-				rows.Close()
-				return nil, fmt.Errorf("unknown batch repair breaker history kind")
-			}
+			h.latched = rollbackFailedAt > manualSuccessAt
+			h.latestSuccess = latestSuccess
 		}
 		if err := rows.Close(); err != nil {
-			return nil, fmt.Errorf("closing batch repair breaker history: %w", err)
+			return nil, fmt.Errorf("closing batch repair breaker metadata: %w", err)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("reading batch repair breaker history: %w", err)
+			return nil, fmt.Errorf("reading batch repair breaker metadata: %w", err)
+		}
+
+		rows, err = d.read.Query(queries.failuresSQL, queries.failuresArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("reading batch repair breaker failures: %w", err)
+		}
+		for rows.Next() {
+			var action, fingerprint string
+			var receipt int64
+			if err := rows.Scan(&action, &fingerprint, &receipt); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scanning batch repair breaker failures: %w", err)
+			}
+			key := RepairBreakerKey{Action: recoverymodel.Action(action), ResourceFingerprint: fingerprint}
+			h := histories[key]
+			if h == nil {
+				rows.Close()
+				return nil, fmt.Errorf("batch repair breaker returned an unknown failure key")
+			}
+			h.failures = append(h.failures, receipt)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("closing batch repair breaker failures: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("reading batch repair breaker failures: %w", err)
 		}
 	}
 	for key, history := range histories {

@@ -1,3 +1,4 @@
+import { createElement } from 'react';
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from './types';
 import type { RecoveryBreaker } from './types';
 
@@ -14,8 +15,21 @@ export function diagnosticBreaker(diagnostic: RecoveryDiagnostic): RecoveryBreak
   return diagnostic.breaker ?? { open: false };
 }
 
-export function recoveryOperationDetails(operation: RecoveryOperation): RecoveryOperation {
-  return operation;
+export function RecoveryHistoryCardSummary({
+  operation,
+  translate,
+  formatTime,
+}: {
+  operation: RecoveryOperation;
+  translate: (key: string) => string;
+  formatTime: (value: string) => string;
+}) {
+  return createElement('span', null,
+    `${translate(`recovery.states.${operation.state}`)} · `,
+    `${translate(`recovery.actions.${operation.action}`)} · `,
+    `${translate(`recovery.sources.${operation.source}`)} · `,
+    formatTime(operation.started_at),
+  );
 }
 
 export function recoveryHistory(operations: RecoveryOperation[], diagnosticID: string): RecoveryOperation[] {

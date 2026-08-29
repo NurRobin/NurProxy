@@ -1,10 +1,11 @@
 //go:build sandbox
 
 // Package sandbox holds an end-to-end test of NurProxy's dry-run / sandbox mode
-// (#93): it boots a real orchestrator and a real agent — both in dry-run — as
+// (#93): it boots a dry-run orchestrator and a hermetic existing-proxy agent as
 // subprocesses, drives the public REST API to stand up a provider, zone, agent
 // adoption, server, and central-TLS domain, and asserts the whole control plane
-// converges with NO external DNS or ACME calls and NO privileges.
+// converges with no external DNS/ACME, bound proxy ports, installed proxy
+// package, or privileges.
 //
 // It is the durable counterpart to scripts/dev-sandbox.sh: same flow, but with
 // hard assertions (domain active, certificate issued, DNS records simulated,
@@ -23,11 +24,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	agentproxy "github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
@@ -90,16 +90,28 @@ func TestSandboxEndToEnd(t *testing.T) {
 	}
 	api.post("/api/v1/zones", map[string]string{"provider_id": prov.ID, "name": "sandbox.test"}, &zone)
 
-	// --- start the dry-run agent ---------------------------------------------
+	// --- start the hermetic existing-nginx agent ------------------------------
 	agentPort := freePort(t)
 	agentDataDir := filepath.Join(dataRoot, "agent1")
+	proxyConfigDir := filepath.Join(dataRoot, "nginx", "conf.d")
+	if err := os.MkdirAll(proxyConfigDir, 0o755); err != nil {
+		t.Fatalf("create sandbox nginx config dir: %v", err)
+	}
+	operatorPath := filepath.Join(proxyConfigDir, "operator.conf")
+	operatorBytes := []byte("# operator-owned sandbox fixture\n")
+	if err := os.WriteFile(operatorPath, operatorBytes, 0o644); err != nil {
+		t.Fatalf("write operator fixture: %v", err)
+	}
 	agent := startProcess(t, bin.agent, []string{
-		"-dry-run",
 		"-orchestrator", base,
 		"-fqdn", "edge1.sandbox.test",
 		"-api-port", fmt.Sprintf("%d", agentPort),
 		"-data-dir", agentDataDir,
-	}, "")
+		"-proxy-mode", "existing",
+		"-proxy-type", "nginx",
+		"-proxy-config-dir", proxyConfigDir,
+		"-proxy-binary", bin.proxy,
+	}, "NURPROXY_NO_SUDO=1", "PATH="+filepath.Dir(bin.proxy)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	defer agent.stop()
 
 	// --- adopt the agent once it registers -----------------------------------
@@ -217,36 +229,100 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Error("no audit entry with source=dryrun for certificate issuance")
 	}
 
-	rawToken, err := os.ReadFile(filepath.Join(agentDataDir, "token"))
+	stalePath := filepath.Join(proxyConfigDir, "nurproxy-stale.sandbox.test.conf.nurproxy-tmp")
+	if err := os.WriteFile(stalePath, []byte(agentproxy.ManagedArtifactMarker+"\n# stale sandbox temp\n"), 0o644); err != nil {
+		t.Fatalf("inject managed stale temp: %v", err)
+	}
+	api.post(fmt.Sprintf("/api/v1/domains/%d/config/reset", domain.ID), map[string]any{}, nil)
+
+	var repairs []recoverymodel.OperationReport
+	waitFor(t, 15*time.Second, func() bool {
+		if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+			return false
+		}
+		api.get("/api/v1/agents/"+agentID+"/repairs", &repairs)
+		return len(repairs) == 1 && repairs[0].Action == recoverymodel.ActionRemoveManagedTemp &&
+			repairs[0].Source == recoverymodel.RequestSourceAutomatic && repairs[0].State == recoverymodel.OperationStateSucceeded
+	})
+	if repairs[0].SnapshotReference == "" || repairs[0].ValidationOutcome != "valid" {
+		t.Fatalf("stale-temp repair omitted snapshot/validation evidence: %#v", repairs[0])
+	}
+	wantStates := []recoverymodel.OperationState{
+		recoverymodel.OperationStateDetected, recoverymodel.OperationStatePlanned,
+		recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateApplying,
+		recoverymodel.OperationStateValidating, recoverymodel.OperationStateSucceeded,
+	}
+	if len(repairs[0].Steps) != len(wantStates) {
+		t.Fatalf("stale-temp repair steps = %#v, want %v", repairs[0].Steps, wantStates)
+	}
+	for i, want := range wantStates {
+		if repairs[0].Steps[i].State != want {
+			t.Fatalf("stale-temp repair step %d = %q, want %q", i, repairs[0].Steps[i].State, want)
+		}
+	}
+	var resolvedDiagnostics []recoverymodel.Diagnostic
+	waitFor(t, 10*time.Second, func() bool {
+		api.get("/api/v1/agents/"+agentID+"/diagnostics?include_resolved=true", &resolvedDiagnostics)
+		for _, diagnostic := range resolvedDiagnostics {
+			if diagnostic.Code == recoverymodel.CodeManagedStaleTemp && diagnostic.ProposedAction == recoverymodel.ActionRemoveManagedTemp {
+				return true
+			}
+		}
+		return false
+	})
+
+	managedPath := filepath.Join(proxyConfigDir, "nurproxy-app.sandbox.test.conf")
+	managedBefore, err := os.ReadFile(managedPath)
 	if err != nil {
-		t.Fatalf("read sandbox agent token: %v", err)
+		t.Fatalf("read managed fixture before unknown failure: %v", err)
 	}
-	agentAPI := &apiClient{base: base, key: strings.TrimSpace(string(rawToken)), t: t}
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	unknown := recoverymodel.Diagnostic{
-		Code: recoverymodel.CodeUnknownProxyError, Subsystem: "proxy", Severity: recoverymodel.SeverityError,
-		Ownership: recoverymodel.OwnershipUnknown, Summary: "test-posted preclassified unknown proxy failure",
-		Evidence: "authenticated report round-trip fixture", ResourceFingerprint: "sandbox-report-round-trip",
-		FirstSeenAt: now, LastSeenAt: now, Occurrences: 1,
+	failValidation := filepath.Join(filepath.Dir(bin.proxy), "fail-validation")
+	if err := os.WriteFile(failValidation, []byte("enabled\n"), 0o600); err != nil {
+		t.Fatalf("enable sandbox validation failure: %v", err)
 	}
-	unknown.ID = recoverymodel.StableDiagnosticID(agentID, unknown.Code, unknown.ResourceFingerprint)
-	agentAPI.post("/api/v1/agents/"+agentID+"/recovery/report", proxymodel.RecoveryReportEnvelope{
-		Report: proxymodel.RecoveryReport{Diagnostics: []recoverymodel.Diagnostic{unknown}},
+	api.put(fmt.Sprintf("/api/v1/domains/%d/config", domain.ID), map[string]any{
+		"config": "server { listen 8081; server_name app.sandbox.test; }\n",
 	}, nil)
-	var recoveryDiagnostics []recoverymodel.Diagnostic
-	api.get("/api/v1/agents/"+agentID+"/diagnostics", &recoveryDiagnostics)
-	if len(recoveryDiagnostics) != 1 || recoveryDiagnostics[0].ID != unknown.ID || recoveryDiagnostics[0].ProposedAction != "" || recoveryDiagnostics[0].AutoRepairEligible {
-		t.Fatalf("authenticated preclassified diagnostic round-trip changed diagnosis-only fields: %#v", recoveryDiagnostics)
+
+	var activeDiagnostics []recoverymodel.Diagnostic
+	waitFor(t, 15*time.Second, func() bool {
+		api.get("/api/v1/agents/"+agentID+"/diagnostics", &activeDiagnostics)
+		for _, diagnostic := range activeDiagnostics {
+			if diagnostic.Code == recoverymodel.CodeUnknownProxyError {
+				return true
+			}
+		}
+		return false
+	})
+	var unknown *recoverymodel.Diagnostic
+	for i := range activeDiagnostics {
+		if activeDiagnostics[i].Code == recoverymodel.CodeUnknownProxyError {
+			unknown = &activeDiagnostics[i]
+			break
+		}
+	}
+	if unknown == nil || unknown.Ownership != recoverymodel.OwnershipUnknown || unknown.ProposedAction != "" || unknown.AutoRepairEligible || unknown.HardChange {
+		t.Fatalf("unknown validation error was not diagnosis-only: %#v", unknown)
+	}
+	api.get("/api/v1/agents/"+agentID+"/repairs", &repairs)
+	if len(repairs) != 1 {
+		t.Fatalf("unknown validation error created a repair operation: %#v", repairs)
+	}
+	if got, err := os.ReadFile(operatorPath); err != nil || !bytes.Equal(got, operatorBytes) {
+		t.Fatalf("unknown validation failure changed operator config: got=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(managedPath); err != nil || !bytes.Equal(got, managedBefore) {
+		t.Fatalf("unknown validation failure did not roll back managed config: err=%v", err)
 	}
 
-	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; authenticated preclassified diagnostic report round-trip passed (classification, native validation, and recovery are not covered)", dom.DNSRecordID)
+	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; stale managed temp auto-healed and an unclassified validation failure remained diagnosis-only (validator/reload are hermetic fixtures, not native nginx proof)", dom.DNSRecordID)
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
-type binaries struct{ orch, agent string }
+type binaries struct{ orch, agent, proxy string }
 
 func repoRoot(t *testing.T) string {
 	// test/sandbox -> repo root is two levels up.
@@ -263,7 +339,7 @@ func repoRoot(t *testing.T) string {
 func buildBinaries(t *testing.T, root string) binaries {
 	t.Helper()
 	out := t.TempDir()
-	b := binaries{orch: filepath.Join(out, "nurproxy-orch"), agent: filepath.Join(out, "nurproxy-agent")}
+	b := binaries{orch: filepath.Join(out, "nurproxy-orch"), agent: filepath.Join(out, "nurproxy-agent"), proxy: filepath.Join(out, "nginx")}
 	build := func(bin, tags, pkg string) {
 		args := []string{"build"}
 		if tags != "" {
@@ -278,6 +354,7 @@ func buildBinaries(t *testing.T, root string) binaries {
 	}
 	build(b.orch, "headless", "./cmd/nurproxy")
 	build(b.agent, "", "./cmd/nurproxy-agent")
+	build(b.proxy, "sandbox", "./test/sandbox/proxyfixture")
 	return b
 }
 
@@ -286,12 +363,14 @@ type process struct {
 	t   *testing.T
 }
 
-func startProcess(t *testing.T, bin string, args []string, env string) *process {
+func startProcess(t *testing.T, bin string, args []string, env ...string) *process {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Env = os.Environ()
-	if env != "" {
-		cmd.Env = append(cmd.Env, env)
+	for _, value := range env {
+		if value != "" {
+			cmd.Env = append(cmd.Env, value)
+		}
 	}
 	logf, err := os.Create(filepath.Join(t.TempDir(), filepath.Base(bin)+".log"))
 	if err == nil {

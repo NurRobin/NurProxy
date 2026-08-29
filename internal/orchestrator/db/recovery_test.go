@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -231,20 +232,92 @@ func TestRepairBreakerStatusesBatchProjectsActiveKeys(t *testing.T) {
 	}
 }
 
-func TestRepairBreakerStatusesBatchBoundsWholeProjection(t *testing.T) {
+func TestRepairBreakerStatusesBatchChunksOversizedProjection(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
-	diagnostics := make([]recoverymodel.Diagnostic, maxActiveDiagnosticIDs+200)
+	diagnostics := make([]recoverymodel.Diagnostic, maxActiveDiagnosticIDs+201)
 	for i := range diagnostics {
 		diagnostics[i] = testDiagnostic(a.ID, fmt.Sprintf("fp-batch-bound-%d", i))
 	}
 	statuses, err := d.GetRepairBreakerStatuses(a.ID, diagnostics, recoveryTime(10))
 	if err != nil || len(statuses) != len(diagnostics) {
-		t.Fatalf("max bounded batch count = %d, err=%v, want %d", len(statuses), err, len(diagnostics))
+		t.Fatalf("chunked batch count = %d, err=%v, want %d", len(statuses), err, len(diagnostics))
 	}
-	diagnostics = append(diagnostics, testDiagnostic(a.ID, "fp-batch-overflow"))
-	if _, err := d.GetRepairBreakerStatuses(a.ID, diagnostics, recoveryTime(10)); err == nil {
-		t.Fatal("oversized breaker projection was accepted")
+}
+
+func TestRepairBreakerBatchQueriesBoundHistoryPerKey(t *testing.T) {
+	keys := []RepairBreakerKey{
+		{Action: recoverymodel.ActionRemoveManagedTemp, ResourceFingerprint: "fp-query-1"},
+		{Action: recoverymodel.ActionRestoreLastLiveArtifact, ResourceFingerprint: "fp-query-2"},
+	}
+	queries := buildRepairBreakerBatchQueries("agent-1", keys, recoveryTime(10).UnixNano())
+	if strings.Contains(queries.metadataSQL, "ROW_NUMBER") || strings.Contains(queries.failuresSQL, "ROW_NUMBER") {
+		t.Fatal("batch breaker queries rank unbounded history")
+	}
+	if got := strings.Count(queries.metadataSQL, "MAX(received_at)"); got != 3 {
+		t.Fatalf("metadata latest-outcome lookup count = %d, want 3", got)
+	}
+	if got := strings.Count(queries.failuresSQL, "LIMIT 256"); got != len(keys) {
+		t.Fatalf("per-key failure limit count = %d, want %d", got, len(keys))
+	}
+	if len(queries.metadataArgs) > 999 || len(queries.failuresArgs) > 999 {
+		t.Fatalf("batch query argument counts exceed portable SQLite bound: metadata=%d failures=%d", len(queries.metadataArgs), len(queries.failuresArgs))
+	}
+}
+
+func TestRepairBreakerStatusesBatchMatchesScalarSemantics(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	base := time.Date(2026, 8, 29, 5, 0, 0, 0, time.UTC)
+	threshold := testDiagnostic(a.ID, "fp-parity-threshold")
+	latched := testDiagnostic(a.ID, "fp-parity-latched")
+	cleared := testDiagnostic(a.ID, "fp-parity-cleared")
+	closed := testDiagnostic(a.ID, "fp-parity-closed")
+	diagnostics := []recoverymodel.Diagnostic{threshold, latched, cleared, closed}
+	for _, diagnostic := range diagnostics {
+		if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := func(id string, diagnostic recoverymodel.Diagnostic, source recoverymodel.RequestSource, state recoverymodel.OperationState, at time.Time) {
+		t.Helper()
+		op := newUserOperation(id, diagnostic, recoveryTime(0))
+		if source == recoverymodel.RequestSourceAutomatic {
+			op = testOperation(id, diagnostic.ID, recoverymodel.OperationStateDetected)
+		}
+		if err := d.CreateRepairOperation(a.ID, op, diagnostic.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		if source == recoverymodel.RequestSourceAutomatic {
+			op = advanceOperation(t, d, a.ID, op, recoverymodel.OperationStatePlanned)
+		}
+		op = advanceOperationToTerminal(t, d, a.ID, op, state)
+		if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, at.UnixNano(), op.OperationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, minute := range []int{0, 1, 2, 10} {
+		record(fmt.Sprintf("op-parity-threshold-%d", i), threshold, recoverymodel.RequestSourceUser, recoverymodel.OperationStateRolledBack, base.Add(time.Duration(minute)*time.Minute))
+	}
+	record("op-parity-latch-failure", latched, recoverymodel.RequestSourceAutomatic, recoverymodel.OperationStateRollbackFailed, base)
+	record("op-parity-latch-auto-success", latched, recoverymodel.RequestSourceAutomatic, recoverymodel.OperationStateSucceeded, base.Add(time.Minute))
+	record("op-parity-clear-failure", cleared, recoverymodel.RequestSourceAutomatic, recoverymodel.OperationStateRollbackFailed, base)
+	record("op-parity-clear-user-success", cleared, recoverymodel.RequestSourceUser, recoverymodel.OperationStateSucceeded, base.Add(time.Minute))
+
+	now := base.Add(11 * time.Minute)
+	batched, err := d.GetRepairBreakerStatuses(a.ID, diagnostics, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, diagnostic := range diagnostics {
+		key := RepairBreakerKey{Action: diagnostic.ProposedAction, ResourceFingerprint: diagnostic.ResourceFingerprint}
+		scalar, err := d.GetRepairBreakerStatus(a.ID, diagnostic.ProposedAction, diagnostic.ResourceFingerprint, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(batched[key], scalar) {
+			t.Errorf("batch status for %s = %#v, scalar = %#v", diagnostic.ResourceFingerprint, batched[key], scalar)
+		}
 	}
 }
 

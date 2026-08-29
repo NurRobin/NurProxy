@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import {
   diagnosticLocation,
   diagnosticActionVisible,
   diagnosticBreaker,
   recoveryErrorCode,
   recoveryHistory,
+  RecoveryHistoryCardSummary,
   recoveryOperationTerminal,
   repairAvailability,
-  recoveryOperationDetails,
 } from '../src/lib/recovery-ui.ts';
 import { pollingActive } from '../src/lib/usePolling.ts';
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../src/lib/types.ts';
@@ -122,14 +124,20 @@ test('repair history is scoped to the selected diagnostic', () => {
   assert.deepEqual(recoveryHistory(history, 'diag-1').map((item) => item.operation_id), ['new', 'old']);
 });
 
-test('historical operation details retain source and every audit field', () => {
+test('collapsed historical operation summary renders its source', () => {
   const operation = {
-    operation_id: 'op-full', diagnostic_id: 'diag-1', action: 'remove_managed_temp', source: 'automatic', state: 'rolled_back',
-    steps: [{ name: 'rollback', summary: 'restored', state: 'rolled_back', at: '2026-08-29T05:00:02Z' }],
-    snapshot_reference: 'recovery/op-full', validation_outcome: 'invalid', rollback_outcome: 'restored', error: 'sanitized',
-    started_at: '2026-08-29T05:00:00Z', finished_at: '2026-08-29T05:00:02Z',
+    operation_id: 'op-old', diagnostic_id: 'diag-1', action: 'remove_managed_temp', source: 'automatic', state: 'rolled_back',
+    started_at: '2026-08-29T05:00:00Z',
   } as RecoveryOperation;
-  assert.deepEqual(recoveryOperationDetails(operation), operation);
+  const markup = renderToStaticMarkup(createElement(RecoveryHistoryCardSummary, {
+    operation,
+    translate: (key: string) => key,
+    formatTime: () => 'relative-time',
+  }));
+  assert.match(markup, /recovery\.states\.rolled_back/);
+  assert.match(markup, /recovery\.actions\.remove_managed_temp/);
+  assert.match(markup, /recovery\.sources\.automatic/);
+  assert.match(markup, /relative-time/);
 });
 
 test('hidden polling continues only while a recovery operation is active', () => {

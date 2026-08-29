@@ -165,8 +165,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 24 {
-		t.Fatalf("this test pins the schema target at 24 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 25 {
+		t.Fatalf("this test pins the schema target at 25 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
