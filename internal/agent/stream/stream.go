@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -102,6 +103,10 @@ type managedArtifact struct {
 
 type ManagedApplier interface {
 	Apply(context.Context, helperprotocol.ManagedIntentSetEnvelope) (helperprotocol.Signed[helperprotocol.HelperReceipt], error)
+}
+
+type managedArtifactReader interface {
+	ReadManaged(context.Context) ([]proxy.Artifact, error)
 }
 
 // Client manages the agent's stream connection and applies pushed routes.
@@ -426,26 +431,7 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 }
 
 func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string) {
-	reports := make([]proxymodel.ArtifactReport, 0, len(set.Intents))
-	managed := make(map[string]managedArtifact, len(set.Intents))
-	for _, intent := range set.Intents {
-		report := proxymodel.ArtifactReport{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Backend: intent.Backend, Error: applyError}
-		if applyError == "" {
-			artifact, err := c.caddy.Render(ctx, intent.Route)
-			if err != nil {
-				report.Error = "post-apply artifact rendering failed"
-			} else {
-				report.TargetKind = string(artifact.Target.Kind)
-				report.TargetPath = artifact.Target.Path
-				report.Content = artifact.Content
-				report.Checksum = checksum(artifact.Content)
-				report.Enabled = artifact.Enabled
-				report.Warnings = artifact.Warnings
-				managed[intent.ArtifactID] = managedArtifact{targetKind: report.TargetKind, targetPath: report.TargetPath, checksum: report.Checksum}
-			}
-		}
-		reports = append(reports, report)
-	}
+	reports, managed := c.managedAckReports(ctx, set, applyError)
 	if applyError == "" {
 		c.carryKeepManaged(set.Keep, managed)
 		c.setManaged(managed)
@@ -454,6 +440,86 @@ func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, a
 		c.applyStateMu.Unlock()
 	}
 	c.sendAck(ctx, reports)
+}
+
+func (c *Client) managedAckReports(ctx context.Context, set proxymodel.IntentSet, applyError string) ([]proxymodel.ArtifactReport, map[string]managedArtifact) {
+	reports := make([]proxymodel.ArtifactReport, 0, len(set.Intents))
+	managed := make(map[string]managedArtifact, len(set.Intents))
+	info := c.caddy.Info()
+	var liveByPath map[string]proxy.Artifact
+	var liveReadError string
+	if applyError == "" && (info.Kind == proxy.KindNginx || info.Kind == proxy.KindApache) {
+		reader, ok := c.caddy.(managedArtifactReader)
+		if !ok {
+			liveReadError = "post-apply live artifact reader unavailable"
+		} else if live, err := reader.ReadManaged(ctx); err != nil {
+			liveReadError = "post-apply live artifact read failed"
+		} else {
+			liveByPath = make(map[string]proxy.Artifact, len(live))
+			for _, artifact := range live {
+				if _, duplicate := liveByPath[artifact.Target.Path]; duplicate {
+					liveReadError = "post-apply live artifact identity is ambiguous"
+					break
+				}
+				liveByPath[artifact.Target.Path] = artifact
+			}
+		}
+	}
+	for _, intent := range set.Intents {
+		report := proxymodel.ArtifactReport{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Backend: intent.Backend, Error: applyError}
+		if applyError == "" {
+			var artifact proxy.Artifact
+			var err error
+			if info.Kind == proxy.KindNginx || info.Kind == proxy.KindApache {
+				if liveReadError != "" {
+					report.Error = liveReadError
+				} else {
+					var target proxy.Target
+					target, err = managedFileTarget(info, intent)
+					if err == nil {
+						var found bool
+						artifact, found = liveByPath[target.Path]
+						if !found || artifact.Target.Kind != proxy.TargetKindFile || artifact.Adopted || !artifact.Enabled || !proxy.HasManagedArtifactMarker(artifact.Content) {
+							err = fmt.Errorf("helper-installed artifact is absent or lacks exact provenance")
+						}
+					}
+				}
+			} else {
+				artifact, err = c.caddy.Render(ctx, intent.Route)
+			}
+			if report.Error == "" {
+				if err != nil {
+					report.Error = "post-apply live artifact verification failed"
+				} else {
+					report.TargetKind = string(artifact.Target.Kind)
+					report.TargetPath = artifact.Target.Path
+					report.Content = artifact.Content
+					report.Checksum = checksum(artifact.Content)
+					report.Enabled = artifact.Enabled
+					report.Warnings = artifact.Warnings
+					managed[intent.ArtifactID] = managedArtifact{targetKind: report.TargetKind, targetPath: report.TargetPath, checksum: report.Checksum}
+				}
+			}
+		}
+		reports = append(reports, report)
+	}
+	return reports, managed
+}
+
+func managedFileTarget(info proxy.Info, intent proxymodel.RouteIntent) (proxy.Target, error) {
+	if intent.Backend != string(info.Kind) || !filepath.IsAbs(info.ConfigDir) || filepath.Clean(info.ConfigDir) != info.ConfigDir {
+		return proxy.Target{}, fmt.Errorf("managed file target does not match the detected root-owned backend")
+	}
+	var name string
+	switch info.Kind {
+	case proxy.KindNginx:
+		name = nginxproxy.ManagedFileName(intent.Route.Host)
+	case proxy.KindApache:
+		name = apacheproxy.ManagedFileName(intent.Route.Host)
+	default:
+		return proxy.Target{}, fmt.Errorf("managed file target is unavailable for backend")
+	}
+	return proxy.Target{Kind: proxy.TargetKindFile, Path: filepath.Join(info.ConfigDir, name)}, nil
 }
 
 // startLogTail begins an on-demand tail for the requested session (§15). The path

@@ -21,6 +21,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
+	nginxproxy "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
 	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
@@ -786,6 +787,87 @@ type fakeCaddyBackend struct {
 	addRoutes int
 	pruneHit  bool
 	pruneKeep []proxy.Target
+}
+
+type managedLiveFileBackend struct {
+	dir         string
+	liveContent string
+	renderCalls int
+}
+
+func (b *managedLiveFileBackend) Info() proxy.Info {
+	return proxy.Info{Kind: proxy.KindNginx, ConfigDir: b.dir}
+}
+func (b *managedLiveFileBackend) EnsureServer(context.Context) error              { return nil }
+func (b *managedLiveFileBackend) ClearRoutes(context.Context) error               { return nil }
+func (b *managedLiveFileBackend) AddRoute(context.Context, json.RawMessage) error { return nil }
+func (b *managedLiveFileBackend) Apply(context.Context, []proxy.Artifact) error   { return nil }
+func (b *managedLiveFileBackend) Prune(context.Context, []proxy.Target) (int, error) {
+	return 0, nil
+}
+func (b *managedLiveFileBackend) Render(_ context.Context, route proxymodel.Route) (proxy.Artifact, error) {
+	b.renderCalls++
+	return proxy.Artifact{
+		Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: filepath.Join(b.dir, nginxproxy.ManagedFileName(route.Host))},
+		Content: "legacy renderer without helper-owned TLS",
+		Enabled: true,
+	}, nil
+}
+func (b *managedLiveFileBackend) ReadManaged(context.Context) ([]proxy.Artifact, error) {
+	return []proxy.Artifact{{
+		Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: filepath.Join(b.dir, nginxproxy.ManagedFileName("tls.example.test"))},
+		Content: b.liveContent,
+		Enabled: true,
+	}}, nil
+}
+func (b *managedLiveFileBackend) InstallCerts(context.Context, []proxy.CertBundle) error {
+	return nil
+}
+func (b *managedLiveFileBackend) EnsureServerTLS(context.Context, []proxy.TLSIntent) error {
+	return nil
+}
+
+func TestManagedAckUsesHelperInstalledLiveArtifact(t *testing.T) {
+	live := proxy.StampManagedArtifact("server { listen 443 ssl; }\n")
+	backend := &managedLiveFileBackend{dir: t.TempDir(), liveContent: live}
+	client := New("http://unused", "agent-1", "token", backend, health.New())
+	set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{
+		ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{
+			Host: "tls.example.test", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8080}, ForceHTTPS: true,
+		},
+	}}}
+
+	reports, managed := client.managedAckReports(context.Background(), set, "")
+	if len(reports) != 1 || reports[0].Error != "" {
+		t.Fatalf("reports = %#v", reports)
+	}
+	if reports[0].Content != live || reports[0].Checksum != checksum(live) || !reports[0].Enabled {
+		t.Fatalf("ACK did not describe helper-installed artifact: %#v", reports[0])
+	}
+	if backend.renderCalls != 0 {
+		t.Fatalf("legacy renderer called %d time(s)", backend.renderCalls)
+	}
+	if got := managed["dom-1"]; got.targetPath != reports[0].TargetPath || got.checksum != reports[0].Checksum {
+		t.Fatalf("managed state = %#v, report = %#v", got, reports[0])
+	}
+}
+
+func TestManagedAckRejectsLiveArtifactWithoutHelperProvenance(t *testing.T) {
+	backend := &managedLiveFileBackend{dir: t.TempDir(), liveContent: "server { listen 80; }\n"}
+	client := New("http://unused", "agent-1", "token", backend, health.New())
+	set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{
+		ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{
+			Host: "tls.example.test", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8080},
+		},
+	}}}
+
+	reports, managed := client.managedAckReports(context.Background(), set, "")
+	if len(reports) != 1 || reports[0].Error != "post-apply live artifact verification failed" {
+		t.Fatalf("reports = %#v", reports)
+	}
+	if len(managed) != 0 || backend.renderCalls != 0 {
+		t.Fatalf("unprovenanced artifact entered managed state: managed=%#v render_calls=%d", managed, backend.renderCalls)
+	}
 }
 
 func (c *fakeCaddyBackend) Info() proxy.Info                       { return proxy.Info{Kind: proxy.KindCaddy} }
