@@ -32,6 +32,14 @@ export function diagnosticActionVisible(diagnostic: RecoveryDiagnostic): boolean
   return diagnostic.proposed_action !== '' || diagnostic.hard_change || diagnostic.ownership !== 'nurproxy';
 }
 
+export function diagnosticStateLabelKey(active: boolean): string {
+  return active ? 'recovery.needsAttention' : 'recovery.resolved';
+}
+
+export function diagnosticResolutionLabelKey(diagnostic: RecoveryDiagnostic): string | null {
+  return diagnostic.resolution_reason ? `recovery.resolutionReasons.${diagnostic.resolution_reason}` : null;
+}
+
 export function diagnosticBreaker(diagnostic: RecoveryDiagnostic): RecoveryBreaker {
   return diagnostic.breaker ?? { open: false };
 }

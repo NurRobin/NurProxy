@@ -205,6 +205,7 @@ export interface RecoveryDiagnostic {
   subsystem: string;
   severity: RecoverySeverity;
   ownership: RecoveryOwnership;
+  ownership_confidence?: 'certain' | 'inferred' | 'unknown';
   summary: string;
   evidence: string;
   affected_paths: string[];
@@ -218,6 +219,10 @@ export interface RecoveryDiagnostic {
   first_seen_at: string;
   last_seen_at: string;
   occurrences: number;
+  resolved_at?: string;
+  resolution_reason?: 'repaired' | 'resource_disappeared' | 'desired_state_changed'
+    | 'operator_resolved' | 'superseded' | 'condition_no_longer_observed';
+  resolution_operation_id?: string;
   breaker?: RecoveryBreaker;
 }
 

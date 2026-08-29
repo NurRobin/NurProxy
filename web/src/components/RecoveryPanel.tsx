@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { Agent, HardRecoveryPlan, RecoveryDiagnostic, RecoveryHelperStatus, RecoveryOperation } from '../lib/types';
 import { api } from '../lib/api';
 import { formatRelativeTime } from '../lib/utils';
-import { diagnosticActionVisible, diagnosticBreaker, diagnosticLocation, hardPlanAvailability, newestHardPlan, recoveryErrorCode, recoveryHistory, RecoveryHistoryCardSummary, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
+import { diagnosticActionVisible, diagnosticBreaker, diagnosticLocation, diagnosticResolutionLabelKey, diagnosticStateLabelKey, hardPlanAvailability, newestHardPlan, recoveryErrorCode, recoveryHistory, RecoveryHistoryCardSummary, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
 import { usePolling } from '../lib/usePolling';
 import { useToast, errMessage } from './toast-context';
 import Button from './Button';
@@ -249,25 +249,33 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
             const validationEscape = breaker.open && breaker.reason === 'rollback_failed_latched';
             const hardPlan = newestHardPlan(hardPlans, diagnostic.id);
             const hardAvailability = hardPlanAvailability(diagnostic, hardPlan);
+            const resolutionLabelKey = diagnosticResolutionLabelKey(diagnostic);
             return (
               <article key={diagnostic.id} className="rounded-lg border border-border bg-surface-2 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
+                      <span className={`rounded px-2 py-0.5 text-xs font-semibold ${isActive ? 'bg-warning-soft text-warning-fg' : 'bg-success-soft text-success-fg'}`}>
+                        {t(diagnosticStateLabelKey(isActive))}
+                      </span>
                       <span className={`rounded px-2 py-0.5 text-xs font-medium ${
                         severityTone(diagnostic.severity) === 'danger' ? 'bg-danger-soft text-danger-fg' :
                         severityTone(diagnostic.severity) === 'warning' ? 'bg-warning-soft text-warning-fg' : 'bg-info-soft text-info-fg'
                       }`}>{t(`recovery.severity.${diagnostic.severity}`)}</span>
                       <code className="font-mono text-xs text-fg-faint">{diagnostic.code}</code>
-                      {!isActive && <span className="text-xs text-success-fg">{t('recovery.resolved')}</span>}
                     </div>
                     <p className="mt-2 font-medium text-fg">{diagnostic.summary}</p>
                     <p className="mt-1 text-xs text-fg-faint">
-                      {t('recovery.ownership')}: {t(`recovery.ownershipValues.${diagnostic.ownership}`)} · {diagnostic.subsystem} · {formatRelativeTime(diagnostic.last_seen_at)} · {t('recovery.occurrences', { count: diagnostic.occurrences })}
+                      {t('recovery.ownership')}: {t(`recovery.ownershipValues.${diagnostic.ownership}`)}
+                      {diagnostic.ownership_confidence && ` (${t(`recovery.ownershipConfidence.${diagnostic.ownership_confidence}`)})`}
+                      {' · '}{diagnostic.subsystem} · {t('recovery.lastSeen')} {formatRelativeTime(diagnostic.last_seen_at)} · {t('recovery.occurrences', { count: diagnostic.occurrences })}
                     </p>
-                    <p className="mt-1 text-xs text-fg-faint">{t('recovery.firstSeen')}: {new Date(diagnostic.first_seen_at).toLocaleString()}</p>
-                    <p className="mt-1 break-all font-mono text-xs text-fg-faint">{t('recovery.fingerprint')}: {diagnostic.resource_fingerprint}</p>
-                    {location && <p className="mt-1 break-all font-mono text-xs text-fg-muted">{t('recovery.location')}: {location}</p>}
+                    {!isActive && resolutionLabelKey && (
+                      <p className="mt-2 text-xs font-medium text-success-fg">{t('recovery.resolvedBecause')}: {t(resolutionLabelKey)}</p>
+                    )}
+                    {related[0] && (
+                      <p className="mt-2 text-xs text-fg-muted"><RecoveryHistoryCardSummary operation={related[0]} translate={(key) => t(key)} formatTime={formatRelativeTime} /></p>
+                    )}
                   </div>
                   {diagnosticActionVisible(diagnostic) && (
                     diagnostic.hard_change ? (
@@ -291,15 +299,6 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                   )}
                 </div>
 
-                {diagnostic.evidence && (
-                  <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-surface px-3 py-2 font-mono text-xs text-fg-muted">{diagnostic.evidence}</pre>
-                )}
-                {diagnostic.affected_paths.length > 0 && (
-                  <div className="mt-3">
-                    <p className="text-xs font-medium text-fg-muted">{t('recovery.affectedPaths')}</p>
-                    <ul className="mt-1 space-y-1">{diagnostic.affected_paths.map((path) => <li key={path}><code className="break-all font-mono text-xs text-fg-faint">{path}</code></li>)}</ul>
-                  </div>
-                )}
                 {isActive && diagnostic.hard_change && !hardAvailability.enabled && hardAvailability.reason && (
                   <p className="mt-3 text-xs text-fg-faint">{t(`recovery.reasons.${hardAvailability.reason}`, { defaultValue: diagnostic.repair_refusal_code || hardAvailability.reason })}</p>
                 )}
@@ -327,24 +326,41 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                   </Callout></div>
                 )}
 
-                {related.length > 0 && (
-                  <div className="mt-4 border-t border-border pt-3">
-                    <p className="text-sm font-medium text-fg">{t('recovery.history', { count: related.length })}</p>
-                    <div className="mt-2 space-y-2">
-                      {related.map((operation, index) => index === 0 ? (
-                        <div key={operation.operation_id} className="rounded border border-border bg-surface p-3">
-                          <p className="text-sm font-medium text-fg"><RecoveryHistoryCardSummary operation={operation} translate={(key) => t(key)} formatTime={formatRelativeTime} /></p>
-                          <OperationDetails operation={operation} />
+                <details className="mt-4 border-t border-border pt-3">
+                  <summary className="cursor-pointer text-sm font-medium text-fg-muted">{t('recovery.viewDetails')}</summary>
+                  <div className="mt-3 space-y-3">
+                    <dl className="grid gap-2 text-xs sm:grid-cols-2">
+                      <div><dt className="text-fg-faint">{t('recovery.firstSeen')}</dt><dd className="text-fg-muted">{new Date(diagnostic.first_seen_at).toLocaleString()}</dd></div>
+                      <div><dt className="text-fg-faint">{t('recovery.lastSeen')}</dt><dd className="text-fg-muted">{new Date(diagnostic.last_seen_at).toLocaleString()}</dd></div>
+                      {diagnostic.resolved_at && <div><dt className="text-fg-faint">{t('recovery.resolvedAt')}</dt><dd className="text-fg-muted">{new Date(diagnostic.resolved_at).toLocaleString()}</dd></div>}
+                      {diagnostic.resolution_operation_id && <div><dt className="text-fg-faint">{t('recovery.resolutionOperation')}</dt><dd className="break-all font-mono text-fg-muted">{diagnostic.resolution_operation_id}</dd></div>}
+                    </dl>
+                    <p className="break-all font-mono text-xs text-fg-faint">{t('recovery.fingerprint')}: {diagnostic.resource_fingerprint}</p>
+                    {location && <p className="break-all font-mono text-xs text-fg-muted">{t('recovery.location')}: {location}</p>}
+                    {diagnostic.evidence && (
+                      <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-surface px-3 py-2 font-mono text-xs text-fg-muted">{diagnostic.evidence}</pre>
+                    )}
+                    {diagnostic.affected_paths.length > 0 && (
+                      <div>
+                        <p className="text-xs font-medium text-fg-muted">{t('recovery.affectedPaths')}</p>
+                        <ul className="mt-1 space-y-1">{diagnostic.affected_paths.map((path) => <li key={path}><code className="break-all font-mono text-xs text-fg-faint">{path}</code></li>)}</ul>
+                      </div>
+                    )}
+                    {related.length > 0 && (
+                      <div>
+                        <p className="text-sm font-medium text-fg">{t('recovery.history', { count: related.length })}</p>
+                        <div className="mt-2 space-y-2">
+                          {related.map((operation) => (
+                            <details key={operation.operation_id} className="rounded border border-border bg-surface p-3">
+                              <summary className="cursor-pointer text-sm font-medium text-fg-muted"><RecoveryHistoryCardSummary operation={operation} translate={(key) => t(key)} formatTime={formatRelativeTime} /></summary>
+                              <OperationDetails operation={operation} />
+                            </details>
+                          ))}
                         </div>
-                      ) : (
-                        <details key={operation.operation_id} className="rounded border border-border bg-surface p-3">
-                          <summary className="cursor-pointer text-sm font-medium text-fg-muted"><RecoveryHistoryCardSummary operation={operation} translate={(key) => t(key)} formatTime={formatRelativeTime} /></summary>
-                          <OperationDetails operation={operation} />
-                        </details>
-                      ))}
+                      </div>
+                    )}
                     </div>
-                  </div>
-                )}
+                </details>
               </article>
             );
           })}

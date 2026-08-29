@@ -4,6 +4,8 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
   diagnosticLocation,
+  diagnosticResolutionLabelKey,
+  diagnosticStateLabelKey,
   diagnosticActionVisible,
   diagnosticBreaker,
   recoveryErrorCode,
@@ -161,6 +163,13 @@ test('collapsed historical operation summary renders its source', () => {
   assert.match(markup, /recovery\.actions\.remove_managed_temp/);
   assert.match(markup, /recovery\.sources\.automatic/);
   assert.match(markup, /relative-time/);
+});
+
+test('incident state is independent from original fault severity and repair outcome', () => {
+  assert.equal(diagnosticStateLabelKey(true), 'recovery.needsAttention');
+  assert.equal(diagnosticStateLabelKey(false), 'recovery.resolved');
+  assert.equal(diagnosticResolutionLabelKey({ resolution_reason: 'resource_disappeared' } as RecoveryDiagnostic), 'recovery.resolutionReasons.resource_disappeared');
+  assert.equal(diagnosticResolutionLabelKey({} as RecoveryDiagnostic), null);
 });
 
 test('hidden polling continues only while a recovery operation is active', () => {
