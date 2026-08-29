@@ -1,10 +1,15 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+)
 
 type recoveryAuthorityPublic interface {
 	KeyID() string
 	PublicKeyText() string
+	SignExecutionGrant(helperprotocol.ExecutionGrant) (helperprotocol.Signed[helperprotocol.ExecutionGrant], error)
 }
 
 type recoveryAuthorityResponse struct {

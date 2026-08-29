@@ -12,13 +12,17 @@ import (
 )
 
 func signedRecoveryPlan(t *testing.T) helperprotocol.Signed[helperprotocol.HelperPlan] {
+	return signedRecoveryPlanWithID(t, "helper-plan-1")
+}
+
+func signedRecoveryPlanWithID(t *testing.T, helperPlanID string) helperprotocol.Signed[helperprotocol.HelperPlan] {
 	t.Helper()
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	plan := helperprotocol.HelperPlan{
-		HelperPlanID: "helper-plan-1", HelperInstanceID: "helper-1", DiagnosticID: "diagnostic-1",
+		HelperPlanID: helperPlanID, HelperInstanceID: "helper-1", DiagnosticID: "diagnostic-1",
 		Action: helperprotocol.ActionValidateReloadProxy, LogicalTarget: helperprotocol.LogicalTargetDetectedProxy,
 		ExecutionPlanHash: strings.Repeat("a", 64), ResourceFingerprint: strings.Repeat("b", 64),
 		RollbackCoverage: helperprotocol.RollbackCoverageFull,
@@ -55,6 +59,9 @@ func TestRecoveryExecutionPlanConfirmationOrderingAndIdempotency(t *testing.T) {
 	}
 	if err := d.StoreRecoveryExecutionPlan(agent.ID, "operation-1", signed, receivedAt); err != nil {
 		t.Fatalf("idempotent plan store: %v", err)
+	}
+	if err := d.StoreRecoveryExecutionPlan(agent.ID, "operation-2", signedRecoveryPlanWithID(t, "helper-plan-2"), receivedAt); !errors.Is(err, ErrActiveRecoveryPlan) {
+		t.Fatalf("competing active plan error = %v", err)
 	}
 	plan, err := d.GetRecoveryExecutionPlan(agent.ID, "helper-plan-1")
 	if err != nil || plan.OperationID != "operation-1" || plan.DisplayPlanHash != signed.Envelope.Payload.DisplayPlanHash {

@@ -15,6 +15,7 @@ const maxRecoveryExecutionPlansPerAgent = 256
 var (
 	ErrRecoveryPlanMismatch         = errors.New("recovery plan does not match durable state")
 	ErrRecoveryPlanExpired          = errors.New("recovery plan has expired")
+	ErrActiveRecoveryPlan           = errors.New("active recovery plan already exists for diagnostic")
 	ErrRecoveryConfirmationOrder    = errors.New("recovery confirmations are out of order")
 	ErrRecoveryConfirmationConflict = errors.New("recovery confirmation conflicts with durable state")
 )
@@ -94,6 +95,14 @@ func (d *DB) StoreRecoveryExecutionPlan(agentID, operationID string, signed help
 	if _, err := tx.Exec(`DELETE FROM recovery_execution_plans
 		WHERE agent_id = ? AND expires_at <= ? AND confirmation_1_id = '' AND signed_grant = ''`, agentID, receivedNanos); err != nil {
 		return fmt.Errorf("prune expired recovery execution plans: %w", err)
+	}
+	var activePlanID string
+	if err := tx.QueryRow(`SELECT helper_plan_id FROM recovery_execution_plans
+		WHERE agent_id = ? AND diagnostic_id = ? AND action = ? AND resource_fingerprint = ? AND expires_at > ?
+		ORDER BY received_at DESC LIMIT 1`, agentID, plan.DiagnosticID, string(plan.Action), plan.ResourceFingerprint, receivedNanos).Scan(&activePlanID); err == nil {
+		return ErrActiveRecoveryPlan
+	} else if err != sql.ErrNoRows {
+		return fmt.Errorf("query active recovery execution plan: %w", err)
 	}
 	var count int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM recovery_execution_plans WHERE agent_id = ?`, agentID).Scan(&count); err != nil {
