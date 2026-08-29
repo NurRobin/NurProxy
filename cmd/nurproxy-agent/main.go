@@ -88,6 +88,9 @@ func main() {
 		case "apply":
 			cmdApply(os.Args[2:])
 			return
+		case "root-helper":
+			cmdRootHelper(os.Args[2:])
+			return
 		}
 	}
 
