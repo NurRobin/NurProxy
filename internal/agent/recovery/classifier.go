@@ -107,6 +107,9 @@ func classifyFailure(ctx Context, failure *proxy.Failure) classification {
 		return hardSystemClassification(recoverymodel.CodeSystemdSandboxDenied, "systemd_sandbox", recoverymodel.RepairScopeAgentSandbox, true, "")
 	}
 	if failure.Permission {
+		if strings.TrimSpace(failure.Output) == recoverypolicy.ExclusiveManagedDirectoryEvidence {
+			return hardSystemClassification(recoverymodel.CodePermissionDenied, "permission_denied", recoverymodel.RepairScopeExclusiveManagedDirectory, true, "")
+		}
 		if evidenceClass, refusalCode, ok := permissionEnvironmentRefusal(failure.Output); ok {
 			return hardSystemClassification(recoverymodel.CodePermissionDenied, evidenceClass, recoverymodel.RepairScopeUnsupportedEnvironment, false, refusalCode)
 		}

@@ -36,19 +36,27 @@ const (
 	CodeUnknownProxyError         Code = "unknown_proxy_error"
 )
 
+var allCodes = []Code{
+	CodeManagedOrphanConfig, CodeManagedStaleTemp,
+	CodeManagedCertFileMissing, CodeManagedRuntimeKeyMissing,
+	CodeManagedRuntimeKeyMismatch, CodeGeneratedConfigInvalid,
+	CodeOperatorConfigInvalid, CodePermissionDenied,
+	CodeSystemdSandboxDenied, CodeProxyReloadFailed,
+	CodeProxyNotRunning, CodePortConflict, CodeProxyBinaryMissing,
+	CodeUnknownProxyError,
+}
+
+func AllCodes() []Code {
+	return append([]Code(nil), allCodes...)
+}
+
 func (v Code) Valid() bool {
-	switch v {
-	case CodeManagedOrphanConfig, CodeManagedStaleTemp,
-		CodeManagedCertFileMissing, CodeManagedRuntimeKeyMissing,
-		CodeManagedRuntimeKeyMismatch, CodeGeneratedConfigInvalid,
-		CodeOperatorConfigInvalid, CodePermissionDenied,
-		CodeSystemdSandboxDenied, CodeProxyReloadFailed,
-		CodeProxyNotRunning, CodePortConflict, CodeProxyBinaryMissing,
-		CodeUnknownProxyError:
-		return true
-	default:
-		return false
+	for _, code := range allCodes {
+		if v == code {
+			return true
+		}
 	}
+	return false
 }
 
 func (v *Code) UnmarshalJSON(data []byte) error {

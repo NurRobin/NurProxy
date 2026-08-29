@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -29,10 +30,12 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	nginxproxy "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverypolicy"
 )
 
 const (
@@ -59,6 +62,7 @@ const (
 // separate from a single Apply so the classic ports-80/443 bind-failure stays
 // distinctly attributed (and clears health on success), exactly as before.
 type caddyBackend interface {
+	Info() proxy.Info
 	EnsureServer(ctx context.Context) error
 	ClearRoutes(ctx context.Context) error
 	AddRoute(ctx context.Context, route json.RawMessage) error
@@ -392,6 +396,14 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 	}
 	receipt, err := applier.Apply(ctx, envelope)
 	if err != nil {
+		if errors.Is(err, recoverycontrol.ErrManagedStagingAccess) && c.recovery != nil {
+			info := c.caddy.Info()
+			c.recovery.Observe(ctx, &proxy.Failure{
+				Backend: info.Kind, Phase: proxy.FailurePhaseValidate, Permission: true,
+				Output: recoverypolicy.ExclusiveManagedDirectoryEvidence, Err: recoverycontrol.ErrManagedStagingAccess,
+			})
+			c.syncRecoveryHealth()
+		}
 		log.Printf("Stream: privileged managed apply failed: %v", err)
 		if c.health != nil {
 			c.health.SetError("privileged managed proxy reconciliation failed")

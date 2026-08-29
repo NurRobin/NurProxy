@@ -16,6 +16,8 @@ import (
 
 const DefaultStagingRoot = "/var/lib/nurproxy-agent/helper-staging"
 
+var ErrManagedStagingAccess = errors.New("exclusive managed staging access denied")
+
 type ManagedHelper interface {
 	PlanManagedApply(context.Context, helperprotocol.Signed[helperprotocol.ApplyIntent]) (helperprotocol.Signed[helperprotocol.ManagedApplyPlan], error)
 	ExecuteManagedApply(context.Context, helperprotocol.Signed[helperprotocol.ApplyGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error)
@@ -103,17 +105,32 @@ func (c *ManagedController) Apply(ctx context.Context, envelope helperprotocol.M
 
 func (c *ManagedController) stage(envelope helperprotocol.ManagedIntentSetEnvelope) (func(), error) {
 	rootInfo, err := os.Lstat(c.stagingRoot)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm()&0o007 != 0 {
+	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return nil, fmt.Errorf("%w: inspect staging root: %w", ErrManagedStagingAccess, err)
+		}
 		return nil, fmt.Errorf("managed staging root is unavailable or not bounded")
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("managed staging root is unavailable or not bounded")
+	}
+	if rootInfo.Mode().Perm()&0o007 != 0 {
+		return nil, fmt.Errorf("%w: staging root grants access outside its owner and group", ErrManagedStagingAccess)
 	}
 	root, err := os.OpenRoot(c.stagingRoot)
 	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return nil, fmt.Errorf("%w: open staging root: %w", ErrManagedStagingAccess, err)
+		}
 		return nil, fmt.Errorf("open managed staging root: %w", err)
 	}
 	operationID := envelope.Intent.Envelope.Payload.OperationID
 	_ = root.RemoveAll(operationID)
 	if err := root.Mkdir(operationID, 0o700); err != nil {
 		root.Close()
+		if errors.Is(err, fs.ErrPermission) {
+			return nil, fmt.Errorf("%w: create staging operation: %w", ErrManagedStagingAccess, err)
+		}
 		return nil, fmt.Errorf("create managed staging operation: %w", err)
 	}
 	cleanup := func() {

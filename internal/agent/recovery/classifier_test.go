@@ -10,6 +10,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverypolicy"
 )
 
 func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
@@ -68,9 +69,11 @@ func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
 		{"proxy binary missing", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, BinaryMissing: true, Err: errors.New("missing")}, recoverymodel.CodeProxyBinaryMissing, recoverymodel.OwnershipSystem, "", false, true},
 		{"unknown proxy error", errors.New("unexpected proxy failure token=secret"), recoverymodel.CodeUnknownProxyError, recoverymodel.OwnershipUnknown, "", false, false},
 	}
+	seen := make(map[recoverymodel.Code]bool, len(tests))
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := Classify(ctx, tt.err)
+			seen[got.Code] = true
 			if got.Code != tt.wantCode || got.Ownership != tt.ownership || got.ProposedAction != tt.action || got.AutoRepairEligible != tt.eligible || got.HardChange != tt.hardChange {
 				t.Fatalf("classification = code=%q owner=%q action=%q eligible=%v hard=%v", got.Code, got.Ownership, got.ProposedAction, got.AutoRepairEligible, got.HardChange)
 			}
@@ -80,7 +83,16 @@ func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
 			if strings.Contains(got.Evidence, "secret") {
 				t.Fatalf("evidence leaked secret: %q", got.Evidence)
 			}
+			_, _, hasHardAction := recoverypolicy.HardActionForDiagnostic(got.Code, got.RepairScope)
+			if got.ProposedAction == "" && !hasHardAction && got.RepairRefusalCode == "" {
+				t.Fatalf("diagnostic has neither deterministic action nor explicit refusal: %+v", got)
+			}
 		})
+	}
+	for _, code := range recoverymodel.AllCodes() {
+		if !seen[code] {
+			t.Errorf("diagnostic catalogue code %q has no classifier fixture", code)
+		}
 	}
 }
 
@@ -203,6 +215,7 @@ func TestClassifierHardDiagnosticsExposeOnlyTypedEligibleScopes(t *testing.T) {
 		refusalCode string
 	}{
 		{"sandbox", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "Failed at step NAMESPACE spawning /usr/sbin/nginx: Operation not permitted", Err: os.ErrPermission}, recoverymodel.CodeSystemdSandboxDenied, recoverymodel.RepairScopeAgentSandbox, true, ""},
+		{"exclusive helper staging", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "NurProxy exclusive helper staging directory access denied", Err: os.ErrPermission}, recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeExclusiveManagedDirectory, true, ""},
 		{"ambiguous permission", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "permission denied", Err: os.ErrPermission}, recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeAmbiguous, false, "permission_scope_ambiguous"},
 		{"read-only filesystem", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "open config: read-only file system", Err: os.ErrPermission}, recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeUnsupportedEnvironment, false, "read_only_filesystem"},
 		{"selinux", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "avc:  denied  { write } for nginx", Err: os.ErrPermission}, recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeUnsupportedEnvironment, false, "selinux_or_apparmor_denied"},

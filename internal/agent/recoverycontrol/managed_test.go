@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -159,5 +160,25 @@ func TestManagedControllerUsesDurableReceiptWithoutReexecution(t *testing.T) {
 	}
 	if helper.executeCalls != 0 || remote.receiptCalls != 0 {
 		t.Fatalf("durable receipt path executed again: execute=%d submit=%d", helper.executeCalls, remote.receiptCalls)
+	}
+}
+
+func TestManagedControllerClassifiesExclusiveStagingPermissionDrift(t *testing.T) {
+	envelope, plan, grant, receipt := managedControllerFixture(t)
+	staging := t.TempDir()
+	if err := os.Chmod(staging, 0o707); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(staging, 0o700)
+	controller, err := NewManaged(
+		&managedHelperMock{plan: plan, receipt: receipt},
+		&managedRemoteMock{record: ManagedExecutionRecord{OperationID: "apply-operation-1", SignedGrant: &grant}},
+		staging,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Apply(context.Background(), envelope); !errors.Is(err, ErrManagedStagingAccess) {
+		t.Fatalf("staging permission drift = %v, want ErrManagedStagingAccess", err)
 	}
 }

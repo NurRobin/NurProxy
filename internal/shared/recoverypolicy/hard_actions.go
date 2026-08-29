@@ -10,6 +10,8 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
+const ExclusiveManagedDirectoryEvidence = "NurProxy exclusive helper staging directory access denied"
+
 func HardDiagnosticFingerprint(code recoverymodel.Code, backend, evidenceClass string, paths []string) string {
 	values := []string{string(code), backend, evidenceClass}
 	canonicalPaths := append([]string(nil), paths...)

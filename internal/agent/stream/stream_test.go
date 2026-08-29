@@ -22,6 +22,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
@@ -30,11 +31,12 @@ import (
 type managedApplierMock struct {
 	calls   int
 	receipt helperprotocol.Signed[helperprotocol.HelperReceipt]
+	err     error
 }
 
 func (m *managedApplierMock) Apply(context.Context, helperprotocol.ManagedIntentSetEnvelope) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
 	m.calls++
-	return m.receipt, nil
+	return m.receipt, m.err
 }
 
 func TestManagedRoutesUseHelperApplierWithoutLegacyMutation(t *testing.T) {
@@ -163,6 +165,20 @@ func (b *recoveryStreamBackend) Render(context.Context, proxymodel.Route) (proxy
 }
 func (b *recoveryStreamBackend) InstallCerts(context.Context, []proxy.CertBundle) error   { return nil }
 func (b *recoveryStreamBackend) EnsureServerTLS(context.Context, []proxy.TLSIntent) error { return nil }
+
+func TestManagedStagingAccessFailureBecomesExactHardDiagnostic(t *testing.T) {
+	backend := &recoveryStreamBackend{info: proxy.Info{Kind: proxy.KindNginx}}
+	coordinator := recovery.NewCoordinator("agent-1", backend, nil, nil, nil, nil, nil)
+	coordinator.SetContext(recovery.Context{AgentID: "agent-1", ProxyInfo: backend.info})
+	applier := &managedApplierMock{err: fmt.Errorf("stage desired state: %w", recoverycontrol.ErrManagedStagingAccess)}
+	client := New("http://orchestrator.invalid", "agent-1", "token", backend, health.New()).WithRecovery(coordinator).WithManagedApply(applier)
+	client.applyManagedIntents(context.Background(), helperprotocol.ManagedIntentSetEnvelope{})
+	diagnostics := coordinator.ActiveDiagnostics()
+	if len(diagnostics) != 1 || diagnostics[0].Code != recoverymodel.CodePermissionDenied ||
+		diagnostics[0].RepairScope != recoverymodel.RepairScopeExclusiveManagedDirectory || !diagnostics[0].RepairEligible || !diagnostics[0].HardChange {
+		t.Fatalf("managed staging failure diagnostic = %#v", diagnostics)
+	}
+}
 
 func TestApplyIntentsRepairsBeforeOneFreshReconcile(t *testing.T) {
 	root := t.TempDir()
@@ -484,6 +500,7 @@ type orderingBackend struct {
 	tlsIntents  []proxy.TLSIntent
 }
 
+func (o *orderingBackend) Info() proxy.Info                       { return proxy.Info{Kind: proxy.KindCaddy} }
 func (o *orderingBackend) EnsureServer(ctx context.Context) error { return nil }
 func (o *orderingBackend) ClearRoutes(ctx context.Context) error  { return nil }
 func (o *orderingBackend) AddRoute(ctx context.Context, route json.RawMessage) error {
@@ -626,6 +643,7 @@ type fileBackend struct {
 	pruneHit        bool
 }
 
+func (f *fileBackend) Info() proxy.Info                       { return proxy.Info{Kind: proxy.KindNginx} }
 func (f *fileBackend) EnsureServer(ctx context.Context) error { return nil }
 func (f *fileBackend) ClearRoutes(ctx context.Context) error  { return nil }
 func (f *fileBackend) AddRoute(ctx context.Context, route json.RawMessage) error {
@@ -770,6 +788,7 @@ type fakeCaddyBackend struct {
 	pruneKeep []proxy.Target
 }
 
+func (c *fakeCaddyBackend) Info() proxy.Info                       { return proxy.Info{Kind: proxy.KindCaddy} }
 func (c *fakeCaddyBackend) EnsureServer(ctx context.Context) error { return nil }
 func (c *fakeCaddyBackend) ClearRoutes(ctx context.Context) error  { return nil }
 func (c *fakeCaddyBackend) AddRoute(ctx context.Context, route json.RawMessage) error {
