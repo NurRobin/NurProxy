@@ -1,0 +1,378 @@
+package helper
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io/fs"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+	"github.com/google/uuid"
+)
+
+const planLifetime = 5 * time.Minute
+
+type ProtocolError struct {
+	Code      helperprotocol.ErrorCode
+	Message   string
+	Retryable bool
+}
+
+func (e *ProtocolError) Error() string { return e.Message }
+
+type PlanMaterial struct {
+	Steps               []helperprotocol.PlanStep
+	ExecutionPlanHash   string
+	ResourceFingerprint string
+	RollbackCoverage    helperprotocol.RollbackCoverage
+}
+
+type PreparedAction struct {
+	SnapshotDigest   string
+	RollbackCoverage helperprotocol.RollbackCoverage
+}
+
+type ActionResult struct {
+	Mutated         bool
+	Validated       bool
+	SanitizedResult string
+}
+
+type ActionHandler interface {
+	Plan(context.Context, helperprotocol.PlanActionRequest) (PlanMaterial, error)
+	Rediscover(context.Context, helperprotocol.HelperPlan) (executionPlanHash string, resourceFingerprint string, err error)
+	Prepare(context.Context, string, helperprotocol.HelperPlan) (PreparedAction, error)
+	Execute(context.Context, string, helperprotocol.HelperPlan, PreparedAction) (ActionResult, error)
+	Rollback(context.Context, string, helperprotocol.HelperPlan, PreparedAction) error
+}
+
+type Engine struct {
+	config         RootConfig
+	buildID        string
+	journal        *Journal
+	attestationKey ed25519.PrivateKey
+	actions        map[helperprotocol.Action]ActionHandler
+	now            func() time.Time
+	executeMu      sync.Mutex
+}
+
+func NewEngine(config RootConfig, buildID string, journal *Journal, attestationKey ed25519.PrivateKey, actions map[helperprotocol.Action]ActionHandler) (*Engine, error) {
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	if !validConfigID(buildID) || config.ExpectedBuildID != buildID {
+		return nil, fmt.Errorf("helper build id does not match root configuration")
+	}
+	if journal == nil || len(attestationKey) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("helper journal or attestation key is invalid")
+	}
+	compiled := make(map[helperprotocol.Action]ActionHandler, len(actions))
+	for action, handler := range actions {
+		if !action.Valid() || action == helperprotocol.ActionApplyManagedProxyState || handler == nil {
+			return nil, fmt.Errorf("invalid compiled helper action")
+		}
+		compiled[action] = handler
+	}
+	return &Engine{config: config, buildID: buildID, journal: journal, attestationKey: attestationKey, actions: compiled, now: time.Now}, nil
+}
+
+func (e *Engine) Hello(request helperprotocol.HelperHelloRequest) (helperprotocol.Signed[helperprotocol.HelperHello], error) {
+	if err := request.Validate(); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "invalid helper hello request", false)
+	}
+	if request.AgentBuildID != e.buildID {
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, protocolFailure(helperprotocol.ErrorBuildIDMismatch, "main agent and helper build ids differ", false)
+	}
+	publicKey := e.attestationKey.Public().(ed25519.PublicKey)
+	response := helperprotocol.HelperHello{
+		RequestID:            request.RequestID,
+		HelperInstanceID:     e.config.HelperInstanceID,
+		HelperBuildID:        e.buildID,
+		AttestationKeyID:     e.config.AttestationKeyID,
+		AttestationPublicKey: base64.RawURLEncoding.EncodeToString(publicKey),
+	}
+	return helperprotocol.Sign(e.config.AttestationKeyID, e.attestationKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperHello, response))
+}
+
+func (e *Engine) Plan(ctx context.Context, request helperprotocol.PlanActionRequest) (helperprotocol.Signed[helperprotocol.HelperPlan], error) {
+	if err := request.Validate(); err != nil || !targetMatchesAction(request.Action, request.LogicalTarget) {
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "action and logical target are not an allowed pair", false)
+	}
+	handler, ok := e.actions[request.Action]
+	if !ok {
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "no compiled action can prove a unique local target", false)
+	}
+	material, err := handler.Plan(ctx, request)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "local target discovery refused the action", false)
+	}
+	if err := validatePlanMaterial(material); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "compiled action produced an invalid local plan", false)
+	}
+	now := e.now().UTC()
+	plan := helperprotocol.HelperPlan{
+		HelperPlanID:        uuid.NewString(),
+		HelperInstanceID:    e.config.HelperInstanceID,
+		DiagnosticID:        request.DiagnosticReference,
+		Action:              request.Action,
+		LogicalTarget:       request.LogicalTarget,
+		ExecutionPlanHash:   material.ExecutionPlanHash,
+		ResourceFingerprint: material.ResourceFingerprint,
+		RollbackCoverage:    material.RollbackCoverage,
+		Steps:               append([]helperprotocol.PlanStep(nil), material.Steps...),
+		ExpiresAt:           now.Add(planLifetime).Format(time.RFC3339Nano),
+	}
+	plan.DisplayPlanHash, err = helperprotocol.DisplayPlanDigest(plan)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, err
+	}
+	if err := plan.Validate(); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, err
+	}
+	if err := e.journal.StorePlan(plan); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, err
+	}
+	return helperprotocol.Sign(e.config.AttestationKeyID, e.attestationKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperPlan, plan))
+}
+
+func (e *Engine) Execute(ctx context.Context, request helperprotocol.Envelope[helperprotocol.ExecuteActionRequest]) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	e.executeMu.Lock()
+	defer e.executeMu.Unlock()
+	if request.MessageType != helperprotocol.MessageExecuteActionRequest || request.Domain != helperprotocol.ProtocolDomain || request.ProtocolVersion != helperprotocol.ProtocolVersion {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "invalid execute request envelope", false)
+	}
+	if err := request.Payload.Validate(); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "invalid execute request", false)
+	}
+	grantSigned := request.Payload.Grant
+	if grantSigned.KeyID != e.config.OrchestratorKeyID || helperprotocol.Verify(e.config.OrchestratorPublicKey(), grantSigned, helperprotocol.MessageExecutionGrant) != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "orchestrator execution grant signature is invalid", false)
+	}
+	grant := grantSigned.Envelope.Payload
+	if grant.HelperInstanceID != e.config.HelperInstanceID {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorHelperInstanceMismatch, "execution grant targets another helper instance", false)
+	}
+	requestDigest, err := helperprotocol.Digest(request)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	if existing, receiptErr := e.journal.GetReceipt(grant.OperationID, requestDigest); receiptErr == nil {
+		return e.signReceipt(existing)
+	} else if errors.Is(receiptErr, ErrRequestConflict) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "operation id is already bound to another request", false)
+	} else if receiptErr != nil && !errors.Is(receiptErr, fs.ErrNotExist) && !errors.Is(receiptErr, ErrReceiptNotFound) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, receiptErr
+	}
+	if err := e.validateGrantTime(grant.IssuedAt, grant.ExpiresAt); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	plan, err := e.journal.LoadPlan(grant.HelperPlanID)
+	if err != nil {
+		if errors.Is(err, ErrPlanNotFound) {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorHelperPlanNotFound, "helper-local plan was not found", false)
+		}
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	if !timeAfter(e.now().UTC(), plan.ExpiresAt) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorStalePlan, "helper-local plan has expired", false)
+	}
+	if grant.DiagnosticID != plan.DiagnosticID || grant.Action != plan.Action || grant.DisplayPlanHash != plan.DisplayPlanHash ||
+		grant.ExecutionPlanHash != plan.ExecutionPlanHash || grant.ResourceFingerprint != plan.ResourceFingerprint {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorDisplayPlanMismatch, "execution grant does not match the helper-local displayed plan", false)
+	}
+	handler, ok := e.actions[plan.Action]
+	if !ok {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "compiled action is unavailable", false)
+	}
+	executionHash, fingerprint, err := handler.Rediscover(ctx, plan)
+	if err != nil || executionHash != plan.ExecutionPlanHash || fingerprint != plan.ResourceFingerprint {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorStalePlan, "local host facts changed after planning", false)
+	}
+	if e.journal.BreakerOpen() {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorOutcomeIndeterminate, "persistent helper breaker is open", false)
+	}
+	record, existing, err := e.journal.BeginOperation(grant.OperationID, grant.GrantID, requestDigest, plan.Action)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrGrantReplay):
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "execution grant was already consumed by another operation", false)
+		case errors.Is(err, ErrRequestConflict):
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "operation id conflicts with an existing request", false)
+		default:
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		}
+	}
+	if existing && record.State != helperprotocol.JournalAuthorized {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorOutcomeIndeterminate, "existing operation cannot be safely resumed", false)
+	}
+	prepared, prepareErr := handler.Prepare(ctx, grant.OperationID, plan)
+	if prepareErr != nil || !prepared.ValidFor(plan.RollbackCoverage) {
+		prepared = PreparedAction{RollbackCoverage: plan.RollbackCoverage}
+		receipt := e.newReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalFailedBeforeMutation, prepared, "privileged pre-state snapshot failed")
+		if _, transitionErr := e.journal.Transition(grant.OperationID, helperprotocol.JournalFailedBeforeMutation, receipt); transitionErr != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, transitionErr
+		}
+		return e.signReceipt(receipt)
+	}
+	running := e.newReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalRunning, prepared, "privileged execution started")
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalRunning, running); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	result, executeErr := handler.Execute(ctx, grant.OperationID, plan, prepared)
+	if !result.Mutated {
+		failed := e.newReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalFailedBeforeMutation, prepared, "action failed before mutation")
+		if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalFailedBeforeMutation, failed); err != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		}
+		return e.signReceipt(failed)
+	}
+	mutated := e.newReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalMutated, prepared, "privileged mutation completed")
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalMutated, mutated); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	if executeErr != nil || !result.Validated {
+		return e.rollback(ctx, grant.OperationID, requestDigest, plan, prepared)
+	}
+	validated := e.newReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalValidated, prepared, "post-mutation validation succeeded")
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalValidated, validated); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	message := truncateUTF8(result.SanitizedResult, 4096)
+	if strings.TrimSpace(message) == "" {
+		message = "privileged action succeeded"
+	}
+	succeeded := e.newReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalSucceeded, prepared, message)
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalSucceeded, succeeded); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	return e.signReceipt(succeeded)
+}
+
+func (e *Engine) rollback(ctx context.Context, operationID, requestDigest string, plan helperprotocol.HelperPlan, prepared PreparedAction) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	running := e.newReceipt(operationID, requestDigest, plan, helperprotocol.JournalRollbackRunning, prepared, "local rollback started")
+	if _, err := e.journal.Transition(operationID, helperprotocol.JournalRollbackRunning, running); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	handler := e.actions[plan.Action]
+	rollbackErr := handler.Rollback(ctx, operationID, plan, prepared)
+	state := helperprotocol.JournalRolledBack
+	message := "privileged action failed and pre-state was fully restored"
+	if rollbackErr != nil || prepared.RollbackCoverage != helperprotocol.RollbackCoverageFull {
+		state = helperprotocol.JournalRollbackFailed
+		message = "privileged action failed and full restoration could not be proven"
+		if err := e.journal.OpenBreaker(message); err != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		}
+	}
+	receipt := e.newReceipt(operationID, requestDigest, plan, state, prepared, message)
+	if _, err := e.journal.Transition(operationID, state, receipt); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	return e.signReceipt(receipt)
+}
+
+func (e *Engine) GetReceipt(request helperprotocol.GetReceiptRequest) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	if err := request.Validate(); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "invalid receipt request", false)
+	}
+	receipt, err := e.journal.GetReceipt(request.OperationID, request.CanonicalRequestDigest)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	return e.signReceipt(receipt)
+}
+
+func (e *Engine) signReceipt(receipt helperprotocol.HelperReceipt) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	return helperprotocol.Sign(e.config.AttestationKeyID, e.attestationKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperReceipt, receipt))
+}
+
+func (e *Engine) newReceipt(operationID, requestDigest string, plan helperprotocol.HelperPlan, state helperprotocol.JournalState, prepared PreparedAction, message string) helperprotocol.HelperReceipt {
+	return helperprotocol.HelperReceipt{
+		OperationID:            operationID,
+		CanonicalRequestDigest: requestDigest,
+		HelperInstanceID:       e.config.HelperInstanceID,
+		Action:                 plan.Action,
+		State:                  state,
+		RollbackCoverage:       prepared.RollbackCoverage,
+		SnapshotDigest:         prepared.SnapshotDigest,
+		SanitizedResult:        truncateUTF8(message, 4096),
+		UpdatedAt:              e.now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func (e *Engine) validateGrantTime(issuedText, expiresText string) error {
+	issued, issuedErr := time.Parse(time.RFC3339Nano, issuedText)
+	expires, expiresErr := time.Parse(time.RFC3339Nano, expiresText)
+	now := e.now().UTC()
+	if issuedErr != nil || expiresErr != nil || now.Before(issued.Add(-30*time.Second)) || !now.Before(expires) {
+		return protocolFailure(helperprotocol.ErrorExecutionGrantExpired, "execution grant is expired or not yet valid", false)
+	}
+	return nil
+}
+
+func (p PreparedAction) ValidFor(coverage helperprotocol.RollbackCoverage) bool {
+	if p.RollbackCoverage != coverage || !coverage.Valid() {
+		return false
+	}
+	if coverage == helperprotocol.RollbackCoverageNone {
+		return p.SnapshotDigest == ""
+	}
+	return validDigest(p.SnapshotDigest)
+}
+
+func validatePlanMaterial(material PlanMaterial) error {
+	if !validDigest(material.ExecutionPlanHash) || !validDigest(material.ResourceFingerprint) ||
+		!material.RollbackCoverage.Valid() || len(material.Steps) == 0 || len(material.Steps) > 64 {
+		return fmt.Errorf("invalid compiled plan material")
+	}
+	for _, step := range material.Steps {
+		if !validConfigID(step.Kind) || strings.TrimSpace(step.Summary) == "" || len(step.Summary) > 512 {
+			return fmt.Errorf("invalid compiled plan step")
+		}
+	}
+	return nil
+}
+
+func targetMatchesAction(action helperprotocol.Action, target helperprotocol.LogicalTarget) bool {
+	switch action {
+	case helperprotocol.ActionRepairAgentSandboxPaths:
+		return target == helperprotocol.LogicalTargetAgentUnit
+	case helperprotocol.ActionRepairManagedPathAccess:
+		return target == helperprotocol.LogicalTargetManagedPath
+	case helperprotocol.ActionValidateReloadProxy, helperprotocol.ActionStartProxy, helperprotocol.ActionRestartProxy:
+		return target == helperprotocol.LogicalTargetDetectedProxy
+	case helperprotocol.ActionInstallSupportedPackage:
+		return target == helperprotocol.LogicalTargetProxyPackage
+	case helperprotocol.ActionOpenProxyFirewallPorts:
+		return target == helperprotocol.LogicalTargetLocalFirewall
+	default:
+		return false
+	}
+}
+
+func timeAfter(now time.Time, expiryText string) bool {
+	expires, err := time.Parse(time.RFC3339Nano, expiryText)
+	return err == nil && now.Before(expires)
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	value = strings.ToValidUTF8(value, "�")
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+func protocolFailure(code helperprotocol.ErrorCode, message string, retryable bool) error {
+	return &ProtocolError{Code: code, Message: message, Retryable: retryable}
+}

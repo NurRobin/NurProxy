@@ -1,6 +1,7 @@
 package helperprotocol
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,50 @@ func validExecutionGrant() ExecutionGrant {
 		ConfirmationEventIDs: []string{"confirmation-1", "confirmation-2"},
 		IssuedAt:             issued.Format(time.RFC3339Nano),
 		ExpiresAt:            issued.Add(2 * time.Minute).Format(time.RFC3339Nano),
+	}
+}
+
+func TestHelloResponseCarriesBuildAndAttestationIdentity(t *testing.T) {
+	response := HelperHello{
+		RequestID:            "request-1",
+		HelperInstanceID:     "helper-1",
+		HelperBuildID:        "v0.4.0-dev-010e5a7",
+		AttestationKeyID:     "helper-attestation-1",
+		AttestationPublicKey: base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+	}
+	if err := response.Validate(); err != nil {
+		t.Fatalf("valid helper hello rejected: %v", err)
+	}
+	response.AttestationPublicKey += "="
+	if err := response.Validate(); err == nil {
+		t.Fatal("noncanonical attestation key encoding accepted")
+	}
+}
+
+func TestProtocolErrorCodesAreClosed(t *testing.T) {
+	for _, code := range []ErrorCode{
+		ErrorExecutionGrantInvalid,
+		ErrorExecutionGrantExpired,
+		ErrorHelperPlanNotFound,
+		ErrorDisplayPlanMismatch,
+		ErrorHelperInstanceMismatch,
+		ErrorRootConfigUntrusted,
+		ErrorAmbiguousLocalTarget,
+		ErrorOutcomeIndeterminate,
+		ErrorHelperJournalCorrupt,
+		ErrorUnsafePackageTransaction,
+		ErrorFirewallScopeAmbiguous,
+		ErrorBuildIDMismatch,
+		ErrorPeerCredentialsInvalid,
+		ErrorRequestConflict,
+		ErrorStalePlan,
+	} {
+		if !code.Valid() {
+			t.Fatalf("required error code is invalid: %s", code)
+		}
+	}
+	if ErrorCode("ROOT_SHELL_FAILED").Valid() {
+		t.Fatal("unknown error code accepted")
 	}
 }
 
@@ -88,6 +133,7 @@ func TestJournalTransitionsAreClosedAndFailClosed(t *testing.T) {
 		{JournalValidated, JournalRollbackRunning},
 		{JournalRollbackRunning, JournalRolledBack},
 		{JournalRollbackRunning, JournalRollbackFailed},
+		{JournalRollbackRunning, JournalOutcomeIndeterminate},
 		{JournalRunning, JournalOutcomeIndeterminate},
 		{JournalMutated, JournalOutcomeIndeterminate},
 		{JournalValidated, JournalOutcomeIndeterminate},
@@ -150,5 +196,32 @@ func TestApplyIntentBindsHostOperationAndCanonicalLifetime(t *testing.T) {
 	intent.HelperInstanceID = ""
 	if err := intent.Validate(); err == nil {
 		t.Fatal("apply intent without helper binding accepted")
+	}
+}
+
+func TestDisplayedPlanHashCoversEveryVisibleField(t *testing.T) {
+	plan := HelperPlan{
+		HelperPlanID:        "plan-1",
+		HelperInstanceID:    "helper-1",
+		DiagnosticID:        "diagnostic-1",
+		Action:              ActionRestartProxy,
+		LogicalTarget:       LogicalTargetDetectedProxy,
+		ExecutionPlanHash:   strings.Repeat("b", 64),
+		ResourceFingerprint: strings.Repeat("c", 64),
+		RollbackCoverage:    RollbackCoveragePartial,
+		Steps:               []PlanStep{{Kind: "restart", Summary: "Restart nginx"}},
+		ExpiresAt:           time.Date(2026, 8, 29, 10, 5, 0, 0, time.UTC).Format(time.RFC3339Nano),
+	}
+	digest, err := DisplayPlanDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.DisplayPlanHash = digest
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("valid displayed plan rejected: %v", err)
+	}
+	plan.Steps[0].Summary = "Restart a different service"
+	if err := plan.Validate(); err == nil {
+		t.Fatal("displayed plan mutation did not invalidate display hash")
 	}
 }

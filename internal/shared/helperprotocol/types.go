@@ -28,6 +28,9 @@ const (
 	MessageCancellationGrant          MessageType = "cancellation_grant"
 	MessageHelperPlan                 MessageType = "helper_plan"
 	MessageHelperReceipt              MessageType = "helper_receipt"
+	MessageHelperHelloRequest         MessageType = "helper_hello_request"
+	MessageHelperHello                MessageType = "helper_hello"
+	MessageErrorResponse              MessageType = "error_response"
 )
 
 func (m MessageType) Valid() bool {
@@ -38,9 +41,92 @@ func (m MessageType) Valid() bool {
 		MessageExecutionGrant, MessageApplyIntent, MessageApplyGrant,
 		MessageCancellationGrant, MessageHelperPlan, MessageHelperReceipt:
 		return true
+	case MessageHelperHelloRequest, MessageHelperHello, MessageErrorResponse:
+		return true
 	default:
 		return false
 	}
+}
+
+type ErrorCode string
+
+const (
+	ErrorExecutionGrantInvalid    ErrorCode = "EXECUTION_GRANT_INVALID"
+	ErrorExecutionGrantExpired    ErrorCode = "EXECUTION_GRANT_EXPIRED"
+	ErrorHelperPlanNotFound       ErrorCode = "HELPER_PLAN_NOT_FOUND"
+	ErrorDisplayPlanMismatch      ErrorCode = "DISPLAY_PLAN_MISMATCH"
+	ErrorHelperInstanceMismatch   ErrorCode = "HELPER_INSTANCE_MISMATCH"
+	ErrorRootConfigUntrusted      ErrorCode = "ROOT_CONFIG_UNTRUSTED"
+	ErrorAmbiguousLocalTarget     ErrorCode = "AMBIGUOUS_LOCAL_TARGET"
+	ErrorOutcomeIndeterminate     ErrorCode = "OUTCOME_INDETERMINATE"
+	ErrorHelperJournalCorrupt     ErrorCode = "HELPER_JOURNAL_CORRUPT"
+	ErrorUnsafePackageTransaction ErrorCode = "UNSAFE_PACKAGE_TRANSACTION"
+	ErrorFirewallScopeAmbiguous   ErrorCode = "FIREWALL_SCOPE_AMBIGUOUS"
+	ErrorBuildIDMismatch          ErrorCode = "BUILD_ID_MISMATCH"
+	ErrorPeerCredentialsInvalid   ErrorCode = "PEER_CREDENTIALS_INVALID"
+	ErrorRequestConflict          ErrorCode = "REQUEST_CONFLICT"
+	ErrorStalePlan                ErrorCode = "STALE_PLAN"
+)
+
+func (c ErrorCode) Valid() bool {
+	switch c {
+	case ErrorExecutionGrantInvalid, ErrorExecutionGrantExpired,
+		ErrorHelperPlanNotFound, ErrorDisplayPlanMismatch,
+		ErrorHelperInstanceMismatch, ErrorRootConfigUntrusted,
+		ErrorAmbiguousLocalTarget, ErrorOutcomeIndeterminate,
+		ErrorHelperJournalCorrupt, ErrorUnsafePackageTransaction,
+		ErrorFirewallScopeAmbiguous, ErrorBuildIDMismatch,
+		ErrorPeerCredentialsInvalid, ErrorRequestConflict, ErrorStalePlan:
+		return true
+	default:
+		return false
+	}
+}
+
+type HelperHelloRequest struct {
+	RequestID    string `json:"request_id"`
+	AgentID      string `json:"agent_id"`
+	AgentBuildID string `json:"agent_build_id"`
+}
+
+func (r HelperHelloRequest) Validate() error {
+	if !validID(r.RequestID) || !validID(r.AgentID) || !validID(r.AgentBuildID) {
+		return fmt.Errorf("invalid helper hello request")
+	}
+	return nil
+}
+
+type HelperHello struct {
+	RequestID            string `json:"request_id"`
+	HelperInstanceID     string `json:"helper_instance_id"`
+	HelperBuildID        string `json:"helper_build_id"`
+	AttestationKeyID     string `json:"attestation_key_id"`
+	AttestationPublicKey string `json:"attestation_public_key"`
+}
+
+func (r HelperHello) Validate() error {
+	if !validID(r.RequestID) || !validID(r.HelperInstanceID) || !validID(r.HelperBuildID) || !validID(r.AttestationKeyID) {
+		return fmt.Errorf("invalid helper hello")
+	}
+	key, err := base64.RawURLEncoding.Strict().DecodeString(r.AttestationPublicKey)
+	if err != nil || len(key) != 32 {
+		return fmt.Errorf("invalid helper attestation public key")
+	}
+	return nil
+}
+
+type ErrorResponse struct {
+	RequestID string    `json:"request_id"`
+	Code      ErrorCode `json:"code"`
+	Message   string    `json:"message"`
+	Retryable bool      `json:"retryable"`
+}
+
+func (r ErrorResponse) Validate() error {
+	if !validID(r.RequestID) || !r.Code.Valid() || strings.TrimSpace(r.Message) == "" || len(r.Message) > 512 {
+		return fmt.Errorf("invalid protocol error response")
+	}
+	return nil
 }
 
 type Action string
@@ -149,7 +235,7 @@ func CanTransition(from, to JournalState) bool {
 	case JournalValidated:
 		return to == JournalSucceeded || to == JournalRollbackRunning || to == JournalOutcomeIndeterminate
 	case JournalRollbackRunning:
-		return to == JournalRolledBack || to == JournalRollbackFailed
+		return to == JournalRolledBack || to == JournalRollbackFailed || to == JournalOutcomeIndeterminate
 	default:
 		return false
 	}
@@ -431,6 +517,7 @@ type PlanStep struct {
 type HelperPlan struct {
 	HelperPlanID        string           `json:"helper_plan_id"`
 	HelperInstanceID    string           `json:"helper_instance_id"`
+	DiagnosticID        string           `json:"diagnostic_id"`
 	Action              Action           `json:"action"`
 	LogicalTarget       LogicalTarget    `json:"logical_target"`
 	DisplayPlanHash     string           `json:"display_plan_hash"`
@@ -442,7 +529,8 @@ type HelperPlan struct {
 }
 
 func (p HelperPlan) Validate() error {
-	if !validID(p.HelperPlanID) || !validID(p.HelperInstanceID) || !p.Action.Valid() || !p.LogicalTarget.Valid() ||
+	if !validID(p.HelperPlanID) || !validID(p.HelperInstanceID) || !validID(p.DiagnosticID) || !p.Action.Valid() ||
+		p.Action == ActionApplyManagedProxyState || !p.LogicalTarget.Valid() ||
 		!validDigest(p.DisplayPlanHash) || !validDigest(p.ExecutionPlanHash) || !validDigest(p.ResourceFingerprint) ||
 		!p.RollbackCoverage.Valid() || len(p.Steps) == 0 || len(p.Steps) > 64 || parseCanonicalTime(p.ExpiresAt) == nil {
 		return fmt.Errorf("invalid helper plan")
@@ -452,7 +540,53 @@ func (p HelperPlan) Validate() error {
 			return fmt.Errorf("invalid helper plan step")
 		}
 	}
+	displayHash, err := DisplayPlanDigest(p)
+	if err != nil || displayHash != p.DisplayPlanHash {
+		return fmt.Errorf("helper display plan hash mismatch")
+	}
 	return nil
+}
+
+type DisplayedPlan struct {
+	HelperPlanID     string           `json:"helper_plan_id"`
+	HelperInstanceID string           `json:"helper_instance_id"`
+	DiagnosticID     string           `json:"diagnostic_id"`
+	Action           Action           `json:"action"`
+	LogicalTarget    LogicalTarget    `json:"logical_target"`
+	RollbackCoverage RollbackCoverage `json:"rollback_coverage"`
+	Steps            []PlanStep       `json:"steps"`
+	ExpiresAt        string           `json:"expires_at"`
+}
+
+func (p DisplayedPlan) Validate() error {
+	if !validID(p.HelperPlanID) || !validID(p.HelperInstanceID) || !validID(p.DiagnosticID) ||
+		!p.Action.Valid() || p.Action == ActionApplyManagedProxyState || !p.LogicalTarget.Valid() ||
+		!p.RollbackCoverage.Valid() || len(p.Steps) == 0 || len(p.Steps) > 64 || parseCanonicalTime(p.ExpiresAt) == nil {
+		return fmt.Errorf("invalid displayed helper plan")
+	}
+	for _, step := range p.Steps {
+		if !validID(step.Kind) || strings.TrimSpace(step.Summary) == "" || len(step.Summary) > 512 {
+			return fmt.Errorf("invalid displayed helper plan step")
+		}
+	}
+	return nil
+}
+
+func (p HelperPlan) Displayed() DisplayedPlan {
+	return DisplayedPlan{
+		HelperPlanID:     p.HelperPlanID,
+		HelperInstanceID: p.HelperInstanceID,
+		DiagnosticID:     p.DiagnosticID,
+		Action:           p.Action,
+		LogicalTarget:    p.LogicalTarget,
+		RollbackCoverage: p.RollbackCoverage,
+		Steps:            append([]PlanStep(nil), p.Steps...),
+		ExpiresAt:        p.ExpiresAt,
+	}
+}
+
+func DisplayPlanDigest(plan HelperPlan) (string, error) {
+	return Digest(plan.Displayed())
 }
 
 type HelperReceipt struct {
