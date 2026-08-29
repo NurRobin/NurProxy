@@ -68,7 +68,7 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - Create: `internal/orchestrator/api/certificates_test.go`
 - Modify: `internal/orchestrator/api/server.go`
 
-- [ ] Register authenticated list/detail/download routes under `/api/v1/certificates`, CRUD/history routes under `/api/v1/certificate-exports`, and plan/test/result routes scoped to the selected agent.
+- [ ] Register authenticated list/detail/download routes under `/api/v1/certificates`, CRUD/history routes under `/api/v1/certificate-exports`, and static plan/result routes scoped to the selected agent.
 - [ ] Accept the PFX password only in the download request body, set `Cache-Control: no-store`, `Pragma: no-cache`, `X-Content-Type-Options: nosniff`, and a sanitized attachment name, then stream without logging the body.
 - [ ] Return public certificate metadata from metadata-only DB queries without loading `KeyPEM`. Audit format and export-definition changes without recording key material, password, or archive bytes.
 - [ ] Mint a short-lived single-use UI confirmation nonce bound to the exact fresh agent plan for copy mode, advanced ownership, and advanced commands. Do not reuse the local-shell `agent_admin_ops` claim code. Root/allowlist widening remains a separate host-presence admin op and is never directly granted by this API.
