@@ -158,6 +158,38 @@ func TestRecoveryReportCoalescesDiagnosticsResolvesOmissionsAndAuditsTransitions
 	}
 }
 
+func TestRecoveryReportFullSnapshotResolvesOnlyOmittedDiagnostics(t *testing.T) {
+	_, database, h, _ := recoveryFixture(t)
+	first := recoveryDiagnostic("agent-1")
+	second := first
+	second.ResourceFingerprint = "fp-second-active"
+	second.ID = recoverymodel.StableDiagnosticID("agent-1", second.Code, second.ResourceFingerprint)
+
+	w := doRequestWithAuth(t, h, http.MethodPost, "/api/v1/agents/agent-1/recovery/report",
+		proxymodel.RecoveryReportEnvelope{Report: proxymodel.RecoveryReport{Diagnostics: []recoverymodel.Diagnostic{first, second}}}, recoveryAgentToken)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("initial snapshot = %d: %s", w.Code, w.Body.String())
+	}
+	first.LastSeenAt = first.LastSeenAt.Add(time.Microsecond)
+	first.Occurrences++
+	w = doRequestWithAuth(t, h, http.MethodPost, "/api/v1/agents/agent-1/recovery/report",
+		proxymodel.RecoveryReportEnvelope{Report: proxymodel.RecoveryReport{Diagnostics: []recoverymodel.Diagnostic{first}}}, recoveryAgentToken)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("next snapshot = %d: %s", w.Code, w.Body.String())
+	}
+	active, err := database.ListDiagnostics("agent-1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != first.ID {
+		t.Fatalf("active diagnostics = %#v, want only %s", active, first.ID)
+	}
+	all, err := database.ListDiagnostics("agent-1", true)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("diagnostic history = %#v, err=%v", all, err)
+	}
+}
+
 func TestManualRepairPersistsBeforeTypedPublishAndRejectsInjectedFields(t *testing.T) {
 	srv, database, h, cookie := recoveryFixture(t)
 	d := recoveryDiagnostic("agent-1")
@@ -256,6 +288,55 @@ func TestConcurrentManualRepairCreatesOnlyOneActiveOperation(t *testing.T) {
 	}
 	if accepted != 1 {
 		t.Fatalf("accepted requests = %d, want 1", accepted)
+	}
+}
+
+func TestManualRepairRemainsDurablyPendingWhenEveryStreamBufferIsFull(t *testing.T) {
+	srv, database, h, cookie := recoveryFixture(t)
+	d := recoveryDiagnostic("agent-1")
+	if err := database.UpsertDiagnostic("agent-1", d); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateAgentRecoveryCapability("agent-1", &recoverymodel.Capability{Stage: 1, Actions: []recoverymodel.Action{d.ProposedAction}}); err != nil {
+		t.Fatal(err)
+	}
+	first, unsubFirst := srv.hub.Subscribe("agent-1")
+	defer unsubFirst()
+	second, unsubSecond := srv.hub.Subscribe("agent-1")
+	defer unsubSecond()
+	for i := 0; i < cap(first); i++ {
+		if !srv.hub.Publish("agent-1", agenthub.Event{Type: agenthub.EventPing}) {
+			t.Fatalf("fill publish %d failed", i)
+		}
+	}
+	if len(second) != cap(second) {
+		t.Fatal("second stream buffer was not filled")
+	}
+
+	w := doRequest(t, h, http.MethodPost, "/api/v1/agents/agent-1/repairs", map[string]any{
+		"diagnostic_id": d.ID, "action": d.ProposedAction,
+	}, cookie)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("buffered repair = %d, want 202: %s", w.Code, w.Body.String())
+	}
+	pending, err := database.ListPendingUserRepairOperations("agent-1", 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("durable pending operations = %#v, err=%v", pending, err)
+	}
+	reconnected, unsubReconnected := srv.hub.Subscribe("agent-1")
+	defer unsubReconnected()
+	srv.publishPendingManualRepairs("agent-1")
+	select {
+	case event := <-reconnected:
+		if event.Type != agenthub.EventRepairRequest {
+			t.Fatalf("reconnect event = %q", event.Type)
+		}
+		var envelope proxymodel.RepairRequestEnvelope
+		if err := json.Unmarshal(event.Data, &envelope); err != nil || envelope.Request.OperationID != pending[0].OperationID {
+			t.Fatalf("replayed pending request = %#v, err=%v", envelope.Request, err)
+		}
+	default:
+		t.Fatal("pending repair was not replayed to reconnect")
 	}
 }
 
@@ -436,6 +517,10 @@ func TestAutomaticRecoveryReportEnforcesLifecycleActionAndIdempotency(t *testing
 	if w.Code != http.StatusConflict {
 		t.Fatalf("action mismatch report = %d, want 409: %s", w.Code, w.Body.String())
 	}
+	var conflict map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&conflict); err != nil || conflict["code"] != "operation_conflict" {
+		t.Fatalf("report conflict = %#v, err=%v", conflict, err)
+	}
 	history, err := database.ListRepairOperations("agent-1", 10)
 	if err != nil || len(history) != 1 || history[0].Action != d.ProposedAction || history[0].State != recoverymodel.OperationStatePlanned {
 		t.Fatalf("operation after mismatch = %#v, err=%v", history, err)
@@ -452,6 +537,121 @@ func TestAutomaticRecoveryReportEnforcesLifecycleActionAndIdempotency(t *testing
 	}
 	if states["detected"] != 1 || states["planned"] != 1 {
 		t.Fatalf("operation audits = %#v, want one per transition", states)
+	}
+}
+
+func TestRepairACKConflictHasStableCode(t *testing.T) {
+	srv, database, h, cookie := recoveryFixture(t)
+	d := recoveryDiagnostic("agent-1")
+	if err := database.UpsertDiagnostic("agent-1", d); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateAgentRecoveryCapability("agent-1", &recoverymodel.Capability{Stage: 1, Actions: []recoverymodel.Action{d.ProposedAction}}); err != nil {
+		t.Fatal(err)
+	}
+	_, unsub := srv.hub.Subscribe("agent-1")
+	defer unsub()
+	w := doRequest(t, h, http.MethodPost, "/api/v1/agents/agent-1/repairs", map[string]any{"diagnostic_id": d.ID, "action": d.ProposedAction}, cookie)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("create = %d: %s", w.Code, w.Body.String())
+	}
+	var operation recoverymodel.OperationReport
+	if err := json.NewDecoder(w.Body).Decode(&operation); err != nil {
+		t.Fatal(err)
+	}
+	operation.State = recoverymodel.OperationStateApplying
+	operation.SnapshotReference = "recovery/" + operation.OperationID
+	operation.Steps = append(operation.Steps, recoverymodel.Step{Name: "applying", Summary: "invalid skip", State: operation.State, At: operation.StartedAt.Add(time.Second)})
+	w = doRequestWithAuth(t, h, http.MethodPost, "/api/v1/agents/agent-1/repairs/"+operation.OperationID+"/ack", operation, recoveryAgentToken)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("illegal ack = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	var conflict map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&conflict); err != nil || conflict["code"] != "operation_conflict" {
+		t.Fatalf("ack conflict = %#v, err=%v", conflict, err)
+	}
+}
+
+func TestRepairACKAcceptsAgentSafetyAbortAndPreApplyRollback(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		states   []recoverymodel.OperationState
+		terminal bool
+	}{
+		{name: "diagnosis only", states: []recoverymodel.OperationState{recoverymodel.OperationStateDiagnosisOnly}, terminal: true},
+		{name: "suppressed", states: []recoverymodel.OperationState{recoverymodel.OperationStateSuppressed}, terminal: true},
+		{name: "rollback before apply", states: []recoverymodel.OperationState{recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, database, h, cookie := recoveryFixture(t)
+			diagnostic := recoveryDiagnostic("agent-1")
+			if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.UpdateAgentRecoveryCapability("agent-1", &recoverymodel.Capability{Stage: 1, Actions: []recoverymodel.Action{diagnostic.ProposedAction}}); err != nil {
+				t.Fatal(err)
+			}
+			_, unsubscribe := srv.hub.Subscribe("agent-1")
+			defer unsubscribe()
+			w := doRequest(t, h, http.MethodPost, "/api/v1/agents/agent-1/repairs", map[string]any{"diagnostic_id": diagnostic.ID, "action": diagnostic.ProposedAction}, cookie)
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("create = %d: %s", w.Code, w.Body.String())
+			}
+			var operation recoverymodel.OperationReport
+			if err := json.NewDecoder(w.Body).Decode(&operation); err != nil {
+				t.Fatal(err)
+			}
+			for i, state := range tc.states {
+				operation.State = state
+				if state == recoverymodel.OperationStateSnapshotted {
+					operation.SnapshotReference = "recovery/" + operation.OperationID
+				}
+				at := operation.StartedAt.Add(time.Duration(i+1) * time.Second)
+				operation.Steps = append(operation.Steps, recoverymodel.Step{Name: string(state), Summary: "agent safety transition", State: state, At: at})
+				if tc.terminal && i == len(tc.states)-1 {
+					operation.FinishedAt = &at
+				}
+				w = doRequestWithAuth(t, h, http.MethodPost, "/api/v1/agents/agent-1/repairs/"+operation.OperationID+"/ack", operation, recoveryAgentToken)
+				if w.Code != http.StatusNoContent {
+					t.Fatalf("ack %s = %d: %s", state, w.Code, w.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestManualRepairCanValidateAfterRollbackFailedLatch(t *testing.T) {
+	srv, database, h, cookie := recoveryFixture(t)
+	diagnostic := recoveryDiagnostic("agent-1")
+	if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateAgentRecoveryCapability("agent-1", &recoverymodel.Capability{Stage: 1, Actions: []recoverymodel.Action{diagnostic.ProposedAction}}); err != nil {
+		t.Fatal(err)
+	}
+	_, unsubscribe := srv.hub.Subscribe("agent-1")
+	defer unsubscribe()
+	failure := recoverymodel.OperationReport{
+		OperationID: "op-api-rollback-failed", DiagnosticID: diagnostic.ID, Action: diagnostic.ProposedAction,
+		Source: recoverymodel.RequestSourceAutomatic, State: recoverymodel.OperationStateDetected, StartedAt: diagnostic.LastSeenAt,
+		Steps: []recoverymodel.Step{{Name: "detected", Summary: "detected", State: recoverymodel.OperationStateDetected, At: diagnostic.LastSeenAt}},
+	}
+	if err := database.CreateRepairOperation("agent-1", failure, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	failure = ackRecoveryState(t, h, failure, recoverymodel.OperationStatePlanned, recoveryAgentToken)
+	failure = ackRecoveryState(t, h, failure, recoverymodel.OperationStateSnapshotted, recoveryAgentToken)
+	failure = ackRecoveryState(t, h, failure, recoverymodel.OperationStateApplying, recoveryAgentToken)
+	failure = ackRecoveryState(t, h, failure, recoverymodel.OperationStateRollingBack, recoveryAgentToken)
+	_ = ackRecoveryState(t, h, failure, recoverymodel.OperationStateRollbackFailed, recoveryAgentToken)
+
+	open, err := database.RepairBreakerOpen("agent-1", diagnostic.ProposedAction, diagnostic.ResourceFingerprint, time.Now().UTC())
+	if err != nil || !open {
+		t.Fatalf("automatic breaker open = %t, err=%v", open, err)
+	}
+	w := doRequest(t, h, http.MethodPost, "/api/v1/agents/agent-1/repairs", map[string]any{"diagnostic_id": diagnostic.ID, "action": diagnostic.ProposedAction}, cookie)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("manual validation repair = %d, want 202: %s", w.Code, w.Body.String())
 	}
 }
 

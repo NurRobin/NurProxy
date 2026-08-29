@@ -13,6 +13,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // streamKeepalive is how often the open stream emits a keepalive and refreshes
@@ -62,6 +63,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 			log.Printf("stream: initial route push for agent %s failed: %v", id, err)
 		}
 	}
+	s.publishPendingManualRepairs(id)
 
 	ctx := r.Context()
 	ka := time.NewTicker(streamKeepalive)
@@ -87,6 +89,27 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 			}
 			_, _ = fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
+			s.publishPendingManualRepairs(id)
+		}
+	}
+}
+
+func (s *Server) publishPendingManualRepairs(agentID string) {
+	operations, err := s.db.ListPendingUserRepairOperations(agentID, 500)
+	if err != nil {
+		log.Printf("stream: pending recovery requests for agent %s: %v", agentID, err)
+		return
+	}
+	for _, operation := range operations {
+		if len(operation.Steps) != 1 {
+			continue
+		}
+		request := recoverymodel.RepairRequest{
+			OperationID: operation.OperationID, DiagnosticID: operation.DiagnosticID,
+			Action: operation.Action, StartedAt: operation.StartedAt, InitialStep: operation.Steps[0],
+		}
+		if !s.hub.PublishRepairRequest(agentID, request) {
+			return
 		}
 	}
 }

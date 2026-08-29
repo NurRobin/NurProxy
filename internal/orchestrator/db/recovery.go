@@ -14,7 +14,7 @@ import (
 
 const maxActiveDiagnosticIDs = 500
 
-var ErrActiveRepairOperation = errors.New("active repair operation already exists for diagnostic")
+var ErrActiveRepairOperation = errors.New("active repair operation already exists for action and fingerprint")
 
 func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnostic) error {
 	if strings.TrimSpace(agentID) == "" {
@@ -275,8 +275,9 @@ func (d *DB) createRepairOperation(agentID string, report recoverymodel.Operatio
 	if rejectActive {
 		var active int
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM recovery_operations
-			WHERE agent_id = ? AND diagnostic_id = ? AND state NOT IN (?, ?, ?, ?, ?)`,
-			agentID, report.DiagnosticID,
+			WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
+			AND state NOT IN (?, ?, ?, ?, ?)`,
+			agentID, string(report.Action), fingerprint,
 			string(recoverymodel.OperationStateDiagnosisOnly), string(recoverymodel.OperationStateSucceeded),
 			string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed),
 			string(recoverymodel.OperationStateSuppressed),
@@ -618,6 +619,33 @@ func (d *DB) ListRepairOperations(agentID string, limit int) ([]recoverymodel.Op
 	return reports, rows.Err()
 }
 
+func (d *DB) ListPendingUserRepairOperations(agentID string, limit int) ([]recoverymodel.OperationReport, error) {
+	if strings.TrimSpace(agentID) == "" {
+		return nil, fmt.Errorf("repair operation agent ID is required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := d.read.Query(operationSelect+` WHERE agent_id = ? AND request_source = ? AND state = ?
+		ORDER BY created_at ASC, id ASC LIMIT ?`, agentID, string(recoverymodel.RequestSourceUser), string(recoverymodel.OperationStatePlanned), limit)
+	if err != nil {
+		return nil, fmt.Errorf("listing pending user repair operations: %w", err)
+	}
+	defer rows.Close()
+	reports := make([]recoverymodel.OperationReport, 0)
+	for rows.Next() {
+		report, _, err := scanRepairOperation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning pending user repair operation: %w", err)
+		}
+		reports = append(reports, report)
+	}
+	return reports, rows.Err()
+}
+
 func (d *DB) GetRepairOperation(agentID, operationID string) (*recoverymodel.OperationReport, error) {
 	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(operationID) == "" {
 		return nil, fmt.Errorf("repair operation agent and ID are required")
@@ -668,22 +696,26 @@ func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fing
 		return false, fmt.Errorf("encoding repair breaker time: %w", err)
 	}
 
-	var latestState string
+	latched, err := d.RepairRollbackFailedLatched(agentID, action, fingerprint)
+	if err != nil {
+		return false, err
+	}
+	if latched {
+		return true, nil
+	}
+
 	var latestReceipt int64
-	err = d.read.QueryRow(`SELECT state, received_at FROM recovery_operations
+	err = d.read.QueryRow(`SELECT received_at FROM recovery_operations
 		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
-		AND state IN (?, ?) ORDER BY received_at DESC LIMIT 1`,
+		AND state = ? ORDER BY received_at DESC LIMIT 1`,
 		agentID, string(action), fingerprint,
-		string(recoverymodel.OperationStateSucceeded), string(recoverymodel.OperationStateRollbackFailed),
-	).Scan(&latestState, &latestReceipt)
+		string(recoverymodel.OperationStateSucceeded),
+	).Scan(&latestReceipt)
 	if err != nil && err != sql.ErrNoRows {
 		return false, fmt.Errorf("reading latest repair breaker outcome: %w", err)
 	}
-	if err == nil && latestState == string(recoverymodel.OperationStateRollbackFailed) {
-		return true, nil
-	}
 	afterSuccess := int64(math.MinInt64)
-	if err == nil && latestState == string(recoverymodel.OperationStateSucceeded) {
+	if err == nil {
 		afterSuccess = latestReceipt
 	}
 
@@ -727,6 +759,28 @@ func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fing
 		}
 	}
 	return false, nil
+}
+
+func (d *DB) RepairRollbackFailedLatched(agentID string, action recoverymodel.Action, fingerprint string) (bool, error) {
+	if strings.TrimSpace(agentID) == "" || !action.Valid() || strings.TrimSpace(fingerprint) == "" {
+		return false, fmt.Errorf("agent, valid action, and fingerprint are required")
+	}
+	var state string
+	err := d.read.QueryRow(`SELECT state FROM recovery_operations
+		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
+		AND (state = ? OR (state = ? AND request_source = ?))
+		ORDER BY received_at DESC LIMIT 1`,
+		agentID, string(action), fingerprint,
+		string(recoverymodel.OperationStateRollbackFailed), string(recoverymodel.OperationStateSucceeded),
+		string(recoverymodel.RequestSourceUser),
+	).Scan(&state)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading rollback-failed repair latch: %w", err)
+	}
+	return state == string(recoverymodel.OperationStateRollbackFailed), nil
 }
 
 func subtractRecoveryDuration(value, duration int64) int64 {
@@ -790,8 +844,8 @@ func legalOperationTransition(from, to recoverymodel.OperationState) bool {
 func operationSuccessors(state recoverymodel.OperationState) []recoverymodel.OperationState {
 	allowed := map[recoverymodel.OperationState][]recoverymodel.OperationState{
 		recoverymodel.OperationStateDetected:    {recoverymodel.OperationStateDiagnosisOnly, recoverymodel.OperationStatePlanned, recoverymodel.OperationStateSuppressed},
-		recoverymodel.OperationStatePlanned:     {recoverymodel.OperationStateSnapshotted},
-		recoverymodel.OperationStateSnapshotted: {recoverymodel.OperationStateApplying},
+		recoverymodel.OperationStatePlanned:     {recoverymodel.OperationStateDiagnosisOnly, recoverymodel.OperationStateSuppressed, recoverymodel.OperationStateSnapshotted},
+		recoverymodel.OperationStateSnapshotted: {recoverymodel.OperationStateApplying, recoverymodel.OperationStateRollingBack},
 		recoverymodel.OperationStateApplying:    {recoverymodel.OperationStateValidating, recoverymodel.OperationStateRollingBack},
 		recoverymodel.OperationStateValidating:  {recoverymodel.OperationStateSucceeded, recoverymodel.OperationStateRollingBack},
 		recoverymodel.OperationStateRollingBack: {recoverymodel.OperationStateRolledBack, recoverymodel.OperationStateRollbackFailed},

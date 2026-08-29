@@ -139,8 +139,8 @@ func (h *Hub) Connected(agentID string) bool {
 }
 
 // Publish sends ev to every live connection for agentID. It never blocks: a
-// connection whose buffer is full simply drops this event. Returns true if the
-// agent had at least one connection to deliver to.
+// connection whose buffer is full simply drops this event. Returns true only if
+// at least one live connection actually enqueued the event.
 func (h *Hub) Publish(agentID string, ev Event) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -149,14 +149,16 @@ func (h *Hub) Publish(agentID string, ev Event) bool {
 	if len(set) == 0 {
 		return false
 	}
+	delivered := false
 	for sub := range set {
 		select {
 		case sub.ch <- ev:
+			delivered = true
 		default:
 			// Buffer full — drop. The agent re-syncs fully on reconnect.
 		}
 	}
-	return true
+	return delivered
 }
 
 // PublishIntents is a convenience wrapper that pushes a full intent-set snapshot

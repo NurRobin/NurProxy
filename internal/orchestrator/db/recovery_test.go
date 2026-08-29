@@ -2,8 +2,10 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -259,6 +261,76 @@ func TestRecoveryOperationTransitionsIdempotencyAndHistory(t *testing.T) {
 	}
 }
 
+func TestUserRepairAcceptsSafetyAbortAndPreApplyRollbackTransitions(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		states    []recoverymodel.OperationState
+		terminal  bool
+		wantFinal recoverymodel.OperationState
+	}{
+		{name: "path safety diagnosis only", states: []recoverymodel.OperationState{recoverymodel.OperationStateDiagnosisOnly}, terminal: true, wantFinal: recoverymodel.OperationStateDiagnosisOnly},
+		{name: "policy suppression", states: []recoverymodel.OperationState{recoverymodel.OperationStateSuppressed}, terminal: true, wantFinal: recoverymodel.OperationStateSuppressed},
+		{name: "snapshot persistence rollback", states: []recoverymodel.OperationState{recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack}, wantFinal: recoverymodel.OperationStateRollingBack},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			a := createTestAgent(t, d)
+			diagnostic := testDiagnostic(a.ID, "fp-"+strings.ReplaceAll(tc.name, " ", "-"))
+			if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+				t.Fatal(err)
+			}
+			operation := newUserOperation("op-"+strings.ReplaceAll(tc.name, " ", "-"), diagnostic, recoveryTime(0))
+			if err := d.CreateRepairOperation(a.ID, operation, diagnostic.ResourceFingerprint); err != nil {
+				t.Fatal(err)
+			}
+			for i, state := range tc.states {
+				operation.State = state
+				if state == recoverymodel.OperationStateSnapshotted {
+					operation.SnapshotReference = "recovery/" + operation.OperationID
+				}
+				at := recoveryTime(i + 1)
+				operation.Steps = append(operation.Steps, recoverymodel.Step{Name: string(state), Summary: "safety transition", State: state, At: at})
+				if tc.terminal && i == len(tc.states)-1 {
+					operation.FinishedAt = &at
+				}
+				if err := d.AdvanceRepairOperation(a.ID, operation); err != nil {
+					t.Fatalf("advance to %s: %v", state, err)
+				}
+			}
+			stored, err := d.GetRepairOperation(a.ID, operation.OperationID)
+			if err != nil || stored.State != tc.wantFinal {
+				t.Fatalf("stored operation = %#v, err=%v", stored, err)
+			}
+		})
+	}
+}
+
+func TestRollbackFailedLatchRemainsOpenWhileAdmittingExplicitUserRepair(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diagnostic := testDiagnostic(a.ID, "fp-manual-validation")
+	if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	failure := newUserOperation("op-rollback-failed-latch", diagnostic, recoveryTime(0))
+	if err := d.CreateRepairOperation(a.ID, failure, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	failure = advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRollbackFailed)
+	open, err := d.RepairBreakerOpen(a.ID, diagnostic.ProposedAction, diagnostic.ResourceFingerprint, recoveryTime(10))
+	if err != nil || !open {
+		t.Fatalf("automatic breaker open = %t, err=%v", open, err)
+	}
+	latched, err := d.RepairRollbackFailedLatched(a.ID, diagnostic.ProposedAction, diagnostic.ResourceFingerprint)
+	if err != nil || !latched {
+		t.Fatalf("rollback-failed latch = %t, err=%v", latched, err)
+	}
+	manual := newUserOperation("op-manual-validation", diagnostic, recoveryTime(11))
+	if err := d.CreateRepairOperationIfNoActive(a.ID, manual, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatalf("explicit user repair was not admitted: %v", err)
+	}
+}
+
 func TestGetRepairOperationIsExactlyAgentScoped(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
@@ -283,24 +355,94 @@ func TestGetRepairOperationIsExactlyAgentScoped(t *testing.T) {
 	}
 }
 
-func TestCreateRepairOperationIfNoActiveIsAtomicPerDiagnostic(t *testing.T) {
+func TestCreateRepairOperationIfNoActiveIsAtomicPerActionAndFingerprint(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
-	diag := testDiagnostic(a.ID, "fp-active-create")
-	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+	firstDiagnostic := testDiagnostic(a.ID, "fp-active-create")
+	secondDiagnostic := firstDiagnostic
+	secondDiagnostic.Code = recoverymodel.CodeManagedOrphanConfig
+	secondDiagnostic.ID = recoverymodel.StableDiagnosticID(a.ID, secondDiagnostic.Code, secondDiagnostic.ResourceFingerprint)
+	if err := d.UpsertDiagnostic(a.ID, firstDiagnostic); err != nil {
 		t.Fatal(err)
 	}
-	first := newUserOperation("op-active-first", diag, recoveryTime(0))
-	if err := d.CreateRepairOperationIfNoActive(a.ID, first, diag.ResourceFingerprint); err != nil {
+	if err := d.UpsertDiagnostic(a.ID, secondDiagnostic); err != nil {
 		t.Fatal(err)
 	}
-	second := newUserOperation("op-active-second", diag, recoveryTime(1))
-	if err := d.CreateRepairOperationIfNoActive(a.ID, second, diag.ResourceFingerprint); err == nil {
-		t.Fatal("second active operation was created")
+	first := newUserOperation("op-active-first", firstDiagnostic, recoveryTime(0))
+	second := newUserOperation("op-active-second", secondDiagnostic, recoveryTime(1))
+
+	type result struct {
+		report recoverymodel.OperationReport
+		err    error
 	}
-	advanceOperationToTerminal(t, d, a.ID, first, recoverymodel.OperationStateSucceeded)
-	if err := d.CreateRepairOperationIfNoActive(a.ID, second, diag.ResourceFingerprint); err != nil {
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, operation := range []recoverymodel.OperationReport{first, second} {
+		operation := operation
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- result{report: operation, err: d.CreateRepairOperationIfNoActive(a.ID, operation, firstDiagnostic.ResourceFingerprint)}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var winner, loser recoverymodel.OperationReport
+	for got := range results {
+		if got.err == nil {
+			if winner.OperationID != "" {
+				t.Fatal("both competing operations were created")
+			}
+			winner = got.report
+		} else {
+			if !errors.Is(got.err, ErrActiveRepairOperation) {
+				t.Fatalf("competing create error = %v", got.err)
+			}
+			loser = got.report
+		}
+	}
+	if winner.OperationID == "" || loser.OperationID == "" {
+		t.Fatalf("winner=%q loser=%q", winner.OperationID, loser.OperationID)
+	}
+	advanceOperationToTerminal(t, d, a.ID, winner, recoverymodel.OperationStateSucceeded)
+	if err := d.CreateRepairOperationIfNoActive(a.ID, loser, firstDiagnostic.ResourceFingerprint); err != nil {
 		t.Fatalf("operation after terminal predecessor: %v", err)
+	}
+}
+
+func TestListPendingUserRepairOperationsReturnsOnlyDurablePlannedRequests(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	firstDiagnostic := testDiagnostic(a.ID, "fp-pending-first")
+	secondDiagnostic := testDiagnostic(a.ID, "fp-pending-second")
+	for _, diagnostic := range []recoverymodel.Diagnostic{firstDiagnostic, secondDiagnostic} {
+		if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending := newUserOperation("op-pending-user", firstDiagnostic, recoveryTime(0))
+	if err := d.CreateRepairOperation(a.ID, pending, firstDiagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	automatic := testOperation("op-pending-auto", firstDiagnostic.ID, recoverymodel.OperationStateDetected)
+	if err := d.CreateRepairOperation(a.ID, automatic, firstDiagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	progressed := newUserOperation("op-progressed-user", secondDiagnostic, recoveryTime(1))
+	if err := d.CreateRepairOperation(a.ID, progressed, secondDiagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	progressed = advanceOperation(t, d, a.ID, progressed, recoverymodel.OperationStateSnapshotted)
+
+	got, err := d.ListPendingUserRepairOperations(a.ID, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].OperationID != pending.OperationID {
+		t.Fatalf("pending user operations = %#v", got)
 	}
 }
 

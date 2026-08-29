@@ -3,6 +3,7 @@ package agenthub
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
@@ -33,7 +34,8 @@ func TestPublishRepairRequestTyped(t *testing.T) {
 	h := New()
 	ch, unsub := h.Subscribe("a1")
 	defer unsub()
-	want := recoverymodel.RepairRequest{OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionRemoveManagedTemp}
+	now := time.Now().UTC()
+	want := recoverymodel.RepairRequest{OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionRemoveManagedTemp, StartedAt: now, InitialStep: recoverymodel.Step{Name: "planned", State: recoverymodel.OperationStatePlanned, At: now}}
 
 	if !h.PublishRepairRequest("a1", want) {
 		t.Fatal("repair request should be delivered")
@@ -255,5 +257,27 @@ func TestPublishDoesNotBlockWhenBufferFull(t *testing.T) {
 	defer unsub()
 	for i := 0; i < 100; i++ {
 		h.Publish("a1", Event{Type: EventPing})
+	}
+}
+
+func TestPublishReportsWhetherAnySubscriberActuallyEnqueued(t *testing.T) {
+	h := New()
+	first, unsubFirst := h.Subscribe("a1")
+	defer unsubFirst()
+	second, unsubSecond := h.Subscribe("a1")
+	defer unsubSecond()
+
+	for i := 0; i < cap(first); i++ {
+		if !h.Publish("a1", Event{Type: EventPing}) {
+			t.Fatalf("fill publish %d unexpectedly failed", i)
+		}
+	}
+	if h.Publish("a1", Event{Type: EventPing}) {
+		t.Fatal("publish with every subscriber buffer full reported delivery")
+	}
+
+	<-second
+	if !h.Publish("a1", Event{Type: EventPing}) {
+		t.Fatal("publish with one available subscriber did not report delivery")
 	}
 }

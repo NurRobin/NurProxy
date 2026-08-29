@@ -182,8 +182,15 @@ func (s *Server) handleCreateRepair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if breakerOpen {
-		writeRecoveryError(w, http.StatusConflict, "circuit_breaker_open", "repair circuit breaker is open")
-		return
+		rollbackFailed, err := s.db.RepairRollbackFailedLatched(id, request.Action, diagnostic.ResourceFingerprint)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to inspect repair rollback latch")
+			return
+		}
+		if !rollbackFailed {
+			writeRecoveryError(w, http.StatusConflict, "circuit_breaker_open", "repair circuit breaker is open")
+			return
+		}
 	}
 
 	now := time.Now().UTC()
@@ -202,9 +209,8 @@ func (s *Server) handleCreateRepair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "recovery_operation", operation.OperationID, "planned", "typed action="+string(operation.Action)+" agent="+id)
-	if !s.hub.PublishRepairRequest(id, recoverymodel.RepairRequest{OperationID: operation.OperationID, DiagnosticID: operation.DiagnosticID, Action: operation.Action}) {
-		writeRecoveryError(w, http.StatusConflict, "agent_disconnected", "agent disconnected before repair delivery")
-		return
+	if !s.hub.PublishRepairRequest(id, recoverymodel.RepairRequest{OperationID: operation.OperationID, DiagnosticID: operation.DiagnosticID, Action: operation.Action, StartedAt: operation.StartedAt, InitialStep: operation.Steps[0]}) {
+		s.audit(r, "recovery_operation", operation.OperationID, "delivery_pending", "typed repair remains queued for reconnect delivery")
 	}
 	writeJSON(w, http.StatusAccepted, operation)
 }
@@ -310,7 +316,7 @@ func (s *Server) handleRecoveryReport(w http.ResponseWriter, r *http.Request) {
 			s.auditAs(r, models.AuditSourceAgent, "recovery_diagnostic", diagnostic.ID, "state_changed", "code="+string(stored.Code)+" agent="+id)
 		}
 	}
-	if envelope.Report.Diagnostics != nil && len(envelope.Report.Diagnostics) == 0 {
+	if envelope.Report.Diagnostics != nil {
 		active, err := s.db.ListDiagnostics(id, false)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to inspect active recovery diagnostics")
@@ -338,7 +344,7 @@ func (s *Server) handleRecoveryReport(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, operation := range envelope.Report.Operations {
 		if err := s.persistReportedOperation(r, id, operation); err != nil {
-			writeError(w, http.StatusConflict, err.Error())
+			writeRecoveryError(w, http.StatusConflict, "operation_conflict", err.Error())
 			return
 		}
 	}
@@ -416,7 +422,7 @@ func (s *Server) handleRepairAck(w http.ResponseWriter, r *http.Request) {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
 	if err := s.persistReportedOperation(r, id, operation); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		writeRecoveryError(w, http.StatusConflict, "operation_conflict", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
