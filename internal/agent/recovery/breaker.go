@@ -152,6 +152,9 @@ func (b *Breaker) Allow(key BreakerKey, source recoverymodel.RequestSource, now 
 	}
 	state.compact(now)
 	if state.rollbackFailed {
+		if source == recoverymodel.RequestSourceUser {
+			return BreakerDecision{Allowed: true, Reason: "manual validation required to clear rollback_failed"}
+		}
 		return BreakerDecision{Reason: "rollback_failed requires successful manual validation"}
 	}
 	if !state.openedAt.IsZero() {

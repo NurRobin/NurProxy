@@ -25,7 +25,9 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/logtail"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	apacheproxy "github.com/NurRobin/NurProxy/internal/agent/proxy/apache"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
+	nginxproxy "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -460,6 +462,45 @@ func (c *Client) sendLogChunk(ctx context.Context, sessionID, path string, ch lo
 // (which can self-ACME as a fallback, §7); file backends that hard-require the
 // cert will fail their own validate, attributed per-artifact.
 func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
+	desired := recovery.DesiredState{Recovery: proxy.RecoveryDesired{KeepCertHosts: append([]string(nil), set.CertKeep...)}, Bundles: recoveryBundles(set.Certs)}
+	if infoProvider, ok := c.caddy.(interface{ Info() proxy.Info }); ok {
+		desired.Classification.ProxyInfo = infoProvider.Info()
+		if desired.Classification.ProxyInfo.ConfigDir != "" {
+			desired.Classification.ManagedRoots = []string{desired.Classification.ProxyInfo.ConfigDir}
+		}
+	}
+	for _, path := range set.Keep {
+		desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, proxy.Target{Kind: proxy.TargetKindFile, Path: path})
+	}
+	for _, intent := range set.Intents {
+		if target := desiredTarget(desired.Classification.ProxyInfo, intent.Route.Host); target.Path != "" {
+			desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, target)
+			bundle, hasBundle := desired.Bundles[intent.Route.Host]
+			validBundle := hasBundle && len(bundle.CertPEM) > 0 && len(bundle.KeyPEM) > 0
+			desired.Classification.DesiredResources = append(desired.Classification.DesiredResources, recovery.DesiredResource{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Target: target, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateLive, ValidBundle: validBundle})
+		}
+	}
+	if c.recovery != nil {
+		initialDesired := desired
+		c.recovery.SetDesired(func() recovery.DesiredState { return initialDesired })
+		diagnostics, err := c.recovery.Inspect(ctx)
+		if err != nil {
+			log.Printf("Stream: recovery inspection failed: %v", err)
+		} else {
+			for _, diagnostic := range diagnostics {
+				report, repairErr := c.recovery.AutoRepair(ctx, diagnostic)
+				if repairErr != nil {
+					log.Printf("Stream: safe recovery failed for %s: %v", diagnostic.Code, repairErr)
+				}
+				if report.State == recoverymodel.OperationStateSucceeded {
+					c.applyStateMu.Lock()
+					c.lastApplyClean = false
+					c.applyStateMu.Unlock()
+				}
+			}
+		}
+		c.syncRecoveryHealth()
+	}
 	certsOK := c.installCerts(ctx, set.Certs)
 
 	// On a full push, scrub cert-store entries for hosts no longer managed (§7) —
@@ -555,40 +596,11 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	// rendered, but before the route apply. A successful safe repair is followed
 	// by this same invocation's normal reconcile; no recursive apply is scheduled.
 	if c.recovery != nil {
-		desired := recovery.DesiredState{Recovery: proxy.RecoveryDesired{KeepCertHosts: append([]string(nil), set.CertKeep...)}, Bundles: recoveryBundles(set.Certs)}
-		if infoProvider, ok := c.caddy.(interface{ Info() proxy.Info }); ok {
-			desired.Classification.ProxyInfo = infoProvider.Info()
-			if desired.Classification.ProxyInfo.ConfigDir != "" {
-				desired.Classification.ManagedRoots = []string{desired.Classification.ProxyInfo.ConfigDir}
-			}
-		}
 		for _, fa := range fileArts {
 			desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, fa.art.Target)
-			bundle, hasBundle := desired.Bundles[fa.intent.Route.Host]
-			validBundle := hasBundle && len(bundle.CertPEM) > 0 && len(bundle.KeyPEM) > 0
-			desired.Classification.DesiredResources = append(desired.Classification.DesiredResources, recovery.DesiredResource{ArtifactID: fa.intent.ArtifactID, Host: fa.intent.Route.Host, Target: fa.art.Target, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateLive, ValidBundle: validBundle})
 		}
-		for _, path := range set.Keep {
-			desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, proxy.Target{Kind: proxy.TargetKindFile, Path: path})
-		}
-		c.recovery.SetDesired(func() recovery.DesiredState { return desired })
-		diagnostics, err := c.recovery.Inspect(ctx)
-		if err != nil {
-			log.Printf("Stream: recovery inspection failed: %v", err)
-		} else {
-			for _, diagnostic := range diagnostics {
-				report, repairErr := c.recovery.AutoRepair(ctx, diagnostic)
-				if repairErr != nil {
-					log.Printf("Stream: safe recovery failed for %s: %v", diagnostic.Code, repairErr)
-				}
-				if report.State == recoverymodel.OperationStateSucceeded {
-					c.applyStateMu.Lock()
-					c.lastApplyClean = false
-					c.applyStateMu.Unlock()
-				}
-			}
-		}
-		c.syncRecoveryHealth()
+		finalDesired := desired
+		c.recovery.SetDesired(func() recovery.DesiredState { return finalDesired })
 	}
 
 	// Change suppression: the periodic reconcile tick re-pushes the same desired
@@ -782,12 +794,25 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	c.lastFullApply = time.Now()
 	c.applyStateMu.Unlock()
 	if clean && c.recovery != nil {
-		c.recovery.ReconcileSucceeded()
+		if err := c.recovery.ReconcileSucceeded(ctx); err != nil {
+			log.Printf("Stream: post-reconcile recovery inspection failed: %v", err)
+		}
 		c.syncRecoveryHealth()
 	}
 
 	log.Printf("Stream: applied %d/%d intents", applied, len(intents))
 	c.sendAck(ctx, reports)
+}
+
+func desiredTarget(info proxy.Info, host string) proxy.Target {
+	switch info.Kind {
+	case proxy.KindNginx:
+		return proxy.Target{Kind: proxy.TargetKindFile, Path: nginxproxy.ResolveLayout(info.ConfigDir).AvailablePath(host)}
+	case proxy.KindApache:
+		return proxy.Target{Kind: proxy.TargetKindFile, Path: apacheproxy.ResolveLayout(info.ConfigDir).AvailablePath(host)}
+	default:
+		return proxy.Target{}
+	}
 }
 
 func recoveryBundles(wire []proxymodel.CertBundle) map[string]proxy.CertBundle {

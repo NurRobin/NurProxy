@@ -485,8 +485,19 @@ func TestRecoveryAdapterInspectsAndExecutesOwnedFileCandidates(t *testing.T) {
 	if _, err := os.Lstat(activeTemp); err != nil {
 		t.Fatalf("active temp was removed: %v", err)
 	}
-	if r.tests != 2 || r.reloads != 2 {
-		t.Fatalf("validate/reload = %d/%d, want 2/2", r.tests, r.reloads)
+	if r.tests != 0 || r.reloads != 0 {
+		t.Fatalf("typed mutation unexpectedly validated/reloaded = %d/%d", r.tests, r.reloads)
+	}
+}
+
+func TestReloadRecoveryAlwaysInvokesBackendReload(t *testing.T) {
+	r := &fakeRunner{}
+	b, _ := newBackend(t, r)
+	if err := b.ReloadRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r.reloads != 1 {
+		t.Fatalf("reloads=%d", r.reloads)
 	}
 }
 

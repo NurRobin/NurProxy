@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -162,6 +163,69 @@ func TestSnapshotManifestIsTypedSecretFreeAndAtomicallyPersisted(t *testing.T) {
 	loaded, err := store.Load("op-atomic")
 	if err != nil || loaded.OperationID != manifest.OperationID {
 		t.Fatalf("load = %#v, %v", loaded, err)
+	}
+}
+
+func TestSnapshotManifestPersistsExactOperationIdentityAndHistory(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	mustMkdir(t, managed, 0o700)
+	path := filepath.Join(managed, "artifact")
+	mustWrite(t, path, []byte("before"), 0o600)
+	guard, _ := NewPathGuard(managed)
+	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	defer store.Close()
+	now := testTime()
+	report := recoverymodel.OperationReport{OperationID: "manual-exact", DiagnosticID: "diag-exact", Action: recoverymodel.ActionRemoveManagedTemp, Source: recoverymodel.RequestSourceUser, State: recoverymodel.OperationStateSnapshotted, SnapshotReference: "manual-exact", StartedAt: now, Steps: []recoverymodel.Step{{Name: "planned", Summary: "safe typed repair requested", State: recoverymodel.OperationStatePlanned, At: now}, {Name: "snapshotted", Summary: "prior filesystem state captured", State: recoverymodel.OperationStateSnapshotted, At: now}}}
+	if _, err := store.CreateOperation(report, "fingerprint", resolveAll(t, guard, path), now); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(report.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded.Report, report) {
+		t.Fatalf("report=%+v want=%+v", loaded.Report, report)
+	}
+}
+
+func TestTransitionReportRejectsChangedHistoryAndIdempotentMismatch(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	if err := os.Mkdir(managed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(managed, "nurproxy-history.conf")
+	if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guard, _ := NewPathGuard(managed)
+	checked, _ := guard.Resolve(path)
+	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	defer store.Close()
+	now := testTime()
+	report := recoverymodel.OperationReport{OperationID: "history", DiagnosticID: "diag-history", Action: recoverymodel.ActionRemoveManagedTemp, Source: recoverymodel.RequestSourceAutomatic, State: recoverymodel.OperationStateSnapshotted, SnapshotReference: "history", StartedAt: now, Steps: []recoverymodel.Step{{Name: "detected", State: recoverymodel.OperationStateDetected, At: now}, {Name: "planned", State: recoverymodel.OperationStatePlanned, At: now}, {Name: "snapshotted", State: recoverymodel.OperationStateSnapshotted, At: now}}}
+	if _, err := store.CreateOperation(report, "fingerprint", []GuardedPath{checked}, now); err != nil {
+		t.Fatal(err)
+	}
+	changed := report
+	changed.State = recoverymodel.OperationStateApplying
+	changed.Steps = append([]recoverymodel.Step(nil), report.Steps...)
+	changed.Steps[0].Name = "changed"
+	changed.Steps = append(changed.Steps, recoverymodel.Step{Name: "applying", State: recoverymodel.OperationStateApplying, At: now})
+	if _, err := store.TransitionReport("history", recoverymodel.OperationStateSnapshotted, changed, now); err == nil {
+		t.Fatal("changed durable history was accepted")
+	}
+	valid := report
+	valid.State = recoverymodel.OperationStateApplying
+	valid.Steps = append(valid.Steps, recoverymodel.Step{Name: "applying", State: recoverymodel.OperationStateApplying, At: now})
+	if _, err := store.TransitionReport("history", recoverymodel.OperationStateSnapshotted, valid, now); err != nil {
+		t.Fatal(err)
+	}
+	changed = valid
+	changed.ValidationOutcome = "different"
+	if _, err := store.TransitionReport("history", recoverymodel.OperationStateSnapshotted, changed, now); err == nil {
+		t.Fatal("mismatched idempotent report was accepted")
 	}
 }
 
@@ -715,8 +779,10 @@ func persistTestManifest(store *SnapshotStore, id string, state recoverymodel.Op
 	if err := os.Mkdir(store.OperationDir(id), 0o700); err != nil {
 		return err
 	}
+	report := recoverymodel.OperationReport{OperationID: id, DiagnosticID: "diag-" + id, Action: recoverymodel.ActionRemoveManagedTemp, Source: recoverymodel.RequestSourceAutomatic, State: state, StartedAt: created}
 	return store.persist(&SnapshotManifest{
 		Version: manifestVersion, OperationID: id, Action: recoverymodel.ActionRemoveManagedTemp,
 		Fingerprint: "fingerprint", CreatedAt: created, UpdatedAt: created, State: state,
+		Report: report, Diagnostic: snapshotDiagnostic(report, "fingerprint", nil, created),
 	})
 }

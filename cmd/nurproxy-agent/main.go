@@ -455,6 +455,9 @@ func main() {
 			recoverySnapshots, recoveryBreaker = snapshots, breaker
 			recoveryCoordinator = recovery.NewCoordinator(mgr.AgentID(), holder, snapshots, breaker, recoveryReporter, guard, nil)
 			recoveryCoordinator.SetContext(recovery.Context{AgentID: mgr.AgentID(), ProxyInfo: info, ManagedRoots: roots, AgentDataRoot: cfg.DataDir})
+			if pruneErr := snapshots.Prune(time.Now().UTC()); pruneErr != nil {
+				log.Printf("WARNING: recovery snapshot retention failed: %v", pruneErr)
+			}
 			if operationIDs, listErr := snapshots.ActiveOperationIDs(); listErr != nil {
 				log.Printf("WARNING: interrupted recovery operations could not be enumerated safely: %v", listErr)
 			} else {

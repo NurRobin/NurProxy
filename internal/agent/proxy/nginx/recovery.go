@@ -81,7 +81,7 @@ func (b *Backend) InspectRecovery(_ context.Context, desired proxy.RecoveryDesir
 	return append(candidates, certCandidates...), nil
 }
 
-func (b *Backend) ExecuteRecovery(ctx context.Context, candidate proxy.RecoveryCandidate, bundles map[string]proxy.CertBundle) error {
+func (b *Backend) ExecuteRecovery(_ context.Context, candidate proxy.RecoveryCandidate, bundles map[string]proxy.CertBundle) error {
 	if err := candidate.Validate(); err != nil {
 		return err
 	}
@@ -118,13 +118,15 @@ func (b *Backend) ExecuteRecovery(ctx context.Context, candidate proxy.RecoveryC
 	default:
 		return proxy.ErrRecoveryUnsupported
 	}
-	if err := b.Validate(ctx); err != nil {
-		return err
+	return nil
+}
+
+func (b *Backend) ReloadRecovery(ctx context.Context) error {
+	if b.runner == nil {
+		return nil
 	}
-	if b.runner != nil {
-		if err := b.runner.Reload(ctx); err != nil {
-			return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
-		}
+	if err := b.runner.Reload(ctx); err != nil {
+		return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
 	}
 	return nil
 }

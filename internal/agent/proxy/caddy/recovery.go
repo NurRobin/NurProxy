@@ -71,6 +71,8 @@ func (b *Backend) ExecuteRecovery(ctx context.Context, candidate proxy.RecoveryC
 	return b.Validate(ctx)
 }
 
+func (b *Backend) ReloadRecovery(context.Context) error { return nil }
+
 func captureRecoveryPaths(paths ...string) ([]proxy.RecoveryPathIdentity, error) {
 	identities := make([]proxy.RecoveryPathIdentity, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))

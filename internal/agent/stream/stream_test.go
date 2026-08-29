@@ -56,6 +56,10 @@ type recoveryStreamBackend struct {
 
 func (b *recoveryStreamBackend) Info() proxy.Info { return proxy.Info{Kind: proxy.KindNginx} }
 func (b *recoveryStreamBackend) InspectRecovery(context.Context, proxy.RecoveryDesired) ([]proxy.RecoveryCandidate, error) {
+	b.order = append(b.order, "inspect")
+	if b.candidate.Action == "" {
+		return nil, nil
+	}
 	return []proxy.RecoveryCandidate{b.candidate}, nil
 }
 func (b *recoveryStreamBackend) ExecuteRecovery(_ context.Context, candidate proxy.RecoveryCandidate, _ map[string]proxy.CertBundle) error {
@@ -64,6 +68,10 @@ func (b *recoveryStreamBackend) ExecuteRecovery(_ context.Context, candidate pro
 }
 func (b *recoveryStreamBackend) Validate(context.Context) error {
 	b.order = append(b.order, "validate")
+	return nil
+}
+func (b *recoveryStreamBackend) ReloadRecovery(context.Context) error {
+	b.order = append(b.order, "activate")
 	return nil
 }
 func (b *recoveryStreamBackend) EnsureServer(context.Context) error {
@@ -75,10 +83,7 @@ func (b *recoveryStreamBackend) ClearRoutes(context.Context) error {
 	return nil
 }
 func (b *recoveryStreamBackend) AddRoute(context.Context, json.RawMessage) error { return nil }
-func (b *recoveryStreamBackend) Apply(context.Context, []proxy.Artifact) error {
-	b.order = append(b.order, "activate")
-	return nil
-}
+func (b *recoveryStreamBackend) Apply(context.Context, []proxy.Artifact) error   { return nil }
 func (b *recoveryStreamBackend) Prune(context.Context, []proxy.Target) (int, error) {
 	b.order = append(b.order, "prune")
 	return 0, nil
@@ -120,8 +125,22 @@ func TestApplyIntentsRepairsBeforeOneFreshReconcile(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale path remains: %v", err)
 	}
-	if got := strings.Join(backend.order, ","); got != "recover,validate,activate,ensure,clear,prune" {
+	if got := strings.Join(backend.order, ","); got != "inspect,recover,validate,activate,ensure,clear,prune,inspect" {
 		t.Fatalf("order=%s", got)
+	}
+}
+
+func TestDesiredTargetProtectsNormalFileBackedIntentBeforeRender(t *testing.T) {
+	for _, tc := range []struct {
+		info proxy.Info
+		want string
+	}{
+		{proxy.Info{Kind: proxy.KindNginx, ConfigDir: "/etc/nginx/sites-available"}, "/etc/nginx/sites-available/nurproxy-app.example.com.conf"},
+		{proxy.Info{Kind: proxy.KindApache, ConfigDir: "/etc/apache2/sites-available"}, "/etc/apache2/sites-available/nurproxy-app.example.com.conf"},
+	} {
+		if got := desiredTarget(tc.info, "app.example.com"); got.Kind != proxy.TargetKindFile || got.Path != tc.want {
+			t.Fatalf("desired target for %s = %#v, want %q", tc.info.Kind, got, tc.want)
+		}
 	}
 }
 

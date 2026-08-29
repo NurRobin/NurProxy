@@ -247,7 +247,7 @@ func TestShapeValidation(t *testing.T) {
 		ResourceFingerprint: "fingerprint", FirstSeenAt: now, LastSeenAt: now, Occurrences: 1,
 	}
 	validCapability := Capability{Stage: 1, Actions: []Action{ActionRemoveManagedTemp}}
-	validRequest := RepairRequest{OperationID: "op-1", DiagnosticID: "diag-1", Action: ActionRemoveManagedTemp}
+	validRequest := RepairRequest{OperationID: "op-1", DiagnosticID: "diag-1", Action: ActionRemoveManagedTemp, StartedAt: now, InitialStep: Step{Name: "planned", Summary: "safe typed repair requested", State: OperationStatePlanned, At: now}}
 	validReport := OperationReport{
 		OperationID: "op-1", DiagnosticID: "diag-1", Action: ActionRemoveManagedTemp,
 		Source: RequestSourceAutomatic, State: OperationStateApplying, StartedAt: now,
@@ -265,6 +265,11 @@ func TestShapeValidation(t *testing.T) {
 		if tt.err != nil {
 			t.Errorf("%s: %v", tt.name, tt.err)
 		}
+	}
+	missingStart := validRequest
+	missingStart.StartedAt = time.Time{}
+	if missingStart.Validate() == nil {
+		t.Fatal("manual repair request without persisted start identity was accepted")
 	}
 
 	invalid := []struct {

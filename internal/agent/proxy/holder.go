@@ -195,6 +195,16 @@ func (h *Holder) ExecuteRecovery(ctx context.Context, candidate RecoveryCandidat
 	return inspector.ExecuteRecovery(ctx, candidate, bundles)
 }
 
+func (h *Holder) ReloadRecovery(ctx context.Context) error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	inspector, ok := h.current.(RecoveryInspector)
+	if !ok {
+		return ErrRecoveryUnsupported
+	}
+	return inspector.ReloadRecovery(ctx)
+}
+
 // ---- caddyOps forwarding (admin-API primitives the API/stream drive) ---------
 //
 // These are NOT part of proxy.Proxy; they are the concrete primitives the bundled

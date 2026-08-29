@@ -241,9 +241,11 @@ type Capability struct {
 }
 
 type RepairRequest struct {
-	OperationID  string `json:"operation_id"`
-	DiagnosticID string `json:"diagnostic_id"`
-	Action       Action `json:"action"`
+	OperationID  string    `json:"operation_id"`
+	DiagnosticID string    `json:"diagnostic_id"`
+	Action       Action    `json:"action"`
+	StartedAt    time.Time `json:"started_at"`
+	InitialStep  Step      `json:"initial_step"`
 }
 
 type Step struct {
@@ -342,6 +344,15 @@ func (r RepairRequest) Validate() error {
 	}
 	if !r.Action.Valid() {
 		return fmt.Errorf("invalid repair action %q", r.Action)
+	}
+	if r.StartedAt.IsZero() || r.InitialStep.State != OperationStatePlanned || r.InitialStep.At.IsZero() || !r.InitialStep.At.Equal(r.StartedAt) || strings.TrimSpace(r.InitialStep.Name) == "" {
+		return fmt.Errorf("repair request requires the persisted planned start identity")
+	}
+	if err := validateBoundedSanitized("repair request initial step name", r.InitialStep.Name); err != nil {
+		return err
+	}
+	if err := validateBoundedSanitized("repair request initial step summary", r.InitialStep.Summary); err != nil {
+		return err
 	}
 	return nil
 }

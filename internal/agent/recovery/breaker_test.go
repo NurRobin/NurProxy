@@ -43,17 +43,17 @@ func TestBreakerIgnoresFailuresOutsideWindowAndSuccessClears(t *testing.T) {
 	}
 }
 
-func TestRollbackFailedBlocksManualUntilSuccessfulManualValidation(t *testing.T) {
+func TestRollbackFailedAllowsOnlyManualValidationUntilItSucceeds(t *testing.T) {
 	now := testTime()
 	b := NewBreaker()
 	key := BreakerKey{Action: recoverymodel.ActionRematerializeRuntimeKey, Fingerprint: "fp"}
 	b.Record(key, recoverymodel.OperationStateRollbackFailed, now, false)
-	if b.Allow(key, recoverymodel.RequestSourceUser, now.Add(2*time.Hour)).Allowed {
-		t.Fatal("manual retry bypassed rollback_failed latch")
+	if !b.Allow(key, recoverymodel.RequestSourceUser, now.Add(2*time.Hour)).Allowed {
+		t.Fatal("manual validation path was blocked by rollback_failed latch")
 	}
 	b.Record(key, recoverymodel.OperationStateSucceeded, now.Add(3*time.Hour), false)
-	if b.Allow(key, recoverymodel.RequestSourceUser, now.Add(3*time.Hour)).Allowed {
-		t.Fatal("automatic success cleared rollback_failed latch")
+	if b.Allow(key, recoverymodel.RequestSourceAutomatic, now.Add(3*time.Hour)).Allowed {
+		t.Fatal("non-manual success cleared rollback_failed latch")
 	}
 	b.Record(key, recoverymodel.OperationStateSucceeded, now.Add(4*time.Hour), true)
 	if !b.Allow(key, recoverymodel.RequestSourceAutomatic, now.Add(4*time.Hour)).Allowed {
@@ -87,7 +87,7 @@ func TestBreakerPersistsWindowAndRollbackFailedLatchAcrossRestart(t *testing.T) 
 	if restarted.Allow(windowKey, recoverymodel.RequestSourceAutomatic, now.Add(3*time.Minute)).Allowed {
 		t.Fatal("time breaker lost across restart")
 	}
-	if restarted.Allow(latchKey, recoverymodel.RequestSourceUser, now.Add(2*time.Hour)).Allowed {
+	if restarted.Allow(latchKey, recoverymodel.RequestSourceAutomatic, now.Add(2*time.Hour)).Allowed {
 		t.Fatal("rollback_failed latch lost across restart")
 	}
 }

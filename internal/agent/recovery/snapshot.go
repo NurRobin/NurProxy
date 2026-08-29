@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +26,7 @@ import (
 
 const (
 	manifestFilename = "manifest.json"
-	manifestVersion  = 1
+	manifestVersion  = 2
 	retentionAge     = 7 * 24 * time.Hour
 	retentionCount   = 20
 )
@@ -50,14 +52,16 @@ type SnapshotEntry struct {
 }
 
 type SnapshotManifest struct {
-	Version     int                          `json:"version"`
-	OperationID string                       `json:"operation_id"`
-	Action      recoverymodel.Action         `json:"action"`
-	Fingerprint string                       `json:"fingerprint"`
-	CreatedAt   time.Time                    `json:"created_at"`
-	UpdatedAt   time.Time                    `json:"updated_at"`
-	State       recoverymodel.OperationState `json:"state"`
-	Entries     []SnapshotEntry              `json:"entries"`
+	Version     int                           `json:"version"`
+	OperationID string                        `json:"operation_id"`
+	Action      recoverymodel.Action          `json:"action"`
+	Fingerprint string                        `json:"fingerprint"`
+	CreatedAt   time.Time                     `json:"created_at"`
+	UpdatedAt   time.Time                     `json:"updated_at"`
+	State       recoverymodel.OperationState  `json:"state"`
+	Report      recoverymodel.OperationReport `json:"report"`
+	Diagnostic  recoverymodel.Diagnostic      `json:"diagnostic"`
+	Entries     []SnapshotEntry               `json:"entries"`
 }
 
 type SnapshotStore struct {
@@ -106,7 +110,18 @@ func (s *SnapshotStore) OperationDir(operationID string) string {
 }
 
 func (s *SnapshotStore) Create(operationID string, action recoverymodel.Action, fingerprint string, paths []GuardedPath, now time.Time) (*SnapshotManifest, error) {
-	if s == nil || !validOperationID(operationID) || !action.Valid() || !validOpaqueID(fingerprint) || now.IsZero() || len(paths) == 0 {
+	report := recoverymodel.OperationReport{OperationID: operationID, DiagnosticID: "legacy-" + fingerprint, Action: action, Source: recoverymodel.RequestSourceAutomatic, State: recoverymodel.OperationStateSnapshotted, SnapshotReference: operationID, StartedAt: now.UTC(), Steps: []recoverymodel.Step{{Name: "detected", State: recoverymodel.OperationStateDetected, At: now.UTC()}, {Name: "planned", State: recoverymodel.OperationStatePlanned, At: now.UTC()}, {Name: "snapshotted", State: recoverymodel.OperationStateSnapshotted, At: now.UTC()}}}
+	return s.CreateOperation(report, fingerprint, paths, now)
+}
+
+func (s *SnapshotStore) CreateOperation(report recoverymodel.OperationReport, fingerprint string, paths []GuardedPath, now time.Time) (*SnapshotManifest, error) {
+	return s.CreateOperationForDiagnostic(report, snapshotDiagnostic(report, fingerprint, paths, now), paths, now)
+}
+
+func (s *SnapshotStore) CreateOperationForDiagnostic(report recoverymodel.OperationReport, diagnostic recoverymodel.Diagnostic, paths []GuardedPath, now time.Time) (*SnapshotManifest, error) {
+	operationID, action := report.OperationID, report.Action
+	fingerprint := diagnostic.ResourceFingerprint
+	if s == nil || !validOperationID(operationID) || !action.Valid() || !validOpaqueID(fingerprint) || now.IsZero() || len(paths) == 0 || report.State != recoverymodel.OperationStateSnapshotted || report.SnapshotReference != operationID || report.Validate() != nil || diagnostic.Validate() != nil || diagnostic.ID != report.DiagnosticID || diagnostic.ProposedAction != action {
 		return nil, fmt.Errorf("invalid snapshot metadata")
 	}
 	s.mu.Lock()
@@ -143,7 +158,7 @@ func (s *SnapshotStore) Create(operationID string, action recoverymodel.Action, 
 	if err := filesDir.Chmod(0o700); err != nil {
 		return nil, err
 	}
-	manifest := &SnapshotManifest{Version: manifestVersion, OperationID: operationID, Action: action, Fingerprint: fingerprint, CreatedAt: now.UTC(), UpdatedAt: now.UTC(), State: recoverymodel.OperationStateSnapshotted, Entries: make([]SnapshotEntry, 0, len(paths))}
+	manifest := &SnapshotManifest{Version: manifestVersion, OperationID: operationID, Action: action, Fingerprint: fingerprint, CreatedAt: now.UTC(), UpdatedAt: now.UTC(), State: recoverymodel.OperationStateSnapshotted, Report: report, Diagnostic: diagnostic, Entries: make([]SnapshotEntry, 0, len(paths))}
 	seen := make(map[string]struct{}, len(paths))
 	for i, checked := range paths {
 		if checked.owner == nil || checked.owner.Recheck(checked) != nil {
@@ -170,6 +185,15 @@ func (s *SnapshotStore) Create(operationID string, action recoverymodel.Action, 
 	}
 	cleanup = false
 	return manifest, nil
+}
+
+func snapshotDiagnostic(report recoverymodel.OperationReport, fingerprint string, paths []GuardedPath, now time.Time) recoverymodel.Diagnostic {
+	affected := make([]string, 0, len(paths))
+	for _, path := range paths {
+		affected = append(affected, path.Path)
+	}
+	sort.Strings(affected)
+	return recoverymodel.Diagnostic{ID: report.DiagnosticID, Code: recoverymodel.CodeUnknownProxyError, Subsystem: "proxy", Severity: recoverymodel.SeverityError, Ownership: recoverymodel.OwnershipNurProxy, Summary: "Durable safe recovery operation", AffectedPaths: affected, ResourceFingerprint: fingerprint, ProposedAction: report.Action, AutoRepairEligible: true, FirstSeenAt: now.UTC(), LastSeenAt: now.UTC(), Occurrences: 1}
 }
 
 func captureSnapshot(filesDir *os.File, index int, checked GuardedPath) (SnapshotEntry, error) {
@@ -268,6 +292,14 @@ func (s *SnapshotStore) loadUnlocked(operationID string) (*SnapshotManifest, err
 }
 
 func (s *SnapshotStore) Transition(operationID string, expected, next recoverymodel.OperationState, now time.Time) (*SnapshotManifest, error) {
+	return s.transition(operationID, expected, next, recoverymodel.OperationReport{}, now)
+}
+
+func (s *SnapshotStore) TransitionReport(operationID string, expected recoverymodel.OperationState, report recoverymodel.OperationReport, now time.Time) (*SnapshotManifest, error) {
+	return s.transition(operationID, expected, report.State, report, now)
+}
+
+func (s *SnapshotStore) transition(operationID string, expected, next recoverymodel.OperationState, report recoverymodel.OperationReport, now time.Time) (*SnapshotManifest, error) {
 	if s == nil || !validOperationID(operationID) {
 		return nil, fmt.Errorf("invalid operation ID")
 	}
@@ -281,6 +313,9 @@ func (s *SnapshotStore) Transition(operationID string, expected, next recoverymo
 		return nil, err
 	}
 	if manifest.State == next && ValidTransition(expected, next) {
+		if report.OperationID != "" && !reflect.DeepEqual(report, manifest.Report) {
+			return nil, fmt.Errorf("idempotent operation report mismatch")
+		}
 		return manifest, nil
 	}
 	if manifest.State != expected {
@@ -288,6 +323,21 @@ func (s *SnapshotStore) Transition(operationID string, expected, next recoverymo
 	}
 	if !ValidTransition(expected, next) {
 		return nil, fmt.Errorf("invalid operation transition %s -> %s", expected, next)
+	}
+	if report.OperationID != "" {
+		if report.OperationID != manifest.OperationID || report.DiagnosticID != manifest.Report.DiagnosticID || report.Action != manifest.Action || report.Source != manifest.Report.Source || !report.StartedAt.Equal(manifest.Report.StartedAt) || report.SnapshotReference != manifest.Report.SnapshotReference || report.State != next {
+			return nil, fmt.Errorf("operation report identity or state mismatch")
+		}
+		if err := report.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid operation report: %w", err)
+		}
+		if len(report.Steps) < len(manifest.Report.Steps) || !slices.Equal(report.Steps[:len(manifest.Report.Steps)], manifest.Report.Steps) {
+			return nil, fmt.Errorf("operation report history prefix mismatch")
+		}
+		manifest.Report = report
+	} else {
+		manifest.Report.State = next
+		manifest.Report.Steps = append(manifest.Report.Steps, recoverymodel.Step{Name: string(next), State: next, At: now.UTC()})
 	}
 	manifest.State = next
 	transitionAt := now.UTC()
@@ -310,7 +360,17 @@ func (s *SnapshotStore) PrepareRestart(operationID string) (RestartDisposition, 
 	if disposition != RestartBeginRollback {
 		return disposition, nil
 	}
-	if _, err := s.Transition(operationID, recoverymodel.OperationStateApplying, recoverymodel.OperationStateRollingBack, time.Now().UTC()); err != nil {
+	report := manifest.Report
+	report.State = recoverymodel.OperationStateRollingBack
+	at := time.Now().UTC()
+	if at.Before(manifest.UpdatedAt) {
+		at = manifest.UpdatedAt
+	}
+	report.Steps = append(report.Steps, recoverymodel.Step{Name: string(report.State), Summary: "resuming rollback after restart", State: report.State, At: at})
+	if err := report.Validate(); err != nil {
+		return RestartNone, fmt.Errorf("invalid restart report: %w", err)
+	}
+	if _, err := s.TransitionReport(operationID, recoverymodel.OperationStateApplying, report, at); err != nil {
 		return RestartNone, err
 	}
 	return RestartResumeRollback, nil
@@ -669,6 +729,12 @@ func validateManifest(manifest *SnapshotManifest, opDir string) error {
 	}
 	if !manifest.State.Valid() {
 		return fmt.Errorf("invalid manifest state")
+	}
+	if manifest.Report.OperationID != manifest.OperationID || manifest.Report.Action != manifest.Action || manifest.Report.State != manifest.State || manifest.Report.Validate() != nil {
+		return fmt.Errorf("invalid manifest operation report")
+	}
+	if manifest.Diagnostic.ID != manifest.Report.DiagnosticID || manifest.Diagnostic.ProposedAction != manifest.Action || manifest.Diagnostic.ResourceFingerprint != manifest.Fingerprint || manifest.Diagnostic.Validate() != nil {
+		return fmt.Errorf("invalid manifest diagnostic")
 	}
 	seen := make(map[string]struct{}, len(manifest.Entries))
 	for _, entry := range manifest.Entries {

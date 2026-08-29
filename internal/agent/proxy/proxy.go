@@ -91,6 +91,7 @@ type Proxy interface {
 type RecoveryInspector interface {
 	InspectRecovery(context.Context, RecoveryDesired) ([]RecoveryCandidate, error)
 	ExecuteRecovery(context.Context, RecoveryCandidate, map[string]CertBundle) error
+	ReloadRecovery(context.Context) error
 }
 
 type RecoveryDesired struct {

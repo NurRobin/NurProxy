@@ -57,7 +57,7 @@ func (b *coordinatorBackend) Validate(context.Context) error {
 	}
 	return b.validateErr
 }
-func (b *coordinatorBackend) Apply(context.Context, []proxy.Artifact) error {
+func (b *coordinatorBackend) ReloadRecovery(context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.activations++
@@ -146,14 +146,36 @@ func TestCoordinatorFailsClosedUntilPolicyAndSupportsDiagnosisOnly(t *testing.T)
 	}
 }
 
-func TestCoordinatorClearsRecoveredDiagnosticsAfterCleanReconcile(t *testing.T) {
+func TestCoordinatorClearsRecoveredDiagnosticsOnlyAfterFreshInspection(t *testing.T) {
+	c, backend, reporter, _, _ := newCoordinatorFixture(t)
+	if diagnostics, _ := c.Inspect(context.Background()); len(diagnostics) != 1 {
+		t.Fatalf("diagnostics=%v", diagnostics)
+	}
+	backend.candidates = nil
+	if err := c.ReconcileSucceeded(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if active := c.ActiveDiagnostics(); len(active) != 0 {
+		t.Fatalf("active=%v", active)
+	}
+	reporter.mu.Lock()
+	last := reporter.reports[len(reporter.reports)-1]
+	reporter.mu.Unlock()
+	if last.Diagnostics == nil || len(last.Diagnostics) != 0 {
+		t.Fatalf("resolution was not emitted as authoritative empty snapshot: %#v", last)
+	}
+}
+
+func TestCoordinatorFreshInspectionDoesNotClearPersistentDiagnosis(t *testing.T) {
 	c, _, _, _, _ := newCoordinatorFixture(t)
 	if diagnostics, _ := c.Inspect(context.Background()); len(diagnostics) != 1 {
 		t.Fatalf("diagnostics=%v", diagnostics)
 	}
-	c.ReconcileSucceeded()
-	if active := c.ActiveDiagnostics(); len(active) != 0 {
-		t.Fatalf("active=%v", active)
+	if err := c.ReconcileSucceeded(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if active := c.ActiveDiagnostics(); len(active) != 1 {
+		t.Fatalf("persistent diagnostic was cleared: %v", active)
 	}
 }
 
@@ -228,7 +250,8 @@ func TestCoordinatorSerializesConcurrentRepairAndRejectsReplayMismatch(t *testin
 	c, backend, _, _, _ := newCoordinatorFixture(t)
 	c.SetPolicy(true)
 	diagnostics, _ := c.Inspect(context.Background())
-	req := recoverymodel.RepairRequest{OperationID: "manual-op", DiagnosticID: diagnostics[0].ID, Action: diagnostics[0].ProposedAction}
+	started := testTime()
+	req := recoverymodel.RepairRequest{OperationID: "manual-op", DiagnosticID: diagnostics[0].ID, Action: diagnostics[0].ProposedAction, StartedAt: started, InitialStep: recoverymodel.Step{Name: "planned", Summary: "safe typed repair requested", State: recoverymodel.OperationStatePlanned, At: started}}
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
@@ -237,6 +260,20 @@ func TestCoordinatorSerializesConcurrentRepairAndRejectsReplayMismatch(t *testin
 	wg.Wait()
 	if backend.maxActive != 1 || backend.executions != 1 {
 		t.Fatalf("max active=%d executions=%d", backend.maxActive, backend.executions)
+	}
+	var manualStates []recoverymodel.OperationState
+	for _, queued := range c.reporter.(*collectingReporter).reports {
+		if len(queued.Operations) == 1 && queued.Operations[0].OperationID == req.OperationID {
+			manualStates = append(manualStates, queued.Operations[0].State)
+		}
+	}
+	if len(manualStates) == 0 || manualStates[0] != recoverymodel.OperationStatePlanned {
+		t.Fatalf("manual states=%v", manualStates)
+	}
+	for _, state := range manualStates {
+		if state == recoverymodel.OperationStateDetected {
+			t.Fatalf("manual operation emitted detected: %v", manualStates)
+		}
 	}
 	bad := req
 	bad.OperationID = "other-op"
@@ -249,6 +286,12 @@ func TestCoordinatorSerializesConcurrentRepairAndRejectsReplayMismatch(t *testin
 	if _, err := c.HandleRequest(context.Background(), reused); err == nil {
 		t.Fatal("reused ID with changed action accepted")
 	}
+	reused = req
+	reused.StartedAt = reused.StartedAt.Add(time.Second)
+	reused.InitialStep.At = reused.StartedAt
+	if _, err := c.HandleRequest(context.Background(), reused); err == nil {
+		t.Fatal("reused ID with changed persisted start identity accepted")
+	}
 }
 
 func TestCoordinatorCapabilityIsStableAndCrashRecoveryNeverRepeatsMutation(t *testing.T) {
@@ -260,7 +303,8 @@ func TestCoordinatorCapabilityIsStableAndCrashRecoveryNeverRepeatsMutation(t *te
 	c.SetPolicy(true)
 	diagnostics, _ := c.Inspect(context.Background())
 	// A request that already completed is replayed from memory without mutation.
-	req := recoverymodel.RepairRequest{OperationID: "crash-safe-op", DiagnosticID: diagnostics[0].ID, Action: candidate.Action}
+	started := testTime()
+	req := recoverymodel.RepairRequest{OperationID: "crash-safe-op", DiagnosticID: diagnostics[0].ID, Action: candidate.Action, StartedAt: started, InitialStep: recoverymodel.Step{Name: "planned", Summary: "safe typed repair requested", State: recoverymodel.OperationStatePlanned, At: started}}
 	first, err := c.HandleRequest(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
@@ -305,5 +349,28 @@ func TestCoordinatorCrashRecoveryRollsBackUnknownApplyingMutation(t *testing.T) 
 	}
 	if data, err := os.ReadFile(path); err != nil || string(data) != "before" {
 		t.Fatalf("restored=%q err=%v", data, err)
+	}
+}
+
+func TestCoordinatorRestartKeepsRollbackFailedDiagnosticLatched(t *testing.T) {
+	store, err := NewSnapshotStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := persistTestManifest(store, "failed-restart", recoverymodel.OperationStateRollbackFailed, testTime()); err != nil {
+		t.Fatal(err)
+	}
+	backend := &coordinatorBackend{}
+	c := NewCoordinator("agent-1", backend, store, NewBreaker(), &collectingReporter{}, nil, func() time.Time { return testTime() })
+	report, err := c.Recover(context.Background(), "failed-restart")
+	if err != nil || report.State != recoverymodel.OperationStateRollbackFailed {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+	if err := c.ReconcileSucceeded(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if active := c.ActiveDiagnostics(); len(active) != 1 || active[0].ID != report.DiagnosticID {
+		t.Fatalf("latched diagnostics=%+v", active)
 	}
 }

@@ -20,6 +20,7 @@ type CoordinatorBackend interface {
 	InspectRecovery(context.Context, proxy.RecoveryDesired) ([]proxy.RecoveryCandidate, error)
 	ExecuteRecovery(context.Context, proxy.RecoveryCandidate, map[string]proxy.CertBundle) error
 	Validate(context.Context) error
+	ReloadRecovery(context.Context) error
 }
 
 type DesiredState struct {
@@ -94,21 +95,11 @@ func (c *Coordinator) ActiveDiagnostics() []recoverymodel.Diagnostic {
 	return out
 }
 
-func (c *Coordinator) ReconcileSucceeded() {
+func (c *Coordinator) ReconcileSucceeded(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	latched := make(map[string]struct{})
-	for _, operation := range c.operations {
-		if operation.State == recoverymodel.OperationStateRollbackFailed {
-			latched[operation.DiagnosticID] = struct{}{}
-		}
-	}
-	for id := range c.diagnostics {
-		if _, keep := latched[id]; !keep {
-			delete(c.diagnostics, id)
-			delete(c.candidates, id)
-		}
-	}
+	_, err := c.inspectLocked(ctx)
+	return err
 }
 
 func (c *Coordinator) Capability() recoverymodel.Capability {
@@ -161,6 +152,10 @@ func pathsOverlap(left, right []string) bool {
 func (c *Coordinator) Inspect(ctx context.Context) ([]recoverymodel.Diagnostic, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.inspectLocked(ctx)
+}
+
+func (c *Coordinator) inspectLocked(ctx context.Context) ([]recoverymodel.Diagnostic, error) {
 	if c.backend == nil {
 		return nil, fmt.Errorf("recovery backend is not configured")
 	}
@@ -170,6 +165,7 @@ func (c *Coordinator) Inspect(ctx context.Context) ([]recoverymodel.Diagnostic, 
 		return nil, err
 	}
 	diagnostics := make([]recoverymodel.Diagnostic, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
 		if err := candidate.Validate(); err != nil {
 			continue
@@ -182,9 +178,27 @@ func (c *Coordinator) Inspect(ctx context.Context) ([]recoverymodel.Diagnostic, 
 			}
 		}
 		c.recordDiagnostic(diagnostic, candidate)
+		seen[diagnostic.ID] = struct{}{}
 		diagnostics = append(diagnostics, diagnostic)
 	}
+	for id := range c.diagnostics {
+		if _, present := seen[id]; present || c.rollbackFailedDiagnostic(id) {
+			continue
+		}
+		delete(c.diagnostics, id)
+		delete(c.candidates, id)
+	}
+	c.emitDiagnosticSnapshot()
 	return diagnostics, nil
+}
+
+func (c *Coordinator) rollbackFailedDiagnostic(id string) bool {
+	for _, operation := range c.operations {
+		if operation.DiagnosticID == id && operation.State == recoverymodel.OperationStateRollbackFailed {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Coordinator) AutoRepair(ctx context.Context, diagnostic recoverymodel.Diagnostic) (recoverymodel.OperationReport, error) {
@@ -200,7 +214,7 @@ func (c *Coordinator) HandleRequest(ctx context.Context, request recoverymodel.R
 		return recoverymodel.OperationReport{}, err
 	}
 	if previous, exists := c.operations[request.OperationID]; exists {
-		if previous.DiagnosticID != request.DiagnosticID || previous.Action != request.Action {
+		if previous.DiagnosticID != request.DiagnosticID || previous.Action != request.Action || !previous.StartedAt.Equal(request.StartedAt) || len(previous.Steps) == 0 || previous.Steps[0] != request.InitialStep {
 			return recoverymodel.OperationReport{}, fmt.Errorf("repair operation ID was already used for a different request")
 		}
 		return previous, nil
@@ -227,22 +241,34 @@ func (c *Coordinator) Recover(ctx context.Context, operationID string) (recovery
 	if err != nil {
 		return recoverymodel.OperationReport{}, err
 	}
-	diagnosticID := "restart-" + manifest.Fingerprint
-	for id, diagnostic := range c.diagnostics {
-		if diagnostic.ResourceFingerprint == manifest.Fingerprint && diagnostic.ProposedAction == manifest.Action {
-			diagnosticID = id
-			break
-		}
+	report := manifest.Report
+	if c.lastNow.Before(manifest.UpdatedAt) {
+		c.lastNow = manifest.UpdatedAt
 	}
-	report := recoverymodel.OperationReport{OperationID: operationID, DiagnosticID: diagnosticID, Action: manifest.Action, Source: recoverymodel.RequestSourceAutomatic, State: manifest.State, SnapshotReference: manifest.OperationID, StartedAt: manifest.CreatedAt}
-	if c.lastNow.Before(manifest.CreatedAt) {
-		c.lastNow = manifest.CreatedAt
+	key := BreakerKey{Action: manifest.Action, Fingerprint: manifest.Fingerprint}
+	if manifest.State == recoverymodel.OperationStateRollbackFailed {
+		c.operations[operationID] = report
+		c.diagnostics[manifest.Diagnostic.ID] = manifest.Diagnostic
+		_ = c.breaker.Record(key, report.State, manifest.UpdatedAt, false)
+		c.emitDiagnosticSnapshot()
+		c.emitOperation(report)
+		return report, nil
 	}
 	disposition, err := c.store.PrepareRestart(operationID)
 	if err != nil {
 		return report, err
 	}
-	key := BreakerKey{Action: manifest.Action, Fingerprint: manifest.Fingerprint}
+	if disposition == RestartResumeRollback && manifest.State == recoverymodel.OperationStateApplying {
+		manifest, err = c.store.Load(operationID)
+		if err != nil {
+			return report, err
+		}
+		report = manifest.Report
+		if c.lastNow.Before(manifest.UpdatedAt) {
+			c.lastNow = manifest.UpdatedAt
+		}
+		c.emitOperation(report)
+	}
 	var validationCause error
 	if disposition == RestartResumeValidation {
 		validationErr := c.backend.Validate(ctx)
@@ -250,30 +276,35 @@ func (c *Coordinator) Recover(ctx context.Context, operationID string) (recovery
 			validationErr = c.activateValidated(ctx)
 		}
 		if validationErr == nil {
-			if _, err = c.store.Transition(operationID, recoverymodel.OperationStateValidating, recoverymodel.OperationStateSucceeded, c.now()); err != nil {
-				return report, err
-			}
 			report.State, report.ValidationOutcome = recoverymodel.OperationStateSucceeded, "valid"
 			c.addStep(&report, report.State, "post-crash validation succeeded")
 			at := c.now()
 			report.FinishedAt = &at
+			if _, err = c.store.TransitionReport(operationID, recoverymodel.OperationStateValidating, report, at); err != nil {
+				return report, err
+			}
 			c.operations[operationID] = report
 			c.emitOperation(report)
 			_ = c.breaker.Record(key, report.State, at, false)
+			_ = c.store.Prune(at)
 			return report, nil
 		}
 		validationCause = validationErr
 		report.ValidationOutcome = recoverymodel.SanitizeEvidence(validationErr.Error())
-		if _, err = c.store.Transition(operationID, recoverymodel.OperationStateValidating, recoverymodel.OperationStateRollingBack, c.now()); err != nil {
+		report.State = recoverymodel.OperationStateRollingBack
+		c.addStep(&report, report.State, "resuming rollback after restart")
+		if _, err = c.store.TransitionReport(operationID, recoverymodel.OperationStateValidating, report, c.now()); err != nil {
 			return report, err
 		}
+		c.emitOperation(report)
 		disposition = RestartResumeRollback
 	}
 	if disposition != RestartResumeRollback {
 		return report, fmt.Errorf("operation state %q is not crash-resumable", manifest.State)
 	}
-	report.State = recoverymodel.OperationStateRollingBack
-	c.addStep(&report, report.State, "resuming rollback after restart")
+	if report.State != recoverymodel.OperationStateRollingBack {
+		return report, fmt.Errorf("operation state %q is not ready for crash rollback", report.State)
+	}
 	rollbackErr := c.store.Rollback(operationID)
 	if rollbackErr == nil {
 		rollbackErr = c.backend.Validate(ctx)
@@ -285,10 +316,6 @@ func (c *Coordinator) Recover(ctx context.Context, operationID string) (recovery
 	if rollbackErr != nil {
 		final = recoverymodel.OperationStateRollbackFailed
 	}
-	if _, err = c.store.Transition(operationID, recoverymodel.OperationStateRollingBack, final, c.now()); err != nil && rollbackErr == nil {
-		rollbackErr = err
-		final = recoverymodel.OperationStateRollbackFailed
-	}
 	report.State = final
 	if rollbackErr == nil {
 		report.RollbackOutcome = "restored and valid"
@@ -298,9 +325,13 @@ func (c *Coordinator) Recover(ctx context.Context, operationID string) (recovery
 	c.addStep(&report, final, report.RollbackOutcome)
 	at := c.now()
 	report.FinishedAt = &at
+	if _, err = c.store.TransitionReport(operationID, recoverymodel.OperationStateRollingBack, report, at); err != nil {
+		return report, err
+	}
 	c.operations[operationID] = report
 	c.emitOperation(report)
 	_ = c.breaker.Record(key, final, at, false)
+	_ = c.store.Prune(at)
 	if rollbackErr != nil {
 		return report, rollbackErr
 	}
@@ -325,8 +356,19 @@ func (c *Coordinator) repairLocked(ctx context.Context, diagnostic recoverymodel
 		opID = fmt.Sprintf("auto-%d-%d", now.UnixNano(), c.sequence)
 	}
 	report := recoverymodel.OperationReport{OperationID: opID, DiagnosticID: diagnostic.ID, Action: diagnostic.ProposedAction, Source: source, State: recoverymodel.OperationStateDetected, StartedAt: now}
-	c.addStep(&report, recoverymodel.OperationStateDetected, "recovery condition detected")
-	c.emitOperation(report)
+	if source == recoverymodel.RequestSourceAutomatic {
+		c.addStep(&report, recoverymodel.OperationStateDetected, "recovery condition detected")
+	} else {
+		report.StartedAt = request.StartedAt
+		if c.lastNow.Before(request.StartedAt) {
+			c.lastNow = request.StartedAt
+		}
+		report.State = recoverymodel.OperationStatePlanned
+		report.Steps = []recoverymodel.Step{request.InitialStep}
+	}
+	if !c.emitOperation(report) {
+		return recoverymodel.OperationReport{}, fmt.Errorf("recovery report queue is at capacity")
+	}
 	finish := func(state recoverymodel.OperationState, message string) recoverymodel.OperationReport {
 		report.State = state
 		c.addStep(&report, state, message)
@@ -349,38 +391,54 @@ func (c *Coordinator) repairLocked(ctx context.Context, diagnostic recoverymodel
 		return finish(recoverymodel.OperationStateSuppressed, decision.Reason), nil
 	}
 
-	report.State = recoverymodel.OperationStatePlanned
-	c.addStep(&report, recoverymodel.OperationStatePlanned, "safe typed repair planned")
+	if source == recoverymodel.RequestSourceAutomatic {
+		report.State = recoverymodel.OperationStatePlanned
+		c.addStep(&report, recoverymodel.OperationStatePlanned, "safe typed repair planned")
+	}
 	paths, err := c.resolveCandidate(candidate)
 	if err != nil {
-		report.Steps = report.Steps[:1]
+		if source == recoverymodel.RequestSourceAutomatic {
+			report.Steps = report.Steps[:1]
+		}
 		return finish(recoverymodel.OperationStateDiagnosisOnly, err.Error()), err
 	}
-	manifest, err := c.store.Create(opID, candidate.Action, diagnostic.ResourceFingerprint, paths, c.now())
-	if err != nil {
-		report.Steps = report.Steps[:1]
-		return finish(recoverymodel.OperationStateDiagnosisOnly, err.Error()), err
-	}
-	c.emitOperation(report)
-	report.SnapshotReference = manifest.OperationID
+	plannedReport := report
+	report.SnapshotReference = opID
 	report.State = recoverymodel.OperationStateSnapshotted
 	c.addStep(&report, report.State, "prior filesystem state captured")
+	manifest, err := c.store.CreateOperationForDiagnostic(report, diagnostic, paths, c.now())
+	if err != nil {
+		report = plannedReport
+		if source == recoverymodel.RequestSourceAutomatic {
+			report.Steps = report.Steps[:1]
+			report.State = recoverymodel.OperationStateDetected
+		}
+		return finish(recoverymodel.OperationStateDiagnosisOnly, err.Error()), err
+	}
+	if source == recoverymodel.RequestSourceAutomatic {
+		c.emitOperation(plannedReport)
+	}
+	report.SnapshotReference = manifest.OperationID
 	c.emitOperation(report)
-	if _, err = c.store.Transition(opID, recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateApplying, c.now()); err != nil {
+	applying := report
+	applying.State = recoverymodel.OperationStateApplying
+	c.addStep(&applying, applying.State, "typed recovery action started")
+	if _, err = c.store.TransitionReport(opID, recoverymodel.OperationStateSnapshotted, applying, c.now()); err != nil {
 		return c.rollbackLocked(ctx, key, &report, recoverymodel.OperationStateSnapshotted, err)
 	}
-	report.State = recoverymodel.OperationStateApplying
-	c.addStep(&report, report.State, "typed recovery action started")
+	report = applying
 	c.emitOperation(report)
 	desired := c.currentDesired()
 	if err = c.backend.ExecuteRecovery(ctx, candidate, desired.Bundles); err != nil {
 		return c.rollbackLocked(ctx, key, &report, recoverymodel.OperationStateApplying, err)
 	}
-	if _, err = c.store.Transition(opID, recoverymodel.OperationStateApplying, recoverymodel.OperationStateValidating, c.now()); err != nil {
+	validating := report
+	validating.State = recoverymodel.OperationStateValidating
+	c.addStep(&validating, validating.State, "full proxy validation started")
+	if _, err = c.store.TransitionReport(opID, recoverymodel.OperationStateApplying, validating, c.now()); err != nil {
 		return c.rollbackLocked(ctx, key, &report, recoverymodel.OperationStateApplying, err)
 	}
-	report.State = recoverymodel.OperationStateValidating
-	c.addStep(&report, report.State, "full proxy validation started")
+	report = validating
 	c.emitOperation(report)
 	if err = c.backend.Validate(ctx); err != nil {
 		return c.rollbackLocked(ctx, key, &report, recoverymodel.OperationStateValidating, err)
@@ -388,26 +446,29 @@ func (c *Coordinator) repairLocked(ctx context.Context, diagnostic recoverymodel
 	if err = c.activateValidated(ctx); err != nil {
 		return c.rollbackLocked(ctx, key, &report, recoverymodel.OperationStateValidating, err)
 	}
-	if _, err = c.store.Transition(opID, recoverymodel.OperationStateValidating, recoverymodel.OperationStateSucceeded, c.now()); err != nil {
-		return report, err
-	}
 	report.ValidationOutcome = "valid"
 	report.State = recoverymodel.OperationStateSucceeded
 	c.addStep(&report, report.State, "repair validated and activated")
 	at := c.now()
 	report.FinishedAt = &at
+	if _, err = c.store.TransitionReport(opID, recoverymodel.OperationStateValidating, report, at); err != nil {
+		return report, err
+	}
 	c.operations[opID] = report
 	delete(c.diagnostics, diagnostic.ID)
 	delete(c.candidates, diagnostic.ID)
 	_ = c.breaker.Record(key, report.State, at, source == recoverymodel.RequestSourceUser)
 	c.emitOperation(report)
+	_ = c.store.Prune(at)
 	return report, nil
 }
 
 func (c *Coordinator) rollbackLocked(ctx context.Context, key BreakerKey, report *recoverymodel.OperationReport, expected recoverymodel.OperationState, cause error) (recoverymodel.OperationReport, error) {
-	_, transitionErr := c.store.Transition(report.OperationID, expected, recoverymodel.OperationStateRollingBack, c.now())
-	report.State = recoverymodel.OperationStateRollingBack
-	c.addStep(report, report.State, "restoring captured state")
+	rolling := *report
+	rolling.State = recoverymodel.OperationStateRollingBack
+	c.addStep(&rolling, rolling.State, "restoring captured state")
+	_, transitionErr := c.store.TransitionReport(report.OperationID, expected, rolling, c.now())
+	*report = rolling
 	c.emitOperation(*report)
 	rollbackErr := transitionErr
 	if rollbackErr == nil {
@@ -423,23 +484,23 @@ func (c *Coordinator) rollbackLocked(ctx context.Context, key BreakerKey, report
 	if rollbackErr != nil {
 		final = recoverymodel.OperationStateRollbackFailed
 	}
-	if _, err := c.store.Transition(report.OperationID, recoverymodel.OperationStateRollingBack, final, c.now()); err != nil && rollbackErr == nil {
-		rollbackErr = err
-		final = recoverymodel.OperationStateRollbackFailed
-	}
 	report.State = final
-	report.Error = recoverymodel.SanitizeEvidence(cause.Error())
 	if rollbackErr == nil {
 		report.RollbackOutcome = "restored and valid"
 	} else {
 		report.RollbackOutcome = recoverymodel.SanitizeEvidence(rollbackErr.Error())
 	}
+	report.Error = recoverymodel.SanitizeEvidence(cause.Error())
 	c.addStep(report, final, report.RollbackOutcome)
 	at := c.now()
 	report.FinishedAt = &at
+	if _, err := c.store.TransitionReport(report.OperationID, recoverymodel.OperationStateRollingBack, *report, at); err != nil {
+		return *report, fmt.Errorf("repair failed: %w; persist rollback outcome: %v", cause, err)
+	}
 	c.operations[report.OperationID] = *report
 	_ = c.breaker.Record(key, final, at, false)
 	c.emitOperation(*report)
+	_ = c.store.Prune(at)
 	if rollbackErr != nil {
 		return *report, fmt.Errorf("repair failed: %w; rollback failed: %v", cause, rollbackErr)
 	}
@@ -450,17 +511,7 @@ func (c *Coordinator) activateValidated(ctx context.Context) error {
 	if c.backend == nil {
 		return fmt.Errorf("recovery backend is not configured")
 	}
-	kind := c.backend.Info().Kind
-	if kind != proxy.KindNginx && kind != proxy.KindApache {
-		return nil
-	}
-	backend, ok := c.backend.(interface {
-		Apply(context.Context, []proxy.Artifact) error
-	})
-	if !ok {
-		return fmt.Errorf("file proxy backend cannot activate validated recovery")
-	}
-	return backend.Apply(ctx, nil)
+	return c.backend.ReloadRecovery(ctx)
 }
 
 func (c *Coordinator) currentDesired() DesiredState {
@@ -524,10 +575,11 @@ func (c *Coordinator) resolveCandidate(candidate proxy.RecoveryCandidate) ([]Gua
 func (c *Coordinator) addStep(report *recoverymodel.OperationReport, state recoverymodel.OperationState, summary string) {
 	report.Steps = append(report.Steps, recoverymodel.Step{Name: string(state), Summary: recoverymodel.SanitizeEvidence(summary), State: state, At: c.now()})
 }
-func (c *Coordinator) emitOperation(report recoverymodel.OperationReport) {
-	if c.reporter != nil {
-		c.reporter.Enqueue(proxymodel.RecoveryReport{Operations: []recoverymodel.OperationReport{report}})
+func (c *Coordinator) emitOperation(report recoverymodel.OperationReport) bool {
+	if c.reporter == nil {
+		return true
 	}
+	return c.reporter.Enqueue(proxymodel.RecoveryReport{Operations: []recoverymodel.OperationReport{report}})
 }
 func (c *Coordinator) recordDiagnostic(d recoverymodel.Diagnostic, candidate proxy.RecoveryCandidate) {
 	if previous, ok := c.diagnostics[d.ID]; ok {
@@ -538,9 +590,22 @@ func (c *Coordinator) recordDiagnostic(d recoverymodel.Diagnostic, candidate pro
 	if candidate.Action.Valid() {
 		c.candidates[d.ID] = candidate
 	}
-	if c.reporter != nil {
-		c.reporter.Enqueue(proxymodel.RecoveryReport{Diagnostics: []recoverymodel.Diagnostic{d}})
+	c.emitDiagnosticSnapshot()
+}
+
+func (c *Coordinator) emitDiagnosticSnapshot() {
+	if c.reporter == nil {
+		return
 	}
+	diagnostics := make([]recoverymodel.Diagnostic, 0, len(c.diagnostics))
+	for _, diagnostic := range c.diagnostics {
+		diagnostics = append(diagnostics, diagnostic)
+	}
+	sort.Slice(diagnostics, func(i, j int) bool { return diagnostics[i].ID < diagnostics[j].ID })
+	if diagnostics == nil {
+		diagnostics = []recoverymodel.Diagnostic{}
+	}
+	c.reporter.Enqueue(proxymodel.RecoveryReport{Diagnostics: diagnostics})
 }
 
 func diagnosticForCandidate(agentID string, candidate proxy.RecoveryCandidate, now time.Time) recoverymodel.Diagnostic {

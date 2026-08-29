@@ -159,7 +159,10 @@ type recordingRecoveryBackend struct {
 	candidates []RecoveryCandidate
 	desired    RecoveryDesired
 	executed   RecoveryCandidate
+	reloads    int
 }
+
+func (r *recordingRecoveryBackend) ReloadRecovery(context.Context) error { r.reloads++; return r.err }
 
 func (r *recordingRecoveryBackend) InspectRecovery(_ context.Context, desired RecoveryDesired) ([]RecoveryCandidate, error) {
 	r.desired = desired
@@ -195,6 +198,9 @@ func TestHolderRecoveryAdapterIsOptionalAndForwardsTypedValues(t *testing.T) {
 	}
 	if !reflect.DeepEqual(backend.executed, want) {
 		t.Fatalf("executed = %+v", backend.executed)
+	}
+	if err := holder.ReloadRecovery(ctx); err != nil || backend.reloads != 1 {
+		t.Fatalf("reload recovery err=%v count=%d", err, backend.reloads)
 	}
 }
 

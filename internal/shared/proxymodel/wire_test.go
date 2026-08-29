@@ -24,7 +24,7 @@ func TestRecoveryWireRoundTrips(t *testing.T) {
 		{
 			name: "request envelope",
 			in: RepairRequestEnvelope{Request: recoverymodel.RepairRequest{
-				OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionRemoveManagedTemp,
+				OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionRemoveManagedTemp, StartedAt: now, InitialStep: recoverymodel.Step{Name: "planned", Summary: "safe typed repair requested", State: recoverymodel.OperationStatePlanned, At: now},
 			}},
 			out: &RepairRequestEnvelope{},
 		},
@@ -66,8 +66,9 @@ func TestRecoveryWireRoundTrips(t *testing.T) {
 }
 
 func TestRepairRequestWireHasNoPathOrCommand(t *testing.T) {
+	now := time.Date(2026, 8, 28, 20, 15, 0, 0, time.UTC)
 	b, err := json.Marshal(RepairRequestEnvelope{Request: recoverymodel.RepairRequest{
-		OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionPruneManagedOrphan,
+		OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionPruneManagedOrphan, StartedAt: now, InitialStep: recoverymodel.Step{Name: "planned", State: recoverymodel.OperationStatePlanned, At: now},
 	}})
 	if err != nil {
 		t.Fatal(err)
