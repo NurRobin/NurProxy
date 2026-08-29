@@ -125,6 +125,20 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 }
 
 func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) bool {
+	agent, err := r.db.GetAgent(agentID)
+	if err != nil {
+		log.Printf("reconciler: cannot resolve backend for agent %s: %v", agentID, err)
+		return false
+	}
+	backend := backendForAgent(agent)
+	if backend != "nginx" && backend != "apache" {
+		return r.hub.PublishIntentSet(agentID, set)
+	}
+	for _, intent := range set.Intents {
+		if intent.Backend != backend {
+			return r.hub.PublishIntentSet(agentID, set)
+		}
+	}
 	managedHub, managed := r.hub.(interface {
 		PublishManagedIntentSet(string, helperprotocol.ManagedIntentSetEnvelope) bool
 	})
@@ -136,14 +150,43 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 	if err != nil {
 		return r.hub.PublishIntentSet(agentID, set)
 	}
-	intent, err := buildApplyIntent(agentID, helper.HelperInstanceID, set, time.Now().UTC())
+	deletions, err := r.db.ListManagedRouteTombstones(agentID)
+	if err != nil {
+		log.Printf("reconciler: cannot load managed route tombstones for agent %s: %v", agentID, err)
+		return false
+	}
+	now := time.Now().UTC()
+	revision, err := helperprotocol.Digest(set)
+	if err != nil {
+		log.Printf("reconciler: cannot digest managed desired state for agent %s: %v", agentID, err)
+		return false
+	}
+	if current, currentErr := r.db.GetCurrentManagedApply(agentID); currentErr == nil &&
+		current.HelperInstanceID == helper.HelperInstanceID && current.DesiredStateRevision == revision &&
+		current.IntentExpiresAt.After(now.Add(30*time.Second)) {
+		currentDeletionDigest, currentDigestErr := helperprotocol.Digest(current.SignedIntent.Envelope.Payload.DeletionSet)
+		deletionDigest, deletionDigestErr := helperprotocol.Digest(deletions)
+		if currentDigestErr == nil && deletionDigestErr == nil && currentDeletionDigest == deletionDigest {
+			return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: current.SignedIntent})
+		}
+	}
+	intent, err := buildApplyIntent(agentID, helper.HelperInstanceID, set, now)
 	if err != nil {
 		log.Printf("reconciler: cannot build managed apply intent for agent %s: %v", agentID, err)
+		return false
+	}
+	intent.DeletionSet = append([]helperprotocol.ManagedDeletion{}, deletions...)
+	if err := intent.Validate(); err != nil {
+		log.Printf("reconciler: managed deletion set is invalid for agent %s: %v", agentID, err)
 		return false
 	}
 	signed, err := r.applyAuthority.SignApplyIntent(intent)
 	if err != nil {
 		log.Printf("reconciler: cannot sign managed apply intent for agent %s: %v", agentID, err)
+		return false
+	}
+	if err := r.db.StoreManagedApplyIntent(agentID, signed, now); err != nil {
+		log.Printf("reconciler: cannot persist managed apply intent for agent %s: %v", agentID, err)
 		return false
 	}
 	return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed})
@@ -187,8 +230,8 @@ func buildApplyIntent(agentID, helperInstanceID string, set proxymodel.IntentSet
 	}
 	intent := helperprotocol.ApplyIntent{
 		AgentID: agentID, HelperInstanceID: helperInstanceID,
-		OperationID: "apply-" + revision[:32], DesiredStateRevision: revision,
-		Resources: resources, Artifacts: artifacts, DeletionSet: []string{}, Routes: routes,
+		OperationID: "apply-" + revision[:24] + "-" + strconv.FormatInt(issued.UnixNano(), 36), DesiredStateRevision: revision,
+		Resources: resources, Artifacts: artifacts, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: routes,
 		PruneCertificates: set.PruneCerts, CertificateKeep: append([]string{}, set.CertKeep...),
 		AuthorizationKind:    helperprotocol.AuthorizationStoredConvergence,
 		AuthorizationEventID: "desired-" + revision[:24],
@@ -1425,6 +1468,27 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 		// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
 		// applied) is fine.
 		artifactID := artifactIDForDomain(dom.ID)
+		if !dom.CertOnly {
+			srv, srvErr := r.db.GetServer(dom.ServerID)
+			if srvErr != nil {
+				log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
+				continue
+			}
+			agent, agentErr := r.db.GetAgent(srv.AgentID)
+			zone, zoneErr := r.db.GetZone(dom.ZoneID)
+			if agentErr != nil || zoneErr != nil {
+				log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
+				continue
+			}
+			backend := backendForAgent(agent)
+			if backend == "nginx" || backend == "apache" {
+				deletion := helperprotocol.ManagedDeletion{ResourceID: artifactID, Host: dom.FQDN(zone.Name), Backend: backend}
+				if tombstoneErr := r.db.UpsertManagedRouteTombstone(agent.ID, deletion, time.Now().UTC()); tombstoneErr != nil {
+					log.Printf("reconciler: cannot persist route deletion for domain %d: %v", dom.ID, tombstoneErr)
+					continue
+				}
+			}
+		}
 		if _, aErr := r.db.GetConfigArtifact(artifactID); aErr == nil {
 			if dErr := r.db.DeleteConfigArtifact(artifactID); dErr != nil {
 				log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)

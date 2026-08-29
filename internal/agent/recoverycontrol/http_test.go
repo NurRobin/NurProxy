@@ -33,6 +33,11 @@ func TestHTTPOrchestratorUsesAgentScopedAuthenticatedRecoveryRoutes(t *testing.T
 			w.WriteHeader(http.StatusCreated)
 		case "POST /api/v1/agents/agent-1/recovery/plans/plan-1/receipt":
 			w.WriteHeader(http.StatusNoContent)
+		case "POST /api/v1/agents/agent-1/recovery/applies/apply-1/plan":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(ManagedExecutionRecord{OperationID: "apply-1"})
+		case "POST /api/v1/agents/agent-1/recovery/applies/apply-1/receipt":
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
@@ -58,9 +63,18 @@ func TestHTTPOrchestratorUsesAgentScopedAuthenticatedRecoveryRoutes(t *testing.T
 	if err := remote.SubmitReceipt(context.Background(), "plan-1", receipt); err != nil {
 		t.Fatal(err)
 	}
+	managedPlan := helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{Envelope: helperprotocol.NewEnvelope(helperprotocol.MessageManagedApplyPlan, helperprotocol.ManagedApplyPlan{})}
+	managedRecord, err := remote.AuthorizeManagedApply(context.Background(), "apply-1", managedPlan)
+	if err != nil || managedRecord.OperationID != "apply-1" {
+		t.Fatalf("managed record = %#v, err=%v", managedRecord, err)
+	}
+	if err := remote.SubmitManagedReceipt(context.Background(), "apply-1", receipt); err != nil {
+		t.Fatal(err)
+	}
 	for _, key := range []string{
 		"GET /api/v1/agents/agent-1/recovery/helper", "GET /api/v1/agents/agent-1/recovery/plans",
 		"POST /api/v1/agents/agent-1/recovery/plans", "POST /api/v1/agents/agent-1/recovery/plans/plan-1/receipt",
+		"POST /api/v1/agents/agent-1/recovery/applies/apply-1/plan", "POST /api/v1/agents/agent-1/recovery/applies/apply-1/receipt",
 	} {
 		if requests[key] != 1 {
 			t.Fatalf("requests[%q] = %d", key, requests[key])

@@ -10,6 +10,7 @@ type recoveryAuthorityPublic interface {
 	KeyID() string
 	PublicKeyText() string
 	SignExecutionGrant(helperprotocol.ExecutionGrant) (helperprotocol.Signed[helperprotocol.ExecutionGrant], error)
+	SignApplyGrant(helperprotocol.ApplyGrant) (helperprotocol.Signed[helperprotocol.ApplyGrant], error)
 }
 
 type recoveryAuthorityResponse struct {

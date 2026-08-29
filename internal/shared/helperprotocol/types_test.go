@@ -32,7 +32,7 @@ func TestApplyIntentBindsValidatedRoutesToLogicalResources(t *testing.T) {
 	now := time.Date(2026, 8, 29, 16, 0, 0, 0, time.UTC)
 	intent := ApplyIntent{
 		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: "apply-1", DesiredStateRevision: "revision-1",
-		Resources: []string{"dom-1"}, Artifacts: []LogicalArtifact{}, DeletionSet: []string{},
+		Resources: []string{"dom-1"}, Artifacts: []LogicalArtifact{}, DeletionSet: []ManagedDeletion{},
 		Routes:            NormalizeManagedIntentSet(proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}}}).Intents,
 		CertificateKeep:   []string{},
 		AuthorizationKind: AuthorizationAuthenticatedDesiredState, AuthorizationEventID: "event-1",
@@ -223,7 +223,7 @@ func TestApplyIntentBindsHostOperationAndCanonicalLifetime(t *testing.T) {
 		DesiredStateRevision: "revision-1",
 		Resources:            []string{"resource-1"},
 		Artifacts:            []LogicalArtifact{},
-		DeletionSet:          []string{},
+		DeletionSet:          []ManagedDeletion{},
 		Routes:               []proxymodel.RouteIntent{},
 		CertificateKeep:      []string{},
 		AuthorizationKind:    AuthorizationAuthenticatedDesiredState,

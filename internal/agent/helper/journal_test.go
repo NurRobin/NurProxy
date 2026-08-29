@@ -69,7 +69,7 @@ func TestJournalPersistsPlansAndRejectsPlanIdentityConflict(t *testing.T) {
 func testManagedPlan() (helperprotocol.ManagedApplyPlan, helperprotocol.Signed[helperprotocol.ApplyIntent]) {
 	intent := helperprotocol.ApplyIntent{
 		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: "apply-operation-1", DesiredStateRevision: strings.Repeat("1", 64),
-		Resources: []string{}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: []proxymodel.RouteIntent{}, CertificateKeep: []string{},
+		Resources: []string{}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: []proxymodel.RouteIntent{}, CertificateKeep: []string{},
 		AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "desired-event-1",
 		IssuedAt:  time.Date(2026, 8, 29, 11, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 		ExpiresAt: time.Date(2026, 8, 29, 11, 5, 0, 0, time.UTC).Format(time.RFC3339Nano),

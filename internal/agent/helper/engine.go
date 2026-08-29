@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
-	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/google/uuid"
 )
 
@@ -191,7 +190,7 @@ func (e *Engine) PlanManagedApply(ctx context.Context, request helperprotocol.Pl
 	if err != nil || validateManagedApplyMaterial(material) != nil {
 		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "local managed apply planning refused the desired state", false)
 	}
-	logicalDigest, artifactDigest, deletionDigest, certificateDigest, err := managedApplyDigests(intent)
+	logicalDigest, artifactDigest, deletionDigest, certificateDigest, err := helperprotocol.ManagedApplyDigests(intent)
 	if err != nil {
 		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
 	}
@@ -385,7 +384,7 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 	if !timeAfter(e.now().UTC(), plan.ExpiresAt) {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorStalePlan, "helper-local managed plan has expired", false)
 	}
-	if !applyGrantMatchesPlan(grant, plan, intent) {
+	if !helperprotocol.ApplyGrantMatchesPlan(grant, plan, intent) {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorDisplayPlanMismatch, "apply grant does not match the helper-local managed plan", false)
 	}
 	executionHash, fingerprint, err := e.managedApply.Rediscover(ctx, plan, intent)
@@ -552,53 +551,6 @@ func validateManagedApplyMaterial(material ManagedApplyMaterial) error {
 		return fmt.Errorf("invalid managed apply material")
 	}
 	return nil
-}
-
-func managedApplyDigests(intent helperprotocol.ApplyIntent) (logical, artifacts, deletions, certificates string, err error) {
-	logical, err = helperprotocol.Digest(struct {
-		Resources         []string                 `json:"resource_ids"`
-		Routes            []proxymodel.RouteIntent `json:"routes"`
-		PruneCertificates bool                     `json:"prune_certificates"`
-		CertificateKeep   []string                 `json:"certificate_keep"`
-	}{
-		Resources: intent.Resources, Routes: intent.Routes,
-		PruneCertificates: intent.PruneCertificates, CertificateKeep: intent.CertificateKeep,
-	})
-	if err != nil {
-		return "", "", "", "", err
-	}
-	artifacts, err = helperprotocol.Digest(intent.Artifacts)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	deletions, err = helperprotocol.Digest(intent.DeletionSet)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	certificateArtifacts := make([]helperprotocol.LogicalArtifact, 0, len(intent.Artifacts))
-	for _, artifact := range intent.Artifacts {
-		switch artifact.Kind {
-		case "certificate", "source_key", "runtime_key":
-			certificateArtifacts = append(certificateArtifacts, artifact)
-		}
-	}
-	certificates, err = helperprotocol.Digest(struct {
-		Artifacts []helperprotocol.LogicalArtifact `json:"certificate_artifacts"`
-		Keep      []string                         `json:"certificate_keep"`
-		Prune     bool                             `json:"prune_certificates"`
-	}{Artifacts: certificateArtifacts, Keep: intent.CertificateKeep, Prune: intent.PruneCertificates})
-	return logical, artifacts, deletions, certificates, err
-}
-
-func applyGrantMatchesPlan(grant helperprotocol.ApplyGrant, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent) bool {
-	return grant.AgentID == intent.AgentID && grant.HelperInstanceID == plan.HelperInstanceID &&
-		grant.OperationID == plan.OperationID && grant.HelperPlanID == plan.HelperPlanID &&
-		grant.AuthorizationKind == intent.AuthorizationKind && grant.AuthorizationEventID == intent.AuthorizationEventID &&
-		grant.DesiredStateRevision == plan.DesiredStateRevision && grant.LogicalManifestDigest == plan.LogicalManifestDigest &&
-		grant.ArtifactManifestDigest == plan.ArtifactManifestDigest && grant.DeletionSetDigest == plan.DeletionSetDigest &&
-		grant.CertificateIdentityDigest == plan.CertificateIdentityDigest && grant.CustomPolicyVersion == plan.CustomPolicyVersion &&
-		grant.ExecutionPlanHash == plan.ExecutionPlanHash && grant.ResourceFingerprint == plan.ResourceFingerprint &&
-		grant.RollbackCoverage == plan.RollbackCoverage
 }
 
 func (e *Engine) validateGrantTime(issuedText, expiresText string) error {

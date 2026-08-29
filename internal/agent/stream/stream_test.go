@@ -2,6 +2,8 @@ package stream
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,9 +22,71 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
+
+type managedApplierMock struct {
+	calls   int
+	receipt helperprotocol.Signed[helperprotocol.HelperReceipt]
+}
+
+func (m *managedApplierMock) Apply(context.Context, helperprotocol.ManagedIntentSetEnvelope) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	m.calls++
+	return m.receipt, nil
+}
+
+func TestManagedRoutesUseHelperApplierWithoutLegacyMutation(t *testing.T) {
+	_, authorityKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, helperKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := helperprotocol.NormalizeManagedIntentSet(proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{
+		ArtifactID: "artifact-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example.test", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 3000}},
+	}}})
+	revision, err := helperprotocol.Digest(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	intent := helperprotocol.ApplyIntent{
+		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: "apply-operation-1", DesiredStateRevision: revision,
+		Resources: []string{"artifact-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: set.Intents,
+		CertificateKeep: []string{}, AuthorizationKind: helperprotocol.AuthorizationStoredConvergence,
+		AuthorizationEventID: "desired-event-1", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+	}
+	signedIntent, err := helperprotocol.Sign("authority-1", authorityKey, helperprotocol.NewEnvelope(helperprotocol.MessageApplyIntent, intent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := helperprotocol.HelperReceipt{OperationID: intent.OperationID, CanonicalRequestDigest: strings.Repeat("a", 64),
+		HelperInstanceID: "helper-1", Action: helperprotocol.ActionApplyManagedProxyState, State: helperprotocol.JournalSucceeded,
+		RollbackCoverage: helperprotocol.RollbackCoveragePartial, SnapshotDigest: strings.Repeat("b", 64),
+		SanitizedResult: "applied", UpdatedAt: now.Format(time.RFC3339Nano)}
+	signedReceipt, err := helperprotocol.Sign("attestation-1", helperKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperReceipt, receipt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applier := &managedApplierMock{receipt: signedReceipt}
+	backend := &fakeCaddyBackend{}
+	client := New("http://orchestrator.invalid", "agent-1", "token", backend, health.New()).WithManagedApply(applier)
+	payload, err := helperprotocol.CanonicalBytes(helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signedIntent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handleEvent(context.Background(), "managed_routes", string(payload))
+	if applier.calls != 1 {
+		t.Fatalf("managed applier calls = %d", applier.calls)
+	}
+	if backend.addRoutes != 0 {
+		t.Fatalf("legacy backend mutated %d route(s)", backend.addRoutes)
+	}
+}
 
 func TestRecoveryPolicyEventIsStrictAndFailClosed(t *testing.T) {
 	coordinator := recovery.NewCoordinator("agent-1", nil, nil, nil, nil, nil, nil)

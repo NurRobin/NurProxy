@@ -707,6 +707,56 @@ var migrations = []string{
 	ALTER TABLE recovery_execution_plans ADD COLUMN receipt_digest TEXT NOT NULL DEFAULT '';
 	ALTER TABLE recovery_execution_plans ADD COLUMN receipt_received_at INTEGER;
 	`,
+
+	// Migration 30: ordinary desired-state changes use the same attested helper
+	// protocol without borrowing the interactive hard-repair confirmation flow.
+	`
+	CREATE TABLE managed_apply_executions (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		operation_id TEXT NOT NULL,
+		helper_instance_id TEXT NOT NULL,
+		desired_state_revision TEXT NOT NULL,
+		signed_intent TEXT NOT NULL,
+		intent_digest TEXT NOT NULL,
+		intent_received_at INTEGER NOT NULL,
+		intent_expires_at INTEGER NOT NULL,
+		is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+		helper_plan_id TEXT NOT NULL DEFAULT '',
+		signed_plan TEXT NOT NULL DEFAULT '',
+		plan_digest TEXT NOT NULL DEFAULT '',
+		plan_received_at INTEGER,
+		plan_expires_at INTEGER,
+		signed_grant TEXT NOT NULL DEFAULT '',
+		grant_digest TEXT NOT NULL DEFAULT '',
+		signed_receipt TEXT NOT NULL DEFAULT '',
+		receipt_digest TEXT NOT NULL DEFAULT '',
+		receipt_received_at INTEGER,
+		PRIMARY KEY (agent_id, operation_id),
+		FOREIGN KEY (agent_id, helper_instance_id)
+			REFERENCES recovery_helper_instances(agent_id, helper_instance_id)
+	);
+	CREATE UNIQUE INDEX idx_managed_apply_current_agent
+		ON managed_apply_executions(agent_id) WHERE is_current = 1;
+	CREATE UNIQUE INDEX idx_managed_apply_helper_plan
+		ON managed_apply_executions(agent_id, helper_plan_id) WHERE helper_plan_id != '';
+	CREATE INDEX idx_managed_apply_agent_received
+		ON managed_apply_executions(agent_id, intent_received_at DESC);
+	`,
+
+	// Migration 31: route deletions survive domain/artifact teardown and offline
+	// agents until a helper-attested managed apply receipt proves removal.
+	`
+	CREATE TABLE managed_route_tombstones (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		resource_id TEXT NOT NULL,
+		host TEXT NOT NULL,
+		backend TEXT NOT NULL CHECK (backend IN ('nginx', 'apache')),
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (agent_id, resource_id)
+	);
+	CREATE INDEX idx_managed_route_tombstones_agent_created
+		ON managed_route_tombstones(agent_id, created_at, resource_id);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

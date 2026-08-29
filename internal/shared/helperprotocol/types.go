@@ -537,7 +537,7 @@ type ApplyIntent struct {
 	DesiredStateRevision string                   `json:"desired_state_revision"`
 	Resources            []string                 `json:"resource_ids"`
 	Artifacts            []LogicalArtifact        `json:"artifact_manifest"`
-	DeletionSet          []string                 `json:"deletion_set"`
+	DeletionSet          []ManagedDeletion        `json:"deletion_set"`
 	Routes               []proxymodel.RouteIntent `json:"routes"`
 	PruneCertificates    bool                     `json:"prune_certificates"`
 	CertificateKeep      []string                 `json:"certificate_keep"`
@@ -545,6 +545,19 @@ type ApplyIntent struct {
 	AuthorizationEventID string                   `json:"authorization_event_id"`
 	IssuedAt             string                   `json:"issued_at"`
 	ExpiresAt            string                   `json:"expires_at"`
+}
+
+type ManagedDeletion struct {
+	ResourceID string `json:"resource_id"`
+	Host       string `json:"host"`
+	Backend    string `json:"backend"`
+}
+
+func (d ManagedDeletion) Validate() error {
+	if !validID(d.ResourceID) || !validCertificateName(d.Host) || (d.Backend != "nginx" && d.Backend != "apache") {
+		return fmt.Errorf("invalid managed deletion")
+	}
+	return nil
 }
 
 func (i ApplyIntent) Validate() error {
@@ -556,7 +569,7 @@ func (i ApplyIntent) Validate() error {
 		validateGrantTimes(i.IssuedAt, i.ExpiresAt) != nil {
 		return fmt.Errorf("invalid apply intent")
 	}
-	for _, id := range append(append([]string(nil), i.Resources...), i.DeletionSet...) {
+	for _, id := range i.Resources {
 		if !validID(id) {
 			return fmt.Errorf("invalid apply intent resource")
 		}
@@ -598,14 +611,17 @@ func (i ApplyIntent) Validate() error {
 		artifacts[key] = struct{}{}
 	}
 	deletions := make(map[string]struct{}, len(i.DeletionSet))
-	for _, id := range i.DeletionSet {
-		if _, exists := resources[id]; exists {
+	for _, deletion := range i.DeletionSet {
+		if deletion.Validate() != nil {
+			return fmt.Errorf("invalid apply deletion")
+		}
+		if _, exists := resources[deletion.ResourceID]; exists {
 			return fmt.Errorf("apply resource cannot be retained and deleted")
 		}
-		if _, exists := deletions[id]; exists {
+		if _, exists := deletions[deletion.ResourceID]; exists {
 			return fmt.Errorf("duplicate apply deletion")
 		}
-		deletions[id] = struct{}{}
+		deletions[deletion.ResourceID] = struct{}{}
 	}
 	routes := make(map[string]struct{}, len(i.Routes))
 	for _, route := range i.Routes {
@@ -627,6 +643,56 @@ func (i ApplyIntent) Validate() error {
 		routes[route.ArtifactID] = struct{}{}
 	}
 	return nil
+}
+
+func ManagedApplyDigests(intent ApplyIntent) (logical, artifacts, deletions, certificates string, err error) {
+	if err = intent.Validate(); err != nil {
+		return "", "", "", "", err
+	}
+	logical, err = Digest(struct {
+		Resources         []string                 `json:"resource_ids"`
+		Routes            []proxymodel.RouteIntent `json:"routes"`
+		PruneCertificates bool                     `json:"prune_certificates"`
+		CertificateKeep   []string                 `json:"certificate_keep"`
+	}{
+		Resources: intent.Resources, Routes: intent.Routes,
+		PruneCertificates: intent.PruneCertificates, CertificateKeep: intent.CertificateKeep,
+	})
+	if err != nil {
+		return "", "", "", "", err
+	}
+	artifacts, err = Digest(intent.Artifacts)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	deletions, err = Digest(intent.DeletionSet)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	certificateArtifacts := make([]LogicalArtifact, 0, len(intent.Artifacts))
+	for _, artifact := range intent.Artifacts {
+		switch artifact.Kind {
+		case "certificate", "source_key", "runtime_key":
+			certificateArtifacts = append(certificateArtifacts, artifact)
+		}
+	}
+	certificates, err = Digest(struct {
+		Artifacts []LogicalArtifact `json:"certificate_artifacts"`
+		Keep      []string          `json:"certificate_keep"`
+		Prune     bool              `json:"prune_certificates"`
+	}{Artifacts: certificateArtifacts, Keep: intent.CertificateKeep, Prune: intent.PruneCertificates})
+	return logical, artifacts, deletions, certificates, err
+}
+
+func ApplyGrantMatchesPlan(grant ApplyGrant, plan ManagedApplyPlan, intent ApplyIntent) bool {
+	return grant.AgentID == intent.AgentID && grant.HelperInstanceID == plan.HelperInstanceID &&
+		grant.OperationID == plan.OperationID && grant.HelperPlanID == plan.HelperPlanID &&
+		grant.AuthorizationKind == intent.AuthorizationKind && grant.AuthorizationEventID == intent.AuthorizationEventID &&
+		grant.DesiredStateRevision == plan.DesiredStateRevision && grant.LogicalManifestDigest == plan.LogicalManifestDigest &&
+		grant.ArtifactManifestDigest == plan.ArtifactManifestDigest && grant.DeletionSetDigest == plan.DeletionSetDigest &&
+		grant.CertificateIdentityDigest == plan.CertificateIdentityDigest && grant.CustomPolicyVersion == plan.CustomPolicyVersion &&
+		grant.ExecutionPlanHash == plan.ExecutionPlanHash && grant.ResourceFingerprint == plan.ResourceFingerprint &&
+		grant.RollbackCoverage == plan.RollbackCoverage
 }
 
 const MaxManifestEntries = 1024

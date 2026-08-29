@@ -56,7 +56,7 @@ func newManagedApplyTest(t *testing.T) (*managedApplyAction, helperprotocol.Appl
 	now := time.Date(2026, 8, 29, 18, 0, 0, 0, time.UTC)
 	intent := helperprotocol.ApplyIntent{
 		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: operationID, DesiredStateRevision: strings.Repeat("1", 64),
-		Resources: []string{"domain-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: set.Intents, CertificateKeep: []string{},
+		Resources: []string{"domain-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: set.Intents, CertificateKeep: []string{},
 		AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "desired-event-1",
 		IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(5 * time.Minute).Format(time.RFC3339Nano),
 	}
@@ -121,11 +121,134 @@ func TestManagedApplyTransactionSnapshotsCommitsValidatesReloadsAndRestores(t *t
 	}
 }
 
+func TestManagedApplyDeletesOnlyExplicitProvenancedRouteAndCanRestoreIt(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	compilation, err := action.compile(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(compilation.Files[0].Path, compilation.Files[0].Content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(compilation.Links[0].Target, compilation.Links[0].Path); err != nil {
+		t.Fatal(err)
+	}
+	operatorPath := filepath.Join(action.layout.AvailableDir, "operator.conf")
+	if err := os.WriteFile(operatorPath, []byte("server { listen 8081; }"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	intent.OperationID = "apply-operation-delete"
+	intent.DesiredStateRevision = strings.Repeat("2", 64)
+	intent.Resources = []string{}
+	intent.Routes = []proxymodel.RouteIntent{}
+	intent.DeletionSet = []helperprotocol.ManagedDeletion{{ResourceID: "domain-1", Host: "app.example.com", Backend: "nginx"}}
+	material, err := action.Plan(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := helperprotocol.ManagedApplyPlan{OperationID: intent.OperationID, CustomPolicyVersion: material.CustomPolicyVersion,
+		ExecutionPlanHash: material.ExecutionPlanHash, ResourceFingerprint: material.ResourceFingerprint, RollbackCoverage: material.RollbackCoverage}
+	prepared, err := action.Prepare(context.Background(), intent.OperationID, plan, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared)
+	if err != nil || !result.Mutated || !result.Validated {
+		t.Fatalf("managed delete = %+v, %v", result, err)
+	}
+	if _, err := os.Lstat(compilation.Files[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("managed vhost remained: %v", err)
+	}
+	if _, err := os.Lstat(compilation.Links[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("managed activation remained: %v", err)
+	}
+	if _, err := os.Stat(operatorPath); err != nil {
+		t.Fatalf("operator sibling was touched: %v", err)
+	}
+	if err := action.Rollback(context.Background(), intent.OperationID, plan, intent, prepared); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(compilation.Files[0].Path); err != nil {
+		t.Fatalf("managed vhost was not restored: %v", err)
+	}
+	if target, err := os.Readlink(compilation.Links[0].Path); err != nil || target != compilation.Links[0].Target {
+		t.Fatalf("managed activation was not restored: %q, %v", target, err)
+	}
+}
+
+func TestManagedApplyPrunesOnlyRecognizedUnretainedCertificateFiles(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	intent.OperationID = "apply-operation-prune"
+	intent.PruneCertificates = true
+	intent.CertificateKeep = []string{"kept.example.com"}
+	staleCert := filepath.Join(action.layout.CertificateDir, "stale.example.com.crt")
+	staleKey := filepath.Join(action.layout.CertificateDir, "stale.example.com.key.plain")
+	keptCert := filepath.Join(action.layout.CertificateDir, "kept.example.com.crt")
+	unknown := filepath.Join(action.layout.CertificateDir, "operator-note")
+	for path, content := range map[string]string{staleCert: "cert", staleKey: "key", keptCert: "kept", unknown: "do not touch"} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	material, err := action.Plan(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := helperprotocol.ManagedApplyPlan{OperationID: intent.OperationID, CustomPolicyVersion: material.CustomPolicyVersion,
+		ExecutionPlanHash: material.ExecutionPlanHash, ResourceFingerprint: material.ResourceFingerprint, RollbackCoverage: material.RollbackCoverage}
+	prepared, err := action.Prepare(context.Background(), intent.OperationID, plan, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared); err != nil || !result.Validated {
+		t.Fatalf("certificate prune = %+v, %v", result, err)
+	}
+	for _, path := range []string{staleCert, staleKey} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale managed certificate remained at %s: %v", path, err)
+		}
+	}
+	for _, path := range []string{keptCert, unknown} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("retained or unknown certificate sibling was touched at %s: %v", path, err)
+		}
+	}
+	if err := action.Rollback(context.Background(), intent.OperationID, plan, intent, prepared); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{staleCert, staleKey} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("certificate prune rollback did not restore %s: %v", path, err)
+		}
+	}
+}
+
 func TestManagedApplyRefusesRawConfigurationUntilPolicyParserAdmitsIt(t *testing.T) {
 	action, intent, _ := newManagedApplyTest(t)
 	intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: "server { listen 8443; }"}
 	if _, err := action.Plan(context.Background(), intent); err == nil {
 		t.Fatal("raw configuration bypassed managed custom policy")
+	}
+}
+
+func TestManagedApplyAdmitsParserBoundedNginxCustomConfiguration(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: `server {
+    listen 80;
+    listen [::]:80;
+    server_name app.example.com;
+    location / {
+        proxy_pass http://10.0.0.2:8080;
+        proxy_set_header Host $host;
+    }
+}`}
+	compilation, err := action.compile(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compilation.Files) != 1 || !strings.Contains(string(compilation.Files[0].Content), "proxy_pass http://10.0.0.2:8080") ||
+		!proxy.HasManagedArtifactMarker(string(compilation.Files[0].Content)) {
+		t.Fatalf("bounded raw config was not compiled: %+v", compilation)
 	}
 }
 

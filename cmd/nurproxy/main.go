@@ -206,6 +206,7 @@ func main() {
 	// Start the reconciliation engine: it syncs desired state (DB) with the
 	// actual state on agents (routes) and at DNS providers (records).
 	rec := reconciler.New(database, agentclient.New(), reconcilerInterval(database))
+	rec.SetApplyAuthority(recoveryAuthority)
 	rec.SetHub(hub)
 	rec.SetDryRunDNS(dnsDryRun)
 	rec.Start(rootCtx)

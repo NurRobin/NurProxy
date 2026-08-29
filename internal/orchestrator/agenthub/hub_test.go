@@ -43,7 +43,7 @@ func TestPublishManagedIntentSetKeepsSignedDesiredStateAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := helperprotocol.ApplyIntent{AgentID: "a1", HelperInstanceID: "helper-1", OperationID: "apply-1", DesiredStateRevision: revision, Resources: []string{"dom-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: set.Intents, CertificateKeep: []string{}, AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "event-1", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)}
+	intent := helperprotocol.ApplyIntent{AgentID: "a1", HelperInstanceID: "helper-1", OperationID: "apply-1", DesiredStateRevision: revision, Resources: []string{"dom-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: set.Intents, CertificateKeep: []string{}, AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "event-1", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)}
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)

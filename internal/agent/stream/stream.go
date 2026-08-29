@@ -29,6 +29,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	nginxproxy "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
@@ -95,6 +96,10 @@ type managedArtifact struct {
 	checksum   string
 }
 
+type ManagedApplier interface {
+	Apply(context.Context, helperprotocol.ManagedIntentSetEnvelope) (helperprotocol.Signed[helperprotocol.HelperReceipt], error)
+}
+
 // Client manages the agent's stream connection and applies pushed routes.
 type Client struct {
 	orchestratorURL string
@@ -137,13 +142,22 @@ type Client struct {
 	// tailsMu guards tails, the live on-demand tail sessions keyed by session ID.
 	// Each session has a cancel func that the matching stop event (or Run's
 	// shutdown) calls to end the tailer.
-	tailsMu  sync.Mutex
-	tails    map[string]context.CancelFunc
-	recovery *recovery.Coordinator
+	tailsMu        sync.Mutex
+	tails          map[string]context.CancelFunc
+	recovery       *recovery.Coordinator
+	managedApplyMu sync.RWMutex
+	managedApply   ManagedApplier
 }
 
 func (c *Client) WithRecovery(coordinator *recovery.Coordinator) *Client {
 	c.recovery = coordinator
+	return c
+}
+
+func (c *Client) WithManagedApply(applier ManagedApplier) *Client {
+	c.managedApplyMu.Lock()
+	c.managedApply = applier
+	c.managedApplyMu.Unlock()
 	return c
 }
 
@@ -310,6 +324,13 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			return
 		}
 		c.applyIntents(ctx, set)
+	case "managed_routes":
+		envelope, err := helperprotocol.Decode[helperprotocol.ManagedIntentSetEnvelope]([]byte(data))
+		if err != nil || envelope.Validate() != nil || envelope.Intent.Envelope.Payload.AgentID != c.agentID {
+			log.Printf("Stream: bad managed intent payload")
+			return
+		}
+		c.applyManagedIntents(ctx, envelope)
 	case "ping":
 		// Liveness only — nothing to do.
 	case "log_tail":
@@ -356,6 +377,71 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 	default:
 		log.Printf("Stream: ignoring unknown event %q", eventType)
 	}
+}
+
+func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotocol.ManagedIntentSetEnvelope) {
+	c.managedApplyMu.RLock()
+	applier := c.managedApply
+	c.managedApplyMu.RUnlock()
+	if applier == nil {
+		log.Printf("Stream: managed desired state pending verified root helper")
+		if c.health != nil {
+			c.health.SetError("managed desired state pending verified root helper")
+		}
+		return
+	}
+	receipt, err := applier.Apply(ctx, envelope)
+	if err != nil {
+		log.Printf("Stream: privileged managed apply failed: %v", err)
+		if c.health != nil {
+			c.health.SetError("privileged managed proxy reconciliation failed")
+		}
+		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed")
+		return
+	}
+	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
+		log.Printf("Stream: privileged managed apply ended as %s", receipt.Envelope.Payload.State)
+		if c.health != nil {
+			c.health.SetError("privileged managed proxy reconciliation did not succeed")
+		}
+		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation did not succeed")
+		return
+	}
+	if c.health != nil {
+		c.health.SetError("")
+	}
+	c.sendManagedAck(ctx, envelope.IntentSet, "")
+}
+
+func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string) {
+	reports := make([]proxymodel.ArtifactReport, 0, len(set.Intents))
+	managed := make(map[string]managedArtifact, len(set.Intents))
+	for _, intent := range set.Intents {
+		report := proxymodel.ArtifactReport{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Backend: intent.Backend, Error: applyError}
+		if applyError == "" {
+			artifact, err := c.caddy.Render(ctx, intent.Route)
+			if err != nil {
+				report.Error = "post-apply artifact rendering failed"
+			} else {
+				report.TargetKind = string(artifact.Target.Kind)
+				report.TargetPath = artifact.Target.Path
+				report.Content = artifact.Content
+				report.Checksum = checksum(artifact.Content)
+				report.Enabled = artifact.Enabled
+				report.Warnings = artifact.Warnings
+				managed[intent.ArtifactID] = managedArtifact{targetKind: report.TargetKind, targetPath: report.TargetPath, checksum: report.Checksum}
+			}
+		}
+		reports = append(reports, report)
+	}
+	if applyError == "" {
+		c.carryKeepManaged(set.Keep, managed)
+		c.setManaged(managed)
+		c.applyStateMu.Lock()
+		c.lastApplyClean = false
+		c.applyStateMu.Unlock()
+	}
+	c.sendAck(ctx, reports)
 }
 
 // startLogTail begins an on-demand tail for the requested session (§15). The path

@@ -142,7 +142,7 @@ func managedIntentFixture(t *testing.T) helperprotocol.Signed[helperprotocol.App
 	now := time.Now().UTC()
 	intent := helperprotocol.ApplyIntent{
 		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: "apply-operation-1", DesiredStateRevision: strings.Repeat("1", 64),
-		Resources: []string{}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: []proxymodel.RouteIntent{}, CertificateKeep: []string{},
+		Resources: []string{}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: []proxymodel.RouteIntent{}, CertificateKeep: []string{},
 		AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "desired-event-1",
 		IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
 	}

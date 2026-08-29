@@ -314,7 +314,7 @@ func (f engineFixture) managedIntent(t *testing.T) helperprotocol.Signed[helperp
 	intent := helperprotocol.ApplyIntent{
 		AgentID: f.config.AgentID, HelperInstanceID: f.config.HelperInstanceID,
 		OperationID: "apply-operation-1", DesiredStateRevision: strings.Repeat("1", 64),
-		Resources: []string{"domain-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: routes,
+		Resources: []string{"domain-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: routes,
 		CertificateKeep: []string{}, AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "desired-event-1",
 		IssuedAt: f.now.Format(time.RFC3339Nano), ExpiresAt: f.now.Add(4 * time.Minute).Format(time.RFC3339Nano),
 	}

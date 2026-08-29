@@ -93,6 +93,27 @@ func (h *HTTP) SubmitReceipt(ctx context.Context, helperPlanID string, receipt h
 	return h.postJSON(ctx, h.basePath()+"/plans/"+url.PathEscape(helperPlanID)+"/receipt", receipt, http.StatusNoContent)
 }
 
+func (h *HTTP) AuthorizeManagedApply(ctx context.Context, operationID string, plan helperprotocol.Signed[helperprotocol.ManagedApplyPlan]) (ManagedExecutionRecord, error) {
+	if strings.TrimSpace(operationID) == "" || strings.Contains(operationID, "/") {
+		return ManagedExecutionRecord{}, fmt.Errorf("invalid managed apply operation identity")
+	}
+	var record ManagedExecutionRecord
+	if err := h.postJSONResponse(ctx, h.basePath()+"/applies/"+url.PathEscape(operationID)+"/plan", plan, &record, http.StatusOK, http.StatusCreated); err != nil {
+		return ManagedExecutionRecord{}, err
+	}
+	if record.OperationID != operationID {
+		return ManagedExecutionRecord{}, fmt.Errorf("orchestrator returned another managed apply operation")
+	}
+	return record, nil
+}
+
+func (h *HTTP) SubmitManagedReceipt(ctx context.Context, operationID string, receipt helperprotocol.Signed[helperprotocol.HelperReceipt]) error {
+	if strings.TrimSpace(operationID) == "" || strings.Contains(operationID, "/") {
+		return fmt.Errorf("invalid managed apply operation identity")
+	}
+	return h.postJSON(ctx, h.basePath()+"/applies/"+url.PathEscape(operationID)+"/receipt", receipt, http.StatusNoContent)
+}
+
 func (h *HTTP) basePath() string {
 	return "/api/v1/agents/" + url.PathEscape(h.agentID) + "/recovery"
 }
@@ -148,6 +169,44 @@ func (h *HTTP) postJSON(ctx context.Context, path string, value any, accepted ..
 		}
 	}
 	return &HTTPError{StatusCode: response.StatusCode}
+}
+
+func (h *HTTP) postJSONResponse(ctx context.Context, path string, value, destination any, accepted ...int) error {
+	body, err := json.Marshal(value)
+	if err != nil || len(body) > helperprotocol.MaxFrameBytes {
+		return fmt.Errorf("encode bounded recovery control request")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	h.authorize(req)
+	req.Header.Set("Content-Type", "application/json")
+	response, err := h.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	acceptedStatus := false
+	for _, status := range accepted {
+		acceptedStatus = acceptedStatus || response.StatusCode == status
+	}
+	if !acceptedStatus {
+		return &HTTPError{StatusCode: response.StatusCode}
+	}
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil || len(payload) == 0 || len(payload) > maxResponseBytes {
+		return fmt.Errorf("invalid bounded recovery control response")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(destination); err != nil {
+		return fmt.Errorf("decode recovery control response: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("recovery control response contains trailing data")
+	}
+	return nil
 }
 
 func (h *HTTP) authorize(request *http.Request) {

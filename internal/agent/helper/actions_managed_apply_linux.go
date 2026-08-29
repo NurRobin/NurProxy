@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/apache"
@@ -22,6 +23,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
+	"github.com/NurRobin/NurProxy/internal/shared/nginxparse"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"golang.org/x/sys/unix"
 )
@@ -41,12 +43,14 @@ type managedCompiledFile struct {
 	SHA256  string `json:"sha256"`
 	Mode    uint32 `json:"mode"`
 	Class   string `json:"class"`
+	Delete  bool   `json:"delete"`
 	Content []byte `json:"-"`
 }
 
 type managedCompiledLink struct {
 	Path   string `json:"path"`
 	Target string `json:"target"`
+	Delete bool   `json:"delete"`
 }
 
 type managedCompilation struct {
@@ -151,17 +155,45 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 	if err != nil || fingerprint != plan.ResourceFingerprint {
 		return ActionResult{}, fmt.Errorf("managed targets changed after snapshot")
 	}
-	if err := a.host.Validate(ctx, a.target); err != nil {
-		return ActionResult{}, fmt.Errorf("native proxy validation failed before managed mutation: %w", err)
+	if !compilation.hasDeletions() {
+		if err := a.host.Validate(ctx, a.target); err != nil {
+			return ActionResult{}, fmt.Errorf("native proxy validation failed before managed mutation: %w", err)
+		}
 	}
 	mutated := false
+	for _, link := range compilation.Links {
+		if !link.Delete {
+			continue
+		}
+		removed, err := removeManagedLink(link, a.ownerUID)
+		if err != nil {
+			return ActionResult{Mutated: mutated}, err
+		}
+		mutated = mutated || removed
+	}
 	for _, file := range compilation.Files {
+		if !file.Delete {
+			continue
+		}
+		removed, err := removeManagedFile(file, a.ownerUID)
+		if err != nil {
+			return ActionResult{Mutated: mutated}, err
+		}
+		mutated = mutated || removed
+	}
+	for _, file := range compilation.Files {
+		if file.Delete {
+			continue
+		}
 		if err := installManagedFile(file, a.ownerUID); err != nil {
 			return ActionResult{Mutated: mutated}, err
 		}
 		mutated = true
 	}
 	for _, link := range compilation.Links {
+		if link.Delete {
+			continue
+		}
 		if err := installManagedLink(link, a.ownerUID); err != nil {
 			return ActionResult{Mutated: mutated}, err
 		}
@@ -233,7 +265,7 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		base := certstore.SanitizeHost(host)
 		compilation.Files = append(compilation.Files,
 			compiledFile(filepath.Join(a.layout.CertificateDir, base+".crt"), pair.cert, 0o644, "secret"),
-			compiledFile(filepath.Join(a.layout.CertificateDir, base+".key"), pair.key, 0o600, "secret"),
+			compiledFile(filepath.Join(a.layout.CertificateDir, base+".key.plain"), pair.key, 0o600, "secret"),
 		)
 	}
 	for _, routeIntent := range intent.Routes {
@@ -241,21 +273,28 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			return managedCompilation{}, fmt.Errorf("route backend does not match root-owned proxy mapping")
 		}
 		route := routeIntent.Route
-		if route.IsRaw() {
-			return managedCompilation{}, fmt.Errorf("raw custom configuration is not admitted by policy %s", a.layout.CustomPolicyVersion)
-		}
 		certPath, keyPath := "", ""
 		if _, ok := certificates[route.Host]; ok {
 			base := certstore.SanitizeHost(route.Host)
 			certPath = filepath.Join(a.layout.CertificateDir, base+".crt")
-			keyPath = filepath.Join(a.layout.CertificateDir, base+".key")
+			keyPath = filepath.Join(a.layout.CertificateDir, base+".key.plain")
 		}
 		authPath := ""
-		if route.BasicAuth != nil {
+		if route.BasicAuth != nil || route.IsRaw() {
 			authPath = filepath.Join(a.layout.CertificateDir, "auth-"+certstore.SanitizeHost(route.Host)+".htpasswd")
+		}
+		if route.BasicAuth != nil {
 			compilation.Files = append(compilation.Files, compiledFile(authPath, []byte(route.BasicAuth.Username+":"+route.BasicAuth.PasswordHash+"\n"), 0o600, "secret"))
 		}
-		content, err := a.renderRoute(route, certPath, keyPath, authPath)
+		var content string
+		if route.IsRaw() {
+			if a.target.Kind != "nginx" || nginxparse.ValidateManaged(route.Raw.Content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}) != nil {
+				return managedCompilation{}, fmt.Errorf("raw custom configuration is not admitted by policy %s", a.layout.CustomPolicyVersion)
+			}
+			content = route.Raw.Content
+		} else {
+			content, err = a.renderRoute(route, certPath, keyPath, authPath)
+		}
 		if err != nil {
 			return managedCompilation{}, err
 		}
@@ -263,6 +302,38 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		compilation.Files = append(compilation.Files, compiledFile(available, []byte(proxy.StampManagedArtifact(content)), 0o644, "vhost"))
 		if a.layout.EnabledDir != "" {
 			compilation.Links = append(compilation.Links, managedCompiledLink{Path: filepath.Join(a.layout.EnabledDir, filepath.Base(available)), Target: available})
+		}
+	}
+	for _, deletion := range intent.DeletionSet {
+		if deletion.Backend != a.target.Kind {
+			return managedCompilation{}, fmt.Errorf("managed deletion backend does not match root-owned proxy mapping")
+		}
+		available := filepath.Join(a.layout.AvailableDir, managedFileName(a.target.Kind, deletion.Host))
+		compilation.Files = append(compilation.Files, managedCompiledFile{Path: available, Class: "vhost", Delete: true})
+		compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, "auth-"+certstore.SanitizeHost(deletion.Host)+".htpasswd"), Class: "secret", Delete: true})
+		if a.layout.EnabledDir != "" {
+			compilation.Links = append(compilation.Links, managedCompiledLink{Path: filepath.Join(a.layout.EnabledDir, filepath.Base(available)), Target: available, Delete: true})
+		}
+	}
+	if intent.PruneCertificates {
+		keep := make(map[string]struct{}, len(intent.CertificateKeep))
+		for _, host := range intent.CertificateKeep {
+			keep[certstore.SanitizeHost(host)] = struct{}{}
+		}
+		entries, err := os.ReadDir(a.layout.CertificateDir)
+		if err != nil {
+			return managedCompilation{}, fmt.Errorf("read exclusive managed certificate directory: %w", err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			base, recognized := managedCertificateBase(name)
+			if !recognized {
+				continue
+			}
+			if _, retained := keep[base]; retained {
+				continue
+			}
+			compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, name), Class: "secret", Delete: true})
 		}
 	}
 	sort.Slice(compilation.Files, func(i, j int) bool {
@@ -361,6 +432,15 @@ func managedFileName(kind, host string) string {
 	return nginx.ManagedFileName(host)
 }
 
+func managedCertificateBase(name string) (string, bool) {
+	for _, suffix := range []string{".key.plain", ".key.enc", ".crt", ".key"} {
+		if base := strings.TrimSuffix(name, suffix); base != name && base != "" && certstore.SanitizeHost(base) == base {
+			return base, true
+		}
+	}
+	return "", false
+}
+
 func compiledFile(path string, content []byte, mode os.FileMode, class string) managedCompiledFile {
 	digest := sha256.Sum256(content)
 	return managedCompiledFile{Path: path, SHA256: hex.EncodeToString(digest[:]), Mode: uint32(mode.Perm()), Class: class, Content: append([]byte(nil), content...)}
@@ -368,6 +448,20 @@ func compiledFile(path string, content []byte, mode os.FileMode, class string) m
 
 func managedCompilationDigest(compilation managedCompilation) (string, error) {
 	return helperprotocol.Digest(compilation)
+}
+
+func (c managedCompilation) hasDeletions() bool {
+	for _, file := range c.Files {
+		if file.Delete {
+			return true
+		}
+	}
+	for _, link := range c.Links {
+		if link.Delete {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *managedApplyAction) fingerprint(ctx context.Context, compilation managedCompilation) (string, error) {
@@ -404,9 +498,17 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 		return fmt.Errorf("managed compilation has noncanonical collections")
 	}
 	for _, file := range compilation.Files {
-		if validatePrivatePath(file.Path) != nil || !validDigest(file.SHA256) || (file.Mode != 0o600 && file.Mode != 0o644) ||
-			(file.Class != "vhost" && file.Class != "secret") {
+		if validatePrivatePath(file.Path) != nil || (file.Class != "vhost" && file.Class != "secret") {
 			return fmt.Errorf("managed compilation contains an invalid file")
+		}
+		if file.Delete {
+			if file.SHA256 != "" || file.Mode != 0 || len(file.Content) != 0 {
+				return fmt.Errorf("managed compilation contains an invalid file deletion")
+			}
+			continue
+		}
+		if !validDigest(file.SHA256) || (file.Mode != 0o600 && file.Mode != 0o644) {
+			return fmt.Errorf("managed compilation contains invalid file content")
 		}
 		digest := sha256.Sum256(file.Content)
 		if hex.EncodeToString(digest[:]) != file.SHA256 {
@@ -419,6 +521,48 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 		}
 	}
 	return nil
+}
+
+func removeManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error) {
+	if !file.Delete || (file.Class != "vhost" && file.Class != "secret") {
+		return false, fmt.Errorf("invalid managed file deletion")
+	}
+	current, err := inspectManagedPath(file.Path, file.Class, "", ownerUID)
+	if err != nil {
+		return false, err
+	}
+	if !current.Exists {
+		return false, nil
+	}
+	dir := filepath.Dir(file.Path)
+	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
+		return false, err
+	}
+	if err := os.Remove(file.Path); err != nil {
+		return false, err
+	}
+	return true, syncDirectory(dir)
+}
+
+func removeManagedLink(link managedCompiledLink, ownerUID uint32) (bool, error) {
+	if !link.Delete {
+		return false, fmt.Errorf("invalid managed activation deletion")
+	}
+	current, err := inspectManagedPath(link.Path, "link", link.Target, ownerUID)
+	if err != nil {
+		return false, err
+	}
+	if !current.Exists {
+		return false, nil
+	}
+	dir := filepath.Dir(link.Path)
+	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
+		return false, err
+	}
+	if err := os.Remove(link.Path); err != nil {
+		return false, err
+	}
+	return true, syncDirectory(dir)
 }
 
 func readStagedArtifact(root, operationID, name string, artifact helperprotocol.LogicalArtifact, agentUID, stagingRootUID uint32) ([]byte, error) {
@@ -504,7 +648,7 @@ func inspectManagedPath(path, class, expectedLinkTarget string, ownerUID uint32)
 	if err != nil {
 		return item, err
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
+	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return item, fmt.Errorf("managed target has no unix identity")
 	}

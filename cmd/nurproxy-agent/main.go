@@ -476,7 +476,7 @@ func main() {
 			streamClient.WithRecovery(recoveryCoordinator)
 			go recoveryReporter.Run(ctx)
 			if existingMode && !cfg.DryRun {
-				go runHardRecoveryControl(ctx, cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, recoveryCoordinator)
+				go runHardRecoveryControl(ctx, cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, recoveryCoordinator, streamClient, filepath.Join(cfg.DataDir, "helper-staging"))
 			}
 		}
 	}
@@ -666,7 +666,7 @@ func toRuntimeEnv(env runtimeenv.Env) *models.RuntimeEnv {
 	}
 }
 
-func runHardRecoveryControl(ctx context.Context, orchestratorURL, agentID, token, buildID string, coordinator *recovery.Coordinator) {
+func runHardRecoveryControl(ctx context.Context, orchestratorURL, agentID, token, buildID string, coordinator *recovery.Coordinator, streamClient *stream.Client, stagingRoot string) {
 	remote, err := recoverycontrol.NewHTTP(orchestratorURL, agentID, token, nil)
 	if err != nil {
 		log.Printf("WARNING: privileged recovery control is unavailable: %v", err)
@@ -684,6 +684,12 @@ func runHardRecoveryControl(ctx context.Context, orchestratorURL, agentID, token
 			}
 			if clientErr == nil {
 				controller = recoverycontrol.New(client, remote)
+				managedController, managedErr := recoverycontrol.NewManaged(client, remote, stagingRoot)
+				if managedErr != nil {
+					log.Printf("WARNING: ordinary privileged reconciliation is unavailable: %v", managedErr)
+				} else {
+					streamClient.WithManagedApply(managedController)
+				}
 				coordinator.SetPrivilegedRecoveryAvailable(true)
 				log.Printf("Privileged recovery helper identity verified")
 				break
