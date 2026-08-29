@@ -852,6 +852,33 @@ func TestManagedAckUsesHelperInstalledLiveArtifact(t *testing.T) {
 	}
 }
 
+func TestManagedAckUsesAttestedHelperArtifactWhenAgentCannotReadRootOwnedConfig(t *testing.T) {
+	live := proxy.StampManagedArtifact("server { listen 443 ssl; }\n")
+	backend := &managedLiveFileBackend{dir: t.TempDir(), liveContent: "unreadable to the agent"}
+	client := New("http://unused", "agent-1", "token", backend, health.New())
+	set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{
+		ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{
+			Host: "tls.example.test", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8080}, ForceHTTPS: true,
+		},
+	}}}
+	target := filepath.Join(backend.dir, nginxproxy.ManagedFileName("tls.example.test"))
+	attested := []helperprotocol.ManagedArtifactReceipt{{
+		ArtifactID: "dom-1", Backend: "nginx", TargetKind: "file", TargetPath: target,
+		Content: live, Checksum: checksum(live), Enabled: true,
+	}}
+
+	reports, managed := client.managedAckReportsFromReceipt(set, attested)
+	if len(reports) != 1 || reports[0].Error != "" || reports[0].Content != live || reports[0].Checksum != checksum(live) {
+		t.Fatalf("reports = %#v", reports)
+	}
+	if backend.renderCalls != 0 {
+		t.Fatalf("legacy renderer called %d time(s)", backend.renderCalls)
+	}
+	if got := managed["dom-1"]; got.targetPath != target || got.checksum != checksum(live) {
+		t.Fatalf("managed state = %#v", got)
+	}
+}
+
 func TestManagedAckRejectsLiveArtifactWithoutHelperProvenance(t *testing.T) {
 	backend := &managedLiveFileBackend{dir: t.TempDir(), liveContent: "server { listen 80; }\n"}
 	client := New("http://unused", "agent-1", "token", backend, health.New())

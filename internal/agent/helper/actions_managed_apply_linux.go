@@ -40,13 +40,14 @@ type managedApplyAction struct {
 }
 
 type managedCompiledFile struct {
-	Path     string `json:"path"`
-	SHA256   string `json:"sha256"`
-	Mode     uint32 `json:"mode"`
-	Class    string `json:"class"`
-	Delete   bool   `json:"delete"`
-	Preserve bool   `json:"preserve"`
-	Content  []byte `json:"-"`
+	ResourceID string `json:"resource_id,omitempty"`
+	Path       string `json:"path"`
+	SHA256     string `json:"sha256"`
+	Mode       uint32 `json:"mode"`
+	Class      string `json:"class"`
+	Delete     bool   `json:"delete"`
+	Preserve   bool   `json:"preserve"`
+	Content    []byte `json:"-"`
 }
 
 type managedCompiledLink struct {
@@ -203,7 +204,11 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		mutated = true
 	}
 	if !mutated {
-		return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged"}, nil
+		artifacts, err := a.attestManagedArtifacts(compilation)
+		if err != nil {
+			return ActionResult{}, fmt.Errorf("managed proxy artifact attestation failed: %w", err)
+		}
+		return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged", ManagedArtifacts: artifacts}, nil
 	}
 	if err := a.host.Validate(ctx, a.target); err != nil {
 		return ActionResult{Mutated: true}, fmt.Errorf("native proxy validation failed after managed commit: %w", err)
@@ -218,7 +223,11 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 	if err != nil || !post.Active || post.Kind != a.target.Kind || post.Unit != a.target.Unit {
 		return ActionResult{Mutated: true}, fmt.Errorf("managed proxy postcondition could not be proven")
 	}
-	return ActionResult{Mutated: true, Validated: true, SanitizedResult: fmt.Sprintf("applied %d managed files and %d activation links", len(compilation.Files), len(compilation.Links))}, nil
+	artifacts, err := a.attestManagedArtifacts(compilation)
+	if err != nil {
+		return ActionResult{Mutated: true}, fmt.Errorf("managed proxy artifact attestation failed: %w", err)
+	}
+	return ActionResult{Mutated: true, Validated: true, SanitizedResult: fmt.Sprintf("applied %d managed files and %d activation links", len(compilation.Files), len(compilation.Links)), ManagedArtifacts: artifacts}, nil
 }
 
 func (a *managedApplyAction) Rollback(ctx context.Context, operationID string, _ helperprotocol.ManagedApplyPlan, _ helperprotocol.ApplyIntent, prepared PreparedAction) error {
@@ -330,6 +339,7 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			compiledContent = []byte(content)
 		}
 		file := compiledFile(available, compiledContent, 0o644, "vhost")
+		file.ResourceID = routeIntent.ArtifactID
 		file.Preserve = preserve
 		compilation.Files = append(compilation.Files, file)
 		if a.layout.EnabledDir != "" {
@@ -557,12 +567,13 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 	if compilation.Files == nil || compilation.Links == nil {
 		return fmt.Errorf("managed compilation has noncanonical collections")
 	}
+	totalReceiptContent := 0
 	for _, file := range compilation.Files {
 		if validatePrivatePath(file.Path) != nil || (file.Class != "vhost" && file.Class != "secret") {
 			return fmt.Errorf("managed compilation contains an invalid file")
 		}
 		if file.Delete {
-			if file.Preserve || file.SHA256 != "" || file.Mode != 0 || len(file.Content) != 0 {
+			if file.ResourceID != "" || file.Preserve || file.SHA256 != "" || file.Mode != 0 || len(file.Content) != 0 {
 				return fmt.Errorf("managed compilation contains an invalid file deletion")
 			}
 			continue
@@ -577,6 +588,17 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 		if hex.EncodeToString(digest[:]) != file.SHA256 {
 			return fmt.Errorf("managed compilation content digest mismatch")
 		}
+		if file.Class == "vhost" {
+			if file.ResourceID == "" || len(file.ResourceID) > 128 {
+				return fmt.Errorf("managed vhost has no bounded resource identity")
+			}
+			totalReceiptContent += len(file.Content)
+			if totalReceiptContent > helperprotocol.MaxManagedReceiptContentBytes {
+				return fmt.Errorf("managed vhost receipts exceed protocol content limit")
+			}
+		} else if file.ResourceID != "" {
+			return fmt.Errorf("managed secret unexpectedly has a resource identity")
+		}
 	}
 	for _, link := range compilation.Links {
 		if validatePrivatePath(link.Path) != nil || validatePrivatePath(link.Target) != nil {
@@ -587,6 +609,54 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 		}
 	}
 	return nil
+}
+
+func (a *managedApplyAction) attestManagedArtifacts(compilation managedCompilation) ([]helperprotocol.ManagedArtifactReceipt, error) {
+	if err := validateManagedCompilationTargets(compilation); err != nil {
+		return nil, err
+	}
+	enabledByTarget := make(map[string]bool, len(compilation.Links))
+	for _, link := range compilation.Links {
+		if link.Delete {
+			continue
+		}
+		item, err := inspectManagedPath(link.Path, "link", link.Target, a.ownerUID)
+		if err != nil || !item.Exists {
+			return nil, fmt.Errorf("activation link postcondition is not exact")
+		}
+		enabledByTarget[link.Target] = true
+	}
+	artifacts := make([]helperprotocol.ManagedArtifactReceipt, 0, len(compilation.Files))
+	for _, file := range compilation.Files {
+		if file.Delete || file.Class != "vhost" {
+			continue
+		}
+		var item managedFileSnapshot
+		var err error
+		if file.Preserve {
+			item, err = inspectPreservedManagedFile(file, a.ownerUID)
+		} else {
+			item, err = inspectManagedPath(file.Path, file.Class, "", a.ownerUID)
+		}
+		if err != nil || !item.Exists {
+			return nil, fmt.Errorf("managed vhost postcondition is not exact")
+		}
+		digest := sha256.Sum256(item.Content)
+		actualChecksum := hex.EncodeToString(digest[:])
+		if !file.Preserve && actualChecksum != file.SHA256 {
+			return nil, fmt.Errorf("managed vhost content changed before attestation")
+		}
+		receipt := helperprotocol.ManagedArtifactReceipt{
+			ArtifactID: file.ResourceID, Backend: a.target.Kind, TargetKind: "file", TargetPath: file.Path,
+			Content: string(item.Content), Checksum: actualChecksum,
+			Enabled: a.layout.EnabledDir == "" || enabledByTarget[file.Path], Warnings: []string{},
+		}
+		if !receipt.Enabled || receipt.Validate() != nil {
+			return nil, fmt.Errorf("managed artifact receipt is invalid")
+		}
+		artifacts = append(artifacts, receipt)
+	}
+	return artifacts, nil
 }
 
 func inspectPreservedManagedFile(file managedCompiledFile, ownerUID uint32) (managedFileSnapshot, error) {

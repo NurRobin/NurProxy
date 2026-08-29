@@ -40,9 +40,10 @@ type PreparedAction struct {
 }
 
 type ActionResult struct {
-	Mutated         bool
-	Validated       bool
-	SanitizedResult string
+	Mutated          bool
+	Validated        bool
+	SanitizedResult  string
+	ManagedArtifacts []helperprotocol.ManagedArtifactReceipt
 }
 
 type ActionHandler interface {
@@ -461,6 +462,7 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 			message = "managed proxy state already converged"
 		}
 		succeeded := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalSucceeded, prepared, message)
+		succeeded.ManagedArtifacts = append([]helperprotocol.ManagedArtifactReceipt(nil), result.ManagedArtifacts...)
 		if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalSucceeded, succeeded); err != nil {
 			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 		}
@@ -489,6 +491,7 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 		message = "managed proxy state applied"
 	}
 	succeeded := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalSucceeded, prepared, message)
+	succeeded.ManagedArtifacts = append([]helperprotocol.ManagedArtifactReceipt(nil), result.ManagedArtifacts...)
 	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalSucceeded, succeeded); err != nil {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 	}

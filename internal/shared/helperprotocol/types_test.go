@@ -1,13 +1,42 @@
 package helperprotocol
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
+
+func TestManagedArtifactReceiptBindsExactRootHelperOutput(t *testing.T) {
+	content := "# nurproxy-managed:v1\nserver {}\n"
+	digest := sha256.Sum256([]byte(content))
+	artifact := ManagedArtifactReceipt{
+		ArtifactID: "dom-1", Backend: "nginx", TargetKind: "file",
+		TargetPath: "/etc/nginx/sites-available/nurproxy-app.example.conf",
+		Content:    content, Checksum: hex.EncodeToString(digest[:]), Enabled: true, Warnings: []string{},
+	}
+	receipt := HelperReceipt{
+		OperationID: "apply-1", CanonicalRequestDigest: strings.Repeat("a", 64), HelperInstanceID: "helper-1",
+		Action: ActionApplyManagedProxyState, State: JournalSucceeded, RollbackCoverage: RollbackCoveragePartial,
+		ManagedArtifacts: []ManagedArtifactReceipt{artifact}, UpdatedAt: time.Date(2026, 8, 29, 16, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("valid managed receipt rejected: %v", err)
+	}
+	receipt.ManagedArtifacts[0].Checksum = strings.Repeat("b", 64)
+	if err := receipt.Validate(); err == nil {
+		t.Fatal("managed receipt accepted content with another checksum")
+	}
+	receipt.ManagedArtifacts[0] = artifact
+	receipt.ManagedArtifacts[0].TargetPath = "/etc/nginx/sites-available/../nginx.conf"
+	if err := receipt.Validate(); err == nil {
+		t.Fatal("managed receipt accepted a noncanonical target path")
+	}
+}
 
 func validExecutionGrant() ExecutionGrant {
 	issued := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)

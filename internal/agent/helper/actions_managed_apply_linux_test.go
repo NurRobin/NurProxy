@@ -128,6 +128,26 @@ func TestManagedApplyCompilesSignedStructuredRouteToLocalPinnedTargets(t *testin
 	}
 }
 
+func TestManagedApplyAttestationRejectsContentChangedAfterCommit(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	compilation, err := action.compile(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(compilation.Files[0].Path, compilation.Files[0].Content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(compilation.Links[0].Target, compilation.Links[0].Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(compilation.Files[0].Path, []byte(proxy.StampManagedArtifact("server { listen 8081; }\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := action.attestManagedArtifacts(compilation); err == nil {
+		t.Fatal("helper attested vhost bytes that changed after commit")
+	}
+}
+
 func TestManagedApplyTransactionSnapshotsCommitsValidatesReloadsAndRestores(t *testing.T) {
 	action, intent, host := newManagedApplyTest(t)
 	material, err := action.Plan(context.Background(), intent)
@@ -146,6 +166,11 @@ func TestManagedApplyTransactionSnapshotsCommitsValidatesReloadsAndRestores(t *t
 	result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared)
 	if err != nil || !result.Mutated || !result.Validated {
 		t.Fatalf("managed execute = %+v, %v", result, err)
+	}
+	if len(result.ManagedArtifacts) != 1 || result.ManagedArtifacts[0].ArtifactID != intent.Routes[0].ArtifactID ||
+		result.ManagedArtifacts[0].TargetPath == "" || !result.ManagedArtifacts[0].Enabled ||
+		!proxy.HasManagedArtifactMarker(result.ManagedArtifacts[0].Content) {
+		t.Fatalf("managed execute did not attest the installed vhost: %+v", result.ManagedArtifacts)
 	}
 	compilation, err := action.compile(intent)
 	if err != nil {
@@ -401,6 +426,9 @@ func TestManagedApplyPreservesExactUnmarkedLegacyGeneratedConfiguration(t *testi
 	result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared)
 	if err != nil || result.Mutated || !result.Validated || len(host.mutations) != 0 {
 		t.Fatalf("legacy generated preserve execute = %+v, %v; mutations=%v", result, err, host.mutations)
+	}
+	if len(result.ManagedArtifacts) != 1 || result.ManagedArtifacts[0].Content != legacy || !result.ManagedArtifacts[0].Enabled {
+		t.Fatalf("preserved legacy vhost was not attested exactly: %+v", result.ManagedArtifacts)
 	}
 	after, err := os.Lstat(initial.Files[0].Path)
 	if err != nil || !os.SameFile(before, after) {

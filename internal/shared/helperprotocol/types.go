@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -855,15 +856,47 @@ func DisplayPlanDigest(plan HelperPlan) (string, error) {
 }
 
 type HelperReceipt struct {
-	OperationID            string           `json:"operation_id"`
-	CanonicalRequestDigest string           `json:"canonical_request_digest"`
-	HelperInstanceID       string           `json:"helper_instance_id"`
-	Action                 Action           `json:"action"`
-	State                  JournalState     `json:"state"`
-	RollbackCoverage       RollbackCoverage `json:"rollback_coverage"`
-	SnapshotDigest         string           `json:"snapshot_digest,omitempty"`
-	SanitizedResult        string           `json:"sanitized_result"`
-	UpdatedAt              string           `json:"updated_at"`
+	OperationID            string                   `json:"operation_id"`
+	CanonicalRequestDigest string                   `json:"canonical_request_digest"`
+	HelperInstanceID       string                   `json:"helper_instance_id"`
+	Action                 Action                   `json:"action"`
+	State                  JournalState             `json:"state"`
+	RollbackCoverage       RollbackCoverage         `json:"rollback_coverage"`
+	SnapshotDigest         string                   `json:"snapshot_digest,omitempty"`
+	SanitizedResult        string                   `json:"sanitized_result"`
+	ManagedArtifacts       []ManagedArtifactReceipt `json:"managed_artifacts,omitempty"`
+	UpdatedAt              string                   `json:"updated_at"`
+}
+
+const MaxManagedReceiptContentBytes = MaxFrameBytes / 8
+
+type ManagedArtifactReceipt struct {
+	ArtifactID string   `json:"artifact_id"`
+	Backend    string   `json:"backend"`
+	TargetKind string   `json:"target_kind"`
+	TargetPath string   `json:"target_path"`
+	Content    string   `json:"content"`
+	Checksum   string   `json:"checksum"`
+	Enabled    bool     `json:"enabled"`
+	Warnings   []string `json:"warnings"`
+}
+
+func (a ManagedArtifactReceipt) Validate() error {
+	if !validID(a.ArtifactID) || (a.Backend != "nginx" && a.Backend != "apache") || a.TargetKind != "file" ||
+		!strings.HasPrefix(a.TargetPath, "/") || path.Clean(a.TargetPath) != a.TargetPath || len(a.TargetPath) > 4096 ||
+		len(a.Content) > MaxManagedReceiptContentBytes || !validDigest(a.Checksum) || len(a.Warnings) > 64 {
+		return fmt.Errorf("invalid managed artifact receipt")
+	}
+	digest := sha256.Sum256([]byte(a.Content))
+	if hex.EncodeToString(digest[:]) != a.Checksum {
+		return fmt.Errorf("managed artifact receipt checksum mismatch")
+	}
+	for _, warning := range a.Warnings {
+		if strings.TrimSpace(warning) == "" || len(warning) > 512 {
+			return fmt.Errorf("invalid managed artifact receipt warning")
+		}
+	}
+	return nil
 }
 
 func (r HelperReceipt) Validate() error {
@@ -871,6 +904,29 @@ func (r HelperReceipt) Validate() error {
 		!r.Action.Valid() || !r.State.Valid() || !r.RollbackCoverage.Valid() ||
 		(r.SnapshotDigest != "" && !validDigest(r.SnapshotDigest)) || len(r.SanitizedResult) > 4096 || parseCanonicalTime(r.UpdatedAt) == nil {
 		return fmt.Errorf("invalid helper receipt")
+	}
+	if r.ManagedArtifacts != nil && (r.Action != ActionApplyManagedProxyState || r.State != JournalSucceeded || len(r.ManagedArtifacts) > MaxManifestEntries) {
+		return fmt.Errorf("invalid helper receipt managed artifacts")
+	}
+	seenIDs := make(map[string]struct{}, len(r.ManagedArtifacts))
+	seenPaths := make(map[string]struct{}, len(r.ManagedArtifacts))
+	totalContent := 0
+	for _, artifact := range r.ManagedArtifacts {
+		if artifact.Validate() != nil {
+			return fmt.Errorf("invalid helper receipt managed artifact")
+		}
+		if _, exists := seenIDs[artifact.ArtifactID]; exists {
+			return fmt.Errorf("duplicate helper receipt artifact")
+		}
+		if _, exists := seenPaths[artifact.TargetPath]; exists {
+			return fmt.Errorf("duplicate helper receipt artifact target")
+		}
+		seenIDs[artifact.ArtifactID] = struct{}{}
+		seenPaths[artifact.TargetPath] = struct{}{}
+		totalContent += len(artifact.Content)
+		if totalContent > MaxManagedReceiptContentBytes {
+			return fmt.Errorf("helper receipt managed artifacts exceed content limit")
+		}
 	}
 	return nil
 }

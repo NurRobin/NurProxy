@@ -413,7 +413,7 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 		if c.health != nil {
 			c.health.SetError("privileged managed proxy reconciliation failed")
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed")
+		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed", nil)
 		return
 	}
 	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
@@ -421,17 +421,23 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 		if c.health != nil {
 			c.health.SetError("privileged managed proxy reconciliation did not succeed")
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation did not succeed")
+		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation did not succeed", nil)
 		return
 	}
 	if c.health != nil {
 		c.health.SetError("")
 	}
-	c.sendManagedAck(ctx, envelope.IntentSet, "")
+	c.sendManagedAck(ctx, envelope.IntentSet, "", receipt.Envelope.Payload.ManagedArtifacts)
 }
 
-func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string) {
-	reports, managed := c.managedAckReports(ctx, set, applyError)
+func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string, attested []helperprotocol.ManagedArtifactReceipt) {
+	var reports []proxymodel.ArtifactReport
+	var managed map[string]managedArtifact
+	if applyError == "" {
+		reports, managed = c.managedAckReportsFromReceipt(set, attested)
+	} else {
+		reports, managed = c.managedAckReports(ctx, set, applyError)
+	}
 	if applyError == "" {
 		c.carryKeepManaged(set.Keep, managed)
 		c.setManaged(managed)
@@ -440,6 +446,43 @@ func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, a
 		c.applyStateMu.Unlock()
 	}
 	c.sendAck(ctx, reports)
+}
+
+func (c *Client) managedAckReportsFromReceipt(set proxymodel.IntentSet, attested []helperprotocol.ManagedArtifactReceipt) ([]proxymodel.ArtifactReport, map[string]managedArtifact) {
+	reports := make([]proxymodel.ArtifactReport, 0, len(set.Intents))
+	managed := make(map[string]managedArtifact, len(set.Intents))
+	byID := make(map[string]helperprotocol.ManagedArtifactReceipt, len(attested))
+	invalidSet := len(attested) != len(set.Intents)
+	for _, artifact := range attested {
+		if artifact.Validate() != nil {
+			invalidSet = true
+		}
+		if _, duplicate := byID[artifact.ArtifactID]; duplicate {
+			invalidSet = true
+		}
+		byID[artifact.ArtifactID] = artifact
+	}
+	info := c.caddy.Info()
+	for _, intent := range set.Intents {
+		report := proxymodel.ArtifactReport{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Backend: intent.Backend}
+		artifact, found := byID[intent.ArtifactID]
+		target, targetErr := managedFileTarget(info, intent)
+		if invalidSet || !found || targetErr != nil || artifact.Backend != intent.Backend || artifact.TargetKind != string(proxy.TargetKindFile) ||
+			artifact.TargetPath != target.Path || !artifact.Enabled {
+			report.Error = "post-apply attested artifact verification failed"
+			reports = append(reports, report)
+			continue
+		}
+		report.TargetKind = artifact.TargetKind
+		report.TargetPath = artifact.TargetPath
+		report.Content = artifact.Content
+		report.Checksum = artifact.Checksum
+		report.Enabled = artifact.Enabled
+		report.Warnings = append([]string(nil), artifact.Warnings...)
+		managed[intent.ArtifactID] = managedArtifact{targetKind: report.TargetKind, targetPath: report.TargetPath, checksum: report.Checksum}
+		reports = append(reports, report)
+	}
+	return reports, managed
 }
 
 func (c *Client) managedAckReports(ctx context.Context, set proxymodel.IntentSet, applyError string) ([]proxymodel.ArtifactReport, map[string]managedArtifact) {
