@@ -23,6 +23,11 @@ import (
 // It is masked from the settings API (see system.go) so it never leaves the box.
 const sessionSecretSetting = "session_secret"
 
+const (
+	sessionSecretPersistAttempts = 3
+	sessionSecretRetryDelay      = 50 * time.Millisecond
+)
+
 // RoutePusher computes an agent's desired routes and delivers them over its live
 // stream. The reconciler implements it; API handlers call it to push config the
 // instant a domain changes.
@@ -152,10 +157,11 @@ func NewServer(database *db.DB, version string) *Server {
 // an ephemeral random key is used: still unforgeable, but sessions reset on the
 // next restart.
 func loadOrCreateSessionKey(database *db.DB) []byte {
-	if v, err := database.GetSetting(sessionSecretSetting); err == nil && v != "" {
-		if key, derr := base64.StdEncoding.DecodeString(v); derr == nil && len(key) == 32 {
-			return key
-		}
+	stored, getErr := database.GetSetting(sessionSecretSetting)
+	if key, ok := decodeSessionKey(stored); getErr == nil && ok {
+		return key
+	}
+	if getErr == nil && stored != "" {
 		log.Printf("warning: stored session secret is malformed; regenerating (existing sessions will be invalidated)")
 	}
 
@@ -164,10 +170,44 @@ func loadOrCreateSessionKey(database *db.DB) []byte {
 		// crypto/rand is broken — unrecoverable for a security-sensitive key.
 		log.Fatalf("failed to generate session secret: %v", err)
 	}
-	if err := database.SetSetting(sessionSecretSetting, base64.StdEncoding.EncodeToString(key)); err != nil {
-		log.Printf("warning: could not persist session secret, sessions will reset on restart: %v", err)
+	candidate := base64.StdEncoding.EncodeToString(key)
+	var lastPersistErr error
+	for attempt := 0; attempt < sessionSecretPersistAttempts; attempt++ {
+		actual, _, err := database.CompareAndSwapSetting(sessionSecretSetting, stored, candidate)
+		if err != nil {
+			lastPersistErr = err
+			if authoritative, readErr := database.GetSetting(sessionSecretSetting); readErr == nil {
+				if persisted, ok := decodeSessionKey(authoritative); ok {
+					return persisted
+				}
+				stored = authoritative
+			}
+		} else {
+			if persisted, ok := decodeSessionKey(actual); ok {
+				return persisted
+			}
+			stored = actual
+		}
+		if attempt+1 < sessionSecretPersistAttempts {
+			time.Sleep(sessionSecretRetryDelay)
+		}
 	}
+	if authoritative, err := database.GetSetting(sessionSecretSetting); err == nil {
+		if persisted, ok := decodeSessionKey(authoritative); ok {
+			return persisted
+		}
+	}
+	if lastPersistErr != nil {
+		log.Printf("warning: could not persist session secret after retries, sessions will reset on restart: %v", lastPersistErr)
+		return key
+	}
+	log.Printf("warning: stored session secret remained malformed after atomic replacement; sessions will reset on restart")
 	return key
+}
+
+func decodeSessionKey(encoded string) ([]byte, bool) {
+	key, err := base64.StdEncoding.DecodeString(encoded)
+	return key, err == nil && len(key) == 32
 }
 
 // Handler returns the mux wrapped with middleware.

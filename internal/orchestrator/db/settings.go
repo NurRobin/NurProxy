@@ -65,6 +65,43 @@ func (d *DB) InitializeAdminPassword(hash string) (bool, error) {
 	return n == 1, nil
 }
 
+// CompareAndSwapSetting stores newValue only when the setting is absent or its
+// current value equals expected, then returns the authoritative stored value.
+// The write and read-back share one transaction, so callers on different
+// database handles cannot retain different locally generated values.
+func (d *DB) CompareAndSwapSetting(key, expected, newValue string) (actual string, swapped bool, err error) {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return "", false, fmt.Errorf("beginning setting compare-and-swap: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := tx.Exec(`
+		INSERT INTO settings (key, value, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+			value = excluded.value,
+			updated_at = excluded.updated_at
+		WHERE settings.value = ?`,
+		key, newValue, now, expected,
+	)
+	if err != nil {
+		return "", false, fmt.Errorf("comparing and swapping setting %s: %w", key, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", false, fmt.Errorf("reading setting compare-and-swap result: %w", err)
+	}
+	if err := tx.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&actual); err != nil {
+		return "", false, fmt.Errorf("reading setting %s after compare-and-swap: %w", key, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, fmt.Errorf("committing setting compare-and-swap: %w", err)
+	}
+	return actual, n == 1, nil
+}
+
 // ListSettings returns all stored settings.
 func (d *DB) ListSettings() ([]models.Setting, error) {
 	rows, err := d.read.Query("SELECT key, value, updated_at FROM settings ORDER BY key")
