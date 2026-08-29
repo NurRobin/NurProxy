@@ -73,6 +73,9 @@ type Server struct {
 	// recoveryMu serializes report transitions and manual repair admission so
 	// two requests cannot create competing active operations from one diagnosis.
 	recoveryMu sync.Mutex
+	// recoveryAuthority is intentionally exposed to handlers through its public
+	// identity only until a confirmation-bound grant endpoint is invoked.
+	recoveryAuthority recoveryAuthorityPublic
 
 	// dnsDryRun / acmeDryRun reflect sandbox mode so the health endpoint can tell
 	// the dashboard to show a "dry-run — no external calls" banner (#93).
@@ -264,6 +267,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/repairs", s.requireAuth(s.handleListRepairs))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs", s.requireAuth(s.handleCreateRepair))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/report", s.requireAgentAuth(s.handleRecoveryReport))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/authority", s.requireAgentAuth(s.handleGetRecoveryAuthority))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs/{opId}/ack", s.requireAgentAuth(s.handleRepairAck))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/safe-auto-repair", s.requireAuth(s.handleSetSafeAutoRepair))
 	// Live push channel: the agent dials out and holds this open; the

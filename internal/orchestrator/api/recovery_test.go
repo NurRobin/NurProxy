@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/recoveryauth"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -70,6 +72,30 @@ func TestRecoveryRoutesRequireCorrectPrincipal(t *testing.T) {
 		map[string]any{}, recoveryAgentToken)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("cross-agent ack = %d, want 403", w.Code)
+	}
+}
+
+func TestAgentCanFetchOnlyItsPinnedRecoveryAuthority(t *testing.T) {
+	srv, _, h, _ := recoveryFixture(t)
+	authority, err := recoveryauth.New(make([]byte, ed25519.SeedSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetRecoveryAuthority(authority)
+	w := doRequestWithAuth(t, h, http.MethodGet, "/api/v1/agents/agent-1/recovery/authority", nil, recoveryAgentToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("authority response = %d: %s", w.Code, w.Body.String())
+	}
+	var response recoveryAuthorityResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Algorithm != "Ed25519" || response.KeyID != authority.KeyID() || response.PublicKey != authority.PublicKeyText() {
+		t.Fatalf("authority response = %#v", response)
+	}
+	w = doRequestWithAuth(t, h, http.MethodGet, "/api/v1/agents/other/recovery/authority", nil, recoveryAgentToken)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("cross-agent authority response = %d, want 403", w.Code)
 	}
 }
 

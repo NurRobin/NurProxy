@@ -25,6 +25,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/mcp"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/metrics"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/recoveryauth"
 	orchtls "github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
@@ -129,6 +130,21 @@ func main() {
 		log.Fatalf("encryption key name changed during startup")
 	}
 
+	// The helper grant authority is distinct from both database encryption and
+	// session signing. Only its public key is provisioned onto agent hosts.
+	recoveryAuthorityFile, recoveryAuthorityCreated, err := dataRoot.OpenOrCreateRegular("recovery-authority.key")
+	if err != nil {
+		log.Fatalf("failed to securely open recovery authority key: %v", err)
+	}
+	defer recoveryAuthorityFile.Close()
+	recoveryAuthority, err := recoveryauth.LoadOrGenerate(recoveryAuthorityFile, recoveryAuthorityCreated)
+	if err != nil {
+		log.Fatalf("failed to load recovery authority: %v", err)
+	}
+	if same, err := dataRoot.SameFile("recovery-authority.key", recoveryAuthorityFile); err != nil || !same {
+		log.Fatalf("recovery authority key name changed during startup")
+	}
+
 	// Open database
 	databaseFile, _, err := dataRoot.OpenOrCreateRegular("nurproxy.db")
 	if err != nil {
@@ -226,6 +242,7 @@ func main() {
 	// Create API server, wiring in the hub + reconciler so the stream endpoint
 	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
+	srv.SetRecoveryAuthority(recoveryAuthority)
 	srv.SetAgentHub(hub, rec)
 	// Wire the DNS-takeover override so an operator can migrate an existing domain
 	// whose public DNS predates NurProxy (overwrite a conflicting foreign record
