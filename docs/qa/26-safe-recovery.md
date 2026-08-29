@@ -47,3 +47,15 @@ compatibility with the agent's existing `last_error`. Live and replayed repair
 requests must equal the complete persisted request, including their initial
 step and timestamps. History after a duplicate terminal ACK must equal the
 complete terminal operation report.
+
+## Dashboard recovery projection bounds
+
+The diagnostics endpoint returns every active diagnostic plus at most 100
+resolved entries by default (caller-selectable from 0 through 200). Breaker
+projection accepts arbitrarily many returned keys in portable SQLite-sized
+chunks: latest success/latch metadata uses indexed lookups, while each terminal
+failure state contributes at most 256 recent receipts per key. This keeps work
+independent of older unbounded operation history without changing the scalar
+breaker semantics. Every recovery-history card summary includes operation
+state, action, request source, and relative start time, including while older
+cards remain collapsed.
