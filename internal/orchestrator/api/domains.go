@@ -629,36 +629,28 @@ func (s *Server) handleUpdateDomainConfig(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{"message": "manual config set"})
 }
 
-// resetDomainArtifact deletes the domain's current "dom-<id>" artifact before
-// a config edit or reset is pushed.
+// resetDomainArtifact returns the domain's current "dom-<id>" artifact to model
+// authority before a config edit or reset is pushed.
 // The reconciler treats a manual artifact as authoritative and pushes its stored
 // bytes verbatim, ignoring the domain row entirely — so after a config reset (or
 // a new manual config on the row) the old bytes would be re-pushed, the agent
 // would ACK identical content, and AppendConfigArtifactVersion's semantic-equality
 // gate would return before the source-updating UPDATE: source stays "manual" and
-// the row change never reaches the agent. Deleting the artifact breaks that loop
-// safely — the reconciler renders from the domain model when no artifact exists,
-// and the agent's next apply-ACK recreates the row with source=generated and the
-// agent's real rendered content. The artifact is removed regardless of its last
-// source classification: an apply ACK can classify raw model content as generated,
-// so source alone cannot prove that its bytes still follow the updated domain row.
+// the row change never reaches the agent. Resetting source/drift authority breaks
+// that loop while retaining the canonical target identity and version history.
 func (s *Server) resetDomainArtifact(r *http.Request, domainID int64) {
 	artifactID := artifactIDForDomainID(domainID)
-	_, err := s.db.GetConfigArtifact(artifactID)
+	err := s.db.ResetConfigArtifactToDomainModel(artifactID)
 	if err != nil {
 		// No artifact is the common case (nothing to reset); anything else is a
 		// real lookup failure that would leave a stale manual artifact silently
 		// overriding the domain row — make it visible.
 		if !errors.Is(err, db.ErrArtifactNotFound) {
-			log.Printf("resetDomainArtifact: looking up artifact %s: %v", artifactID, err)
+			log.Printf("resetDomainArtifact: resetting artifact %s: %v", artifactID, err)
 		}
 		return
 	}
-	if dErr := s.db.DeleteConfigArtifact(artifactID); dErr != nil {
-		log.Printf("resetDomainArtifact: failed to delete artifact %s: %v", artifactID, dErr)
-		return
-	}
-	s.audit(r, "config_artifact", artifactID, "reset", "stale artifact removed; agent re-renders from the domain model")
+	s.audit(r, "config_artifact", artifactID, "reset", "artifact authority reset; agent re-renders from the domain model")
 }
 
 // POST /api/v1/domains/{id}/config/reset

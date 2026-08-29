@@ -224,6 +224,14 @@ func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 
 	artifactID := fmt.Sprintf("dom-%d", dom.ID)
 	content := `{"@id":"r1","match":[{"host":["app.example.com"]}]}`
+	adoptedID := "adopt-agent-1-caddy-caddy-route-r1"
+	if err := database.CreateConfigArtifact(&models.ConfigArtifact{
+		ID: adoptedID, AgentID: "agent-1", Backend: "caddy",
+		Target: models.Target{Kind: "caddy-route", Path: "caddy:route:r1"},
+		Source: models.ArtifactSourceGenerated, Content: content,
+	}, "agent:agent-1", "restart adoption race"); err != nil {
+		t.Fatalf("seed adopted target occupant: %v", err)
+	}
 	ack := proxymodel.ApplyAck{Reports: []proxymodel.ArtifactReport{{
 		ArtifactID: artifactID,
 		Host:       "app.example.com",
@@ -267,6 +275,9 @@ func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 	}
 	if art.DomainID == nil || *art.DomainID != dom.ID {
 		t.Errorf("artifact domain id = %v, want %d", art.DomainID, dom.ID)
+	}
+	if _, err := database.GetConfigArtifact(adoptedID); err == nil {
+		t.Error("temporary adopted identity still occupies the canonical managed target")
 	}
 
 	// A re-apply of byte-identical content must NOT spawn a phantom version.

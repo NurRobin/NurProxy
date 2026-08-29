@@ -281,7 +281,18 @@ func (s *Server) storeArtifactReport(r *http.Request, agentID string, rep *proxy
 			Content:  rep.Content,
 			Enabled:  rep.Enabled,
 		}
-		if cErr := s.db.CreateConfigArtifact(art, "agent:"+agentID, "initial apply"); cErr != nil {
+		var cErr error
+		occupant, lookupErr := s.db.GetConfigArtifactByTarget(agentID, rep.TargetKind, rep.TargetPath)
+		adoptedPrefix := "adopt-" + agentID + "-"
+		if lookupErr == nil && occupant != nil && strings.HasPrefix(occupant.ID, adoptedPrefix) &&
+			occupant.Source == models.ArtifactSourceGenerated && domainID != nil {
+			cErr = s.db.ReplaceConfigArtifactTarget(occupant.ID, art, "agent:"+agentID, "canonical apply after restart adoption")
+		} else if lookupErr != nil {
+			cErr = lookupErr
+		} else {
+			cErr = s.db.CreateConfigArtifact(art, "agent:"+agentID, "initial apply")
+		}
+		if cErr != nil {
 			log.Printf("ack: failed to create artifact %s: %v", rep.ArtifactID, cErr)
 			return
 		}
