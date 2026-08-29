@@ -261,15 +261,39 @@ func TestSandboxEndToEnd(t *testing.T) {
 		}
 	}
 	var resolvedDiagnostics []recoverymodel.Diagnostic
+	var staleDiagnosticID string
 	waitFor(t, 10*time.Second, func() bool {
 		api.get("/api/v1/agents/"+agentID+"/diagnostics?include_resolved=true", &resolvedDiagnostics)
 		for _, diagnostic := range resolvedDiagnostics {
 			if diagnostic.Code == recoverymodel.CodeManagedStaleTemp && diagnostic.ProposedAction == recoverymodel.ActionRemoveManagedTemp {
+				staleDiagnosticID = diagnostic.ID
 				return true
 			}
 		}
 		return false
 	})
+	var activeAfterRepair []recoverymodel.Diagnostic
+	waitFor(t, 10*time.Second, func() bool {
+		api.get("/api/v1/agents/"+agentID+"/diagnostics", &activeAfterRepair)
+		for _, diagnostic := range activeAfterRepair {
+			if diagnostic.ID == staleDiagnosticID {
+				return false
+			}
+		}
+		return true
+	})
+	resolvedDiagnostics = nil
+	api.get("/api/v1/agents/"+agentID+"/diagnostics?include_resolved=true", &resolvedDiagnostics)
+	historyRetained := false
+	for _, diagnostic := range resolvedDiagnostics {
+		if diagnostic.ID == staleDiagnosticID {
+			historyRetained = true
+			break
+		}
+	}
+	if !historyRetained {
+		t.Fatalf("resolved stale-temp diagnostic %q disappeared from history", staleDiagnosticID)
+	}
 
 	managedPath := filepath.Join(proxyConfigDir, "nurproxy-app.sandbox.test.conf")
 	managedBefore, err := os.ReadFile(managedPath)
