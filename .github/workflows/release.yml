@@ -28,6 +28,8 @@ jobs:
           cache: true
       - name: Run tests
         run: go test ./...
+      - name: Cross-build release matrix
+        run: make build-release-matrix
 
   release:
     name: Release

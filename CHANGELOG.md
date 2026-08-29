@@ -5,12 +5,14 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0-rc.1] - 2026-08-29
+## [0.5.0-rc.2] - 2026-08-29
 
 This release candidate introduces NurProxy's privilege-separated agent and its
 safe recovery system. It also collects the DNS, TLS, observability, lifecycle,
 and operator-safety work completed since 0.4.0. It is intended for release-branch
-testing before the final 0.5.0 release.
+testing before the final 0.5.0 release. The `rc.1` tag failed during the
+cross-platform build before GoReleaser published a release or any artifacts;
+`rc.2` contains the portability fix and a pre-tag matrix gate.
 
 ### Highlights
 
@@ -83,6 +85,10 @@ testing before the final 0.5.0 release.
 
 ### Fixed
 
+- Release builds now compile recovery snapshot metadata portably on 32-bit ARM,
+  use a no-follow directory walker on Darwin/FreeBSD, and explicitly refuse the
+  Linux-only helper bootstrap on other platforms. Branch CI cross-builds the
+  complete GoReleaser target matrix so these failures are caught before tagging.
 - Cloudflare record updates preserve the existing `proxied` flag.
 - Deleted TLS routes are pruned before backend validation, preventing stale
   vhosts from deadlocking reconciliation after their certificate is removed.
@@ -244,5 +250,5 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
-[0.5.0-rc.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.1
+[0.5.0-rc.2]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.2
 [0.3.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.3.0

@@ -1,4 +1,4 @@
-.PHONY: build build-agent build-headless build-all test test-integration test-e2e test-sandbox lint clean dev dev-sandbox help
+.PHONY: build build-agent build-headless build-all build-release-matrix test test-integration test-e2e test-sandbox lint clean dev dev-sandbox help
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -14,6 +14,25 @@ build-headless: ## Build headless orchestrator (no embedded dashboard, API+CLI o
 	go build -tags headless $(LDFLAGS) -o nurproxy-headless ./cmd/nurproxy
 
 build-all: build build-agent ## Build both binaries
+
+RELEASE_TARGETS := linux/amd64 linux/arm64 linux/arm/v7 darwin/amd64 darwin/arm64 freebsd/amd64 freebsd/arm64
+
+build-release-matrix: ## Cross-build both binaries for every GoReleaser target
+	@set -eu; \
+	out=$$(mktemp -d); \
+	trap 'rm -rf "$$out"' EXIT HUP INT TERM; \
+	for target in $(RELEASE_TARGETS); do \
+		goos=$${target%%/*}; \
+		rest=$${target#*/}; \
+		goarch=$${rest%%/*}; \
+		goarm=; \
+		if [ "$$goarch" = arm ]; then goarm=$${rest#*/v}; fi; \
+		name=$$(printf '%s' "$$target" | tr / -); \
+		for binary in nurproxy nurproxy-agent; do \
+			CGO_ENABLED=0 GOOS="$$goos" GOARCH="$$goarch" GOARM="$$goarm" \
+				go build -trimpath -o "$$out/$${binary}_$${name}" "./cmd/$$binary"; \
+		done; \
+	done
 
 ## Test
 test: ## Run unit tests

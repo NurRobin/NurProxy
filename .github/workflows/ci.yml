@@ -80,6 +80,8 @@ jobs:
         run: go build -o nurproxy ./cmd/nurproxy
       - name: Build agent
         run: go build -o nurproxy-agent ./cmd/nurproxy-agent
+      - name: Cross-build release matrix
+        run: make build-release-matrix
       - name: Upload binaries
         uses: actions/upload-artifact@v7
         with:

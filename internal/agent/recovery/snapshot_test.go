@@ -711,6 +711,27 @@ func TestRetentionRemovalRequiresSelectedDirectoryIdentity(t *testing.T) {
 	}
 }
 
+func TestOpenDirNoSymlinksByComponentsRejectsIntermediateSymlink(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real", "child")
+	mustMkdir(t, realDir, 0o700)
+	opened, err := openDirNoSymlinksByComponents(realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "linked")
+	if err := os.Symlink(filepath.Join(root, "real"), link); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err = openDirNoSymlinksByComponents(filepath.Join(link, "child")); err == nil {
+		_ = opened.Close()
+		t.Fatal("intermediate symlink was followed")
+	}
+}
+
 func resolveAll(t *testing.T, guard *PathGuard, paths ...string) []GuardedPath {
 	t.Helper()
 	result := make([]GuardedPath, 0, len(paths))

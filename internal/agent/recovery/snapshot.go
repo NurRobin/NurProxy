@@ -465,7 +465,7 @@ func restorePrepared(item preparedSnapshot) error {
 	var stat unix.Stat_t
 	err = unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
 	if item.exists {
-		if err != nil || uint64(stat.Dev) != item.device || stat.Ino != item.inode || stat.Mode&unix.S_IFMT != item.entryType {
+		if err != nil || uint64(stat.Dev) != item.device || stat.Ino != item.inode || uint32(stat.Mode&unix.S_IFMT) != item.entryType {
 			return fmt.Errorf("target identity changed after preflight")
 		}
 	} else if !errors.Is(err, unix.ENOENT) {
@@ -512,8 +512,8 @@ func preflightTarget(entry SnapshotEntry) (*os.File, bool, uint64, uint64, uint3
 		_ = parent.Close()
 		return nil, false, 0, 0, 0, err
 	}
-	entryType := stat.Mode & unix.S_IFMT
-	if entryType != unix.S_IFREG && entryType != unix.S_IFLNK {
+	entryType := uint32(stat.Mode & unix.S_IFMT)
+	if entryType != uint32(unix.S_IFREG) && entryType != uint32(unix.S_IFLNK) {
 		_ = parent.Close()
 		return nil, false, 0, 0, 0, fmt.Errorf("refusing to replace unsupported entry type")
 	}
@@ -584,7 +584,7 @@ func (s *SnapshotStore) Prune(now time.Time) error {
 		}
 		var stat unix.Stat_t
 		if err := unix.Fstatat(int(s.operations.Fd()), entry.Name(), &stat, unix.AT_SYMLINK_NOFOLLOW); err == nil && stat.Mode&unix.S_IFMT == unix.S_IFDIR {
-			operations = append(operations, candidate{id: entry.Name(), created: time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec), incomplete: true, device: device, inode: inode})
+			operations = append(operations, candidate{id: entry.Name(), created: time.Unix(int64(stat.Mtim.Sec), int64(stat.Mtim.Nsec)), incomplete: true, device: device, inode: inode})
 		}
 	}
 	sort.Slice(operations, func(i, j int) bool { return operations[i].created.After(operations[j].created) })
@@ -878,12 +878,28 @@ func openOrCreatePrivateDirAt(parent *os.File, name string) (*os.File, error) {
 	return dir, nil
 }
 
-func openDirNoSymlinks(path string) (*os.File, error) {
-	fd, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS})
+func openDirNoSymlinksByComponents(path string) (*os.File, error) {
+	if !safeAbsoluteCleanPath(path) {
+		return nil, fmt.Errorf("directory must be an absolute clean path")
+	}
+	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
-	return os.NewFile(uintptr(fd), path), nil
+	current := os.NewFile(uintptr(fd), "/")
+	for _, component := range strings.Split(strings.TrimPrefix(path, "/"), string(filepath.Separator)) {
+		if component == "" {
+			continue
+		}
+		next, err := openDirAt(int(current.Fd()), component)
+		if err != nil {
+			_ = current.Close()
+			return nil, err
+		}
+		_ = current.Close()
+		current = next
+	}
+	return current, nil
 }
 
 func openDirAt(parent int, name string) (*os.File, error) {
