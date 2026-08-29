@@ -17,16 +17,25 @@ import (
 const MaxRootConfigBytes = 64 << 10
 
 type RootConfig struct {
-	AgentID                   string `json:"agent_id"`
-	HelperInstanceID          string `json:"helper_instance_id"`
-	ExpectedBuildID           string `json:"expected_build_id"`
-	AgentUser                 string `json:"agent_user"`
-	AgentUID                  uint32 `json:"agent_uid"`
-	OrchestratorKeyID         string `json:"orchestrator_key_id"`
-	OrchestratorPublicKeyText string `json:"orchestrator_public_key"`
-	AttestationKeyID          string `json:"attestation_key_id"`
-	AttestationPrivateKeyFile string `json:"attestation_private_key_file"`
-	StoreDir                  string `json:"store_dir"`
+	AgentID                   string            `json:"agent_id"`
+	HelperInstanceID          string            `json:"helper_instance_id"`
+	ExpectedBuildID           string            `json:"expected_build_id"`
+	AgentUser                 string            `json:"agent_user"`
+	AgentUID                  uint32            `json:"agent_uid"`
+	OrchestratorKeyID         string            `json:"orchestrator_key_id"`
+	OrchestratorPublicKeyText string            `json:"orchestrator_public_key"`
+	AttestationKeyID          string            `json:"attestation_key_id"`
+	AttestationPrivateKeyFile string            `json:"attestation_private_key_file"`
+	StoreDir                  string            `json:"store_dir"`
+	ProxyTarget               ProxyTargetConfig `json:"proxy_target"`
+}
+
+type ProxyTargetConfig struct {
+	Kind            string   `json:"kind"`
+	Binary          string   `json:"binary"`
+	Unit            string   `json:"unit"`
+	SystemctlBinary string   `json:"systemctl_binary"`
+	ConfigRoots     []string `json:"config_roots"`
 }
 
 func (c RootConfig) Validate() error {
@@ -45,7 +54,76 @@ func (c RootConfig) Validate() error {
 	if err := validatePrivatePath(c.StoreDir); err != nil {
 		return fmt.Errorf("invalid helper store path: %w", err)
 	}
+	if err := c.ProxyTarget.Validate(); err != nil {
+		return fmt.Errorf("invalid proxy target: %w", err)
+	}
 	return nil
+}
+
+func (c ProxyTargetConfig) Validate() error {
+	allowed := map[string]struct {
+		binaries map[string]bool
+		units    map[string]bool
+		roots    []string
+	}{
+		"nginx": {
+			binaries: map[string]bool{"nginx": true},
+			units:    map[string]bool{"nginx.service": true},
+			roots:    []string{"/etc/nginx"},
+		},
+		"apache": {
+			binaries: map[string]bool{"apachectl": true, "apache2ctl": true, "httpd": true, "apache2": true},
+			units:    map[string]bool{"apache2.service": true, "httpd.service": true},
+			roots:    []string{"/etc/apache2", "/etc/httpd"},
+		},
+		"caddy": {
+			binaries: map[string]bool{"caddy": true},
+			units:    map[string]bool{"caddy.service": true},
+			roots:    []string{"/etc/caddy"},
+		},
+	}
+	mapping, ok := allowed[c.Kind]
+	if !ok || !mapping.binaries[filepath.Base(c.Binary)] || !mapping.units[c.Unit] {
+		return fmt.Errorf("proxy kind, binary, or unit is not a compiled mapping")
+	}
+	if !trustedExecutableLocation(c.Binary) || (c.SystemctlBinary != "/usr/bin/systemctl" && c.SystemctlBinary != "/bin/systemctl") {
+		return fmt.Errorf("proxy or systemctl binary path is not allowed")
+	}
+	if len(c.ConfigRoots) == 0 || len(c.ConfigRoots) > 8 {
+		return fmt.Errorf("proxy config roots are not bounded")
+	}
+	seen := make(map[string]struct{}, len(c.ConfigRoots))
+	for _, root := range c.ConfigRoots {
+		if err := validatePrivatePath(root); err != nil || !pathWithinAny(root, mapping.roots) {
+			return fmt.Errorf("proxy config root is outside the compiled backend layout")
+		}
+		if _, exists := seen[root]; exists {
+			return fmt.Errorf("duplicate proxy config root")
+		}
+		seen[root] = struct{}{}
+	}
+	return nil
+}
+
+func trustedExecutableLocation(path string) bool {
+	if err := validatePrivatePath(path); err != nil {
+		return false
+	}
+	switch filepath.Dir(path) {
+	case "/usr/bin", "/usr/sbin", "/bin", "/sbin":
+		return true
+	default:
+		return false
+	}
+}
+
+func pathWithinAny(path string, roots []string) bool {
+	for _, root := range roots {
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c RootConfig) OrchestratorPublicKey() ed25519.PublicKey {

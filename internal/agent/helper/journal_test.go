@@ -198,3 +198,31 @@ func TestJournalCorruptionFailsClosedAndPersistsBreaker(t *testing.T) {
 		t.Fatal("breaker remained closed after journal corruption")
 	}
 }
+
+func TestJournalStoresImmutablePrivilegedSnapshot(t *testing.T) {
+	journal := testJournal(t)
+	value := struct {
+		Unit   string `json:"unit"`
+		Active bool   `json:"active"`
+	}{Unit: "nginx.service", Active: true}
+	digest, err := journal.StoreSnapshot("operation-1", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := journal.LoadSnapshot("operation-1", digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := helperprotocol.Decode[struct {
+		Unit   string `json:"unit"`
+		Active bool   `json:"active"`
+	}](payload)
+	if err != nil || decoded.Unit != value.Unit || decoded.Active != value.Active {
+		t.Fatalf("unexpected snapshot: %#v, %v", decoded, err)
+	}
+	changed := value
+	changed.Active = false
+	if _, err := journal.StoreSnapshot("operation-1", changed); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("mutable snapshot accepted: %v", err)
+	}
+}

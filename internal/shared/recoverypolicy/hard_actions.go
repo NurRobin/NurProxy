@@ -1,9 +1,29 @@
 package recoverypolicy
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"sort"
+
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
+
+func HardDiagnosticFingerprint(code recoverymodel.Code, backend, evidenceClass string, paths []string) string {
+	values := []string{string(code), backend, evidenceClass}
+	canonicalPaths := append([]string(nil), paths...)
+	sort.Strings(canonicalPaths)
+	values = append(values, canonicalPaths...)
+	h := sha256.New()
+	for _, value := range values {
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(value)))
+		_, _ = h.Write(size[:])
+		_, _ = h.Write([]byte(value))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 func HardActionForDiagnostic(code recoverymodel.Code, scope recoverymodel.RepairScope) (helperprotocol.Action, helperprotocol.LogicalTarget, bool) {
 	switch code {

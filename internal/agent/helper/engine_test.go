@@ -90,6 +90,7 @@ func newEngineFixture(t *testing.T) engineFixture {
 		AttestationKeyID:          "attestation-1",
 		AttestationPrivateKeyFile: filepath.Join(parent, "attestation.key"),
 		StoreDir:                  filepath.Join(parent, "journal"),
+		ProxyTarget:               ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{"/etc/nginx"}},
 	}
 	handler := &fakeActionHandler{material: PlanMaterial{
 		Steps:               []helperprotocol.PlanStep{{Kind: "validate", Summary: "Validate and reload nginx"}},

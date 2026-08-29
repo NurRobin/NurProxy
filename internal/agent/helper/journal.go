@@ -1,6 +1,8 @@
 package helper
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -97,6 +99,7 @@ type Journal struct {
 	plansDir      string
 	operationsDir string
 	grantsDir     string
+	snapshotsDir  string
 	breakerPath   string
 	breakerIsOpen bool
 }
@@ -111,9 +114,10 @@ func NewJournal(root string, ownerUID uint32) (*Journal, error) {
 		plansDir:      filepath.Join(root, "plans"),
 		operationsDir: filepath.Join(root, "operations"),
 		grantsDir:     filepath.Join(root, "grants"),
+		snapshotsDir:  filepath.Join(root, "snapshots"),
 		breakerPath:   filepath.Join(root, "breaker.json"),
 	}
-	for _, dir := range []string{j.plansDir, j.operationsDir, j.grantsDir} {
+	for _, dir := range []string{j.plansDir, j.operationsDir, j.grantsDir, j.snapshotsDir} {
 		if err := ensurePrivateDirectory(dir, ownerUID); err != nil {
 			return nil, fmt.Errorf("create helper journal directory: %w", err)
 		}
@@ -131,6 +135,50 @@ func NewJournal(root string, ownerUID uint32) (*Journal, error) {
 		return nil, err
 	}
 	return j, nil
+}
+
+func (j *Journal) StoreSnapshot(operationID string, value any) (string, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !validConfigID(operationID) {
+		return "", fmt.Errorf("invalid snapshot operation identity")
+	}
+	payload, err := helperprotocol.CanonicalBytes(value)
+	if err != nil {
+		return "", err
+	}
+	digest, err := helperprotocol.Digest(value)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(j.snapshotsDir, operationID+".json")
+	if err := j.writeRecord(path, value, true); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+		existing, readErr := readTrustedFile(path, j.ownerUID, helperprotocol.MaxFrameBytes, true)
+		if readErr != nil || string(existing) != string(payload) {
+			return "", ErrRequestConflict
+		}
+	}
+	return digest, nil
+}
+
+func (j *Journal) LoadSnapshot(operationID, expectedDigest string) ([]byte, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !validConfigID(operationID) || !validDigest(expectedDigest) {
+		return nil, fmt.Errorf("invalid snapshot identity")
+	}
+	payload, err := readTrustedFile(filepath.Join(j.snapshotsDir, operationID+".json"), j.ownerUID, helperprotocol.MaxFrameBytes, true)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(payload)
+	if hex.EncodeToString(digest[:]) != expectedDigest {
+		return nil, ErrJournalCorrupt
+	}
+	return payload, nil
 }
 
 func (j *Journal) StorePlan(plan helperprotocol.HelperPlan) error {

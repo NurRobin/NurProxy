@@ -1,14 +1,10 @@
 package recovery
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +13,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverypolicy"
 )
 
 type DesiredResource struct {
@@ -76,7 +73,7 @@ func Classify(ctx Context, err error) recoverymodel.Diagnostic {
 		paths = append(paths, guarded.Path)
 		fingerprintPaths = append(fingerprintPaths, guarded.ResolvedPath)
 	}
-	fingerprint := fingerprint(result.code, backend, result.evidenceClass, fingerprintPaths)
+	fingerprint := recoverypolicy.HardDiagnosticFingerprint(result.code, string(backend), result.evidenceClass, fingerprintPaths)
 	diagnostic := recoverymodel.Diagnostic{
 		Code: result.code, Subsystem: "proxy", Severity: recoverymodel.SeverityError,
 		Ownership: result.ownership, OwnershipConfidence: result.ownershipConfidence,
@@ -494,21 +491,6 @@ func proxyNotRunningFailure(output string) bool {
 	return false
 }
 
-func fingerprint(code recoverymodel.Code, backend proxy.Kind, evidenceClass string, paths []string) string {
-	values := []string{string(code), string(backend), evidenceClass}
-	canonicalPaths := append([]string(nil), paths...)
-	sort.Strings(canonicalPaths)
-	values = append(values, canonicalPaths...)
-	h := sha256.New()
-	for _, value := range values {
-		var size [4]byte
-		binary.BigEndian.PutUint32(size[:], uint32(len(value)))
-		_, _ = h.Write(size[:])
-		_, _ = h.Write([]byte(value))
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 func normalizedBackend(backend proxy.Kind) proxy.Kind {
 	switch backend {
 	case proxy.KindCaddy, proxy.KindNginx, proxy.KindApache, proxy.KindCustom:
@@ -539,7 +521,7 @@ func summaryFor(code recoverymodel.Code) string {
 }
 
 func fallbackDiagnostic(agentID string, backend proxy.Kind, now time.Time) recoverymodel.Diagnostic {
-	fingerprint := fingerprint(recoverymodel.CodeUnknownProxyError, backend, "invalid_context", nil)
+	fingerprint := recoverypolicy.HardDiagnosticFingerprint(recoverymodel.CodeUnknownProxyError, string(backend), "invalid_context", nil)
 	return recoverymodel.Diagnostic{
 		ID:   recoverymodel.StableDiagnosticID(agentID, recoverymodel.CodeUnknownProxyError, fingerprint),
 		Code: recoverymodel.CodeUnknownProxyError, Subsystem: "proxy", Severity: recoverymodel.SeverityError,

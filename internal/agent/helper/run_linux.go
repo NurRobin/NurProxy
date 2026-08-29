@@ -35,7 +35,11 @@ func RunRootHelper(ctx context.Context, buildID string) error {
 	if err := journal.Recover(); err != nil {
 		return fmt.Errorf("recover helper journal: %w", err)
 	}
-	engine, err := NewEngine(config, buildID, journal, key, map[helperprotocol.Action]ActionHandler{})
+	actions, err := compiledRootActions(config, journal, systemProxyServiceHost{})
+	if err != nil {
+		return fmt.Errorf("compile helper actions: %w", err)
+	}
+	engine, err := NewEngine(config, buildID, journal, key, actions)
 	if err != nil {
 		return fmt.Errorf("initialize helper engine: %w", err)
 	}
@@ -45,4 +49,20 @@ func RunRootHelper(ctx context.Context, buildID string) error {
 	}
 	defer listener.Close()
 	return NewServer(engine).Serve(ctx, listener)
+}
+
+func compiledRootActions(config RootConfig, journal *Journal, proxyHost proxyServiceHost) (map[helperprotocol.Action]ActionHandler, error) {
+	actions := make(map[helperprotocol.Action]ActionHandler, 3)
+	for _, action := range []helperprotocol.Action{
+		helperprotocol.ActionValidateReloadProxy,
+		helperprotocol.ActionStartProxy,
+		helperprotocol.ActionRestartProxy,
+	} {
+		handler, err := newProxyServiceAction(action, config.ProxyTarget, journal, proxyHost)
+		if err != nil {
+			return nil, err
+		}
+		actions[action] = handler
+	}
+	return actions, nil
 }
