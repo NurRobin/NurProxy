@@ -37,6 +37,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // backendName is the registry key for the externally-installed nginx backend.
@@ -496,7 +497,7 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 		if wanted[path] {
 			continue
 		}
-		marked, identity, err := proxy.ProbeManagedArtifactFile(path)
+		identity, marked, err := proxy.CaptureManagedRecoveryPath(path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, proxy.ErrManagedArtifactNotRegular) {
 				continue
@@ -506,23 +507,21 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 		if !marked {
 			continue
 		}
-		if err := identity.Recheck(); err != nil {
-			return removed, fmt.Errorf("rechecking orphan config %q: %w", path, err)
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return removed, fmt.Errorf("removing orphan config %q: %w", path, err)
-		}
+		host := strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix)
+		identities := []proxy.RecoveryPathIdentity{identity}
 		if !b.layout.IsConfD() {
 			link := b.enabledLinkFor(path)
-			if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return removed, fmt.Errorf("removing orphan symlink %q: %w", link, err)
+			if linkIdentity, linkErr := proxy.CaptureRecoveryPath(link); linkErr == nil && linkIdentity.Exists && recoveryLinkTargets(linkIdentity, filepath.Dir(linkIdentity.Path), identity.Path) {
+				identities = append(identities, linkIdentity)
 			}
 		}
-		// Drop the orphaned vhost's htpasswd sidecar too, if any.
-		_ = os.Remove(strings.TrimSuffix(path, confSuffix) + htpasswdSuffix)
-		// Scrub the orphaned vhost's centrally-issued cert/key artifacts so a
-		// deleted domain leaves no decrypted private key behind.
-		b.removeCerts(ctx, path)
+		identities = appendExistingRecoveryPaths(identities, strings.TrimSuffix(path, confSuffix)+htpasswdSuffix)
+		if b.certs != nil {
+			identities = appendExistingRecoveryPaths(identities, b.certs.AllRecoveryPaths(host)...)
+		}
+		if err := proxy.RemoveRecoveryCandidatePaths(proxy.NewRecoveryCandidate(recoverymodel.ActionPruneManagedOrphan, host, identities...)); err != nil {
+			return removed, fmt.Errorf("removing orphan config %q: %w", path, err)
+		}
 		removed++
 	}
 	if removed > 0 && b.runner != nil {

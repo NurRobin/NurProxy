@@ -2,9 +2,15 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"unicode"
 
+	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // Proxy is the agent-side abstraction over a reverse-proxy backend (§5). It
@@ -80,6 +86,68 @@ type Proxy interface {
 	// InstallCerts writes cert/key bundles to the backend's expected location
 	// (§7), before Apply of any config that references them (preflight ordering).
 	InstallCerts(ctx context.Context, certs []CertBundle) error
+}
+
+type RecoveryInspector interface {
+	InspectRecovery(context.Context, RecoveryDesired) ([]RecoveryCandidate, error)
+	ExecuteRecovery(context.Context, RecoveryCandidate, map[string]CertBundle) error
+}
+
+type RecoveryDesired struct {
+	KeepTargets          []Target
+	KeepCertHosts        []string
+	ActiveOperationPaths []string
+}
+
+type RecoveryPathIdentity struct {
+	Path          string
+	Exists        bool
+	Mode          uint32
+	Device        uint64
+	Inode         uint64
+	SymlinkTarget string
+	SHA256        string
+
+	parentDevice uint64
+	parentInode  uint64
+}
+
+type RecoveryCandidate struct {
+	Action     recoverymodel.Action
+	Host       string
+	Paths      []string
+	Identities []RecoveryPathIdentity
+}
+
+func (candidate RecoveryCandidate) Validate() error {
+	switch candidate.Action {
+	case recoverymodel.ActionPruneManagedOrphan, recoverymodel.ActionRemoveManagedTemp,
+		recoverymodel.ActionRematerializeCertBundle, recoverymodel.ActionRematerializeRuntimeKey:
+	default:
+		return fmt.Errorf("unsupported recovery action %q", candidate.Action)
+	}
+	if strings.TrimSpace(candidate.Host) != candidate.Host || dnsname.ValidateSubdomain(candidate.Host) != nil || strings.ContainsAny(candidate.Host, `/\\`) {
+		return fmt.Errorf("invalid recovery host")
+	}
+	for _, r := range candidate.Host {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("invalid recovery host")
+		}
+	}
+	if len(candidate.Paths) == 0 {
+		return fmt.Errorf("recovery candidate has no paths")
+	}
+	seen := make(map[string]struct{}, len(candidate.Paths))
+	for _, path := range candidate.Paths {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return fmt.Errorf("recovery path must be absolute and clean")
+		}
+		if _, exists := seen[path]; exists {
+			return fmt.Errorf("duplicate recovery path")
+		}
+		seen[path] = struct{}{}
+	}
+	return nil
 }
 
 // Info is a backend's static identity plus detected host facts (§5). It is the

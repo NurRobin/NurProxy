@@ -12,6 +12,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // TestExecRunner_command_sudoAndResolve covers the §12 fix: an unprivileged agent
@@ -366,6 +367,81 @@ func TestManagedProvenanceControlsReadAndPrune(t *testing.T) {
 		if _, err := os.Lstat(path); err != nil {
 			t.Errorf("unsafe entry %q was pruned: %v", path, err)
 		}
+	}
+}
+
+func TestRecoveryAdapterInspectsAndExecutesOwnedFileCandidates(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout, _ := newBackendWithCerts(t, r)
+	for _, dir := range []string{layout.Available, layout.Enabled, b.certs.Dir()} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	host := "orphan.example.com"
+	config := layout.AvailablePath(host)
+	if err := os.WriteFile(config, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := layout.EnabledPath(host)
+	if err := os.Symlink(config, link); err != nil {
+		t.Fatal(err)
+	}
+	auth := strings.TrimSuffix(config, confSuffix) + htpasswdSuffix
+	if err := os.WriteFile(auth, []byte("admin:x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	certInspection, err := b.certs.InspectRecovery(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{certInspection.CertPath, certInspection.SourceKeyPath, certInspection.RuntimeKeyPath} {
+		if err := os.WriteFile(path, []byte("sidecar"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	temp := layout.AvailablePath("stale.example.com") + tempSuffix
+	if err := os.WriteFile(temp, []byte(proxy.StampManagedArtifact("staged\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activeTemp := layout.AvailablePath("active.example.com") + tempSuffix
+	if err := os.WriteFile(activeTemp, []byte(proxy.StampManagedArtifact("active\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	candidates, err := b.InspectRecovery(context.Background(), proxy.RecoveryDesired{ActiveOperationPaths: []string{activeTemp}, KeepCertHosts: []string{"missing.example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byAction := map[recoverymodel.Action]proxy.RecoveryCandidate{}
+	for _, candidate := range candidates {
+		byAction[candidate.Action] = candidate
+		if err := candidate.Validate(); err != nil || len(candidate.Paths) != len(candidate.Identities) {
+			t.Fatalf("invalid candidate: %+v err=%v", candidate, err)
+		}
+	}
+	orphan := byAction[recoverymodel.ActionPruneManagedOrphan]
+	stale := byAction[recoverymodel.ActionRemoveManagedTemp]
+	missingCert := byAction[recoverymodel.ActionRematerializeCertBundle]
+	if orphan.Host != host || len(orphan.Paths) < 3 || stale.Host != "stale.example.com" || missingCert.Host != "missing.example.com" {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+	if err := b.ExecuteRecovery(context.Background(), stale, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ExecuteRecovery(context.Background(), orphan, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range append(orphan.Paths, stale.Paths...) {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("recovered path %q remains: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(activeTemp); err != nil {
+		t.Fatalf("active temp was removed: %v", err)
+	}
+	if r.tests != 2 || r.reloads != 2 {
+		t.Fatalf("validate/reload = %d/%d, want 2/2", r.tests, r.reloads)
 	}
 }
 

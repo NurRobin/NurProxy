@@ -15,6 +15,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // errProbe is a sentinel module-probe failure used by the capability tests.
@@ -46,6 +47,18 @@ func TestBackend_Detect_alwaysAvailable(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("Detect = false, want true (bundled caddy is always available)")
+	}
+}
+
+func TestRecoveryAdapterSupportsOnlyCertificateAndRuntimeKeyActions(t *testing.T) {
+	store := certstore.New(t.TempDir(), []byte("01234567890123456789012345678901"))
+	b := New(agentcaddy.NewMockClient()).WithCertStore(store)
+	candidates, err := b.InspectRecovery(context.Background(), proxy.RecoveryDesired{KeepCertHosts: []string{"app.example.com"}})
+	if err != nil || len(candidates) != 1 || candidates[0].Action != recoverymodel.ActionRematerializeCertBundle {
+		t.Fatalf("caddy candidates = %+v, err=%v", candidates, err)
+	}
+	if err := b.ExecuteRecovery(context.Background(), proxy.RecoveryCandidate{Action: recoverymodel.ActionPruneManagedOrphan, Host: "app.example.com", Paths: []string{"/tmp/nurproxy.conf"}}, nil); !errors.Is(err, proxy.ErrRecoveryUnsupported) {
+		t.Fatalf("caddy file recovery error = %v", err)
 	}
 }
 

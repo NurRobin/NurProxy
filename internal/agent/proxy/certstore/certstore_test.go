@@ -2,12 +2,114 @@ package certstore
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 )
+
+func testCertificatePair(t *testing.T, host string) ([]byte, []byte) {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: host}, DNSNames: []string{host}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, privateKey.Public(), privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+}
+
+func TestInspectAndRefreshRuntimeKeyCryptographically(t *testing.T) {
+	host := "app.example.com"
+	certPEM, keyPEM := testCertificatePair(t, host)
+	_, wrongKey := testCertificatePair(t, "wrong.example.com")
+	encryptKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := New(t.TempDir(), encryptKey)
+	if _, err := store.Install(Bundle{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+
+	inspection, err := store.InspectRecovery(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyMissing || inspection.RuntimeKeyPath == "" {
+		t.Fatalf("missing runtime inspection = %+v", inspection)
+	}
+	if err := store.RefreshRuntimeKey(host); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = store.InspectRecovery(host)
+	if err != nil || !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyValid {
+		t.Fatalf("refreshed inspection = %+v, err=%v", inspection, err)
+	}
+
+	if err := os.WriteFile(inspection.RuntimeKeyPath, wrongKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = store.InspectRecovery(host)
+	if err != nil || !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyMismatch {
+		t.Fatalf("mismatched runtime inspection = %+v, err=%v", inspection, err)
+	}
+	if err := store.RefreshRuntimeKey(host); err != nil {
+		t.Fatal(err)
+	}
+	if inspection, err = store.InspectRecovery(host); err != nil || inspection.RuntimeKeyState != RuntimeKeyValid {
+		t.Fatalf("repaired runtime inspection = %+v, err=%v", inspection, err)
+	}
+}
+
+func TestInspectRecoveryAbsentBundleAndSymlinkFailClosed(t *testing.T) {
+	store := New(t.TempDir(), []byte("01234567890123456789012345678901"))
+	inspection, err := store.InspectRecovery("absent.example.com")
+	if err != nil || inspection.BundlePresent || inspection.BundleValid {
+		t.Fatalf("absent inspection = %+v, err=%v", inspection, err)
+	}
+
+	host := "app.example.com"
+	certPEM, keyPEM := testCertificatePair(t, host)
+	if _, err := store.Install(Bundle{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	runtimePath := filepath.Join(store.Dir(), SanitizeHost(host)+keyMaterializedSuffix)
+	if err := os.Symlink(filepath.Join(store.Dir(), SanitizeHost(host)+keySuffix), runtimePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InspectRecovery(host); err == nil {
+		t.Fatal("runtime-key symlink was accepted")
+	}
+}
+
+func TestInstallRecoveryBundleRejectsCryptographicMismatch(t *testing.T) {
+	host := "app.example.com"
+	certPEM, _ := testCertificatePair(t, host)
+	_, wrongKey := testCertificatePair(t, "wrong.example.com")
+	store := New(t.TempDir(), nil)
+	if err := store.InstallRecoveryBundle(Bundle{Host: host, CertPEM: certPEM, KeyPEM: wrongKey}); err == nil {
+		t.Fatal("mismatched recovery bundle was installed")
+	}
+	if inspection, err := store.InspectRecovery(host); err != nil || inspection.BundlePresent {
+		t.Fatalf("rejected bundle left artifacts: %+v err=%v", inspection, err)
+	}
+}
 
 func TestInstall_encryptsKeyAtRest_andReadsBack(t *testing.T) {
 	dir := t.TempDir()

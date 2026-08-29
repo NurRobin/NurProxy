@@ -14,6 +14,8 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
+var ErrRecoveryUnsupported = fmt.Errorf("proxy backend does not support recovery")
+
 // caddyOps is the superset of concrete admin-API primitives the agent's local
 // API and stream drive on the bundled-Caddy backend (EnsureServer / ClearRoutes /
 // AddRoute / RemoveRoute / GetConfig / Render / InstallCerts / EnsureServerTLS).
@@ -171,6 +173,26 @@ func (h *Holder) InstallCerts(ctx context.Context, certs []CertBundle) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.current.InstallCerts(ctx, certs)
+}
+
+func (h *Holder) InspectRecovery(ctx context.Context, desired RecoveryDesired) ([]RecoveryCandidate, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	inspector, ok := h.current.(RecoveryInspector)
+	if !ok {
+		return nil, nil
+	}
+	return inspector.InspectRecovery(ctx, desired)
+}
+
+func (h *Holder) ExecuteRecovery(ctx context.Context, candidate RecoveryCandidate, bundles map[string]CertBundle) error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	inspector, ok := h.current.(RecoveryInspector)
+	if !ok {
+		return ErrRecoveryUnsupported
+	}
+	return inspector.ExecuteRecovery(ctx, candidate, bundles)
 }
 
 // ---- caddyOps forwarding (admin-API primitives the API/stream drive) ---------
