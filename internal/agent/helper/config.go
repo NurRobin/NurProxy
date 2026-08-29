@@ -29,7 +29,20 @@ type RootConfig struct {
 	StoreDir                  string                    `json:"store_dir"`
 	ProxyTarget               ProxyTargetConfig         `json:"proxy_target"`
 	PackageTarget             PackageTargetConfig       `json:"package_target"`
+	FirewallTarget            *FirewallTargetConfig     `json:"firewall_target"`
 	ManagedApply              *ManagedApplyTargetConfig `json:"managed_apply"`
+}
+
+type FirewallTargetConfig struct {
+	Backend string `json:"backend"`
+	Binary  string `json:"binary"`
+}
+
+func (c FirewallTargetConfig) Validate() error {
+	if c.Backend != "ufw" || c.Binary != "/usr/sbin/ufw" || !trustedExecutableLocation(c.Binary) {
+		return fmt.Errorf("firewall backend is not a compiled provenanced mapping")
+	}
+	return nil
 }
 
 type ManagedApplyTargetConfig struct {
@@ -75,6 +88,11 @@ func (c RootConfig) Validate() error {
 	}
 	if err := c.PackageTarget.Validate(c.ProxyTarget.Kind); err != nil {
 		return fmt.Errorf("invalid package target: %w", err)
+	}
+	if c.FirewallTarget != nil {
+		if err := c.FirewallTarget.Validate(); err != nil {
+			return fmt.Errorf("invalid firewall target: %w", err)
+		}
 	}
 	if c.ManagedApply != nil {
 		if err := c.ManagedApply.Validate(c.ProxyTarget.Kind); err != nil {

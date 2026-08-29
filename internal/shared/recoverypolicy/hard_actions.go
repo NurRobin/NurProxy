@@ -32,7 +32,7 @@ func HardActionForDiagnostic(code recoverymodel.Code, scope recoverymodel.Repair
 			return helperprotocol.ActionRepairAgentSandboxPaths, helperprotocol.LogicalTargetAgentUnit, true
 		}
 	case recoverymodel.CodePermissionDenied:
-		if scope == recoverymodel.RepairScopeExactProvenancedFile || scope == recoverymodel.RepairScopeExclusiveManagedDirectory {
+		if scope == recoverymodel.RepairScopeExclusiveManagedDirectory {
 			return helperprotocol.ActionRepairManagedPathAccess, helperprotocol.LogicalTargetManagedPath, true
 		}
 	case recoverymodel.CodeProxyReloadFailed:
@@ -46,6 +46,10 @@ func HardActionForDiagnostic(code recoverymodel.Code, scope recoverymodel.Repair
 	case recoverymodel.CodeProxyBinaryMissing:
 		if scope == recoverymodel.RepairScopeSupportedPackage {
 			return helperprotocol.ActionInstallSupportedPackage, helperprotocol.LogicalTargetProxyPackage, true
+		}
+	case recoverymodel.CodeUnknownProxyError:
+		if scope == recoverymodel.RepairScopeLocalFirewall {
+			return helperprotocol.ActionOpenProxyFirewallPorts, helperprotocol.LogicalTargetLocalFirewall, true
 		}
 	}
 	return "", "", false

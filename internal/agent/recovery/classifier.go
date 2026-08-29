@@ -107,6 +107,9 @@ func classifyFailure(ctx Context, failure *proxy.Failure) classification {
 		return hardSystemClassification(recoverymodel.CodeSystemdSandboxDenied, "systemd_sandbox", recoverymodel.RepairScopeAgentSandbox, true, "")
 	}
 	if failure.Permission {
+		if evidenceClass, refusalCode, ok := permissionEnvironmentRefusal(failure.Output); ok {
+			return hardSystemClassification(recoverymodel.CodePermissionDenied, evidenceClass, recoverymodel.RepairScopeUnsupportedEnvironment, false, refusalCode)
+		}
 		return hardSystemClassification(recoverymodel.CodePermissionDenied, "permission_denied", recoverymodel.RepairScopeAmbiguous, false, "permission_scope_ambiguous")
 	}
 	if portConflictFailure(failure.Output) {
@@ -463,6 +466,27 @@ func systemdSandboxFailure(output string) bool {
 		}
 	}
 	return false
+}
+
+func permissionEnvironmentRefusal(output string) (string, string, bool) {
+	normalized := strings.ToLower(output)
+	for _, match := range []struct {
+		needles       []string
+		evidenceClass string
+		refusalCode   string
+	}{
+		{[]string{"read-only file system", "readonly filesystem"}, "read_only_filesystem", "read_only_filesystem"},
+		{[]string{"avc:  denied", "selinux", "apparmor=\"denied\"", "apparmor denied"}, "mandatory_access_control", "selinux_or_apparmor_denied"},
+		{[]string{"immutable", "append-only", "operation not permitted (immutable"}, "immutable_target", "immutable_or_append_only_target"},
+		{[]string{"acl not supported", "operation not supported while setting acl"}, "unsupported_acl", "unsupported_acl_semantics"},
+	} {
+		for _, needle := range match.needles {
+			if strings.Contains(normalized, needle) {
+				return match.evidenceClass, match.refusalCode, true
+			}
+		}
+	}
+	return "", "", false
 }
 
 func portConflictFailure(output string) bool {

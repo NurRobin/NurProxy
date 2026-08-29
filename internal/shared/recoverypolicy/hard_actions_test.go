@@ -17,12 +17,13 @@ func TestHardActionForDiagnosticIsClosedAndDeterministic(t *testing.T) {
 		ok     bool
 	}{
 		{recoverymodel.CodeSystemdSandboxDenied, recoverymodel.RepairScopeAgentSandbox, helperprotocol.ActionRepairAgentSandboxPaths, helperprotocol.LogicalTargetAgentUnit, true},
-		{recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeExactProvenancedFile, helperprotocol.ActionRepairManagedPathAccess, helperprotocol.LogicalTargetManagedPath, true},
+		{recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeExactProvenancedFile, "", "", false},
 		{recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeExclusiveManagedDirectory, helperprotocol.ActionRepairManagedPathAccess, helperprotocol.LogicalTargetManagedPath, true},
 		{recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeSharedBackendNamespace, "", "", false},
 		{recoverymodel.CodeProxyReloadFailed, recoverymodel.RepairScopeDetectedProxyService, helperprotocol.ActionValidateReloadProxy, helperprotocol.LogicalTargetDetectedProxy, true},
 		{recoverymodel.CodeProxyNotRunning, recoverymodel.RepairScopeDetectedProxyService, helperprotocol.ActionStartProxy, helperprotocol.LogicalTargetDetectedProxy, true},
 		{recoverymodel.CodeProxyBinaryMissing, recoverymodel.RepairScopeSupportedPackage, helperprotocol.ActionInstallSupportedPackage, helperprotocol.LogicalTargetProxyPackage, true},
+		{recoverymodel.CodeUnknownProxyError, recoverymodel.RepairScopeLocalFirewall, helperprotocol.ActionOpenProxyFirewallPorts, helperprotocol.LogicalTargetLocalFirewall, true},
 		{recoverymodel.CodePortConflict, recoverymodel.RepairScopeUnsupportedEnvironment, "", "", false},
 	}
 	for _, tt := range tests {

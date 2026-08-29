@@ -97,6 +97,12 @@ func cmdHelperBootstrap(args []string) {
 			log.Fatalf("Root helper bootstrap cannot refresh build binding: %v", err)
 		}
 		config.ExpectedBuildID = version
+		if config.FirewallTarget == nil && trustedBootstrapFile("/usr/sbin/ufw") {
+			config.FirewallTarget = &helper.FirewallTargetConfig{Backend: "ufw", Binary: "/usr/sbin/ufw"}
+			if err := helper.WriteRootConfig(helper.DefaultRootConfigPath, config); err != nil {
+				log.Fatalf("Root helper bootstrap cannot add compiled firewall mapping: %v", err)
+			}
+		}
 	} else if !os.IsNotExist(rootHelperCause(loadErr)) {
 		log.Fatalf("Root helper bootstrap found an untrusted existing configuration: %v", loadErr)
 	} else {
@@ -109,6 +115,9 @@ func cmdHelperBootstrap(args []string) {
 		})
 		if err != nil {
 			log.Fatalf("Root helper bootstrap cannot compile root trust: %v", err)
+		}
+		if trustedBootstrapFile("/usr/sbin/ufw") {
+			config.FirewallTarget = &helper.FirewallTargetConfig{Backend: "ufw", Binary: "/usr/sbin/ufw"}
 		}
 		if _, err := helper.LoadOrCreateAttestationKey(config.AttestationPrivateKeyFile); err != nil {
 			log.Fatalf("Root helper bootstrap cannot create attestation identity: %v", err)
@@ -224,6 +233,11 @@ func readBootstrapIdentity(path string, maxBytes int64) (string, error) {
 func directoryExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
+}
+
+func trustedBootstrapFile(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm()&0o022 == 0
 }
 
 func activateHelperSocket(ctx context.Context) error {

@@ -131,6 +131,17 @@ func TestPackageTargetConfigMatchesCompiledBackendPackage(t *testing.T) {
 	}
 }
 
+func TestFirewallTargetConfigAdmitsOnlyPinnedUFW(t *testing.T) {
+	if err := (FirewallTargetConfig{Backend: "ufw", Binary: "/usr/sbin/ufw"}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []FirewallTargetConfig{{Backend: "firewalld", Binary: "/usr/bin/firewall-cmd"}, {Backend: "ufw", Binary: "/tmp/ufw"}, {Backend: "iptables", Binary: "/usr/sbin/iptables"}} {
+		if err := target.Validate(); err == nil {
+			t.Fatalf("unsafe firewall target accepted: %+v", target)
+		}
+	}
+}
+
 func TestProxyTargetConfigRejectsUncompiledTargets(t *testing.T) {
 	valid := ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{"/etc/nginx", "/etc/nginx/sites-enabled"}}
 	if err := valid.Validate(); err != nil {
