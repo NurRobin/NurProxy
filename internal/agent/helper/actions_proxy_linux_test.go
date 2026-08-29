@@ -157,6 +157,30 @@ func TestProxyServiceActionFailsBeforeMutationWhenValidationFails(t *testing.T) 
 	}
 }
 
+func TestTrustedProxyConfigEntryRejectsAgentOwnedButAllowsReadOnlyOperatorFile(t *testing.T) {
+	agentUID := uint32(991)
+	for _, test := range []struct {
+		name  string
+		owner uint32
+		mode  os.FileMode
+		want  bool
+	}{
+		{name: "root file", owner: 0, mode: 0o644, want: true},
+		{name: "read only operator file", owner: 1000, mode: 0o644, want: true},
+		{name: "agent owned file", owner: agentUID, mode: 0o400, want: false},
+		{name: "group writable operator file", owner: 1000, mode: 0o664, want: false},
+		{name: "world writable operator file", owner: 1000, mode: 0o646, want: false},
+		{name: "operator symlink", owner: 1000, mode: os.ModeSymlink | 0o777, want: true},
+		{name: "agent symlink", owner: agentUID, mode: os.ModeSymlink | 0o777, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := trustedProxyConfigEntry(test.owner, test.mode, agentUID); got != test.want {
+				t.Fatalf("trustedProxyConfigEntry(%d, %v, %d) = %v, want %v", test.owner, test.mode, agentUID, got, test.want)
+			}
+		})
+	}
+}
+
 func repeatedDigest(value string) string {
 	var result string
 	for len(result) < 64 {

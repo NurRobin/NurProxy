@@ -255,9 +255,11 @@ func mutationForAction(action helperprotocol.Action) proxyServiceMutation {
 	}
 }
 
-type systemProxyServiceHost struct{}
+type systemProxyServiceHost struct {
+	agentUID uint32
+}
 
-func (systemProxyServiceHost) Inspect(ctx context.Context, target ProxyTargetConfig) (proxyServiceFacts, error) {
+func (h systemProxyServiceHost) Inspect(ctx context.Context, target ProxyTargetConfig) (proxyServiceFacts, error) {
 	binaryDigest, err := trustedRegularFileDigest(target.Binary, maxTrustedBinaryBytes)
 	if err != nil {
 		return proxyServiceFacts{}, fmt.Errorf("inspect pinned proxy binary: %w", err)
@@ -265,7 +267,7 @@ func (systemProxyServiceHost) Inspect(ctx context.Context, target ProxyTargetCon
 	if _, err := trustedRegularFileDigest(target.SystemctlBinary, maxTrustedBinaryBytes); err != nil {
 		return proxyServiceFacts{}, fmt.Errorf("inspect pinned systemctl binary: %w", err)
 	}
-	configDigest, err := proxyConfigDigest(target.ConfigRoots)
+	configDigest, err := proxyConfigDigest(target.ConfigRoots, h.agentUID)
 	if err != nil {
 		return proxyServiceFacts{}, fmt.Errorf("fingerprint proxy configuration: %w", err)
 	}
@@ -334,7 +336,7 @@ func trustedRegularFileDigest(path string, maxBytes int64) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func proxyConfigDigest(roots []string) (string, error) {
+func proxyConfigDigest(roots []string, agentUID uint32) (string, error) {
 	type entry struct {
 		path string
 		mode fs.FileMode
@@ -366,7 +368,7 @@ func proxyConfigDigest(roots []string) (string, error) {
 			}
 			item := entry{path: root + "\x00" + rel, mode: info.Mode(), size: info.Size()}
 			owner, ok := info.Sys().(*syscall.Stat_t)
-			if !ok || owner.Uid != 0 || (info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm()&0o022 != 0) {
+			if !ok || !trustedProxyConfigEntry(owner.Uid, info.Mode(), agentUID) {
 				return fmt.Errorf("config entry owner or permissions are not trusted")
 			}
 			switch {
@@ -401,6 +403,13 @@ func proxyConfigDigest(roots []string) (string, error) {
 		_, _ = h.Write(item.data)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func trustedProxyConfigEntry(ownerUID uint32, mode fs.FileMode, agentUID uint32) bool {
+	if agentUID == 0 || ownerUID == agentUID {
+		return false
+	}
+	return mode&os.ModeSymlink != 0 || mode.Perm()&0o022 == 0
 }
 
 func readNoFollowFile(path string, expectedSize int64) ([]byte, error) {

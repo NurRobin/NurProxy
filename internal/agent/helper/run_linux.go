@@ -37,7 +37,8 @@ func RunRootHelper(ctx context.Context, buildID string) error {
 	if err := journal.Recover(); err != nil {
 		return fmt.Errorf("recover helper journal: %w", err)
 	}
-	actions, err := compiledRootActions(config, journal, systemProxyServiceHost{})
+	proxyHost := systemProxyServiceHost{agentUID: config.AgentUID}
+	actions, err := compiledRootActions(config, journal, proxyHost)
 	if err != nil {
 		return fmt.Errorf("compile helper actions: %w", err)
 	}
@@ -46,7 +47,7 @@ func RunRootHelper(ctx context.Context, buildID string) error {
 		return fmt.Errorf("initialize helper engine: %w", err)
 	}
 	if config.ManagedApply != nil {
-		managedApply, err := newManagedApplyAction(config.AgentUID, config.ProxyTarget, *config.ManagedApply, journal, systemProxyServiceHost{})
+		managedApply, err := newManagedApplyAction(config.AgentUID, config.ProxyTarget, *config.ManagedApply, journal, proxyHost)
 		if err != nil {
 			return fmt.Errorf("compile managed apply action: %w", err)
 		}
