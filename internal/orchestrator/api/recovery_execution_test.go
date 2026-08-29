@@ -30,7 +30,7 @@ func hardRecoveryDiagnostic(agentID string) recoverymodel.Diagnostic {
 	return diagnostic
 }
 
-func enrollAndSignRecoveryPlan(t *testing.T, database *db.DB, diagnostic recoverymodel.Diagnostic) helperprotocol.Signed[helperprotocol.HelperPlan] {
+func enrollAndSignRecoveryPlan(t *testing.T, database *db.DB, diagnostic recoverymodel.Diagnostic) (helperprotocol.Signed[helperprotocol.HelperPlan], ed25519.PrivateKey) {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -59,7 +59,7 @@ func enrollAndSignRecoveryPlan(t *testing.T, database *db.DB, diagnostic recover
 	if err != nil {
 		t.Fatal(err)
 	}
-	return signed
+	return signed, privateKey
 }
 
 func TestHardRecoveryPlanRequiresAttestedDiagnosticAndTwoAdminConfirmations(t *testing.T) {
@@ -73,7 +73,7 @@ func TestHardRecoveryPlanRequiresAttestedDiagnosticAndTwoAdminConfirmations(t *t
 	if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
 		t.Fatal(err)
 	}
-	signedPlan := enrollAndSignRecoveryPlan(t, database, diagnostic)
+	signedPlan, helperPrivateKey := enrollAndSignRecoveryPlan(t, database, diagnostic)
 	basePath := "/api/v1/agents/agent-1/recovery/plans"
 	w := doRequestWithAuth(t, handler, http.MethodPost, basePath, signedPlan, recoveryAgentToken)
 	if w.Code != http.StatusCreated {
@@ -118,6 +118,35 @@ func TestHardRecoveryPlanRequiresAttestedDiagnosticAndTwoAdminConfirmations(t *t
 	if w.Code != http.StatusOK {
 		t.Fatalf("agent grant fetch = %d: %s", w.Code, w.Body.String())
 	}
+	executeRequest := helperprotocol.NewEnvelope(helperprotocol.MessageExecuteActionRequest, helperprotocol.ExecuteActionRequest{
+		OperationID: grant.OperationID, HelperPlanID: grant.HelperPlanID, Grant: *stored.SignedGrant,
+	})
+	requestDigest, err := helperprotocol.Digest(executeRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := helperprotocol.HelperReceipt{
+		OperationID: grant.OperationID, CanonicalRequestDigest: requestDigest, HelperInstanceID: grant.HelperInstanceID,
+		Action: grant.Action, State: helperprotocol.JournalSucceeded, RollbackCoverage: helperprotocol.RollbackCoverageFull,
+		SnapshotDigest: strings.Repeat("f", 64), SanitizedResult: "proxy reloaded",
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	signedReceipt, err := helperprotocol.Sign("attestation-1", helperPrivateKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperReceipt, receipt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = doRequestWithAuth(t, handler, http.MethodPost, basePath+"/helper-plan-1/receipt", signedReceipt, recoveryAgentToken)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("helper receipt = %d: %s", w.Code, w.Body.String())
+	}
+	w = doRequestWithAuth(t, handler, http.MethodGet, basePath, nil, recoveryAgentToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("agent plan list = %d: %s", w.Code, w.Body.String())
+	}
+	var plans []db.RecoveryExecutionPlan
+	if err := json.Unmarshal(w.Body.Bytes(), &plans); err != nil || len(plans) != 1 || plans[0].SignedReceipt == nil {
+		t.Fatalf("agent plan list = %#v, err=%v", plans, err)
+	}
 }
 
 func TestHardRecoveryPlanRejectsTamperedAttestationAndDisplayHash(t *testing.T) {
@@ -126,7 +155,7 @@ func TestHardRecoveryPlanRejectsTamperedAttestationAndDisplayHash(t *testing.T) 
 	if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
 		t.Fatal(err)
 	}
-	signedPlan := enrollAndSignRecoveryPlan(t, database, diagnostic)
+	signedPlan, _ := enrollAndSignRecoveryPlan(t, database, diagnostic)
 	tampered := signedPlan
 	tampered.Envelope.Payload.ResourceFingerprint = strings.Repeat("c", 64)
 	basePath := "/api/v1/agents/agent-1/recovery/plans"
@@ -140,5 +169,23 @@ func TestHardRecoveryPlanRejectsTamperedAttestationAndDisplayHash(t *testing.T) 
 	w := doRequest(t, handler, http.MethodPost, basePath+"/helper-plan-1/confirm", badConfirmation, cookie)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("display hash substitution = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	_, attackerKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedReceipt := helperprotocol.HelperReceipt{
+		OperationID: "operation-forged", CanonicalRequestDigest: strings.Repeat("a", 64), HelperInstanceID: "helper-1",
+		Action: helperprotocol.ActionValidateReloadProxy, State: helperprotocol.JournalSucceeded,
+		RollbackCoverage: helperprotocol.RollbackCoverageFull, SnapshotDigest: strings.Repeat("b", 64),
+		SanitizedResult: "forged", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	forgedSigned, err := helperprotocol.Sign("attestation-1", attackerKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperReceipt, forgedReceipt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = doRequestWithAuth(t, handler, http.MethodPost, basePath+"/helper-plan-1/receipt", forgedSigned, recoveryAgentToken)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("forged helper receipt = %d, want 400: %s", w.Code, w.Body.String())
 	}
 }

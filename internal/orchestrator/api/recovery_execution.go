@@ -105,6 +105,20 @@ func (s *Server) handleGetRecoveryExecutionPlan(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, plan)
 }
 
+func (s *Server) handleListRecoveryExecutionPlans(w http.ResponseWriter, r *http.Request) {
+	agentID := pathParam(r, "id")
+	if callerID, _ := r.Context().Value(ctxAgentID).(string); callerID != agentID {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	plans, err := s.db.ListRecoveryExecutionPlans(agentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list recovery execution plans")
+		return
+	}
+	writeJSON(w, http.StatusOK, plans)
+}
+
 func (s *Server) handleConfirmRecoveryExecutionPlan(w http.ResponseWriter, r *http.Request) {
 	agentID, planID := pathParam(r, "id"), pathParam(r, "planId")
 	var request recoveryConfirmationRequest
@@ -186,6 +200,47 @@ func (s *Server) handleGetRecoveryExecutionGrant(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJSON(w, http.StatusOK, plan.SignedGrant)
+}
+
+func (s *Server) handleSubmitRecoveryExecutionReceipt(w http.ResponseWriter, r *http.Request) {
+	agentID, planID := pathParam(r, "id"), pathParam(r, "planId")
+	if callerID, _ := r.Context().Value(ctxAgentID).(string); callerID != agentID {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	payload, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
+	if err != nil || len(payload) == 0 || len(payload) > maxJSONBody {
+		writeRecoveryError(w, http.StatusBadRequest, "invalid_helper_receipt", "invalid bounded helper receipt")
+		return
+	}
+	signed, err := helperprotocol.Decode[helperprotocol.Signed[helperprotocol.HelperReceipt]](payload)
+	if err != nil || signed.Envelope.MessageType != helperprotocol.MessageHelperReceipt {
+		writeRecoveryError(w, http.StatusBadRequest, "invalid_helper_receipt", "helper receipt envelope is invalid")
+		return
+	}
+	enrolled, err := s.db.GetRecoveryHelper(agentID)
+	if err != nil {
+		writeRecoveryError(w, http.StatusConflict, "helper_not_enrolled", "recovery helper is not enrolled")
+		return
+	}
+	publicKey, err := base64.RawURLEncoding.Strict().DecodeString(enrolled.AttestationPublicKey)
+	if err != nil || len(publicKey) != ed25519.PublicKeySize || signed.KeyID != enrolled.AttestationKeyID ||
+		signed.Envelope.Payload.HelperInstanceID != enrolled.HelperInstanceID ||
+		helperprotocol.Verify(ed25519.PublicKey(publicKey), signed, helperprotocol.MessageHelperReceipt) != nil {
+		writeRecoveryError(w, http.StatusBadRequest, "invalid_helper_attestation", "helper receipt attestation is invalid")
+		return
+	}
+	if err := s.db.StoreRecoveryExecutionReceipt(agentID, planID, signed, time.Now().UTC()); err != nil {
+		if errors.Is(err, db.ErrRecoveryPlanMismatch) || errors.Is(err, db.ErrRecoveryConfirmationOrder) {
+			writeRecoveryError(w, http.StatusConflict, "helper_receipt_mismatch", "helper receipt does not match the granted canonical request")
+			return
+		}
+		writeRecoveryError(w, http.StatusBadRequest, "invalid_helper_receipt", "helper receipt could not be persisted")
+		return
+	}
+	s.auditAs(r, models.AuditSourceAgent, "recovery_plan", planID, "receipt_attested",
+		"agent="+agentID+" state="+string(signed.Envelope.Payload.State)+" operation="+signed.Envelope.Payload.OperationID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func deterministicRecoveryGrantID(agentID, planID, eventID string) string {

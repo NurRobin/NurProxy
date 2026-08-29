@@ -270,9 +270,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/recovery/helper", s.requireAuth(s.handleEnrollRecoveryHelper))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/helper", s.requireAgentAuth(s.handleGetRecoveryHelper))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/plans", s.requireAgentAuth(s.handleSubmitRecoveryExecutionPlan))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/plans", s.requireAgentAuth(s.handleListRecoveryExecutionPlans))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/plans/{planId}", s.requireAuth(s.handleGetRecoveryExecutionPlan))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/plans/{planId}/confirm", s.requireAuth(s.handleConfirmRecoveryExecutionPlan))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/plans/{planId}/grant", s.requireAgentAuth(s.handleGetRecoveryExecutionGrant))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/plans/{planId}/receipt", s.requireAgentAuth(s.handleSubmitRecoveryExecutionReceipt))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs/{opId}/ack", s.requireAgentAuth(s.handleRepairAck))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/safe-auto-repair", s.requireAuth(s.handleSetSafeAutoRepair))
 	// Live push channel: the agent dials out and holds this open; the

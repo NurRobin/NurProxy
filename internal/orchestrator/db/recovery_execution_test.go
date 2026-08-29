@@ -150,4 +150,44 @@ func TestRecoveryExecutionGrantMustMatchConfirmedPlan(t *testing.T) {
 	if err := d.StoreRecoveryExecutionGrant(agent.ID, "helper-plan-1", wrongSigned); !errors.Is(err, ErrRecoveryPlanMismatch) {
 		t.Fatalf("mismatched grant error = %v", err)
 	}
+	executeRequest := helperprotocol.NewEnvelope(helperprotocol.MessageExecuteActionRequest, helperprotocol.ExecuteActionRequest{
+		OperationID: grant.OperationID, HelperPlanID: grant.HelperPlanID, Grant: signedGrant,
+	})
+	requestDigest, err := helperprotocol.Digest(executeRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := helperprotocol.HelperReceipt{
+		OperationID: grant.OperationID, CanonicalRequestDigest: requestDigest, HelperInstanceID: grant.HelperInstanceID,
+		Action: grant.Action, State: helperprotocol.JournalSucceeded, RollbackCoverage: helperprotocol.RollbackCoverageFull,
+		SnapshotDigest: strings.Repeat("d", 64), SanitizedResult: "proxy reloaded",
+		UpdatedAt: at.Add(3 * time.Minute).Format(time.RFC3339Nano),
+	}
+	signedReceipt, err := helperprotocol.Sign("attestation-1", privateKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperReceipt, receipt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StoreRecoveryExecutionReceipt(agent.ID, "helper-plan-1", signedReceipt, at.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StoreRecoveryExecutionReceipt(agent.ID, "helper-plan-1", signedReceipt, at.Add(3*time.Minute)); err != nil {
+		t.Fatalf("idempotent receipt store: %v", err)
+	}
+	stored, err = d.GetRecoveryExecutionPlan(agent.ID, "helper-plan-1")
+	if err != nil || stored.SignedReceipt == nil || stored.SignedReceipt.Envelope.Payload.CanonicalRequestDigest != requestDigest {
+		t.Fatalf("stored receipt = %#v, err=%v", stored, err)
+	}
+	wrongReceipt := receipt
+	wrongReceipt.CanonicalRequestDigest = strings.Repeat("0", 64)
+	wrongSignedReceipt, err := helperprotocol.Sign("attestation-1", privateKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperReceipt, wrongReceipt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StoreRecoveryExecutionReceipt(agent.ID, "helper-plan-1", wrongSignedReceipt, at.Add(4*time.Minute)); !errors.Is(err, ErrRecoveryPlanMismatch) {
+		t.Fatalf("mismatched receipt error = %v", err)
+	}
+	plans, err := d.ListRecoveryExecutionPlans(agent.ID)
+	if err != nil || len(plans) != 1 || plans[0].SignedReceipt == nil {
+		t.Fatalf("listed recovery execution plans = %#v, err=%v", plans, err)
+	}
 }

@@ -699,6 +699,14 @@ var migrations = []string{
 	CREATE INDEX idx_recovery_execution_plans_agent_received
 		ON recovery_execution_plans(agent_id, received_at DESC, helper_plan_id);
 	`,
+
+	// Migration 29: helper-attested execution outcomes remain bound to the exact
+	// canonical execute request and survive agent retries and restarts.
+	`
+	ALTER TABLE recovery_execution_plans ADD COLUMN signed_receipt TEXT NOT NULL DEFAULT '';
+	ALTER TABLE recovery_execution_plans ADD COLUMN receipt_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE recovery_execution_plans ADD COLUMN receipt_received_at INTEGER;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
