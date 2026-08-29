@@ -657,6 +657,21 @@ func TestRender_structuredRoute_producesFileArtifact(t *testing.T) {
 	if art.Content == "" {
 		t.Error("Render produced empty content")
 	}
+	if !proxy.HasManagedArtifactMarker(art.Content) || strings.Count(art.Content, proxy.ManagedArtifactMarker) != 1 {
+		t.Fatalf("Render content has no single managed marker: %q", art.Content)
+	}
+}
+
+func TestRender_rawRouteStampsManagedArtifactMarkerOnce(t *testing.T) {
+	b, _ := newBackend(t, &fakeRunner{})
+	raw := "server { listen 80; }\n" + proxy.ManagedArtifactMarker + "\n"
+	art, err := b.Render(context.Background(), proxymodel.Route{Host: "raw.example.com", Raw: proxymodel.RawConfig{Backend: "nginx", Content: raw}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proxy.HasManagedArtifactMarker(art.Content) || strings.Count(art.Content, proxy.ManagedArtifactMarker) != 1 {
+		t.Fatalf("raw Render marker = %q", art.Content)
+	}
 }
 
 func TestReadManaged_adoptsAllFiles_taggingManagedVsOperator(t *testing.T) {

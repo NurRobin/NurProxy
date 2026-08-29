@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
@@ -48,7 +49,7 @@ func newRecoveryFixture(t *testing.T, backend proxy.Kind) recoveryFixture {
 func TestClassifierMarkerOwnershipRequiresExactBackendLayout(t *testing.T) {
 	fixture := newRecoveryFixture(t, proxy.KindNginx)
 	available := filepath.Join(fixture.available, "nurproxy-app.conf")
-	if err := os.WriteFile(available, []byte("managed"), 0o600); err != nil {
+	if err := os.WriteFile(available, []byte(proxy.StampManagedArtifact("managed")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	enabled := filepath.Join(fixture.enabled, filepath.Base(available))
@@ -77,7 +78,7 @@ func TestClassifierMarkerOwnershipRequiresExactBackendLayout(t *testing.T) {
 	}
 	enabledTemp := filepath.Join(fixture.enabled, "nurproxy-stage.conf.nurproxy-tmp")
 	availableTemp := filepath.Join(fixture.available, filepath.Base(enabledTemp))
-	if err := os.WriteFile(availableTemp, []byte("stage"), 0o600); err != nil {
+	if err := os.WriteFile(availableTemp, []byte(proxy.StampManagedArtifact("stage")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(availableTemp, enabledTemp); err != nil {
@@ -87,6 +88,31 @@ func TestClassifierMarkerOwnershipRequiresExactBackendLayout(t *testing.T) {
 	if err := os.Link(wrongTarget, hardlinkMarker); err != nil {
 		t.Fatal(err)
 	}
+	stampedTarget := filepath.Join(fixture.available, "stamped-source")
+	if err := os.WriteFile(stampedTarget, []byte(proxy.StampManagedArtifact("hardlink")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stampedHardlink := filepath.Join(fixture.available, "nurproxy-stamped-hardlink.conf")
+	if err := os.Link(stampedTarget, stampedHardlink); err != nil {
+		t.Fatal(err)
+	}
+	malformed := filepath.Join(fixture.available, "nurproxy-malformed.conf")
+	if err := os.WriteFile(malformed, []byte(proxy.ManagedArtifactMarker+"\n"+proxy.ManagedArtifactMarker+"\nserver {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unmarkedTemp := filepath.Join(fixture.available, "nurproxy-unmarked.conf.nurproxy-tmp")
+	if err := os.WriteFile(unmarkedTemp, []byte("staged without provenance"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lateMarker := filepath.Join(fixture.available, "nurproxy-late-marker.conf")
+	lateContent := strings.Repeat("x", proxy.MaxManagedArtifactMarkerProbeBytes+1) + "\n" + proxy.ManagedArtifactMarker + "\n"
+	if err := os.WriteFile(lateMarker, []byte(lateContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	danglingAlias := filepath.Join(fixture.enabled, "nurproxy-missing.conf")
+	if err := os.Symlink(filepath.Join(fixture.available, filepath.Base(danglingAlias)), danglingAlias); err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name     string
@@ -94,12 +120,18 @@ func TestClassifierMarkerOwnershipRequiresExactBackendLayout(t *testing.T) {
 		eligible bool
 	}{
 		{"available marker", available, true},
+		{"old unmarked config", wrongTarget, false},
 		{"exact enabled alias", enabled, true},
 		{"broad managed root is not layout", deceptive, false},
 		{"enabled regular file is not activation alias", enabledRegular, false},
 		{"enabled alias basename differs from target", wrongAlias, false},
 		{"enabled temp alias is not a backend activation", enabledTemp, false},
-		{"available hardlink marker is safe for unlink", hardlinkMarker, true},
+		{"unmarked hardlink is not provenance", hardlinkMarker, false},
+		{"stamped hardlink entry is safe for later unlink", stampedHardlink, true},
+		{"multiple malformed markers fail closed", malformed, false},
+		{"unmarked staged temp fails closed", unmarkedTemp, false},
+		{"marker beyond bounded probe fails closed", lateMarker, false},
+		{"missing enabled target fails closed", danglingAlias, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -114,10 +146,57 @@ func TestClassifierMarkerOwnershipRequiresExactBackendLayout(t *testing.T) {
 	}
 }
 
+func TestClassifierAgentDataRootIsAnIndependentAllowlist(t *testing.T) {
+	fixture := newRecoveryFixture(t, proxy.KindNginx)
+	fixture.ctx.ManagedRoots = []string{filepath.Join(fixture.base, "etc")}
+	target := filepath.Join(fixture.available, "nurproxy-app.conf")
+	if err := os.WriteFile(target, []byte(proxy.StampManagedArtifact("managed")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert := filepath.Join(fixture.certs, "app.crt")
+	fixture.ctx.DesiredResources = []DesiredResource{{
+		ArtifactID: "art-1", Host: "app.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: target},
+		Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateLive, ValidBundle: true,
+		CertPath: cert, RuntimeKeyPath: filepath.Join(fixture.certs, "app.key.plain"),
+	}}
+	output := `nginx: [emerg] cannot load certificate "` + cert + `": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`
+	got := Classify(fixture.ctx, proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, output, errors.New("exit 1")))
+	if !got.AutoRepairEligible || got.Code != recoverymodel.CodeManagedCertFileMissing {
+		t.Fatalf("sibling agent-data allowlist classification = %+v", got)
+	}
+}
+
+func TestClassifierRequiresBackendSpecificMismatchCardinality(t *testing.T) {
+	for _, backend := range []proxy.Kind{proxy.KindNginx, proxy.KindApache} {
+		t.Run(string(backend), func(t *testing.T) {
+			fixture := newRecoveryFixture(t, backend)
+			cert := filepath.Join(fixture.certs, "app.crt")
+			key := filepath.Join(fixture.certs, "app.key.plain")
+			target := filepath.Join(fixture.available, "nurproxy-app.conf")
+			for _, path := range []string{cert, key, target} {
+				if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fixture.ctx.DesiredResources = []DesiredResource{{ArtifactID: "art-1", Host: "app.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: target}, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateLive, ValidBundle: true, CertPath: cert, RuntimeKeyPath: key}}
+			failure := &proxy.Failure{Backend: backend, Phase: proxy.FailurePhaseValidate, RuntimeKeyMismatch: true, Err: errors.New("exit 1")}
+			if backend == proxy.KindNginx {
+				failure.ReferencedPaths = []string{cert, key}
+			} else {
+				failure.ReferencedPaths = []string{key}
+			}
+			got := Classify(fixture.ctx, failure)
+			if got.Code != recoverymodel.CodeUnknownProxyError || got.AutoRepairEligible || got.ProposedAction != "" {
+				t.Fatalf("cross-form mismatch classification = %+v", got)
+			}
+		})
+	}
+}
+
 func TestClassifierMarkerOwnershipFailsClosedForInvalidLayoutContext(t *testing.T) {
 	fixture := newRecoveryFixture(t, proxy.KindNginx)
 	marker := filepath.Join(fixture.available, "nurproxy-app.conf")
-	if err := os.WriteFile(marker, []byte("managed"), 0o600); err != nil {
+	if err := os.WriteFile(marker, []byte(proxy.StampManagedArtifact("managed")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tests := []struct {
@@ -148,7 +227,7 @@ func TestClassifierMarkerOwnershipFailsClosedForInvalidLayoutContext(t *testing.
 func TestClassifierDerivesLayoutFromCanonicalConfigDirectory(t *testing.T) {
 	fixture := newRecoveryFixture(t, proxy.KindNginx)
 	marker := filepath.Join(fixture.available, "nurproxy-app.conf")
-	if err := os.WriteFile(marker, []byte("managed"), 0o600); err != nil {
+	if err := os.WriteFile(marker, []byte(proxy.StampManagedArtifact("managed")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	alias := filepath.Join(fixture.base, "config-dir-alias")

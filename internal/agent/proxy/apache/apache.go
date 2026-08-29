@@ -232,7 +232,7 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 			Kind: proxy.TargetKindFile,
 			Path: b.layout.AvailablePath(route.Host),
 		},
-		Content:  content.String(),
+		Content:  proxy.StampManagedArtifact(content.String()),
 		Enabled:  true,
 		Warnings: warnings,
 	}, nil

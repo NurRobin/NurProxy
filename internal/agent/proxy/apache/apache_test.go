@@ -654,8 +654,23 @@ func TestRender_dropsUnsupportedRateLimit(t *testing.T) {
 	if art.Content == "" {
 		t.Errorf("expected non-empty content even with a dropped option")
 	}
+	if !proxy.HasManagedArtifactMarker(art.Content) || strings.Count(art.Content, proxy.ManagedArtifactMarker) != 1 {
+		t.Fatalf("Render content has no single managed marker: %q", art.Content)
+	}
 	if art.Target.Path != b.layout.AvailablePath("app.example.com") {
 		t.Errorf("target path = %q", art.Target.Path)
+	}
+}
+
+func TestRender_rawRouteStampsManagedArtifactMarkerOnce(t *testing.T) {
+	b, _ := newDebianBackend(t, &fakeRunner{})
+	raw := "<VirtualHost *:80></VirtualHost>\n" + proxy.ManagedArtifactMarker + "\n"
+	art, err := b.Render(context.Background(), proxymodel.Route{Host: "raw.example.com", Raw: proxymodel.RawConfig{Backend: "apache", Content: raw}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proxy.HasManagedArtifactMarker(art.Content) || strings.Count(art.Content, proxy.ManagedArtifactMarker) != 1 {
+		t.Fatalf("raw Render marker = %q", art.Content)
 	}
 }
 

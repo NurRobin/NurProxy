@@ -24,7 +24,11 @@ func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
 	mismatchKey := filepath.Join(fixture.certs, "mismatch.key.plain")
 	mismatchTarget := filepath.Join(fixture.available, "nurproxy-mismatch.example.conf")
 	for _, path := range []string{managed, operator, temp, orphan, mismatchCert, mismatchKey, mismatchTarget} {
-		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+		content := "fixture"
+		if path == temp || path == orphan {
+			content = proxy.StampManagedArtifact(content)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}

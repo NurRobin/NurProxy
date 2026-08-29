@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -142,6 +143,9 @@ func validFailureMetadata(ctx Context, failure *proxy.Failure) bool {
 	if certificateFailure != (len(failure.ReferencedPaths) > 0) || (certificateFailure && failure.Phase != proxy.FailurePhaseValidate) {
 		return false
 	}
+	if failure.RuntimeKeyMismatch && ((failure.Backend == proxy.KindNginx && len(failure.ReferencedPaths) != 1) || (failure.Backend == proxy.KindApache && len(failure.ReferencedPaths) != 2)) {
+		return false
+	}
 	for _, path := range failure.ReferencedPaths {
 		if !proxy.ValidFailurePath(path) {
 			return false
@@ -177,7 +181,7 @@ func classifyLocatedFailure(ctx Context, failure *proxy.Failure) classification 
 		}
 		return classification{code: code, ownership: ownership, evidenceClass: class, paths: []GuardedPath{checked}}
 	}
-	if markerInExactLayout(checked, layout) {
+	if markerInExactLayout(checked, layout) && hasManagedArtifactProvenance(checked) {
 		if filepath.Dir(checked.Path) == layout.available && isManagedTemp(checked.Path) {
 			return classification{code: recoverymodel.CodeManagedStaleTemp, ownership: recoverymodel.OwnershipNurProxy, action: recoverymodel.ActionRemoveManagedTemp, eligible: true, evidenceClass: "managed_temp", paths: []GuardedPath{checked}}
 		}
@@ -252,6 +256,22 @@ func markerInExactLayout(path GuardedPath, layout backendLayout) bool {
 	return filepath.Base(path.ResolvedPath) == name && path.ResolvedPath == filepath.Join(layout.available, name)
 }
 
+func hasManagedArtifactProvenance(path GuardedPath) bool {
+	if (path.EntryType != GuardedPathRegular && path.EntryType != GuardedPathSymlink) || !path.resolvedExists {
+		return false
+	}
+	file, err := os.Open(path.ResolvedPath)
+	if err != nil {
+		return false
+	}
+	probe, readErr := io.ReadAll(io.LimitReader(file, proxy.MaxManagedArtifactMarkerProbeBytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil || path.owner.Recheck(path) != nil {
+		return false
+	}
+	return proxy.HasManagedArtifactMarker(string(probe))
+}
+
 func matchDesiredTarget(resources []DesiredResource, path GuardedPath, layout backendLayout) (*DesiredResource, recoverymodel.Ownership) {
 	var match *DesiredResource
 	for i := range resources {
@@ -301,12 +321,8 @@ func classifyReferencedFailure(ctx Context, failure *proxy.Failure) classificati
 	if !ok {
 		return unknownClassification()
 	}
-	outer, err := NewPathGuard(ctx.ManagedRoots...)
-	if err != nil {
-		return unknownClassification()
-	}
 	dataRoot, ok := canonicalExistingDir(ctx.AgentDataRoot)
-	if !ok || !outer.containsDirectory(dataRoot) {
+	if !ok {
 		return unknownClassification()
 	}
 	guard, err := NewPathGuard(dataRoot)
@@ -363,10 +379,10 @@ func referencesMatchResource(failure *proxy.Failure, references []GuardedPath, r
 		return len(references) == 1 && certOK && references[0].EntryType == GuardedPathAbsent && references[0].Path == cert.Path
 	case failure.MissingRuntimeKey:
 		return len(references) == 1 && keyOK && references[0].EntryType == GuardedPathAbsent && references[0].Path == key.Path
-	case failure.RuntimeKeyMismatch && len(references) == 1:
-		return failure.Backend == proxy.KindNginx && certOK && keyOK && cert.EntryType == GuardedPathRegular && key.EntryType == GuardedPathRegular && references[0].Path == key.Path
-	case failure.RuntimeKeyMismatch && len(references) == 2:
-		return certOK && keyOK && cert.EntryType == GuardedPathRegular && key.EntryType == GuardedPathRegular && references[0].Path == cert.Path && references[1].Path == key.Path
+	case failure.RuntimeKeyMismatch && failure.Backend == proxy.KindNginx:
+		return len(references) == 1 && certOK && keyOK && cert.EntryType == GuardedPathRegular && key.EntryType == GuardedPathRegular && references[0].Path == key.Path
+	case failure.RuntimeKeyMismatch && failure.Backend == proxy.KindApache:
+		return len(references) == 2 && certOK && keyOK && cert.EntryType == GuardedPathRegular && key.EntryType == GuardedPathRegular && references[0].Path == cert.Path && references[1].Path == key.Path
 	default:
 		return false
 	}
