@@ -89,8 +89,8 @@ jget() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
 wait_for() { # wait_for URL DESC
   # A fresh-DB cold boot runs every migration before /health answers; on a slow
   # disk that is tens of seconds, so wait up to ~60s (300 * 0.2s) rather than 10s.
-  local url=$1 desc=$2 i
-  for i in $(seq 1 300); do curl -fsS "$url" >/dev/null 2>&1 && return 0; sleep 0.2; done
+  local url=$1 desc=$2
+  for _ in $(seq 1 300); do curl -fsS "$url" >/dev/null 2>&1 && return 0; sleep 0.2; done
   echo "error: timed out waiting for $desc ($url)" >&2; return 1
 }
 
@@ -134,7 +134,7 @@ for n in $(seq 1 "$AGENTS"); do
 
   # wait for the agent to register, then adopt it onto the zone
   agent_id=""
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     agent_id=$(api GET /api/v1/agents | jget "next((a['id'] for a in d if a['fqdn']=='$fqdn'), '')" 2>/dev/null || echo "")
     [[ -n "$agent_id" ]] && break; sleep 0.2
   done
@@ -154,7 +154,7 @@ done
 
 # --- wait for convergence ---------------------------------------------------
 echo "--> waiting for domains to converge..."
-for i in $(seq 1 50); do
+for _ in $(seq 1 50); do
   active=$(api GET /api/v1/domains | jget "sum(1 for x in d if x['status']=='active')" 2>/dev/null || echo 0)
   [[ "$active" -ge "$AGENTS" ]] && break; sleep 0.4
 done
