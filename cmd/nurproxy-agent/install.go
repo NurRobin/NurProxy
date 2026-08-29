@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	agentconfig "github.com/NurRobin/NurProxy/internal/agent/config"
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/shared/install"
 	"gopkg.in/yaml.v3"
 )
@@ -28,6 +29,7 @@ func agentService(bin, dataDir string, cfg agentconfig.Config, user string) (ins
 		Args:         []string{"--data-dir", dataDir},
 		User:         user,
 		DataDir:      dataDir,
+		WritePaths:   []string{recoverycontrol.DefaultStagingRoot},
 		ConfigFile:   filepath.Join(dataDir, "agent.yaml"),
 		ConfigData:   string(data),
 		Capabilities: install.AgentCapabilities,

@@ -62,6 +62,7 @@ func TestPackagedAgentUnitMatchesRenderUnit(t *testing.T) {
 		User: "nurproxy", Group: "nurproxy", DataDir: "/var/lib/nurproxy-agent/state", EnvFile: "/etc/nurproxy-agent/agent.env",
 		AfterUnits:   []string{"nurproxy-agent-helper.socket"},
 		WantsUnits:   []string{"nurproxy-agent-helper.socket"},
+		WritePaths:   []string{"/var/lib/nurproxy-agent/helper-staging"},
 		Capabilities: AgentCapabilities,
 	}
 	assertPackagedUnit(t, "nurproxy-agent.service", svc)

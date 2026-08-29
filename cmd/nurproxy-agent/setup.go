@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/shared/install"
 )
 
@@ -69,6 +70,7 @@ func cmdSetup(args []string) {
 			Args:         []string{"--data-dir", *dataDir},
 			User:         *user,
 			DataDir:      *dataDir,
+			WritePaths:   []string{recoverycontrol.DefaultStagingRoot},
 			EnvFile:      agentEnvFile,
 			Env:          env,
 			Capabilities: install.AgentCapabilities,

@@ -19,6 +19,7 @@ PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
 ReadWritePaths=/var/lib/nurproxy-agent/state
+ReadWritePaths=/var/lib/nurproxy-agent/helper-staging
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
