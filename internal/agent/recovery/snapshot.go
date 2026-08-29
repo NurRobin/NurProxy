@@ -139,7 +139,7 @@ func (s *SnapshotStore) CreateOperationForDiagnostic(report recoverymodel.Operat
 	}
 	cleanup := true
 	defer func() {
-		opDir.Close()
+		_ = opDir.Close()
 		if cleanup {
 			_ = removeTreeAt(int(s.operations.Fd()), operationID)
 		}
@@ -226,7 +226,7 @@ func captureSnapshot(filesDir *os.File, index int, checked GuardedPath) (Snapsho
 			return SnapshotEntry{}, err
 		}
 		target, err := readlinkAt(parent, filepath.Base(checked.Path))
-		parent.Close()
+		_ = parent.Close()
 		if err != nil {
 			return SnapshotEntry{}, err
 		}
@@ -411,7 +411,7 @@ func (s *SnapshotStore) Rollback(operationID string) error {
 	defer func() {
 		for i := range prepared {
 			if prepared[i].parent != nil {
-				prepared[i].parent.Close()
+				_ = prepared[i].parent.Close()
 			}
 		}
 	}()
@@ -495,12 +495,12 @@ func preflightTarget(entry SnapshotEntry) (*os.File, bool, uint64, uint64, uint3
 	}
 	info, err := parent.Stat()
 	if err != nil {
-		parent.Close()
+		_ = parent.Close()
 		return nil, false, 0, 0, 0, err
 	}
 	device, inode, ok := fileIdentity(info)
 	if !ok || device != entry.ParentDevice || inode != entry.ParentInode {
-		parent.Close()
+		_ = parent.Close()
 		return nil, false, 0, 0, 0, fmt.Errorf("snapshot parent identity changed")
 	}
 	var stat unix.Stat_t
@@ -509,12 +509,12 @@ func preflightTarget(entry SnapshotEntry) (*os.File, bool, uint64, uint64, uint3
 		return parent, false, 0, 0, 0, nil
 	}
 	if err != nil {
-		parent.Close()
+		_ = parent.Close()
 		return nil, false, 0, 0, 0, err
 	}
 	entryType := stat.Mode & unix.S_IFMT
 	if entryType != unix.S_IFREG && entryType != unix.S_IFLNK {
-		parent.Close()
+		_ = parent.Close()
 		return nil, false, 0, 0, 0, fmt.Errorf("refusing to replace unsupported entry type")
 	}
 	return parent, true, uint64(stat.Dev), stat.Ino, entryType, nil
@@ -554,7 +554,7 @@ func (s *SnapshotStore) Prune(now time.Time) error {
 	}
 	dir := os.NewFile(uintptr(dup), s.operationsDir)
 	entries, err := dir.ReadDir(-1)
-	dir.Close()
+	_ = dir.Close()
 	if err != nil {
 		return err
 	}
@@ -631,7 +631,7 @@ func (s *SnapshotStore) ActiveOperationIDs() ([]string, error) {
 	}
 	dir := os.NewFile(uintptr(dup), s.operationsDir)
 	entries, err := dir.ReadDir(-1)
-	dir.Close()
+	_ = dir.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -781,7 +781,7 @@ func validOperationID(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_') {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' {
 			return false
 		}
 	}
@@ -826,30 +826,30 @@ func ensurePrivateDirectory(path string) (*os.File, error) {
 		created := false
 		if errors.Is(openErr, unix.ENOENT) {
 			if err := unix.Mkdirat(int(current.Fd()), component, 0o700); err != nil {
-				current.Close()
+				_ = current.Close()
 				return nil, err
 			}
 			created = true
 			next, openErr = openDirAt(int(current.Fd()), component)
 		}
 		if openErr != nil {
-			current.Close()
+			_ = current.Close()
 			return nil, openErr
 		}
 		if created || i == len(components)-1 {
 			if err := next.Chmod(0o700); err != nil {
-				next.Close()
-				current.Close()
+				_ = next.Close()
+				_ = current.Close()
 				return nil, err
 			}
 		}
 		info, err := next.Stat()
 		if err != nil || !info.IsDir() || ((created || i == len(components)-1) && info.Mode().Perm() != 0o700) {
-			next.Close()
-			current.Close()
+			_ = next.Close()
+			_ = current.Close()
 			return nil, fmt.Errorf("invalid private directory component")
 		}
-		current.Close()
+		_ = current.Close()
 		current = next
 	}
 	return current, nil
@@ -867,12 +867,12 @@ func openOrCreatePrivateDirAt(parent *os.File, name string) (*os.File, error) {
 		return nil, err
 	}
 	if err := dir.Chmod(0o700); err != nil {
-		dir.Close()
+		_ = dir.Close()
 		return nil, err
 	}
 	info, err := dir.Stat()
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
-		dir.Close()
+		_ = dir.Close()
 		return nil, fmt.Errorf("invalid private directory")
 	}
 	return dir, nil
@@ -921,7 +921,7 @@ func readRegularAt(dir *os.File, name string, requiredMode os.FileMode) ([]byte,
 	file := os.NewFile(uintptr(fd), name)
 	info, statErr := file.Stat()
 	if statErr != nil || !info.Mode().IsRegular() || (requiredMode != 0 && info.Mode().Perm() != requiredMode) {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("entry is not a private regular file")
 	}
 	data, readErr := io.ReadAll(file)
@@ -1075,36 +1075,36 @@ func removeTreeAtExpected(parentFD int, name string, expectedDevice, expectedIno
 	}
 	openedInfo, err := child.Stat()
 	if err != nil {
-		child.Close()
+		_ = child.Close()
 		return err
 	}
 	openedDevice, openedInode, ok := fileIdentity(openedInfo)
 	if !ok {
-		child.Close()
+		_ = child.Close()
 		return fmt.Errorf("operation directory identity unavailable")
 	}
 	if expectedDevice != 0 && (openedDevice != expectedDevice || openedInode != expectedInode) {
-		child.Close()
+		_ = child.Close()
 		return fmt.Errorf("operation directory identity changed")
 	}
 	entries, readErr := child.ReadDir(-1)
 	if readErr != nil {
-		child.Close()
+		_ = child.Close()
 		return readErr
 	}
 	for _, entry := range entries {
 		var stat unix.Stat_t
 		if err := unix.Fstatat(int(child.Fd()), entry.Name(), &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			child.Close()
+			_ = child.Close()
 			return err
 		}
 		if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
 			if err := removeTreeAtExpected(int(child.Fd()), entry.Name(), uint64(stat.Dev), stat.Ino); err != nil {
-				child.Close()
+				_ = child.Close()
 				return err
 			}
 		} else if err := unix.Unlinkat(int(child.Fd()), entry.Name(), 0); err != nil {
-			child.Close()
+			_ = child.Close()
 			return err
 		}
 	}

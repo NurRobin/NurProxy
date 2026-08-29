@@ -143,7 +143,7 @@ func (d *Dir) SameFile(name string, opened *os.File) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	if err := unix.Fstat(fd, &current); err != nil {
 		return false, err
 	}

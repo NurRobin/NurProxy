@@ -25,8 +25,8 @@ func TestRepairBreakerUsesTerminalReceiptOrder(t *testing.T) {
 	if err := d.CreateRepairOperation(a.ID, bFailure, diag.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}
-	bFailure = advanceOperationToTerminal(t, d, a.ID, bFailure, recoverymodel.OperationStateRolledBack)
-	aSuccess = advanceOperationToTerminal(t, d, a.ID, aSuccess, recoverymodel.OperationStateSucceeded)
+	advanceOperationToTerminal(t, d, a.ID, bFailure, recoverymodel.OperationStateRolledBack)
+	advanceOperationToTerminal(t, d, a.ID, aSuccess, recoverymodel.OperationStateSucceeded)
 
 	since := time.Now().Add(-time.Minute)
 	count, err := d.CountRecentRepairFailures(a.ID, diag.ProposedAction, diag.ResourceFingerprint, since)
@@ -419,7 +419,7 @@ func TestRepairBreakerOrdersTerminalACKsBySerializedAgentReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	success = advanceOperationToTerminal(t, d, a.ID, success, recoverymodel.OperationStateSucceeded)
-	failure = advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRolledBack)
+	advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRolledBack)
 
 	count, err := d.CountRecentRepairFailures(a.ID, diag.ProposedAction, diag.ResourceFingerprint, time.Now().Add(-time.Minute))
 	if err != nil {

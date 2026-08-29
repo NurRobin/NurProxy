@@ -193,12 +193,6 @@ func locatedFailure(phase proxy.FailurePhase, path string) error {
 	return &proxy.Failure{Backend: proxy.KindNginx, Phase: phase, File: path, Line: 1, Located: true, ManagedHint: true, Output: "configtest failed", Err: errors.New("exit 1")}
 }
 
-func flaggedFailure(path string, mutate func(*proxy.Failure)) error {
-	f := locatedFailure(proxy.FailurePhaseValidate, path).(*proxy.Failure)
-	mutate(f)
-	return f
-}
-
 func resourceWith(base DesiredResource, mutate func(*DesiredResource)) *DesiredResource {
 	mutate(&base)
 	return &base

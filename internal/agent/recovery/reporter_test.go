@@ -31,7 +31,10 @@ func TestBoundedReporterRetriesAndDeduplicates(t *testing.T) {
 	})
 	r.SetBackoff(time.Millisecond)
 	report := validRecoveryReport("op-1", recoverymodel.OperationStateApplying)
-	if !r.Enqueue(report) || !r.Enqueue(report) {
+	if !r.Enqueue(report) {
+		t.Fatal("valid report rejected")
+	}
+	if !r.Enqueue(report) {
 		t.Fatal("valid report rejected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

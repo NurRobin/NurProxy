@@ -86,5 +86,5 @@ func readManagedArtifactFile(path string, limit int64) ([]byte, bool, ManagedArt
 }
 
 func sameManagedFileState(a, b os.FileInfo) bool {
-	return os.SameFile(a, b) && a.Mode() == b.Mode() && a.Size() == b.Size() && a.ModTime() == b.ModTime()
+	return os.SameFile(a, b) && a.Mode() == b.Mode() && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }

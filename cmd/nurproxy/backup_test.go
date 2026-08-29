@@ -186,7 +186,7 @@ func TestBackupRejectsHardlinkedOutputFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := backupDataDir(src, linked); err == nil {
-		t.Fatal("backup accepted a hardlinked output")
+		t.Fatal("backup accepted a hard-linked output")
 	}
 	got, err := os.ReadFile(outside)
 	if err != nil {

@@ -685,15 +685,6 @@ func (r *execRunner) Reload(ctx context.Context) error {
 	return nil
 }
 
-// command builds the exec.Cmd for a step. It resolves the privileged command
-// (see spec) and, when the agent runs unprivileged, invokes it through `sudo -n`
-// so a scoped, passwordless sudoers entry (the §12 remediation) grants exactly
-// these commands instead of requiring the whole agent to run as root.
-func (r *execRunner) command(ctx context.Context, override string, defaultArgs ...string) *exec.Cmd {
-	cmd, _, _ := r.execution(ctx, override, defaultArgs...)
-	return cmd
-}
-
 func (r *execRunner) execution(ctx context.Context, override string, defaultArgs ...string) (*exec.Cmd, string, proxy.ExecutionRole) {
 	name, args := r.spec(override, defaultArgs)
 	target := name

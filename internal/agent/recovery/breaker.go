@@ -79,39 +79,39 @@ func NewPersistentBreaker(agentDataDir string) (*Breaker, error) {
 		return b, nil
 	}
 	if err != nil {
-		dir.Close()
+		_ = dir.Close()
 		return nil, fmt.Errorf("read breaker state: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var disk breakerDisk
 	if err := decoder.Decode(&disk); err != nil {
-		dir.Close()
+		_ = dir.Close()
 		return nil, fmt.Errorf("decode breaker state: %w", err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		dir.Close()
+		_ = dir.Close()
 		return nil, fmt.Errorf("breaker state has trailing data")
 	}
 	if disk.Version != 1 || len(disk.Entries) > 10000 {
-		dir.Close()
+		_ = dir.Close()
 		return nil, fmt.Errorf("invalid breaker state")
 	}
 	for _, entry := range disk.Entries {
 		key := BreakerKey{Action: entry.Action, Fingerprint: entry.Fingerprint}
 		if !key.Action.Valid() || !validOpaqueID(key.Fingerprint) || len(entry.Failures) > breakerFailures || b.states[key] != nil {
-			dir.Close()
+			_ = dir.Close()
 			return nil, fmt.Errorf("invalid breaker entry")
 		}
 		for i, failure := range entry.Failures {
 			if failure.IsZero() || (i > 0 && failure.Before(entry.Failures[i-1])) {
-				dir.Close()
+				_ = dir.Close()
 				return nil, fmt.Errorf("invalid breaker failure history")
 			}
 		}
 		if !entry.OpenedAt.IsZero() && len(entry.Failures) < breakerFailures {
-			dir.Close()
+			_ = dir.Close()
 			return nil, fmt.Errorf("invalid open breaker")
 		}
 		b.states[key] = &breakerState{failures: append([]time.Time(nil), entry.Failures...), openedAt: entry.OpenedAt, rollbackFailed: entry.RollbackFailed}

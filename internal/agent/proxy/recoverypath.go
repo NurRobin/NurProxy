@@ -80,7 +80,7 @@ func ReplaceRecoveryPath(identity RecoveryPathIdentity, data []byte, mode os.Fil
 	if err != nil {
 		return fmt.Errorf("open recovery parent: %w", err)
 	}
-	defer unix.Close(dirfd)
+	defer func() { _ = unix.Close(dirfd) }()
 	if err := recheckRecoveryParent(dirfd, parent, identity); err != nil {
 		return err
 	}
@@ -144,7 +144,7 @@ func recheckRecoveryParent(dirfd int, parent string, identity RecoveryPathIdenti
 	if err != nil {
 		return fmt.Errorf("reopen recovery parent: %w", err)
 	}
-	defer unix.Close(currentfd)
+	defer func() { _ = unix.Close(currentfd) }()
 	var current unix.Stat_t
 	if err := unix.Fstat(currentfd, &current); err != nil || current.Dev != held.Dev || current.Ino != held.Ino {
 		return fmt.Errorf("recovery parent path changed")
@@ -263,7 +263,7 @@ func RemoveRecoveryPath(identity RecoveryPathIdentity) error {
 	if err != nil {
 		return fmt.Errorf("open recovery parent: %w", err)
 	}
-	defer unix.Close(dirfd)
+	defer func() { _ = unix.Close(dirfd) }()
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(dirfd, &parentStat); err != nil || uint64(parentStat.Dev) != identity.parentDevice || parentStat.Ino != identity.parentInode {
 		return fmt.Errorf("recovery parent identity changed")

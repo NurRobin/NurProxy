@@ -64,12 +64,12 @@ func (d *DB) RecoveryAggregates(now time.Time) (RecoveryMetricAggregates, error)
 		var code, severity, ownership string
 		var count int
 		if err := rows.Scan(&code, &severity, &ownership, &count); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("scanning active recovery diagnostic aggregate: %w", err)
 		}
 		aggregate := RecoveryDiagnosticAggregate{Code: recoverymodel.Code(code), Severity: recoverymodel.Severity(severity), Ownership: recoverymodel.Ownership(ownership), Count: count}
 		if !aggregate.Code.Valid() || !aggregate.Severity.Valid() || !aggregate.Ownership.Valid() || aggregate.Count < 1 {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("unknown diagnostic aggregate dimensions")
 		}
 		result.DiagnosticsActive = append(result.DiagnosticsActive, aggregate)
@@ -90,12 +90,12 @@ func (d *DB) RecoveryAggregates(now time.Time) (RecoveryMetricAggregates, error)
 		var action, outcome, source string
 		var count int
 		if err := rows.Scan(&action, &outcome, &source, &count); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("scanning recovery operation total: %w", err)
 		}
 		a, terminalState, requestSource := recoverymodel.Action(action), recoverymodel.OperationState(outcome), recoverymodel.RequestSource(source)
 		if !a.Valid() || !recoveryOperationTerminal(terminalState) || !requestSource.Valid() || count < 1 {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("unknown recovery operation total dimensions")
 		}
 		result.OperationsTotal = append(result.OperationsTotal, RecoveryOperationAggregate{Action: a, Outcome: terminalState, RequestSource: requestSource, Count: count})
@@ -121,12 +121,12 @@ func (d *DB) RecoveryAggregates(now time.Time) (RecoveryMetricAggregates, error)
 		var action string
 		var count int
 		if err := rows.Scan(&action, &count); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("scanning in-progress recovery operation aggregate: %w", err)
 		}
 		a := recoverymodel.Action(action)
 		if !a.Valid() || count < 1 {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("unknown in-progress recovery operation dimensions")
 		}
 		inProgress[a] = count
@@ -172,11 +172,11 @@ func (d *DB) RecoveryAggregates(now time.Time) (RecoveryMetricAggregates, error)
 	for rows.Next() {
 		var key breakerKey
 		if err := rows.Scan(&key.agentID, &key.action, &key.fingerprint); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("scanning recovery circuit breaker key: %w", err)
 		}
 		if strings.TrimSpace(key.agentID) == "" || !key.action.Valid() || strings.TrimSpace(key.fingerprint) == "" {
-			rows.Close()
+			_ = rows.Close()
 			return RecoveryMetricAggregates{}, fmt.Errorf("unknown recovery circuit breaker dimensions")
 		}
 		keys = append(keys, key)
@@ -1046,13 +1046,13 @@ func (d *DB) GetRepairBreakerStatuses(agentID string, diagnostics []recoverymode
 			var action, fingerprint string
 			var rollbackFailedAt, manualSuccessAt, latestSuccess int64
 			if err := rows.Scan(&action, &fingerprint, &rollbackFailedAt, &manualSuccessAt, &latestSuccess); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, fmt.Errorf("scanning batch repair breaker metadata: %w", err)
 			}
 			key := RepairBreakerKey{Action: recoverymodel.Action(action), ResourceFingerprint: fingerprint}
 			h := histories[key]
 			if h == nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, fmt.Errorf("batch repair breaker returned an unknown key")
 			}
 			h.latched = rollbackFailedAt > manualSuccessAt
@@ -1073,13 +1073,13 @@ func (d *DB) GetRepairBreakerStatuses(agentID string, diagnostics []recoverymode
 			var action, fingerprint string
 			var receipt int64
 			if err := rows.Scan(&action, &fingerprint, &receipt); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, fmt.Errorf("scanning batch repair breaker failures: %w", err)
 			}
 			key := RepairBreakerKey{Action: recoverymodel.Action(action), ResourceFingerprint: fingerprint}
 			h := histories[key]
 			if h == nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, fmt.Errorf("batch repair breaker returned an unknown failure key")
 			}
 			h.failures = append(h.failures, receipt)

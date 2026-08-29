@@ -213,7 +213,7 @@ func TestRepairBreakerStatusesBatchProjectsActiveKeys(t *testing.T) {
 	if err := d.CreateRepairOperation(a.ID, failure, latched.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}
-	failure = advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRollbackFailed)
+	advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRollbackFailed)
 	if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, base.Add(3*time.Minute).UnixNano(), failure.OperationID); err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +515,7 @@ func TestRollbackFailedLatchRemainsOpenWhileAdmittingExplicitUserRepair(t *testi
 	if err := d.CreateRepairOperation(a.ID, failure, diagnostic.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}
-	failure = advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRollbackFailed)
+	advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRollbackFailed)
 	open, err := d.RepairBreakerOpen(a.ID, diagnostic.ProposedAction, diagnostic.ResourceFingerprint, recoveryTime(10))
 	if err != nil || !open {
 		t.Fatalf("automatic breaker open = %t, err=%v", open, err)
@@ -634,7 +634,7 @@ func TestListPendingUserRepairOperationsReturnsOnlyDurablePlannedRequests(t *tes
 	if err := d.CreateRepairOperation(a.ID, progressed, secondDiagnostic.ResourceFingerprint); err != nil {
 		t.Fatal(err)
 	}
-	progressed = advanceOperation(t, d, a.ID, progressed, recoverymodel.OperationStateSnapshotted)
+	advanceOperation(t, d, a.ID, progressed, recoverymodel.OperationStateSnapshotted)
 
 	got, err := d.ListPendingUserRepairOperations(a.ID, 500)
 	if err != nil {
