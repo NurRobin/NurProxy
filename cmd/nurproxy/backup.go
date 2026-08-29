@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/dataperms"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"golang.org/x/sys/unix"
 )
 
 // backupFiles are the data-dir entries a backup captures. nurproxy.db is written
@@ -82,11 +84,15 @@ func backupDataDir(dataDir, outPath string) error {
 		return err
 	}
 
-	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	fd, err := unix.Open(outPath, unix.O_CREAT|unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, dataperms.FileMode)
 	if err != nil {
 		return fmt.Errorf("creating %s: %w", outPath, err)
 	}
+	f := os.NewFile(uintptr(fd), outPath)
 	defer f.Close()
+	if err := unix.Fchmod(fd, dataperms.FileMode); err != nil {
+		return fmt.Errorf("restricting %s: %w", outPath, err)
+	}
 
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
@@ -177,8 +183,8 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	}
 	defer gz.Close()
 
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return 0, fmt.Errorf("creating data dir %s: %w", dataDir, err)
+	if _, err := dataperms.Ensure(dataDir); err != nil {
+		return 0, err
 	}
 
 	allowed := map[string]bool{dbFileName: true, encryptionKeyName: true, acmeAccountKeyName: true}
@@ -268,6 +274,9 @@ func restoreArchive(archivePath, dataDir string, force bool) (int, error) {
 	}
 
 	committed = true
+	if _, err := dataperms.Harden(dataDir); err != nil {
+		return restored, fmt.Errorf("restricting restored files: %w", err)
+	}
 	return restored, nil
 }
 

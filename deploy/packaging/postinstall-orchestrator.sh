@@ -3,6 +3,10 @@
 # with sane defaults, so enable + start it straight away.
 set -e
 
+# Apply the same idempotent, no-symlink migration used at normal startup before
+# starting (or restarting) a packaged service. A failure is intentionally fatal.
+/usr/bin/nurproxy permissions --data-dir /var/lib/nurproxy
+
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
   systemctl enable --now nurproxy.service || true

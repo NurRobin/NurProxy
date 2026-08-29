@@ -22,6 +22,7 @@ func TestRenderUnitHardening(t *testing.T) {
 		"After=network-online.target",
 		"ExecStart=/usr/local/bin/nurproxy-agent --data-dir /var/lib/nurproxy-agent",
 		"Restart=on-failure",
+		"UMask=0077",
 		"NoNewPrivileges=true",
 		"ProtectSystem=strict",
 		"ProtectHome=true",

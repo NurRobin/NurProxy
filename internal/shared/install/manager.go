@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // Manager installs and removes a Service using a host's native service system.
@@ -73,10 +75,18 @@ func requireRoot() error {
 // and the service dies at first boot.
 func ensureDataDir(s Service, out io.Writer) error {
 	if s.DataDir != "" {
-		if err := os.MkdirAll(s.DataDir, 0o750); err != nil {
+		mode := os.FileMode(0o750)
+		if s.PrivateData {
+			mode = 0o700
+		}
+		if err := os.MkdirAll(s.DataDir, mode); err != nil {
 			return fmt.Errorf("creating data dir %s: %w", s.DataDir, err)
 		}
-		if err := chownForServiceUser(s, s.DataDir); err != nil {
+		if s.PrivateData {
+			if err := restrictPrivateDataDir(s, s.DataDir); err != nil {
+				return fmt.Errorf("restricting data dir %s: %w", s.DataDir, err)
+			}
+		} else if err := chownForServiceUser(s, s.DataDir); err != nil {
 			return err
 		}
 		fprintf(out, "• data dir %s\n", s.DataDir)
@@ -106,24 +116,37 @@ func ensureDataDir(s Service, out io.Writer) error {
 	return nil
 }
 
+func restrictPrivateDataDir(s Service, path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("opening without following links: %w", err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Fchmod(fd, 0o700); err != nil {
+		return err
+	}
+	uid, gid, change, err := serviceUserIDs(s)
+	if err != nil {
+		return err
+	}
+	if change {
+		if err := unix.Fchown(fd, uid, gid); err != nil {
+			return fmt.Errorf("chowning %s to %s: %w", path, s.User, err)
+		}
+	}
+	return nil
+}
+
 // chownForServiceUser hands paths to Service.User so a non-root service can
 // use the files the (root) installer laid out. Root or an unset user needs no
 // change.
 func chownForServiceUser(s Service, paths ...string) error {
-	if s.User == "" || s.User == "root" {
+	uid, gid, change, err := serviceUserIDs(s)
+	if err != nil {
+		return err
+	}
+	if !change {
 		return nil
-	}
-	u, err := user.Lookup(s.User)
-	if err != nil {
-		return fmt.Errorf("looking up service user %q (create the user first, or install without --user): %w", s.User, err)
-	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return fmt.Errorf("parsing uid %q of service user %s: %w", u.Uid, s.User, err)
-	}
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return fmt.Errorf("parsing gid %q of service user %s: %w", u.Gid, s.User, err)
 	}
 	for _, p := range paths {
 		if err := os.Chown(p, uid, gid); err != nil {
@@ -131,6 +154,25 @@ func chownForServiceUser(s Service, paths ...string) error {
 		}
 	}
 	return nil
+}
+
+func serviceUserIDs(s Service) (uid, gid int, change bool, err error) {
+	if s.User == "" || s.User == "root" {
+		return 0, 0, false, nil
+	}
+	u, err := user.Lookup(s.User)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("looking up service user %q (create the user first, or install without --user): %w", s.User, err)
+	}
+	uid, err = strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("parsing uid %q of service user %s: %w", u.Uid, s.User, err)
+	}
+	gid, err = strconv.Atoi(u.Gid)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("parsing gid %q of service user %s: %w", u.Gid, s.User, err)
+	}
+	return uid, gid, true, nil
 }
 
 // removeData deletes the env file, config file, and (with purge) the data dir,

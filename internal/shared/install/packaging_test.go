@@ -3,6 +3,7 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -14,9 +15,31 @@ func TestPackagedOrchestratorUnitMatchesRenderUnit(t *testing.T) {
 	svc := Service{
 		Name: "nurproxy", Description: "NurProxy orchestrator",
 		BinaryPath: "/usr/bin/nurproxy", User: "root",
-		DataDir: "/var/lib/nurproxy", EnvFile: "/etc/nurproxy/nurproxy.env",
+		DataDir: "/var/lib/nurproxy", EnvFile: "/etc/nurproxy/nurproxy.env", PrivateData: true,
 	}
 	assertPackagedUnit(t, "nurproxy.service", svc)
+}
+
+func TestOrchestratorPostinstallHardensBeforeStarting(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "packaging", "postinstall-orchestrator.sh")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(got)
+	command := "/usr/bin/nurproxy permissions --data-dir /var/lib/nurproxy"
+	harden := strings.Index(script, command)
+	start := strings.Index(script, "systemctl enable --now nurproxy.service")
+	if harden < 0 || start < 0 || harden > start {
+		t.Fatalf("postinstall must harden data before service start/restart:\n%s", script)
+	}
+	lineEnd := strings.IndexByte(script[harden:], '\n')
+	if lineEnd < 0 {
+		lineEnd = len(script) - harden
+	}
+	if strings.Contains(script[harden:harden+lineEnd], "|| true") {
+		t.Fatal("permission migration failure must propagate")
+	}
 }
 
 func TestPackagedAgentUnitMatchesRenderUnit(t *testing.T) {

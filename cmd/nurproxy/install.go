@@ -18,6 +18,7 @@ func orchestratorService(bin, dataDir string, port int, user string) install.Ser
 		BinaryPath:  bin,
 		User:        user,
 		DataDir:     dataDir,
+		PrivateData: true,
 		EnvFile:     "/etc/nurproxy/nurproxy.env",
 		Env: map[string]string{
 			"NP_PORT":     strconv.Itoa(port),

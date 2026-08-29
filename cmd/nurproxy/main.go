@@ -21,6 +21,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agentclient"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/dataperms"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/mcp"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/metrics"
@@ -36,6 +37,7 @@ import (
 var version = "dev"
 
 func main() {
+	dataperms.SetPrivateUmask()
 	// Configure structured logging first so every log line (including the legacy
 	// log.Printf calls, which slog.SetDefault bridges) honors NP_LOG_LEVEL /
 	// NP_LOG_FORMAT.
@@ -61,6 +63,9 @@ func main() {
 			return
 		case "db":
 			cmdDB(os.Args[2:])
+			return
+		case "permissions":
+			cmdPermissions(os.Args[2:])
 			return
 		default:
 			// Management CLI subcommands (provider/zone/agent/server/domain/...).
@@ -102,7 +107,7 @@ func main() {
 	}
 
 	// Ensure data dir exists
-	if err := os.MkdirAll(*dataDir, 0755); err != nil {
+	if _, err := dataperms.Ensure(*dataDir); err != nil {
 		log.Fatalf("failed to create data directory: %v", err)
 	}
 
@@ -118,6 +123,9 @@ func main() {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer database.Close()
+	if _, err := dataperms.Harden(*dataDir); err != nil {
+		log.Fatalf("failed to harden runtime data files: %v", err)
+	}
 
 	// Root context canceled on shutdown signal.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
@@ -287,6 +295,7 @@ const usageText = `usage: nurproxy [command] [flags]
 Commands:
   install, uninstall                                manage the system service
   backup, restore                                   back up / restore the data directory
+  permissions                                       safely restrict orchestrator data files
   version                                           print the version
   provider, zone, agent, server, domain, apikey, auth
                                                     management CLI (each supports -h)

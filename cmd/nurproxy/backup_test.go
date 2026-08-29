@@ -102,6 +102,83 @@ func TestBackup_missingDB_errors(t *testing.T) {
 	}
 }
 
+func TestBackupRestrictsExistingOutputFile(t *testing.T) {
+	src, _ := seedDataDir(t)
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := os.WriteFile(archive, []byte("old"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(archive, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := backupDataDir(src, archive); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMode(t, archive, 0o600)
+}
+
+func TestBackupRejectsLinkedOutputFile(t *testing.T) {
+	src, _ := seedDataDir(t)
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("do not overwrite"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := os.Symlink(outside, linked); err != nil {
+		t.Fatal(err)
+	}
+	if err := backupDataDir(src, linked); err == nil {
+		t.Fatal("backup accepted a symlink output")
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "do not overwrite" {
+		t.Fatalf("outside file changed: %q", got)
+	}
+	assertFileMode(t, outside, 0o644)
+}
+
+func TestRestoreRestrictsExistingDataDirAndFinalFiles(t *testing.T) {
+	src, _ := seedDataDir(t)
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := backupDataDir(src, archive); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "restore")
+	if err := os.Mkdir(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreArchive(archive, dst, false); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMode(t, dst, 0o700)
+	for _, name := range []string{dbFileName, encryptionKeyName, acmeAccountKeyName} {
+		assertFileMode(t, filepath.Join(dst, name), 0o600)
+	}
+}
+
+func TestRestoreRejectsLinkedDataDirectory(t *testing.T) {
+	src, _ := seedDataDir(t)
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := backupDataDir(src, archive); err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(t.TempDir(), "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	if err := os.Symlink(realDir, linked); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreArchive(archive, linked, false); err == nil {
+		t.Fatal("restore accepted a linked data directory")
+	}
+	assertFileMode(t, realDir, 0o755)
+}
+
 // TestRestore_truncatedArchive_leavesExistingDBIntact is the H2 regression: a
 // corrupt/truncated archive must NOT clobber the existing DB. Restore stages to
 // temp files and only commits after the whole archive verifies, so a truncated
@@ -325,6 +402,17 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+func assertFileMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("mode %s = %04o, want %04o", path, got, want)
+	}
 }
 
 func globRestoreTemps(t *testing.T, dir string) []string {

@@ -53,6 +53,62 @@ func TestEnsureDataDir_serviceUserOwnsFiles(t *testing.T) {
 	}
 }
 
+func TestEnsureDataDirPrivateModeIsRestrictiveAndIdempotent(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "orchestrator")
+	if err := os.Mkdir(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := Service{DataDir: dataDir, PrivateData: true}
+	for i := 0; i < 2; i++ {
+		if err := ensureDataDir(s, io.Discard); err != nil {
+			t.Fatalf("ensureDataDir pass %d: %v", i+1, err)
+		}
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("private data dir mode = %04o, want 0700", got)
+	}
+}
+
+func TestEnsureDataDirPrivateRejectsSymlinkWithoutChangingTarget(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(root, "linked")
+	if err := os.Symlink(target, linked); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDataDir(Service{DataDir: linked, PrivateData: true}, io.Discard); err == nil {
+		t.Fatal("private install accepted a linked data dir")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("target mode = %04o, want unchanged 0755", got)
+	}
+}
+
+func TestEnsureDataDirAgentDefaultRemainsServiceUserAccessible(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "agent")
+	if err := ensureDataDir(Service{DataDir: dataDir}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o750 {
+		t.Fatalf("agent/default data dir mode = %04o, want 0750", got)
+	}
+}
+
 // TestEnsureDataDir_unknownServiceUser_errors asserts that an unresolvable
 // Service.User fails the install with an error naming the user, instead of
 // silently leaving a root-owned data dir the service cannot write.

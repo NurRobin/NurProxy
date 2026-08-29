@@ -70,6 +70,7 @@ type Service struct {
 	ConfigFile   string            // optional extra config file to write (e.g. agent.yaml)
 	ConfigData   string            // contents of ConfigFile
 	Capabilities []string          // ambient capabilities, e.g. CAP_NET_BIND_SERVICE (systemd-only)
+	PrivateData  bool              // owner-only data dir (orchestrator); agent defaults retain service-user layout
 }
 
 // fprintf writes progress to the caller's writer; output errors are non-fatal.
@@ -118,6 +119,7 @@ func RenderUnit(s Service) string {
 	w("ExecStart=%s\n", execStart)
 	w("Restart=on-failure\n")
 	w("RestartSec=5\n")
+	w("UMask=0077\n")
 
 	// Security hardening.
 	w("NoNewPrivileges=true\n")

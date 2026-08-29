@@ -144,7 +144,7 @@
 - **Pitfalls:** the 12h scan means a real renewal won't be observed by waiting — force it with a short-dated staging cert or trigger the on-create fast path (`TargetForHost`). Rate-limit failures are intentionally NOT retried within the backoff window (`manager.go:30-33`) — re-running won't burn quota but also won't recover until the limit clears.
 
 ### In-place orchestrator upgrade (no traffic interruption)
-- **Must:** stop the orchestrator → back up the data dir → swap the binary → start. DB migrations run cleanly on the real DB on boot (`migrations.go`). The agent keeps serving traffic the entire time (the proxy — Caddy/nginx/Apache — runs independently of the orchestrator), so there is **no traffic interruption**; the agent simply reconnects to the restarted orchestrator. `/health` reports the new `version` once back up.
+- **Must:** stop the orchestrator → back up the data dir → swap the binary → run `nurproxy permissions --data-dir <dir>` → start. Package upgrades run that same permission migration before start/restart and abort visibly if it cannot establish the private-data invariant. DB migrations run cleanly on the real DB on boot (`migrations.go`). The agent keeps serving traffic the entire time (the proxy — Caddy/nginx/Apache — runs independently of the orchestrator), so there is **no traffic interruption**; the agent simply reconnects to the restarted orchestrator. `/health` reports the new `version` once back up.
 - **Access:**
   - Ops: `systemctl stop nurproxy && cp -a <data-dir> <data-dir>.bak-$TS && install -m755 ./nurproxy /usr/bin/nurproxy && systemctl start nurproxy`.
   - Observe: `curl -s http://<orch>/api/v1/health | jq '{status,version}'`; `nurproxy version`; agent reconnect in both logs.
@@ -156,14 +156,15 @@
   systemctl stop nurproxy
   cp -a /var/lib/nurproxy /var/lib/nurproxy.bak-$(date +%Y%m%d-%H%M%S)
   install -m755 ./nurproxy /usr/bin/nurproxy
+  /usr/bin/nurproxy permissions --data-dir /var/lib/nurproxy
   systemctl start nurproxy
   # Throughout, keep curling a live proxied site to confirm zero downtime:
   while true; do curl -s -o /dev/null -w "%{http_code}\n" https://<live-site>/; sleep 1; done
   curl -s http://localhost:8080/api/v1/health | jq '{status,version}'   # NEW version, status ok
   ```
-- **Pass:** `/health` returns `status:"ok"` with the bumped `version`; migrations log clean (no errors); the live-site curl loop never drops a request; the agent reconnects.
+- **Pass:** the permission command exits zero, the data directory is `0700`, managed files are `0600`, `systemctl show nurproxy -p UMask` reports `UMask=0077`, `/health` returns `status:"ok"` with the bumped `version`; migrations log clean (no errors); the live-site curl loop never drops a request; the agent reconnects.
 - **Coverage:** R (the live-traffic / real-DB migration aspect needs a real run; migration correctness itself is also covered by `make test`).
-- **Pitfalls (folds in §2.11):** expect the **one-time** `:8780/routes context deadline exceeded` per agent reconnect — cosmetic. Always back up the data dir BEFORE the swap (the agent-swap script does this with timestamped `.bak-$TS` copies, `scripts/durox-agent-swap.sh:14-19`). The agent binary swap is the symmetric procedure: `scripts/durox-agent-swap.sh` stops the agent, verifies `nginx -t` before and after, swaps, restarts, and prints rollback hints — run it as root on the edge host with the new binary staged at `/tmp/nurproxy-agent.new`.
+- **Pitfalls (folds in §2.11):** expect the **one-time** `:8780/routes context deadline exceeded` per agent reconnect — cosmetic. Always back up the data dir BEFORE the swap (the agent-swap script does this with timestamped `.bak-$TS` copies, `scripts/durox-agent-swap.sh:14-19`). A failed permission migration is a hard upgrade stop: inspect the named path and file type; do not bypass it with recursive `chmod` or symlink-following tools. Mode narrowing has no automatic rollback (see `17-backup-and-restore.md`). The agent binary swap is the symmetric procedure: `scripts/durox-agent-swap.sh` stops the agent, verifies `nginx -t` before and after, swaps, restarts, and prints rollback hints — run it as root on the edge host with the new binary staged at `/tmp/nurproxy-agent.new`.
 
 ### Agent reconnect after orchestrator restart
 - **Must:** when the orchestrator restarts, the agent re-establishes its outbound stream and resumes heartbeating; the stream client reconnects on error (`internal/agent/stream/stream.go:215`, `TestStreamReconnectsOnError`). On reconnect the orchestrator re-pushes the agent's desired set (intents + certs), so the agent re-adopts its artifacts; the agent ACKs applied artifacts back. A fresh heartbeat flips an `offline` row back to `adopted` (`reconciler.go:385-390`).
