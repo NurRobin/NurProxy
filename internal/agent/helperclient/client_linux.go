@@ -53,8 +53,13 @@ func (c *Client) Hello(ctx context.Context) (helperprotocol.HelperHello, error) 
 		return helperprotocol.HelperHello{}, err
 	}
 	signed, err := helperprotocol.Decode[helperprotocol.Signed[helperprotocol.HelperHello]](response)
-	if err != nil || signed.KeyID != c.pin.AttestationKeyID ||
-		helperprotocol.Verify(c.pin.publicKey(), signed, helperprotocol.MessageHelperHello) != nil {
+	if err != nil {
+		if remoteErr := decodeRemoteError(response, request.RequestID); remoteErr != nil {
+			return helperprotocol.HelperHello{}, remoteErr
+		}
+		return helperprotocol.HelperHello{}, fmt.Errorf("helper hello is not a valid protocol response")
+	}
+	if signed.KeyID != c.pin.AttestationKeyID || helperprotocol.Verify(c.pin.publicKey(), signed, helperprotocol.MessageHelperHello) != nil {
 		return helperprotocol.HelperHello{}, fmt.Errorf("helper hello attestation is invalid")
 	}
 	hello := signed.Envelope.Payload
@@ -82,8 +87,13 @@ func (c *Client) Plan(ctx context.Context, action helperprotocol.Action, target 
 		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, err
 	}
 	signed, err := helperprotocol.Decode[helperprotocol.Signed[helperprotocol.HelperPlan]](response)
-	if err != nil || signed.KeyID != c.pin.AttestationKeyID ||
-		helperprotocol.Verify(c.pin.publicKey(), signed, helperprotocol.MessageHelperPlan) != nil {
+	if err != nil {
+		if remoteErr := decodeRemoteError(response, request.RequestID); remoteErr != nil {
+			return helperprotocol.Signed[helperprotocol.HelperPlan]{}, remoteErr
+		}
+		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, fmt.Errorf("helper plan is not a valid protocol response")
+	}
+	if signed.KeyID != c.pin.AttestationKeyID || helperprotocol.Verify(c.pin.publicKey(), signed, helperprotocol.MessageHelperPlan) != nil {
 		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, fmt.Errorf("helper plan attestation is invalid")
 	}
 	plan := signed.Envelope.Payload
@@ -92,6 +102,74 @@ func (c *Client) Plan(ctx context.Context, action helperprotocol.Action, target 
 		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, fmt.Errorf("helper plan does not match the requested action")
 	}
 	return signed, nil
+}
+
+func (c *Client) Execute(ctx context.Context, grant helperprotocol.Signed[helperprotocol.ExecutionGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error) {
+	payload := grant.Envelope.Payload
+	if grant.Validate() != nil || grant.Envelope.MessageType != helperprotocol.MessageExecutionGrant ||
+		payload.AgentID != c.agentID || payload.HelperInstanceID != c.pin.HelperInstanceID {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", fmt.Errorf("execution grant does not match the enrolled agent helper")
+	}
+	request := helperprotocol.NewEnvelope(helperprotocol.MessageExecuteActionRequest, helperprotocol.ExecuteActionRequest{
+		OperationID: payload.OperationID, HelperPlanID: payload.HelperPlanID, Grant: grant,
+	})
+	requestDigest, err := helperprotocol.Digest(request)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", err
+	}
+	encoded, err := helperprotocol.CanonicalBytes(request)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", err
+	}
+	response, err := c.exchange(ctx, encoded)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, requestDigest, err
+	}
+	receipt, err := c.decodeReceipt(response, payload.OperationID, requestDigest, payload.Action)
+	return receipt, requestDigest, err
+}
+
+func (c *Client) GetReceipt(ctx context.Context, operationID, requestDigest string) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	request := helperprotocol.GetReceiptRequest{OperationID: operationID, CanonicalRequestDigest: requestDigest}
+	if err := request.Validate(); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	encoded, err := helperprotocol.CanonicalBytes(helperprotocol.NewEnvelope(helperprotocol.MessageGetReceiptRequest, request))
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	response, err := c.exchange(ctx, encoded)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	return c.decodeReceipt(response, operationID, requestDigest, "")
+}
+
+func (c *Client) decodeReceipt(response []byte, operationID, requestDigest string, expectedAction helperprotocol.Action) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	signed, err := helperprotocol.Decode[helperprotocol.Signed[helperprotocol.HelperReceipt]](response)
+	if err != nil {
+		if remoteErr := decodeRemoteError(response, operationID); remoteErr != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, remoteErr
+		}
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, fmt.Errorf("helper receipt is not a valid protocol response")
+	}
+	if signed.KeyID != c.pin.AttestationKeyID || helperprotocol.Verify(c.pin.publicKey(), signed, helperprotocol.MessageHelperReceipt) != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, fmt.Errorf("helper receipt attestation is invalid")
+	}
+	receipt := signed.Envelope.Payload
+	if receipt.OperationID != operationID || receipt.CanonicalRequestDigest != requestDigest || receipt.HelperInstanceID != c.pin.HelperInstanceID ||
+		(expectedAction != "" && receipt.Action != expectedAction) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, fmt.Errorf("helper receipt does not match the canonical request")
+	}
+	return signed, nil
+}
+
+func decodeRemoteError(response []byte, requestID string) error {
+	envelope, err := helperprotocol.DecodeEnvelope[helperprotocol.ErrorResponse](response, helperprotocol.MessageErrorResponse)
+	if err != nil || (envelope.Payload.RequestID != requestID && envelope.Payload.RequestID != "unknown") {
+		return nil
+	}
+	return &RemoteError{Code: envelope.Payload.Code, Message: envelope.Payload.Message, Retryable: envelope.Payload.Retryable}
 }
 
 func (c *Client) exchange(ctx context.Context, payload []byte) ([]byte, error) {

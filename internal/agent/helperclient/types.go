@@ -5,9 +5,24 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 )
 
 const DefaultSocketPath = "/run/nurproxy-agent-helper/helper.sock"
+
+type RemoteError struct {
+	Code      helperprotocol.ErrorCode
+	Message   string
+	Retryable bool
+}
+
+func (e *RemoteError) Error() string {
+	if e == nil {
+		return "root helper request failed"
+	}
+	return fmt.Sprintf("root helper request failed (%s): %s", e.Code, e.Message)
+}
 
 type Pin struct {
 	HelperInstanceID     string `json:"helper_instance_id"`

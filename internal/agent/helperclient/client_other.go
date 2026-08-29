@@ -22,3 +22,11 @@ func (c *Client) Hello(context.Context) (helperprotocol.HelperHello, error) {
 func (c *Client) Plan(context.Context, helperprotocol.Action, helperprotocol.LogicalTarget, string) (helperprotocol.Signed[helperprotocol.HelperPlan], error) {
 	return helperprotocol.Signed[helperprotocol.HelperPlan]{}, fmt.Errorf("root helper client is supported only on Linux")
 }
+
+func (c *Client) Execute(context.Context, helperprotocol.Signed[helperprotocol.ExecutionGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error) {
+	return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", fmt.Errorf("root helper client is supported only on Linux")
+}
+
+func (c *Client) GetReceipt(context.Context, string, string) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, fmt.Errorf("root helper client is supported only on Linux")
+}

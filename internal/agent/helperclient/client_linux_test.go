@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -186,5 +187,181 @@ func TestClientPlanRejectsSignedResponseForAnotherDiagnostic(t *testing.T) {
 	defer cancel()
 	if _, err := client.Plan(ctx, helperprotocol.ActionValidateReloadProxy, helperprotocol.LogicalTargetDetectedProxy, "diagnostic-1"); err == nil {
 		t.Fatal("signed helper plan for another diagnostic was accepted")
+	}
+}
+
+func executionGrantFixture(t *testing.T) helperprotocol.Signed[helperprotocol.ExecutionGrant] {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	grant := helperprotocol.ExecutionGrant{
+		GrantID: "grant-1", AgentID: "agent-1", HelperInstanceID: "helper-1", DiagnosticID: "diagnostic-1",
+		OperationID: "operation-1", Action: helperprotocol.ActionValidateReloadProxy, HelperPlanID: "plan-1",
+		DisplayPlanHash: strings.Repeat("a", 64), ExecutionPlanHash: strings.Repeat("b", 64), ResourceFingerprint: strings.Repeat("c", 64),
+		ConfirmationEventIDs: []string{"confirmation-1", "confirmation-2"},
+		IssuedAt:             now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+	}
+	signed, err := helperprotocol.Sign("orchestrator-1", privateKey, helperprotocol.NewEnvelope(helperprotocol.MessageExecutionGrant, grant))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+
+func receiptClientFixture(t *testing.T, expectedType helperprotocol.MessageType, mutate func(*helperprotocol.HelperReceipt)) *Client {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "helper.sock")
+	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: path, Net: "unixpacket"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		payload, err := helperprotocol.ReadUnixPacketFrame(conn)
+		if err != nil {
+			return
+		}
+		var operationID, requestDigest string
+		action := helperprotocol.ActionValidateReloadProxy
+		switch expectedType {
+		case helperprotocol.MessageExecuteActionRequest:
+			request, decodeErr := helperprotocol.DecodeEnvelope[helperprotocol.ExecuteActionRequest](payload, expectedType)
+			if decodeErr != nil {
+				return
+			}
+			operationID = request.Payload.OperationID
+			requestDigest, _ = helperprotocol.Digest(request)
+			action = request.Payload.Grant.Envelope.Payload.Action
+		case helperprotocol.MessageGetReceiptRequest:
+			request, decodeErr := helperprotocol.DecodeEnvelope[helperprotocol.GetReceiptRequest](payload, expectedType)
+			if decodeErr != nil {
+				return
+			}
+			operationID = request.Payload.OperationID
+			requestDigest = request.Payload.CanonicalRequestDigest
+		default:
+			return
+		}
+		receipt := helperprotocol.HelperReceipt{
+			OperationID: operationID, CanonicalRequestDigest: requestDigest, HelperInstanceID: "helper-1",
+			Action: action, State: helperprotocol.JournalSucceeded, RollbackCoverage: helperprotocol.RollbackCoverageFull,
+			SnapshotDigest: strings.Repeat("d", 64), SanitizedResult: "proxy reloaded",
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		if mutate != nil {
+			mutate(&receipt)
+		}
+		signed, _ := helperprotocol.Sign("attestation-helper-1", privateKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperReceipt, receipt))
+		encoded, _ := helperprotocol.CanonicalBytes(signed)
+		_ = helperprotocol.WriteUnixPacketFrame(conn, encoded)
+	}()
+	client, err := newClient(path, "agent-1", "dev-build-1", Pin{
+		HelperInstanceID: "helper-1", AttestationKeyID: "attestation-helper-1",
+		AttestationPublicKey: base64.RawURLEncoding.EncodeToString(publicKey),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.expectedRootUID = uint32(os.Getuid())
+	client.verifyPeerExecutable = func(int32) error { return nil }
+	return client
+}
+
+func TestClientExecuteVerifiesReceiptRequestDigest(t *testing.T) {
+	client := receiptClientFixture(t, helperprotocol.MessageExecuteActionRequest, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	receipt, requestDigest, err := client.Execute(ctx, executionGrantFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Envelope.Payload.CanonicalRequestDigest != requestDigest || receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
+		t.Fatalf("receipt = %#v, request digest = %q", receipt, requestDigest)
+	}
+}
+
+func TestClientExecuteRejectsSignedReceiptForAnotherRequest(t *testing.T) {
+	client := receiptClientFixture(t, helperprotocol.MessageExecuteActionRequest, func(receipt *helperprotocol.HelperReceipt) {
+		receipt.CanonicalRequestDigest = strings.Repeat("e", 64)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, _, err := client.Execute(ctx, executionGrantFixture(t)); err == nil {
+		t.Fatal("signed receipt for another canonical request was accepted")
+	}
+}
+
+func TestClientGetReceiptVerifiesOperationAndDigest(t *testing.T) {
+	requestDigest := strings.Repeat("f", 64)
+	client := receiptClientFixture(t, helperprotocol.MessageGetReceiptRequest, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	receipt, err := client.GetReceipt(ctx, "operation-1", requestDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Envelope.Payload.OperationID != "operation-1" || receipt.Envelope.Payload.CanonicalRequestDigest != requestDigest {
+		t.Fatalf("receipt = %#v", receipt)
+	}
+}
+
+func TestClientPlanReturnsStableRemoteError(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "helper.sock")
+	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: path, Net: "unixpacket"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, acceptErr := listener.AcceptUnix()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		payload, readErr := helperprotocol.ReadUnixPacketFrame(conn)
+		if readErr != nil {
+			return
+		}
+		request, decodeErr := helperprotocol.DecodeEnvelope[helperprotocol.PlanActionRequest](payload, helperprotocol.MessagePlanActionRequest)
+		if decodeErr != nil {
+			return
+		}
+		response := helperprotocol.NewEnvelope(helperprotocol.MessageErrorResponse, helperprotocol.ErrorResponse{
+			RequestID: request.Payload.RequestID, Code: helperprotocol.ErrorStalePlan, Message: "host facts changed", Retryable: false,
+		})
+		encoded, _ := helperprotocol.CanonicalBytes(response)
+		_ = helperprotocol.WriteUnixPacketFrame(conn, encoded)
+	}()
+	client, err := newClient(path, "agent-1", "dev-build-1", Pin{
+		HelperInstanceID: "helper-1", AttestationKeyID: "attestation-helper-1",
+		AttestationPublicKey: base64.RawURLEncoding.EncodeToString(publicKey),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.expectedRootUID = uint32(os.Getuid())
+	client.verifyPeerExecutable = func(int32) error { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = client.Plan(ctx, helperprotocol.ActionValidateReloadProxy, helperprotocol.LogicalTargetDetectedProxy, "diagnostic-1")
+	var remoteErr *RemoteError
+	if !errors.As(err, &remoteErr) || remoteErr.Code != helperprotocol.ErrorStalePlan {
+		t.Fatalf("error = %#v", err)
 	}
 }
