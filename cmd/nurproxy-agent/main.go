@@ -25,6 +25,7 @@ import (
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/generic" // registers the custom (template) backend in the proxy registry
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"   // registers the nginx backend in the proxy registry
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
+	"github.com/NurRobin/NurProxy/internal/agent/recovery"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
@@ -32,6 +33,8 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/logging"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 var version = "dev"
@@ -425,6 +428,51 @@ func main() {
 		WithLogPaths(cfg.ProxyLogPaths).
 		WithCertStore(certStore)
 
+	// Recovery is optional at startup and fail-closed: if durable storage or path
+	// guards cannot be established, the agent keeps reconciling normally but does
+	// not advertise or execute automatic repairs.
+	var recoveryCoordinator *recovery.Coordinator
+	var recoverySnapshots *recovery.SnapshotStore
+	var recoveryBreaker *recovery.Breaker
+	recoveryReporter := recovery.NewBoundedReporter(256, recovery.NewHTTPReportSender(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), nil))
+	if snapshots, snapshotErr := recovery.NewSnapshotStore(cfg.DataDir); snapshotErr != nil {
+		log.Printf("WARNING: safe recovery snapshots unavailable: %v", snapshotErr)
+	} else if breaker, breakerErr := recovery.NewPersistentBreaker(cfg.DataDir); breakerErr != nil {
+		_ = snapshots.Close()
+		log.Printf("WARNING: safe recovery breaker unavailable: %v", breakerErr)
+	} else {
+		info := holder.Info()
+		roots := []string{cfg.DataDir}
+		if info.ConfigDir != "" {
+			roots = append(roots, info.ConfigDir)
+		}
+		guard, guardErr := recovery.NewPathGuard(roots...)
+		if guardErr != nil {
+			_ = snapshots.Close()
+			_ = breaker.Close()
+			log.Printf("WARNING: safe recovery path guard unavailable: %v", guardErr)
+		} else {
+			recoverySnapshots, recoveryBreaker = snapshots, breaker
+			recoveryCoordinator = recovery.NewCoordinator(mgr.AgentID(), holder, snapshots, breaker, recoveryReporter, guard, nil)
+			recoveryCoordinator.SetContext(recovery.Context{AgentID: mgr.AgentID(), ProxyInfo: info, ManagedRoots: roots, AgentDataRoot: cfg.DataDir})
+			if operationIDs, listErr := snapshots.ActiveOperationIDs(); listErr != nil {
+				log.Printf("WARNING: interrupted recovery operations could not be enumerated safely: %v", listErr)
+			} else {
+				for _, operationID := range operationIDs {
+					if report, recoverErr := recoveryCoordinator.Recover(ctx, operationID); recoverErr != nil {
+						log.Printf("WARNING: recovery operation %s restart failed in state %s: %v", operationID, report.State, recoverErr)
+					} else {
+						log.Printf("Recovered interrupted operation %s as %s", operationID, report.State)
+					}
+				}
+			}
+			capability := recoveryCoordinator.Capability()
+			recoveryReporter.Enqueue(proxymodel.RecoveryReport{Capability: &capability})
+			streamClient.WithRecovery(recoveryCoordinator)
+			go recoveryReporter.Run(ctx)
+		}
+	}
+
 	// In existing mode, report the host config the agent can READ into the central
 	// store (§17 "adoption reads all files") so it shows under Config immediately —
 	// even before any domain is applied, and crucially even when the agent lacks
@@ -476,6 +524,10 @@ func main() {
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
 	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
+	if recoveryCoordinator != nil {
+		hb.SetRecoveryCapabilityFn(func() *recoverymodel.Capability { capability := recoveryCoordinator.Capability(); return &capability })
+		hb.SetRecoveryPolicyFn(recoveryCoordinator.SetPolicy)
+	}
 	hb.Start(ctx)
 
 	// Open the stream. Runs until shutdown, reconnecting as needed.
@@ -494,6 +546,12 @@ func main() {
 	defer shutdownCancel()
 
 	hb.Stop()
+	if recoverySnapshots != nil {
+		_ = recoverySnapshots.Close()
+	}
+	if recoveryBreaker != nil {
+		_ = recoveryBreaker.Close()
+	}
 
 	if err := apiServer.Stop(shutdownCtx); err != nil {
 		log.Printf("API server shutdown error: %v", err)

@@ -488,6 +488,10 @@ func (s *SnapshotStore) Prune(now time.Time) error {
 	if err != nil {
 		return err
 	}
+	if _, err := unix.Seek(dup, 0, 0); err != nil {
+		_ = unix.Close(dup)
+		return err
+	}
 	dir := os.NewFile(uintptr(dup), s.operationsDir)
 	entries, err := dir.ReadDir(-1)
 	dir.Close()
@@ -546,6 +550,53 @@ func (s *SnapshotStore) Prune(now time.Time) error {
 		}
 	}
 	return s.operations.Sync()
+}
+
+func (s *SnapshotStore) ActiveOperationIDs() ([]string, error) {
+	if s == nil {
+		return nil, fmt.Errorf("snapshot store is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.operations == nil {
+		return nil, fmt.Errorf("snapshot store is closed")
+	}
+	dup, err := unix.Dup(int(s.operations.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := unix.Seek(dup, 0, 0); err != nil {
+		_ = unix.Close(dup)
+		return nil, err
+	}
+	dir := os.NewFile(uintptr(dup), s.operationsDir)
+	entries, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, entry := range entries {
+		if !validOperationID(entry.Name()) || entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
+			continue
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstatat(int(s.operations.Fd()), entry.Name(), &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+			continue
+		}
+		manifest, loadErr := s.loadUnlocked(entry.Name())
+		if errors.Is(loadErr, unix.ENOENT) {
+			continue
+		}
+		if loadErr != nil {
+			return nil, fmt.Errorf("load recovery operation %q: %w", entry.Name(), loadErr)
+		}
+		if activeSnapshotState(manifest.State) {
+			ids = append(ids, entry.Name())
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 func (s *SnapshotStore) persist(manifest *SnapshotManifest) error {

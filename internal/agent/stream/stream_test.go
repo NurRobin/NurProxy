@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,8 +19,111 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
+	"github.com/NurRobin/NurProxy/internal/agent/recovery"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
+
+func TestRecoveryPolicyEventIsStrictAndFailClosed(t *testing.T) {
+	coordinator := recovery.NewCoordinator("agent-1", nil, nil, nil, nil, nil, nil)
+	c := New("http://orchestrator", "agent-1", "token", &fakeCaddyBackend{}, health.New()).WithRecovery(coordinator)
+	c.handleEvent(context.Background(), "recovery_policy", `{"policy":{"safe_auto_repair":true}}`)
+	if enabled, known := coordinator.Policy(); !known || !enabled {
+		t.Fatalf("policy=(%t,%t)", enabled, known)
+	}
+	c.handleEvent(context.Background(), "recovery_policy", `{"policy":{"safe_auto_repair":false,"command":"rm"}}`)
+	if enabled, known := coordinator.Policy(); !known || !enabled {
+		t.Fatal("invalid policy changed effective state")
+	}
+}
+
+func TestRepairRequestRejectsUnknownDiagnosticAndInjectedFields(t *testing.T) {
+	coordinator := recovery.NewCoordinator("agent-1", nil, nil, nil, nil, nil, nil)
+	c := New("http://orchestrator", "agent-1", "token", &fakeCaddyBackend{}, health.New()).WithRecovery(coordinator)
+	c.handleEvent(context.Background(), "repair_request", `{"request":{"operation_id":"op-1","diagnostic_id":"other-agent-diag","action":"remove_managed_temp"}}`)
+	c.handleEvent(context.Background(), "repair_request", `{"request":{"operation_id":"op-2","diagnostic_id":"diag","action":"remove_managed_temp","path":"/etc/passwd"}}`)
+	// Both are rejection paths; most importantly they do not make policy known or
+	// mutate any backend state while handling an untrusted SSE payload.
+	if _, known := coordinator.Policy(); known {
+		t.Fatal("repair request changed policy")
+	}
+}
+
+type recoveryStreamBackend struct {
+	candidate proxy.RecoveryCandidate
+	order     []string
+}
+
+func (b *recoveryStreamBackend) Info() proxy.Info { return proxy.Info{Kind: proxy.KindNginx} }
+func (b *recoveryStreamBackend) InspectRecovery(context.Context, proxy.RecoveryDesired) ([]proxy.RecoveryCandidate, error) {
+	return []proxy.RecoveryCandidate{b.candidate}, nil
+}
+func (b *recoveryStreamBackend) ExecuteRecovery(_ context.Context, candidate proxy.RecoveryCandidate, _ map[string]proxy.CertBundle) error {
+	b.order = append(b.order, "recover")
+	return proxy.RemoveRecoveryCandidatePaths(candidate)
+}
+func (b *recoveryStreamBackend) Validate(context.Context) error {
+	b.order = append(b.order, "validate")
+	return nil
+}
+func (b *recoveryStreamBackend) EnsureServer(context.Context) error {
+	b.order = append(b.order, "ensure")
+	return nil
+}
+func (b *recoveryStreamBackend) ClearRoutes(context.Context) error {
+	b.order = append(b.order, "clear")
+	return nil
+}
+func (b *recoveryStreamBackend) AddRoute(context.Context, json.RawMessage) error { return nil }
+func (b *recoveryStreamBackend) Apply(context.Context, []proxy.Artifact) error {
+	b.order = append(b.order, "activate")
+	return nil
+}
+func (b *recoveryStreamBackend) Prune(context.Context, []proxy.Target) (int, error) {
+	b.order = append(b.order, "prune")
+	return 0, nil
+}
+func (b *recoveryStreamBackend) Render(context.Context, proxymodel.Route) (proxy.Artifact, error) {
+	return proxy.Artifact{}, nil
+}
+func (b *recoveryStreamBackend) InstallCerts(context.Context, []proxy.CertBundle) error   { return nil }
+func (b *recoveryStreamBackend) EnsureServerTLS(context.Context, []proxy.TLSIntent) error { return nil }
+
+func TestApplyIntentsRepairsBeforeOneFreshReconcile(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	if err := os.Mkdir(managed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(managed, "nurproxy-stale.example.test.conf.nurproxy-tmp")
+	if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := proxy.CaptureRecoveryPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &recoveryStreamBackend{candidate: proxy.NewRecoveryCandidate(recoverymodel.ActionRemoveManagedTemp, "stale.example.test", identity)}
+	store, err := recovery.NewSnapshotStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	guard, err := recovery.NewPathGuard(managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := recovery.NewCoordinator("agent-1", backend, store, recovery.NewBreaker(), nil, guard, nil)
+	coordinator.SetPolicy(true)
+	c := New("http://orchestrator.invalid", "agent-1", "token", backend, health.New()).WithRecovery(coordinator)
+	c.applyIntents(context.Background(), proxymodel.IntentSet{})
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale path remains: %v", err)
+	}
+	if got := strings.Join(backend.order, ","); got != "recover,validate,activate,ensure,clear,prune" {
+		t.Fatalf("order=%s", got)
+	}
+}
 
 func TestStreamRendersIntentAppliesAndAcks(t *testing.T) {
 	ackCh := make(chan proxymodel.ApplyAck, 1)

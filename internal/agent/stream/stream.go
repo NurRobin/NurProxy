@@ -26,7 +26,10 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/logtail"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
+	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 const (
@@ -132,8 +135,14 @@ type Client struct {
 	// tailsMu guards tails, the live on-demand tail sessions keyed by session ID.
 	// Each session has a cancel func that the matching stop event (or Run's
 	// shutdown) calls to end the tailer.
-	tailsMu sync.Mutex
-	tails   map[string]context.CancelFunc
+	tailsMu  sync.Mutex
+	tails    map[string]context.CancelFunc
+	recovery *recovery.Coordinator
+}
+
+func (c *Client) WithRecovery(coordinator *recovery.Coordinator) *Client {
+	c.recovery = coordinator
+	return c
 }
 
 // New creates a stream Client. backend is the bundled-Caddy proxy backend the
@@ -315,6 +324,33 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			return
 		}
 		c.stopLogTail(stop.SessionID)
+	case "recovery_policy":
+		if c.recovery == nil {
+			return
+		}
+		var envelope struct {
+			Policy struct {
+				SafeAutoRepair *bool `json:"safe_auto_repair"`
+			} `json:"policy"`
+		}
+		if err := recoverymodel.DecodeStrict([]byte(data), &envelope); err != nil || envelope.Policy.SafeAutoRepair == nil {
+			log.Printf("Stream: bad recovery_policy payload")
+			return
+		}
+		c.recovery.SetPolicy(*envelope.Policy.SafeAutoRepair)
+	case "repair_request":
+		if c.recovery == nil {
+			return
+		}
+		var envelope proxymodel.RepairRequestEnvelope
+		if err := recoverymodel.DecodeStrict([]byte(data), &envelope); err != nil || envelope.Validate() != nil {
+			log.Printf("Stream: bad repair_request payload")
+			return
+		}
+		if _, err := c.recovery.HandleRequest(ctx, envelope.Request); err != nil {
+			log.Printf("Stream: rejected repair request %q: %v", envelope.Request.OperationID, err)
+		}
+		c.syncRecoveryHealth()
 	default:
 		log.Printf("Stream: ignoring unknown event %q", eventType)
 	}
@@ -478,6 +514,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		art, err := c.caddy.Render(ctx, in.Route)
 		if err != nil {
 			log.Printf("Stream: failed to render intent for %s: %v", host, err)
+			c.observeRecovery(ctx, err)
 			reports = append(reports, proxymodel.ArtifactReport{
 				ArtifactID: in.ArtifactID,
 				Host:       host,
@@ -512,6 +549,46 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		} else {
 			caddyArts = append(caddyArts, caddyArtifact{intent: in, art: art, reportIdx: len(reports) - 1})
 		}
+	}
+
+	// Inspect the backend's owned artifacts after the desired set has been fully
+	// rendered, but before the route apply. A successful safe repair is followed
+	// by this same invocation's normal reconcile; no recursive apply is scheduled.
+	if c.recovery != nil {
+		desired := recovery.DesiredState{Recovery: proxy.RecoveryDesired{KeepCertHosts: append([]string(nil), set.CertKeep...)}, Bundles: recoveryBundles(set.Certs)}
+		if infoProvider, ok := c.caddy.(interface{ Info() proxy.Info }); ok {
+			desired.Classification.ProxyInfo = infoProvider.Info()
+			if desired.Classification.ProxyInfo.ConfigDir != "" {
+				desired.Classification.ManagedRoots = []string{desired.Classification.ProxyInfo.ConfigDir}
+			}
+		}
+		for _, fa := range fileArts {
+			desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, fa.art.Target)
+			bundle, hasBundle := desired.Bundles[fa.intent.Route.Host]
+			validBundle := hasBundle && len(bundle.CertPEM) > 0 && len(bundle.KeyPEM) > 0
+			desired.Classification.DesiredResources = append(desired.Classification.DesiredResources, recovery.DesiredResource{ArtifactID: fa.intent.ArtifactID, Host: fa.intent.Route.Host, Target: fa.art.Target, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateLive, ValidBundle: validBundle})
+		}
+		for _, path := range set.Keep {
+			desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, proxy.Target{Kind: proxy.TargetKindFile, Path: path})
+		}
+		c.recovery.SetDesired(func() recovery.DesiredState { return desired })
+		diagnostics, err := c.recovery.Inspect(ctx)
+		if err != nil {
+			log.Printf("Stream: recovery inspection failed: %v", err)
+		} else {
+			for _, diagnostic := range diagnostics {
+				report, repairErr := c.recovery.AutoRepair(ctx, diagnostic)
+				if repairErr != nil {
+					log.Printf("Stream: safe recovery failed for %s: %v", diagnostic.Code, repairErr)
+				}
+				if report.State == recoverymodel.OperationStateSucceeded {
+					c.applyStateMu.Lock()
+					c.lastApplyClean = false
+					c.applyStateMu.Unlock()
+				}
+			}
+		}
+		c.syncRecoveryHealth()
 	}
 
 	// Change suppression: the periodic reconcile tick re-pushes the same desired
@@ -558,6 +635,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	// them only when the current backend implements them).
 	if err := c.caddy.EnsureServer(ctx); err != nil {
 		log.Printf("Stream: failed to ensure server: %v", err)
+		c.observeRecovery(ctx, err)
 		clean = false
 		if c.health != nil {
 			c.health.SetCaddyRunning(false)
@@ -570,6 +648,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	}
 	if err := c.caddy.ClearRoutes(ctx); err != nil {
 		log.Printf("Stream: failed to clear routes: %v", err)
+		c.observeRecovery(ctx, err)
 		clean = false
 	}
 
@@ -594,6 +673,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	for _, ca := range caddyArts {
 		if err := c.caddy.AddRoute(ctx, json.RawMessage(ca.art.Content)); err != nil {
 			log.Printf("Stream: failed to apply route for %s: %v", ca.intent.Route.Host, err)
+			c.observeRecovery(ctx, err)
 			reports[ca.reportIdx].Error = err.Error()
 			clean = false
 			continue
@@ -625,6 +705,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	if len(fileArts) > 0 {
 		if n, err := c.caddy.Prune(ctx, fileKeep); err != nil {
 			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
+			c.observeRecovery(ctx, err)
 			clean = false
 		} else if n > 0 {
 			log.Printf("Stream: pruned %d orphaned vhost(s)", n)
@@ -651,6 +732,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 			for _, fa := range fileArts {
 				reports[fa.reportIdx].Error = err.Error()
 			}
+			c.observeRecovery(ctx, err)
 		} else {
 			if c.health != nil {
 				c.health.SetError("")
@@ -679,6 +761,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		keep = append(keep, caddyKept...)
 		if n, err := c.caddy.Prune(ctx, keep); err != nil {
 			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
+			c.observeRecovery(ctx, err)
 			clean = false
 		} else if n > 0 {
 			log.Printf("Stream: pruned %d orphaned vhost(s)", n)
@@ -698,9 +781,44 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	c.lastApplyClean = clean
 	c.lastFullApply = time.Now()
 	c.applyStateMu.Unlock()
+	if clean && c.recovery != nil {
+		c.recovery.ReconcileSucceeded()
+		c.syncRecoveryHealth()
+	}
 
 	log.Printf("Stream: applied %d/%d intents", applied, len(intents))
 	c.sendAck(ctx, reports)
+}
+
+func recoveryBundles(wire []proxymodel.CertBundle) map[string]proxy.CertBundle {
+	bundles := make(map[string]proxy.CertBundle, len(wire))
+	for _, bundle := range wire {
+		bundles[bundle.Host] = proxy.CertBundle{Host: bundle.Host, CertPEM: []byte(bundle.CertPEM), KeyPEM: []byte(bundle.KeyPEM), MaterializeKey: bundle.MaterializeKey}
+	}
+	return bundles
+}
+
+func (c *Client) observeRecovery(ctx context.Context, err error) {
+	if c.recovery == nil || err == nil {
+		return
+	}
+	diagnostic := c.recovery.Observe(ctx, err)
+	if diagnostic.AutoRepairEligible {
+		if report, repairErr := c.recovery.AutoRepair(ctx, diagnostic); repairErr != nil {
+			log.Printf("Stream: recovery of %s failed: %v", diagnostic.Code, repairErr)
+		} else if report.State == recoverymodel.OperationStateSucceeded {
+			c.applyStateMu.Lock()
+			c.lastApplyClean = false
+			c.applyStateMu.Unlock()
+		}
+	}
+	c.syncRecoveryHealth()
+}
+
+func (c *Client) syncRecoveryHealth() {
+	if c.recovery != nil && c.health != nil {
+		c.health.SetDiagnostics(c.recovery.ActiveDiagnostics())
+	}
 }
 
 // carryKeepManaged carries forward the managed entries for Keep'd paths (drifted
@@ -780,6 +898,7 @@ func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle
 	}
 	if err := c.caddy.InstallCerts(ctx, bundles); err != nil {
 		log.Printf("Stream: failed to install %d cert bundle(s): %v", len(bundles), err)
+		c.observeRecovery(ctx, err)
 		if c.health != nil {
 			c.health.SetError(fmt.Sprintf("failed to install TLS certificates: %v", err))
 		}
@@ -814,6 +933,7 @@ func (c *Client) applyServerTLS(ctx context.Context, intents []proxymodel.RouteI
 	}
 	if err := c.caddy.EnsureServerTLS(ctx, tlsIntents); err != nil {
 		log.Printf("Stream: failed to configure TLS strategy: %v", err)
+		c.observeRecovery(ctx, err)
 		if c.health != nil {
 			c.health.SetError(fmt.Sprintf("failed to configure TLS strategy: %v", err))
 		}

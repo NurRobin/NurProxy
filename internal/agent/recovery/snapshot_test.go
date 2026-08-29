@@ -464,6 +464,57 @@ func TestSnapshotStoreCloseIsIdempotentAndReleasesFD(t *testing.T) {
 	}
 }
 
+func TestActiveOperationIDsUseBoundDirectoryAndFailClosed(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewSnapshotStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, state := range map[string]recoverymodel.OperationState{"z-applying": recoverymodel.OperationStateApplying, "a-validating": recoverymodel.OperationStateValidating, "m-done": recoverymodel.OperationStateSucceeded} {
+		if err := persistTestManifest(store, id, state, testTime()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids, err := store.ActiveOperationIDs()
+	if err != nil || len(ids) != 2 || ids[0] != "a-validating" || ids[1] != "z-applying" {
+		t.Fatalf("ids=%v err=%v", ids, err)
+	}
+	original := filepath.Join(root, "original-operations")
+	if err := os.Rename(store.operationsDir, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), store.operationsDir); err != nil {
+		t.Fatal(err)
+	}
+	ids, err = store.ActiveOperationIDs()
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("bound ids=%v err=%v", ids, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActiveOperationIDs(); err == nil {
+		t.Fatal("closed store listed operations")
+	}
+}
+
+func TestActiveOperationIDsRejectsCorruptManifest(t *testing.T) {
+	store, err := NewSnapshotStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := persistTestManifest(store, "active", recoverymodel.OperationStateApplying, testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.OperationDir("active"), manifestFilename), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActiveOperationIDs(); err == nil {
+		t.Fatal("corrupt active manifest was ignored")
+	}
+}
+
 func TestRetentionKeepsNewestTwentyRecentAndActiveWithoutFollowingSymlinks(t *testing.T) {
 	root := t.TempDir()
 	store, err := NewSnapshotStore(filepath.Join(root, "data"))

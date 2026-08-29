@@ -2,9 +2,13 @@ package ddns
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 func TestDetectPublicIPTrimsWhitespace(t *testing.T) {
@@ -131,5 +135,55 @@ func TestDetectPublicIP_rejectsGarbage(t *testing.T) {
 
 	if _, err := detectPublicIPFromServices(context.Background(), []string{mock.URL}, wantIPv4); err == nil {
 		t.Fatal("a non-IP response must be rejected, not published verbatim")
+	}
+}
+
+func TestHeartbeatAdvertisesRecoveryCapabilityAndAppliesEffectivePolicy(t *testing.T) {
+	var payload heartbeatPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ip" {
+			_, _ = w.Write([]byte("203.0.113.4"))
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"safe_auto_repair_effective":true}`))
+	}))
+	defer server.Close()
+	old4, old6 := defaultServices, defaultServices6
+	defaultServices, defaultServices6 = []string{server.URL + "/ip"}, nil
+	defer func() { defaultServices, defaultServices6 = old4, old6 }()
+
+	policy := false
+	h := New(server.URL, "agent-1", "token", "v1", time.Hour, nil)
+	h.SetRecoveryCapabilityFn(func() *recoverymodel.Capability {
+		return &recoverymodel.Capability{Stage: 1, Actions: []recoverymodel.Action{recoverymodel.ActionRemoveManagedTemp}}
+	})
+	h.SetRecoveryPolicyFn(func(enabled bool) { policy = enabled })
+	h.sendHeartbeat(context.Background())
+	if payload.RecoveryCapability == nil || payload.RecoveryCapability.Stage != 1 || !policy {
+		t.Fatalf("payload=%+v policy=%t", payload.RecoveryCapability, policy)
+	}
+}
+
+func TestHeartbeatPolicyRemainsFailClosedForMissingOrMalformedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ip" {
+			_, _ = w.Write([]byte("203.0.113.4"))
+			return
+		}
+		_, _ = w.Write([]byte(`{"safe_auto_repair_effective":"yes"}`))
+	}))
+	defer server.Close()
+	old4, old6 := defaultServices, defaultServices6
+	defaultServices, defaultServices6 = []string{server.URL + "/ip"}, nil
+	defer func() { defaultServices, defaultServices6 = old4, old6 }()
+	called := false
+	h := New(server.URL, "agent-1", "token", "v1", time.Hour, nil)
+	h.SetRecoveryPolicyFn(func(bool) { called = true })
+	h.sendHeartbeat(context.Background())
+	if called {
+		t.Fatal("malformed policy response changed fail-closed state")
 	}
 }
