@@ -78,10 +78,9 @@ func TestDomainConfig_ResetAndUpdate_resetManualArtifact(t *testing.T) {
 			wantRaw:     newManual,
 		},
 		{
-			name:         "reset with a generated artifact keeps its history",
-			method:       "POST",
-			pathSuffix:   "/config/reset",
-			wantArtifact: true,
+			name:       "reset removes a stale generated artifact before rendering the model",
+			method:     "POST",
+			pathSuffix: "/config/reset",
 		},
 	}
 

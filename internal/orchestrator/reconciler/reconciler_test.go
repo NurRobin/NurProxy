@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -560,6 +561,10 @@ func TestBuildDesiredRoutes_SkipsDriftedArtifact(t *testing.T) {
 	// mistake it for a deleted domain's orphan (invariant #3).
 	if len(keep) != 1 {
 		t.Errorf("drifted artifact path should be in keep, got %d keep paths", len(keep))
+	}
+	set := r.intentSetFor(agent, desired, keep)
+	if !slices.Contains(set.CertKeep, "app.example.com") {
+		t.Fatalf("drifted live vhost certificate was not retained: %+v", set.CertKeep)
 	}
 
 	// With auto-reconcile enabled, the domain is pushed again (and not in keep-extra).

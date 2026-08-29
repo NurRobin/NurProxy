@@ -623,14 +623,14 @@ func (s *Server) handleUpdateDomainConfig(w http.ResponseWriter, r *http.Request
 	// Same trap as reset: a drift-accepted (manual) artifact outranks the row in
 	// the reconciler, so the OLD manual bytes would keep deploying instead of the
 	// config just stored. Remove it so the push below carries the new override.
-	s.resetManualArtifact(r, id)
+	s.resetDomainArtifact(r, id)
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "manual config set"})
 }
 
-// resetManualArtifact deletes the domain's "dom-<id>" config artifact when its
-// Source is manual (drift-accept, raw edit, or rollback to a manual version).
+// resetDomainArtifact deletes the domain's current "dom-<id>" artifact before
+// a config edit or reset is pushed.
 // The reconciler treats a manual artifact as authoritative and pushes its stored
 // bytes verbatim, ignoring the domain row entirely — so after a config reset (or
 // a new manual config on the row) the old bytes would be re-pushed, the agent
@@ -639,28 +639,26 @@ func (s *Server) handleUpdateDomainConfig(w http.ResponseWriter, r *http.Request
 // the row change never reaches the agent. Deleting the artifact breaks that loop
 // safely — the reconciler renders from the domain model when no artifact exists,
 // and the agent's next apply-ACK recreates the row with source=generated and the
-// agent's real rendered content. A generated artifact already follows the domain
-// model, so it is left alone (its version history is worth keeping).
-func (s *Server) resetManualArtifact(r *http.Request, domainID int64) {
+// agent's real rendered content. The artifact is removed regardless of its last
+// source classification: an apply ACK can classify raw model content as generated,
+// so source alone cannot prove that its bytes still follow the updated domain row.
+func (s *Server) resetDomainArtifact(r *http.Request, domainID int64) {
 	artifactID := artifactIDForDomainID(domainID)
-	art, err := s.db.GetConfigArtifact(artifactID)
+	_, err := s.db.GetConfigArtifact(artifactID)
 	if err != nil {
 		// No artifact is the common case (nothing to reset); anything else is a
 		// real lookup failure that would leave a stale manual artifact silently
 		// overriding the domain row — make it visible.
 		if !errors.Is(err, db.ErrArtifactNotFound) {
-			log.Printf("resetManualArtifact: looking up artifact %s: %v", artifactID, err)
+			log.Printf("resetDomainArtifact: looking up artifact %s: %v", artifactID, err)
 		}
 		return
 	}
-	if art.Source != models.ArtifactSourceManual {
-		return
-	}
 	if dErr := s.db.DeleteConfigArtifact(artifactID); dErr != nil {
-		log.Printf("resetManualArtifact: failed to delete manual artifact %s: %v", artifactID, dErr)
+		log.Printf("resetDomainArtifact: failed to delete artifact %s: %v", artifactID, dErr)
 		return
 	}
-	s.audit(r, "config_artifact", artifactID, "reset", "manual artifact removed; agent re-renders from the domain model")
+	s.audit(r, "config_artifact", artifactID, "reset", "stale artifact removed; agent re-renders from the domain model")
 }
 
 // POST /api/v1/domains/{id}/config/reset
@@ -689,7 +687,7 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "reset_config", "manual config cleared")
 	// A drift-accepted (manual) artifact would override the cleared row on the
 	// next push; remove it so the push below renders from the domain model again.
-	s.resetManualArtifact(r, id)
+	s.resetDomainArtifact(r, id)
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "config reset to auto-generated"})

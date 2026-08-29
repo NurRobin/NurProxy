@@ -428,6 +428,9 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 	}
 	result, executeErr := e.managedApply.Execute(ctx, grant.OperationID, plan, intent, prepared)
+	if executeErr != nil {
+		slog.Error("managed apply execution failed on local host", "operation_id", grant.OperationID, "mutated", result.Mutated, "error", executeErr)
+	}
 	if !result.Mutated && executeErr == nil && result.Validated {
 		message := truncateUTF8(result.SanitizedResult, 4096)
 		if strings.TrimSpace(message) == "" {
@@ -474,6 +477,11 @@ func (e *Engine) rollbackManagedApply(ctx context.Context, operationID, requestD
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 	}
 	rollbackErr := e.managedApply.Rollback(ctx, operationID, plan, intent, prepared)
+	if rollbackErr != nil {
+		slog.Error("managed apply rollback failed on local host", "operation_id", operationID, "error", rollbackErr)
+	} else if prepared.RollbackCoverage != helperprotocol.RollbackCoverageFull {
+		slog.Warn("managed apply rollback restored its bounded snapshot but coverage remains incomplete", "operation_id", operationID, "coverage", prepared.RollbackCoverage)
+	}
 	state := helperprotocol.JournalRolledBack
 	message := "managed apply failed and privileged pre-state was fully restored"
 	if rollbackErr != nil || prepared.RollbackCoverage != helperprotocol.RollbackCoverageFull {

@@ -256,15 +256,51 @@ func buildApplyIntent(agentID, helperInstanceID string, set proxymodel.IntentSet
 func (r *Reconciler) intentSetFor(agent *models.Agent, desired map[string]desiredRoute, keepExtra []string) proxymodel.IntentSet {
 	certs := r.gatherCerts(desired)
 	certs = append(certs, r.gatherCertOnlyCerts(agent)...)
-	certKeep := make([]string, 0, len(certs))
+	certKeepSet := make(map[string]struct{}, len(certs))
 	for i := range certs {
-		certKeep = append(certKeep, certs[i].Host)
+		certKeepSet[certs[i].Host] = struct{}{}
 	}
+	for _, host := range r.liveCertificateKeep(agent) {
+		certKeepSet[host] = struct{}{}
+	}
+	certKeep := make([]string, 0, len(certKeepSet))
+	for host := range certKeepSet {
+		certKeep = append(certKeep, host)
+	}
+	sort.Strings(certKeep)
 	return proxymodel.IntentSet{
 		Intents: intentsFromDesired(desired, backendForAgent(agent)),
 		Certs:   certs, Keep: keepExtra,
 		PruneCerts: true, CertKeep: certKeep,
 	}
+}
+
+func (r *Reconciler) liveCertificateKeep(agent *models.Agent) []string {
+	domains, err := r.db.ListDomainsByAgent(agent.ID)
+	if err != nil {
+		log.Printf("reconciler: cannot list live certificate consumers for agent %s: %v", agent.ID, err)
+		return nil
+	}
+	zoneNames := make(map[string]string)
+	hosts := make([]string, 0, len(domains))
+	for i := range domains {
+		domain := &domains[i]
+		if domain.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zoneName, ok := zoneNames[domain.ZoneID]
+		if !ok {
+			zone, zoneErr := r.db.GetZone(domain.ZoneID)
+			if zoneErr != nil {
+				continue
+			}
+			zoneName = zone.Name
+			zoneNames[domain.ZoneID] = zoneName
+		}
+		hosts = append(hosts, domain.FQDN(zoneName))
+	}
+	sort.Strings(hosts)
+	return hosts
 }
 
 // gatherCertOnlyCerts collects the cert bundles for an agent's cert-only domains
