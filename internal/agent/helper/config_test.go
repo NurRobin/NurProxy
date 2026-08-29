@@ -28,7 +28,7 @@ func TestLoadRootConfigAcceptsOnlyTrustedStrictFile(t *testing.T) {
 	}
 	path := filepath.Join(dir, "helper.conf")
 	publicKey := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-	body := fmt.Sprintf(`{"helper_instance_id":"helper-1","expected_build_id":"dev-010e5a7","agent_user":%q,"agent_uid":%d,"orchestrator_key_id":"orchestrator-1","orchestrator_public_key":%q,"attestation_key_id":"attestation-1","attestation_private_key_file":%q,"store_dir":%q}`,
+	body := fmt.Sprintf(`{"agent_id":"agent-1","helper_instance_id":"helper-1","expected_build_id":"dev-010e5a7","agent_user":%q,"agent_uid":%d,"orchestrator_key_id":"orchestrator-1","orchestrator_public_key":%q,"attestation_key_id":"attestation-1","attestation_private_key_file":%q,"store_dir":%q}`,
 		current.Username, ownerUID, publicKey, filepath.Join(dir, "attestation.key"), filepath.Join(dir, "store"))
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestLoadRootConfigRejectsSymlinkUnknownAndAmbiguousJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-	valid := fmt.Sprintf(`{"helper_instance_id":"helper-1","expected_build_id":"dev-1","agent_user":%q,"agent_uid":%d,"orchestrator_key_id":"key-1","orchestrator_public_key":%q,"attestation_key_id":"attest-1","attestation_private_key_file":%q,"store_dir":%q}`,
+	valid := fmt.Sprintf(`{"agent_id":"agent-1","helper_instance_id":"helper-1","expected_build_id":"dev-1","agent_user":%q,"agent_uid":%d,"orchestrator_key_id":"key-1","orchestrator_public_key":%q,"attestation_key_id":"attest-1","attestation_private_key_file":%q,"store_dir":%q}`,
 		current.Username, ownerUID, key, filepath.Join(dir, "attest.key"), filepath.Join(dir, "store"))
 	for name, body := range map[string]string{
 		"unknown":   strings.Replace(valid, `"store_dir":`, `"path":"/etc/passwd","store_dir":`, 1),

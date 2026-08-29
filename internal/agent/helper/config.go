@@ -17,6 +17,7 @@ import (
 const MaxRootConfigBytes = 64 << 10
 
 type RootConfig struct {
+	AgentID                   string `json:"agent_id"`
 	HelperInstanceID          string `json:"helper_instance_id"`
 	ExpectedBuildID           string `json:"expected_build_id"`
 	AgentUser                 string `json:"agent_user"`
@@ -29,7 +30,7 @@ type RootConfig struct {
 }
 
 func (c RootConfig) Validate() error {
-	if !validConfigID(c.HelperInstanceID) || !validConfigID(c.ExpectedBuildID) ||
+	if !validConfigID(c.AgentID) || !validConfigID(c.HelperInstanceID) || !validConfigID(c.ExpectedBuildID) ||
 		!validConfigID(c.AgentUser) || c.AgentUID == 0 ||
 		!validConfigID(c.OrchestratorKeyID) || !validConfigID(c.AttestationKeyID) {
 		return fmt.Errorf("invalid root configuration identity")

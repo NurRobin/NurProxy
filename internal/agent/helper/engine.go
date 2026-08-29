@@ -86,6 +86,9 @@ func (e *Engine) Hello(request helperprotocol.HelperHelloRequest) (helperprotoco
 	if err := request.Validate(); err != nil {
 		return helperprotocol.Signed[helperprotocol.HelperHello]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "invalid helper hello request", false)
 	}
+	if request.AgentID != e.config.AgentID {
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, protocolFailure(helperprotocol.ErrorPeerCredentialsInvalid, "main agent identity does not match root configuration", false)
+	}
 	if request.AgentBuildID != e.buildID {
 		return helperprotocol.Signed[helperprotocol.HelperHello]{}, protocolFailure(helperprotocol.ErrorBuildIDMismatch, "main agent and helper build ids differ", false)
 	}
@@ -155,6 +158,9 @@ func (e *Engine) Execute(ctx context.Context, request helperprotocol.Envelope[he
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "orchestrator execution grant signature is invalid", false)
 	}
 	grant := grantSigned.Envelope.Payload
+	if grant.AgentID != e.config.AgentID {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "execution grant targets another agent", false)
+	}
 	if grant.HelperInstanceID != e.config.HelperInstanceID {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorHelperInstanceMismatch, "execution grant targets another helper instance", false)
 	}

@@ -80,6 +80,7 @@ func newEngineFixture(t *testing.T) engineFixture {
 		t.Fatal(err)
 	}
 	cfg := RootConfig{
+		AgentID:                   "agent-1",
 		HelperInstanceID:          "helper-1",
 		ExpectedBuildID:           "dev-010e5a7",
 		AgentUser:                 "nurproxy",
@@ -190,6 +191,7 @@ func TestEngineRejectsMissingSignaturePlanTamperingCrossHostAndExpiry(t *testing
 	for name, mutate := range map[string]func(*helperprotocol.ExecutionGrant){
 		"display tampering": func(g *helperprotocol.ExecutionGrant) { g.DisplayPlanHash = strings.Repeat("c", 64) },
 		"cross host":        func(g *helperprotocol.ExecutionGrant) { g.HelperInstanceID = "helper-other" },
+		"cross agent":       func(g *helperprotocol.ExecutionGrant) { g.AgentID = "agent-other" },
 		"expired": func(g *helperprotocol.ExecutionGrant) {
 			g.IssuedAt = time.Date(2026, 8, 29, 9, 55, 0, 0, time.UTC).Format(time.RFC3339Nano)
 			g.ExpiresAt = time.Date(2026, 8, 29, 9, 56, 0, 0, time.UTC).Format(time.RFC3339Nano)
@@ -211,6 +213,16 @@ func TestEngineRejectsMissingSignaturePlanTamperingCrossHostAndExpiry(t *testing
 	request.Payload.Grant.Signature = strings.Repeat("A", 86)
 	if _, err := fixture.engine.Execute(context.Background(), request); err == nil || fixture.handler.executeCount != 0 {
 		t.Fatal("forged signature executed")
+	}
+}
+
+func TestEngineHelloRejectsAnotherAgentIdentity(t *testing.T) {
+	fixture := newEngineFixture(t)
+	_, err := fixture.engine.Hello(helperprotocol.HelperHelloRequest{
+		RequestID: "request-other-agent", AgentID: "agent-other", AgentBuildID: fixture.engine.buildID,
+	})
+	if err == nil {
+		t.Fatal("helper hello accepted another agent identity")
 	}
 }
 
