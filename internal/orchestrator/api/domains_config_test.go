@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -21,6 +22,27 @@ import (
 type captureHub struct {
 	mu   sync.Mutex
 	sets []proxymodel.IntentSet
+}
+
+func TestDeleteDomainPersistsManagedRouteTombstoneBeforeImmediatePush(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+	domainID, fqdn := seedDomainTopology(t, srv, cookie)
+
+	w := doRequest(t, handler, http.MethodDelete, "/api/v1/domains/"+strconv.FormatInt(domainID, 10), nil, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete domain: %d: %s", w.Code, w.Body.String())
+	}
+	deletions, err := database.ListManagedRouteTombstones("agent-1")
+	want := helperprotocol.ManagedDeletion{ResourceID: fmt.Sprintf("dom-%d", domainID), Host: fqdn, Backend: "nginx"}
+	if err != nil || len(deletions) != 1 || deletions[0] != want {
+		t.Fatalf("managed deletion tombstones = %#v, err=%v, want %#v", deletions, err, want)
+	}
+	domain, err := database.GetDomain(domainID)
+	if err != nil || domain.Status != models.DomainStatusDeleting {
+		t.Fatalf("domain state after tombstone = %#v, err=%v", domain, err)
+	}
 }
 
 func (h *captureHub) Connected(string) bool                                { return true }

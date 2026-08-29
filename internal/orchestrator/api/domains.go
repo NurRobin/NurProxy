@@ -15,6 +15,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -349,12 +350,42 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the owning server before we flip status, so we can push the new
-	// (route-removed) set to the agent immediately.
-	dom, _ := s.db.GetDomain(id)
+	// Persist the exact file-backend tombstone before the immediate push can stop
+	// retaining the route's certificate.
+	dom, err := s.db.GetDomain(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+	var tombstoneAgentID string
+	var tombstone *helperprotocol.ManagedDeletion
+	if !dom.CertOnly {
+		srv, srvErr := s.db.GetServer(dom.ServerID)
+		zone, zoneErr := s.db.GetZone(dom.ZoneID)
+		if srvErr != nil || zoneErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to resolve managed deletion identity")
+			return
+		}
+		backend := s.backendForDomain(srv)
+		if backend == "nginx" || backend == "apache" {
+			deletion := helperprotocol.ManagedDeletion{
+				ResourceID: artifactIDForDomainID(dom.ID),
+				Host:       dom.FQDN(zone.Name),
+				Backend:    backend,
+			}
+			if err := s.db.UpsertManagedRouteTombstone(srv.AgentID, deletion, time.Now().UTC()); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to persist managed deletion identity")
+				return
+			}
+			tombstoneAgentID, tombstone = srv.AgentID, &deletion
+		}
+	}
 
 	// Set status to "deleting" — reconciler handles actual cleanup
 	if err := s.db.UpdateDomainStatus(id, models.DomainStatusDeleting, ""); err != nil {
+		if tombstone != nil {
+			_ = s.db.DeleteManagedRouteTombstones(tombstoneAgentID, []helperprotocol.ManagedDeletion{*tombstone})
+		}
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
 	}
@@ -362,9 +393,7 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "delete", "")
 	// A full-sync push now excludes the deleting domain, so a connected agent
 	// drops the route at once; DNS record + row cleanup follow in the reconciler.
-	if dom != nil {
-		s.triggerAgentPush(dom.ServerID)
-	}
+	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "domain marked for deletion"})
 }
