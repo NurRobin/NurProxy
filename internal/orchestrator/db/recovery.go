@@ -118,7 +118,28 @@ func (d *DB) RecoveryAggregates(now time.Time) (RecoveryMetricAggregates, error)
 		agentID, fingerprint string
 		action               recoverymodel.Action
 	}
-	rows, err = tx.Query(`SELECT DISTINCT agent_id, action, resource_fingerprint FROM recovery_operations ORDER BY action, agent_id, resource_fingerprint`)
+	nowNanos, err := recoveryUnixNano(now)
+	if err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("encoding recovery aggregate breaker time: %w", err)
+	}
+	oldestBreakerCandidate := subtractRecoveryDuration(nowNanos, int64(75*time.Minute))
+	rows, err = tx.Query(`SELECT DISTINCT candidate.agent_id, candidate.action, candidate.resource_fingerprint
+		FROM recovery_operations AS candidate
+		WHERE (
+			candidate.state IN (?, ?) AND candidate.received_at > ?
+		) OR (
+			candidate.state = ? AND NOT EXISTS (
+				SELECT 1 FROM recovery_operations AS cleared
+				WHERE cleared.agent_id = candidate.agent_id
+					AND cleared.action = candidate.action
+					AND cleared.resource_fingerprint = candidate.resource_fingerprint
+					AND cleared.state = ? AND cleared.request_source = ?
+					AND cleared.received_at > candidate.received_at
+			)
+		)
+		ORDER BY candidate.action, candidate.agent_id, candidate.resource_fingerprint`,
+		string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed), oldestBreakerCandidate,
+		string(recoverymodel.OperationStateRollbackFailed), string(recoverymodel.OperationStateSucceeded), string(recoverymodel.RequestSourceUser))
 	if err != nil {
 		return RecoveryMetricAggregates{}, fmt.Errorf("listing recovery circuit breaker keys: %w", err)
 	}

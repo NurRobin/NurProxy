@@ -119,16 +119,23 @@ func recoveryMetricDiagnostic(agentID, fingerprint string) recoverymodel.Diagnos
 }
 
 func TestRecoveryMetricDescriptorsStayBounded(t *testing.T) {
-	descriptors := []string{
-		recoveryDiagnosticsActiveDesc.String(), recoveryOperationsTotalDesc.String(),
-		recoveryOperationsInProgressDesc.String(), recoveryCircuitBreakersOpenDesc.String(),
+	descriptors := []struct {
+		desc *prometheus.Desc
+		want string
+	}{
+		{recoveryDiagnosticsActiveDesc, "variableLabels: {code,severity,ownership}"},
+		{recoveryOperationsTotalDesc, "variableLabels: {action,outcome,request_source}"},
+		{recoveryOperationsInProgressDesc, "variableLabels: {action}"},
+		{recoveryCircuitBreakersOpenDesc, "variableLabels: {action}"},
 	}
 	for _, descriptor := range descriptors {
-		for _, forbidden := range []string{"host", "path", "id", "error", "diagnostic", "fingerprint"} {
-			if strings.Contains(strings.ToLower(descriptor), `variableLabels: {`+forbidden) ||
-				strings.Contains(strings.ToLower(descriptor), `,`+forbidden) {
-				t.Fatalf("recovery descriptor contains forbidden label %q: %s", forbidden, descriptor)
-			}
+		got := descriptor.desc.String()
+		if !strings.Contains(got, descriptor.want) {
+			t.Fatalf("recovery descriptor labels are not exact: got %s, want %q", got, descriptor.want)
+		}
+		withoutExpected := strings.Replace(got, descriptor.want, "", 1)
+		if strings.Contains(withoutExpected, "variableLabels:") {
+			t.Fatalf("recovery descriptor has an additional label set: %s", got)
 		}
 	}
 }
