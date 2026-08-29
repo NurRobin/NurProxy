@@ -40,13 +40,17 @@ type Context struct {
 }
 
 type classification struct {
-	code          recoverymodel.Code
-	ownership     recoverymodel.Ownership
-	action        recoverymodel.Action
-	eligible      bool
-	hardChange    bool
-	evidenceClass string
-	paths         []GuardedPath
+	code                recoverymodel.Code
+	ownership           recoverymodel.Ownership
+	ownershipConfidence recoverymodel.OwnershipConfidence
+	action              recoverymodel.Action
+	autoEligible        bool
+	repairEligible      bool
+	repairScope         recoverymodel.RepairScope
+	refusalCode         string
+	hardChange          bool
+	evidenceClass       string
+	paths               []GuardedPath
 }
 
 func Classify(ctx Context, err error) recoverymodel.Diagnostic {
@@ -75,9 +79,11 @@ func Classify(ctx Context, err error) recoverymodel.Diagnostic {
 	fingerprint := fingerprint(result.code, backend, result.evidenceClass, fingerprintPaths)
 	diagnostic := recoverymodel.Diagnostic{
 		Code: result.code, Subsystem: "proxy", Severity: recoverymodel.SeverityError,
-		Ownership: result.ownership, Summary: summaryFor(result.code), Evidence: evidence,
+		Ownership: result.ownership, OwnershipConfidence: result.ownershipConfidence,
+		Summary: summaryFor(result.code), Evidence: evidence,
 		AffectedPaths: paths, ResourceFingerprint: fingerprint, ProposedAction: result.action,
-		AutoRepairEligible: result.eligible, HardChange: result.hardChange,
+		RepairScope: result.repairScope, RepairEligible: result.repairEligible,
+		RepairRefusalCode: result.refusalCode, AutoRepairEligible: result.autoEligible, HardChange: result.hardChange,
 		FirstSeenAt: now, LastSeenAt: now, Occurrences: 1,
 	}
 	diagnostic.ID = recoverymodel.StableDiagnosticID(ctx.AgentID, diagnostic.Code, fingerprint)
@@ -98,22 +104,22 @@ func classifyFailure(ctx Context, failure *proxy.Failure) classification {
 		return unknownClassification()
 	}
 	if failure.BinaryMissing {
-		return systemClassification(recoverymodel.CodeProxyBinaryMissing, "binary_missing")
-	}
-	if failure.Permission {
-		return systemClassification(recoverymodel.CodePermissionDenied, "permission_denied")
+		return hardSystemClassification(recoverymodel.CodeProxyBinaryMissing, "binary_missing", recoverymodel.RepairScopeSupportedPackage, true, "")
 	}
 	if systemdSandboxFailure(failure.Output) {
-		return systemClassification(recoverymodel.CodeSystemdSandboxDenied, "systemd_sandbox")
+		return hardSystemClassification(recoverymodel.CodeSystemdSandboxDenied, "systemd_sandbox", recoverymodel.RepairScopeAgentSandbox, true, "")
+	}
+	if failure.Permission {
+		return hardSystemClassification(recoverymodel.CodePermissionDenied, "permission_denied", recoverymodel.RepairScopeAmbiguous, false, "permission_scope_ambiguous")
 	}
 	if portConflictFailure(failure.Output) {
-		return systemClassification(recoverymodel.CodePortConflict, "port_conflict")
+		return hardSystemClassification(recoverymodel.CodePortConflict, "port_conflict", recoverymodel.RepairScopeUnsupportedEnvironment, false, "process_killing_unsupported")
 	}
 	if proxyNotRunningFailure(failure.Output) {
-		return systemClassification(recoverymodel.CodeProxyNotRunning, "proxy_not_running")
+		return hardSystemClassification(recoverymodel.CodeProxyNotRunning, "proxy_not_running", recoverymodel.RepairScopeDetectedProxyService, true, "")
 	}
 	if failure.Phase == proxy.FailurePhaseReload {
-		return systemClassification(recoverymodel.CodeProxyReloadFailed, "reload_failed")
+		return hardSystemClassification(recoverymodel.CodeProxyReloadFailed, "reload_failed", recoverymodel.RepairScopeDetectedProxyService, true, "")
 	}
 	if failure.MissingCert || failure.MissingRuntimeKey || failure.RuntimeKeyMismatch {
 		return classifyReferencedFailure(ctx, failure)
@@ -179,17 +185,26 @@ func classifyLocatedFailure(ctx Context, failure *proxy.Failure) classification 
 		if ownership == recoverymodel.OwnershipOperator {
 			code, class = recoverymodel.CodeOperatorConfigInvalid, "operator_config"
 		}
-		return classification{code: code, ownership: ownership, evidenceClass: class, paths: []GuardedPath{checked}}
+		return classification{code: code, ownership: ownership, ownershipConfidence: recoverymodel.OwnershipConfidenceCertain,
+			repairScope: recoverymodel.RepairScopeExactProvenancedFile, refusalCode: "generated_config_restore_requires_known_failed_hash", evidenceClass: class, paths: []GuardedPath{checked}}
 	}
 	if markerInExactLayout(checked, layout) && hasManagedArtifactProvenance(checked) {
 		if filepath.Dir(checked.Path) == layout.available && isManagedTemp(checked.Path) {
-			return classification{code: recoverymodel.CodeManagedStaleTemp, ownership: recoverymodel.OwnershipNurProxy, action: recoverymodel.ActionRemoveManagedTemp, eligible: true, evidenceClass: "managed_temp", paths: []GuardedPath{checked}}
+			return classification{code: recoverymodel.CodeManagedStaleTemp, ownership: recoverymodel.OwnershipNurProxy,
+				ownershipConfidence: recoverymodel.OwnershipConfidenceCertain, action: recoverymodel.ActionRemoveManagedTemp,
+				autoEligible: true, repairEligible: true, repairScope: recoverymodel.RepairScopeExactProvenancedFile,
+				evidenceClass: "managed_temp", paths: []GuardedPath{checked}}
 		}
 		if isManagedConfig(checked.Path) {
-			return classification{code: recoverymodel.CodeManagedOrphanConfig, ownership: recoverymodel.OwnershipNurProxy, action: recoverymodel.ActionPruneManagedOrphan, eligible: true, evidenceClass: "managed_orphan", paths: []GuardedPath{checked}}
+			return classification{code: recoverymodel.CodeManagedOrphanConfig, ownership: recoverymodel.OwnershipNurProxy,
+				ownershipConfidence: recoverymodel.OwnershipConfidenceCertain, action: recoverymodel.ActionPruneManagedOrphan,
+				autoEligible: true, repairEligible: true, repairScope: recoverymodel.RepairScopeExactProvenancedFile,
+				evidenceClass: "managed_orphan", paths: []GuardedPath{checked}}
 		}
 	}
-	return classification{code: recoverymodel.CodeOperatorConfigInvalid, ownership: recoverymodel.OwnershipOperator, evidenceClass: "operator_config", paths: []GuardedPath{checked}}
+	return classification{code: recoverymodel.CodeOperatorConfigInvalid, ownership: recoverymodel.OwnershipOperator,
+		ownershipConfidence: recoverymodel.OwnershipConfidenceCertain, repairScope: recoverymodel.RepairScopeExactProvenancedFile,
+		refusalCode: "operator_owned_config", evidenceClass: "operator_config", paths: []GuardedPath{checked}}
 }
 
 func resolveBackendLayout(ctx Context) (backendLayout, bool) {
@@ -358,9 +373,14 @@ func classifyReferencedFailure(ctx Context, failure *proxy.Failure) classificati
 		return unknownClassification()
 	}
 	result := classification{code: code, ownership: ownership, evidenceClass: evidenceClass, paths: references}
+	result.ownershipConfidence = recoverymodel.OwnershipConfidenceCertain
+	result.repairScope = recoverymodel.RepairScopeExactProvenancedFile
 	if ownership == recoverymodel.OwnershipNurProxy && matched.ValidBundle {
 		result.action = action
-		result.eligible = true
+		result.autoEligible = true
+		result.repairEligible = true
+	} else {
+		result.refusalCode = "managed_bundle_unavailable"
 	}
 	return result
 }
@@ -426,12 +446,16 @@ func isManagedTemp(path string) bool {
 	return strings.HasPrefix(name, "nurproxy-") && strings.HasSuffix(name, suffix) && len(name) > len("nurproxy-")+len(suffix)
 }
 
-func systemClassification(code recoverymodel.Code, evidenceClass string) classification {
-	return classification{code: code, ownership: recoverymodel.OwnershipSystem, hardChange: true, evidenceClass: evidenceClass}
+func hardSystemClassification(code recoverymodel.Code, evidenceClass string, scope recoverymodel.RepairScope, eligible bool, refusalCode string) classification {
+	return classification{code: code, ownership: recoverymodel.OwnershipSystem,
+		ownershipConfidence: recoverymodel.OwnershipConfidenceInferred, repairEligible: eligible,
+		repairScope: scope, refusalCode: refusalCode, hardChange: true, evidenceClass: evidenceClass}
 }
 
 func unknownClassification() classification {
-	return classification{code: recoverymodel.CodeUnknownProxyError, ownership: recoverymodel.OwnershipUnknown, evidenceClass: "unknown"}
+	return classification{code: recoverymodel.CodeUnknownProxyError, ownership: recoverymodel.OwnershipUnknown,
+		ownershipConfidence: recoverymodel.OwnershipConfidenceUnknown, repairScope: recoverymodel.RepairScopeAmbiguous,
+		refusalCode: "unknown_proxy_error", evidenceClass: "unknown"}
 }
 
 func systemdSandboxFailure(output string) bool {
@@ -482,7 +506,7 @@ func fingerprint(code recoverymodel.Code, backend proxy.Kind, evidenceClass stri
 		_, _ = h.Write(size[:])
 		_, _ = h.Write([]byte(value))
 	}
-	return "resource_" + hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func normalizedBackend(backend proxy.Kind) proxy.Kind {

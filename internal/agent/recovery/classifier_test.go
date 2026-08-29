@@ -187,6 +187,40 @@ func TestClassifierFingerprintIgnoresRawTextAndUsesEvidenceClass(t *testing.T) {
 	if strings.Contains(a.ResourceFingerprint, "alpha") || strings.Contains(a.ResourceFingerprint, path) || strings.Contains(a.ResourceFingerprint, "backend") {
 		t.Fatalf("fingerprint contains raw input: %q", a.ResourceFingerprint)
 	}
+	if len(a.ResourceFingerprint) != 64 || strings.Trim(a.ResourceFingerprint, "0123456789abcdef") != "" {
+		t.Fatalf("fingerprint is not a canonical SHA-256 digest: %q", a.ResourceFingerprint)
+	}
+}
+
+func TestClassifierHardDiagnosticsExposeOnlyTypedEligibleScopes(t *testing.T) {
+	fixture := newRecoveryFixture(t, proxy.KindNginx)
+	tests := []struct {
+		name        string
+		failure     *proxy.Failure
+		wantCode    recoverymodel.Code
+		wantScope   recoverymodel.RepairScope
+		eligible    bool
+		refusalCode string
+	}{
+		{"sandbox", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "Failed at step NAMESPACE spawning /usr/sbin/nginx: Operation not permitted", Err: os.ErrPermission}, recoverymodel.CodeSystemdSandboxDenied, recoverymodel.RepairScopeAgentSandbox, true, ""},
+		{"ambiguous permission", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "permission denied", Err: os.ErrPermission}, recoverymodel.CodePermissionDenied, recoverymodel.RepairScopeAmbiguous, false, "permission_scope_ambiguous"},
+		{"reload", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseReload, Output: "reload failed", Err: errors.New("exit 1")}, recoverymodel.CodeProxyReloadFailed, recoverymodel.RepairScopeDetectedProxyService, true, ""},
+		{"start", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseReload, Output: `nginx: [error] invalid PID number "" in "/run/nginx.pid"`, Err: errors.New("exit 1")}, recoverymodel.CodeProxyNotRunning, recoverymodel.RepairScopeDetectedProxyService, true, ""},
+		{"package", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, BinaryMissing: true, Err: errors.New("missing")}, recoverymodel.CodeProxyBinaryMissing, recoverymodel.RepairScopeSupportedPackage, true, ""},
+		{"port conflict", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Output: "nginx: [emerg] bind() to 0.0.0.0:443 failed (98: Address already in use)", Err: errors.New("exit 1")}, recoverymodel.CodePortConflict, recoverymodel.RepairScopeUnsupportedEnvironment, false, "process_killing_unsupported"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Classify(fixture.ctx, tt.failure)
+			if got.Code != tt.wantCode || !got.HardChange || got.AutoRepairEligible || got.RepairEligible != tt.eligible ||
+				got.RepairScope != tt.wantScope || got.RepairRefusalCode != tt.refusalCode || got.OwnershipConfidence != recoverymodel.OwnershipConfidenceInferred {
+				t.Fatalf("hard classification = %+v", got)
+			}
+			if err := got.Validate(); err != nil {
+				t.Fatalf("invalid hard diagnostic: %v", err)
+			}
+		})
+	}
 }
 
 func locatedFailure(phase proxy.FailurePhase, path string) error {
