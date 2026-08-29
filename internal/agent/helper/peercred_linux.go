@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -53,10 +54,22 @@ func VerifyPeerExecutable(pid int32) error {
 	}
 	peerStat, peerOK := peer.Sys().(*syscall.Stat_t)
 	selfStat, selfOK := self.Sys().(*syscall.Stat_t)
-	if !peerOK || !selfOK || peerStat.Dev != selfStat.Dev || peerStat.Ino != selfStat.Ino {
-		return fmt.Errorf("peer and helper executable identities differ")
+	if peerOK && selfOK && peerStat.Dev == selfStat.Dev && peerStat.Ino == selfStat.Ino {
+		return nil
 	}
-	return nil
+	peerPath, pathErr := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if pathErr == nil && trustedSystemdSocketActivator(pid, peerPath, peer) {
+		return nil
+	}
+	return fmt.Errorf("peer and helper executable identities differ")
+}
+
+func trustedSystemdSocketActivator(pid int32, path string, info os.FileInfo) bool {
+	if pid != 1 || info == nil || !info.Mode().IsRegular() || fileOwnerUID(info) != 0 || info.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	clean := filepath.Clean(path)
+	return clean == "/usr/lib/systemd/systemd" || clean == "/lib/systemd/systemd"
 }
 
 func validateSelfExecutable(expectedOwnerUID uint32) error {
