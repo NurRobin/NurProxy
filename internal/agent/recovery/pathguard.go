@@ -115,8 +115,8 @@ func (g *PathGuard) Resolve(path string) (GuardedPath, error) {
 			return GuardedPath{}, fmt.Errorf("resolve missing symlink target: %w", err)
 		}
 	}
-	if !withinRoot(root, resolved) {
-		return GuardedPath{}, fmt.Errorf("final path escapes managed root")
+	if _, ok := g.containingRoot(resolved); !ok {
+		return GuardedPath{}, fmt.Errorf("final path escapes managed roots")
 	}
 	resolvedInfo, err := os.Stat(canonical)
 	if err != nil {

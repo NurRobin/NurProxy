@@ -164,6 +164,10 @@ type Info struct {
 	BinaryPath string `json:"binary_path,omitempty"`
 	// ConfigDir is the primary config directory this backend manages.
 	ConfigDir string `json:"config_dir,omitempty"`
+	// ManagedRoots contains every exact directory in which this backend may
+	// expose a managed recovery entry. It never contains a broad configuration
+	// parent merely to cover multiple layout directories.
+	ManagedRoots []string `json:"managed_roots,omitempty"`
 	// LogPaths are the error/access log paths surfaced in the dashboard (§15).
 	LogPaths []string `json:"log_paths,omitempty"`
 }

@@ -1016,6 +1016,22 @@ func TestInfo_reportsNginxKindAndPaths(t *testing.T) {
 	if info.ConfigDir != "/etc/nginx/sites-available" {
 		t.Errorf("ConfigDir = %q", info.ConfigDir)
 	}
+	wantRoots := []string{"/etc/nginx/sites-available", "/etc/nginx/sites-enabled"}
+	if len(info.ManagedRoots) != len(wantRoots) {
+		t.Fatalf("ManagedRoots = %v, want %v", info.ManagedRoots, wantRoots)
+	}
+	for i := range wantRoots {
+		if info.ManagedRoots[i] != wantRoots[i] {
+			t.Fatalf("ManagedRoots = %v, want %v", info.ManagedRoots, wantRoots)
+		}
+	}
+}
+
+func TestInfo_reportsOnlyConfDRootForFlatNginxLayout(t *testing.T) {
+	info := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/conf.d"}).Info()
+	if len(info.ManagedRoots) != 1 || info.ManagedRoots[0] != "/etc/nginx/conf.d" {
+		t.Fatalf("ManagedRoots = %v, want exact conf.d root", info.ManagedRoots)
+	}
 }
 
 func TestNew_versionFromConfig(t *testing.T) {

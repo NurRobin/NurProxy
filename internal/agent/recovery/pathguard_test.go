@@ -77,6 +77,49 @@ func TestPathGuardRejectsSymlinkEscapeAndCanonicalizesExistingParents(t *testing
 	}
 }
 
+func TestPathGuardAllowsSymlinkBetweenTwoExactManagedRoots(t *testing.T) {
+	base := t.TempDir()
+	available := filepath.Join(base, "sites-available")
+	enabled := filepath.Join(base, "sites-enabled")
+	outside := filepath.Join(base, "operator")
+	for _, dir := range []string{available, enabled, outside} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := filepath.Join(available, "nurproxy-app.conf")
+	if err := os.WriteFile(target, []byte("managed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(enabled, filepath.Base(target))
+	if err := os.Symlink(filepath.Join("..", "sites-available", filepath.Base(target)), link); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := NewPathGuard(available, enabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, err := guard.Resolve(link)
+	if err != nil {
+		t.Fatalf("exact cross-root activation symlink rejected: %v", err)
+	}
+	if checked.EntryType != GuardedPathSymlink || checked.ResolvedPath != target {
+		t.Fatalf("resolved activation symlink = %+v", checked)
+	}
+
+	outsideTarget := filepath.Join(outside, "operator.conf")
+	if err := os.WriteFile(outsideTarget, []byte("operator"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	escape := filepath.Join(enabled, "nurproxy-escape.conf")
+	if err := os.Symlink(outsideTarget, escape); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guard.Resolve(escape); err == nil {
+		t.Fatal("symlink outside all exact managed roots accepted")
+	}
+}
+
 func TestPathGuardLstatsFinalSymlinkAndRechecksIdentity(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "managed")

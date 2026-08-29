@@ -442,10 +442,7 @@ func main() {
 		log.Printf("WARNING: safe recovery breaker unavailable: %v", breakerErr)
 	} else {
 		info := holder.Info()
-		roots := []string{cfg.DataDir}
-		if info.ConfigDir != "" {
-			roots = append(roots, info.ConfigDir)
-		}
+		roots := recoveryRootsForBackend(info, cfg.DataDir)
 		guard, guardErr := recovery.NewPathGuard(roots...)
 		if guardErr != nil {
 			_ = snapshots.Close()
@@ -565,6 +562,30 @@ func main() {
 	}
 
 	log.Printf("Agent stopped.")
+}
+
+func recoveryRootsForBackend(info proxy.Info, dataDir string) []string {
+	roots := make([]string, 0, 1+len(info.ManagedRoots))
+	seen := make(map[string]struct{}, 1+len(info.ManagedRoots))
+	appendRoot := func(root string) {
+		if root == "" {
+			return
+		}
+		if _, exists := seen[root]; exists {
+			return
+		}
+		seen[root] = struct{}{}
+		roots = append(roots, root)
+	}
+	appendRoot(dataDir)
+	if len(info.ManagedRoots) == 0 {
+		appendRoot(info.ConfigDir)
+	} else {
+		for _, root := range info.ManagedRoots {
+			appendRoot(root)
+		}
+	}
+	return roots
 }
 
 // watchSignals blocks until a signal arrives on sigCh, then calls cancel to begin

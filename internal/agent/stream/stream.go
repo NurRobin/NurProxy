@@ -465,7 +465,8 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	desired := recovery.DesiredState{Recovery: proxy.RecoveryDesired{KeepCertHosts: append([]string(nil), set.CertKeep...)}, Bundles: recoveryBundles(set.Certs)}
 	if infoProvider, ok := c.caddy.(interface{ Info() proxy.Info }); ok {
 		desired.Classification.ProxyInfo = infoProvider.Info()
-		if desired.Classification.ProxyInfo.ConfigDir != "" {
+		desired.Classification.ManagedRoots = append([]string(nil), desired.Classification.ProxyInfo.ManagedRoots...)
+		if len(desired.Classification.ManagedRoots) == 0 && desired.Classification.ProxyInfo.ConfigDir != "" {
 			desired.Classification.ManagedRoots = []string{desired.Classification.ProxyInfo.ConfigDir}
 		}
 	}

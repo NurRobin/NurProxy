@@ -141,11 +141,12 @@ func (b *Backend) WithVersion(v string) *Backend {
 // Available directory the backend owns (sites-available or conf.d).
 func (b *Backend) Info() proxy.Info {
 	return proxy.Info{
-		Kind:       proxy.KindApache,
-		Version:    b.version,
-		BinaryPath: b.binary,
-		ConfigDir:  b.layout.Available,
-		LogPaths:   b.logPaths,
+		Kind:         proxy.KindApache,
+		Version:      b.version,
+		BinaryPath:   b.binary,
+		ConfigDir:    b.layout.Available,
+		ManagedRoots: b.ProbeDirs(),
+		LogPaths:     b.logPaths,
 	}
 }
 

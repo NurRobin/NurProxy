@@ -916,6 +916,24 @@ func TestProbeDirs_debianLayout_includesEnabledDir(t *testing.T) {
 	}
 }
 
+func TestInfoReportsExactApacheRecoveryRoots(t *testing.T) {
+	debian := New(proxy.Config{Type: "apache", ConfigDir: "/etc/apache2/sites-available"}).Info()
+	wantDebian := []string{"/etc/apache2/sites-available", "/etc/apache2/sites-enabled"}
+	if len(debian.ManagedRoots) != len(wantDebian) {
+		t.Fatalf("Debian ManagedRoots = %v, want %v", debian.ManagedRoots, wantDebian)
+	}
+	for i := range wantDebian {
+		if debian.ManagedRoots[i] != wantDebian[i] {
+			t.Fatalf("Debian ManagedRoots = %v, want %v", debian.ManagedRoots, wantDebian)
+		}
+	}
+
+	flat := New(proxy.Config{Type: "apache", ConfigDir: "/etc/httpd/conf.d"}).Info()
+	if len(flat.ManagedRoots) != 1 || flat.ManagedRoots[0] != "/etc/httpd/conf.d" {
+		t.Fatalf("flat ManagedRoots = %v, want exact conf.d root", flat.ManagedRoots)
+	}
+}
+
 func TestProbeDirs_confDLayout_onlyAvailableDir(t *testing.T) {
 	b := New(proxy.Config{Type: "apache", ConfigDir: "/etc/httpd/conf.d"})
 	dirs := b.ProbeDirs()

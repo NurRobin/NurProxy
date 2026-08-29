@@ -51,10 +51,16 @@ func TestRepairRequestRejectsUnknownDiagnosticAndInjectedFields(t *testing.T) {
 
 type recoveryStreamBackend struct {
 	candidate proxy.RecoveryCandidate
+	info      proxy.Info
 	order     []string
 }
 
-func (b *recoveryStreamBackend) Info() proxy.Info { return proxy.Info{Kind: proxy.KindNginx} }
+func (b *recoveryStreamBackend) Info() proxy.Info {
+	if b.info.Kind == "" {
+		return proxy.Info{Kind: proxy.KindNginx}
+	}
+	return b.info
+}
 func (b *recoveryStreamBackend) InspectRecovery(context.Context, proxy.RecoveryDesired) ([]proxy.RecoveryCandidate, error) {
 	b.order = append(b.order, "inspect")
 	if b.candidate.Action == "" {
@@ -127,6 +133,64 @@ func TestApplyIntentsRepairsBeforeOneFreshReconcile(t *testing.T) {
 	}
 	if got := strings.Join(backend.order, ","); got != "inspect,recover,validate,activate,ensure,clear,prune,inspect" {
 		t.Fatalf("order=%s", got)
+	}
+}
+
+func TestApplyIntentsAllowsOwnedActivationSymlinkFromExactEnabledRoot(t *testing.T) {
+	root := t.TempDir()
+	available := filepath.Join(root, "sites-available")
+	enabled := filepath.Join(root, "sites-enabled")
+	data := filepath.Join(root, "data")
+	for _, dir := range []string{available, enabled} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	config := filepath.Join(available, "nurproxy-stale.example.test.conf")
+	link := filepath.Join(enabled, filepath.Base(config))
+	if err := os.WriteFile(config, []byte(proxy.StampManagedArtifact("server {}\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(config, link); err != nil {
+		t.Fatal(err)
+	}
+	configID, err := proxy.CaptureRecoveryPath(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkID, err := proxy.CaptureRecoveryPath(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &recoveryStreamBackend{
+		candidate: proxy.NewRecoveryCandidate(recoverymodel.ActionPruneManagedOrphan, "stale.example.test", configID, linkID),
+		info: proxy.Info{
+			Kind:         proxy.KindNginx,
+			ConfigDir:    available,
+			ManagedRoots: []string{available, enabled},
+		},
+	}
+	store, err := recovery.NewSnapshotStore(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	guard, err := recovery.NewPathGuard(data, available, enabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := recovery.NewCoordinator("agent-1", backend, store, recovery.NewBreaker(), nil, guard, nil)
+	coordinator.SetContext(recovery.Context{AgentID: "agent-1", ProxyInfo: backend.info, ManagedRoots: backend.info.ManagedRoots, AgentDataRoot: data})
+	coordinator.SetPolicy(true)
+	New("http://orchestrator.invalid", "agent-1", "token", backend, health.New()).WithRecovery(coordinator).
+		applyIntents(context.Background(), proxymodel.IntentSet{})
+	for _, path := range []string{link, config} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("owned recovery path %q remains: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(root); err != nil {
+		t.Fatalf("broad parent was changed: %v", err)
 	}
 }
 

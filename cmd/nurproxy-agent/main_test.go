@@ -3,10 +3,25 @@ package main
 import (
 	"context"
 	"os"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 )
+
+func TestRecoveryRootsForBackendIncludesDataAndExactBackendRoots(t *testing.T) {
+	info := proxy.Info{
+		Kind:         proxy.KindNginx,
+		ConfigDir:    "/etc/nginx/sites-available",
+		ManagedRoots: []string{"/etc/nginx/sites-available", "/etc/nginx/sites-enabled"},
+	}
+	want := []string{"/var/lib/nurproxy-agent", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled"}
+	if got := recoveryRootsForBackend(info, "/var/lib/nurproxy-agent"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("recovery roots = %v, want %v", got, want)
+	}
+}
 
 // TestWatchSignals asserts the signal→cancel wiring that unblocks the adoption
 // wait. The old code never canceled ctx on a signal during WaitForAdoption, so
