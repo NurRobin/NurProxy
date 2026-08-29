@@ -3,6 +3,7 @@
 package helper
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -39,18 +40,20 @@ type managedApplyAction struct {
 }
 
 type managedCompiledFile struct {
-	Path    string `json:"path"`
-	SHA256  string `json:"sha256"`
-	Mode    uint32 `json:"mode"`
-	Class   string `json:"class"`
-	Delete  bool   `json:"delete"`
-	Content []byte `json:"-"`
+	Path     string `json:"path"`
+	SHA256   string `json:"sha256"`
+	Mode     uint32 `json:"mode"`
+	Class    string `json:"class"`
+	Delete   bool   `json:"delete"`
+	Preserve bool   `json:"preserve"`
+	Content  []byte `json:"-"`
 }
 
 type managedCompiledLink struct {
-	Path   string `json:"path"`
-	Target string `json:"target"`
-	Delete bool   `json:"delete"`
+	Path     string `json:"path"`
+	Target   string `json:"target"`
+	Delete   bool   `json:"delete"`
+	Preserve bool   `json:"preserve"`
 }
 
 type managedCompilation struct {
@@ -182,7 +185,7 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		mutated = mutated || removed
 	}
 	for _, file := range compilation.Files {
-		if file.Delete {
+		if file.Delete || file.Preserve {
 			continue
 		}
 		if err := installManagedFile(file, a.ownerUID); err != nil {
@@ -191,7 +194,7 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		mutated = true
 	}
 	for _, link := range compilation.Links {
-		if link.Delete {
+		if link.Delete || link.Preserve {
 			continue
 		}
 		if err := installManagedLink(link, a.ownerUID); err != nil {
@@ -200,7 +203,7 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		mutated = true
 	}
 	if !mutated {
-		return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already empty"}, nil
+		return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged"}, nil
 	}
 	if err := a.host.Validate(ctx, a.target); err != nil {
 		return ActionResult{Mutated: true}, fmt.Errorf("native proxy validation failed after managed commit: %w", err)
@@ -286,22 +289,31 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		if route.BasicAuth != nil {
 			compilation.Files = append(compilation.Files, compiledFile(authPath, []byte(route.BasicAuth.Username+":"+route.BasicAuth.PasswordHash+"\n"), 0o600, "secret"))
 		}
+		available := filepath.Join(a.layout.AvailableDir, managedFileName(a.target.Kind, route.Host))
 		var content string
+		preserve := false
 		if route.IsRaw() {
 			if a.target.Kind != "nginx" || nginxparse.ValidateManaged(route.Raw.Content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}) != nil {
-				return managedCompilation{}, fmt.Errorf("raw custom configuration is not admitted by policy %s", a.layout.CustomPolicyVersion)
+				content = route.Raw.Content
+				preserve = true
+			} else {
+				content = route.Raw.Content
 			}
-			content = route.Raw.Content
 		} else {
 			content, err = a.renderRoute(route, certPath, keyPath, authPath)
 		}
 		if err != nil {
 			return managedCompilation{}, err
 		}
-		available := filepath.Join(a.layout.AvailableDir, managedFileName(a.target.Kind, route.Host))
-		compilation.Files = append(compilation.Files, compiledFile(available, []byte(proxy.StampManagedArtifact(content)), 0o644, "vhost"))
+		compiledContent := []byte(proxy.StampManagedArtifact(content))
+		if preserve {
+			compiledContent = []byte(content)
+		}
+		file := compiledFile(available, compiledContent, 0o644, "vhost")
+		file.Preserve = preserve
+		compilation.Files = append(compilation.Files, file)
 		if a.layout.EnabledDir != "" {
-			compilation.Links = append(compilation.Links, managedCompiledLink{Path: filepath.Join(a.layout.EnabledDir, filepath.Base(available)), Target: available})
+			compilation.Links = append(compilation.Links, managedCompiledLink{Path: filepath.Join(a.layout.EnabledDir, filepath.Base(available)), Target: available, Preserve: preserve})
 		}
 	}
 	for _, deletion := range intent.DeletionSet {
@@ -474,7 +486,13 @@ func (a *managedApplyAction) fingerprint(ctx context.Context, compilation manage
 	}
 	current := make([]managedFileSnapshot, 0, len(compilation.Files)+len(compilation.Links))
 	for _, file := range compilation.Files {
-		item, err := inspectManagedPath(file.Path, file.Class, "", a.ownerUID)
+		var item managedFileSnapshot
+		var err error
+		if file.Preserve {
+			item, err = inspectPreservedManagedFile(file, a.ownerUID)
+		} else {
+			item, err = inspectManagedPath(file.Path, file.Class, "", a.ownerUID)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -484,6 +502,9 @@ func (a *managedApplyAction) fingerprint(ctx context.Context, compilation manage
 		item, err := inspectManagedPath(link.Path, "link", link.Target, a.ownerUID)
 		if err != nil {
 			return "", err
+		}
+		if link.Preserve && !item.Exists {
+			return "", fmt.Errorf("policy-foreign raw configuration has no exact live activation link")
 		}
 		current = append(current, item)
 	}
@@ -502,13 +523,16 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 			return fmt.Errorf("managed compilation contains an invalid file")
 		}
 		if file.Delete {
-			if file.SHA256 != "" || file.Mode != 0 || len(file.Content) != 0 {
+			if file.Preserve || file.SHA256 != "" || file.Mode != 0 || len(file.Content) != 0 {
 				return fmt.Errorf("managed compilation contains an invalid file deletion")
 			}
 			continue
 		}
 		if !validDigest(file.SHA256) || (file.Mode != 0o600 && file.Mode != 0o644) {
 			return fmt.Errorf("managed compilation contains invalid file content")
+		}
+		if file.Preserve && file.Class != "vhost" {
+			return fmt.Errorf("managed compilation preserves an unsupported file class")
 		}
 		digest := sha256.Sum256(file.Content)
 		if hex.EncodeToString(digest[:]) != file.SHA256 {
@@ -519,8 +543,40 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 		if validatePrivatePath(link.Path) != nil || validatePrivatePath(link.Target) != nil {
 			return fmt.Errorf("managed compilation contains an invalid activation link")
 		}
+		if link.Delete && link.Preserve {
+			return fmt.Errorf("managed compilation contains an invalid preserved link deletion")
+		}
 	}
 	return nil
+}
+
+func inspectPreservedManagedFile(file managedCompiledFile, ownerUID uint32) (managedFileSnapshot, error) {
+	item := managedFileSnapshot{Path: file.Path, Content: []byte{}}
+	info, err := os.Lstat(file.Path)
+	if err != nil {
+		return item, fmt.Errorf("policy-foreign raw configuration is not already present: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Uid != ownerUID || info.Mode().Perm()&0o022 != 0 || info.Size() < 0 || info.Size() > maxConfigFileBytes {
+		return item, fmt.Errorf("policy-foreign raw configuration is not a protected privileged file")
+	}
+	content, err := readNoFollowFile(file.Path, info.Size())
+	if err != nil {
+		return item, err
+	}
+	exact := bytes.Equal(content, file.Content)
+	if !exact {
+		exact = bytes.Equal(content, []byte(proxy.StampManagedArtifact(string(file.Content))))
+	}
+	if !exact {
+		return item, fmt.Errorf("policy-foreign raw configuration differs from the protected live file")
+	}
+	item.Exists = true
+	item.Mode = uint32(info.Mode())
+	item.UID = stat.Uid
+	item.GID = stat.Gid
+	item.Content = content
+	return item, nil
 }
 
 func removeManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error) {
@@ -644,6 +700,9 @@ func captureManagedSnapshot(compilation managedCompilation, ownerUID uint32) (ma
 	}
 	snapshot := managedApplySnapshot{Files: make([]managedFileSnapshot, 0, len(compilation.Files)+len(compilation.Links))}
 	for _, file := range compilation.Files {
+		if file.Preserve {
+			continue
+		}
 		item, err := inspectManagedPath(file.Path, file.Class, "", ownerUID)
 		if err != nil {
 			return managedApplySnapshot{}, err
@@ -651,6 +710,9 @@ func captureManagedSnapshot(compilation managedCompilation, ownerUID uint32) (ma
 		snapshot.Files = append(snapshot.Files, item)
 	}
 	for _, link := range compilation.Links {
+		if link.Preserve {
+			continue
+		}
 		item, err := inspectManagedPath(link.Path, "link", link.Target, ownerUID)
 		if err != nil {
 			return managedApplySnapshot{}, err

@@ -302,6 +302,77 @@ func TestManagedApplyAdmitsParserBoundedNginxCustomConfiguration(t *testing.T) {
 	}
 }
 
+func TestManagedApplyPreservesExactExistingPolicyForeignRawConfiguration(t *testing.T) {
+	action, intent, host := newManagedApplyTest(t)
+	action.agentUID = uint32(os.Getuid()) + 1
+	raw := `map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+server {
+    listen 80;
+    server_name app.example.com;
+    location / { proxy_pass http://10.0.0.2:8080; }
+}`
+	intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: raw}
+	available := filepath.Join(action.layout.AvailableDir, managedFileName("nginx", "app.example.com"))
+	enabled := filepath.Join(action.layout.EnabledDir, filepath.Base(available))
+	if err := os.WriteFile(available, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(available, enabled); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(available)
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := action.Plan(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := helperprotocol.ManagedApplyPlan{
+		OperationID: intent.OperationID, CustomPolicyVersion: material.CustomPolicyVersion,
+		ExecutionPlanHash: material.ExecutionPlanHash, ResourceFingerprint: material.ResourceFingerprint,
+		RollbackCoverage: material.RollbackCoverage,
+	}
+	prepared, err := action.Prepare(context.Background(), intent.OperationID, plan, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := action.loadSnapshot(intent.OperationID, prepared)
+	if err != nil || len(snapshot.Files) != 0 {
+		t.Fatalf("preserved raw targets entered rollback snapshot: %+v, %v", snapshot, err)
+	}
+	result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared)
+	if err != nil || result.Mutated || !result.Validated || len(host.mutations) != 0 {
+		t.Fatalf("preserved raw execute = %+v, %v; mutations=%v", result, err, host.mutations)
+	}
+	after, err := os.Lstat(available)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("preserved raw file identity changed: %v", err)
+	}
+	if err := os.Remove(enabled); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := action.Plan(context.Background(), intent); err == nil {
+		t.Fatal("policy-foreign raw config was admitted without its exact live activation link")
+	}
+}
+
+func TestManagedApplyRefusesPolicyForeignRawConfigurationWhenLiveBytesDiffer(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	action.agentUID = uint32(os.Getuid()) + 1
+	intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: "server { listen 8443; }"}
+	available := filepath.Join(action.layout.AvailableDir, managedFileName("nginx", "app.example.com"))
+	if err := os.WriteFile(available, []byte("server { listen 80; }"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := action.Plan(context.Background(), intent); err == nil {
+		t.Fatal("policy-foreign raw config was admitted despite different live bytes")
+	}
+}
+
 func TestManagedApplyReadsCertificatesBeneathPrivateStageAndBindsTheirHashes(t *testing.T) {
 	action, intent, _ := newManagedApplyTest(t)
 	intent.Routes[0].Route.TLS.Policy = proxymodel.TLSPolicyCentral
