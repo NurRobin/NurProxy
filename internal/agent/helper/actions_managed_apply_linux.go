@@ -311,6 +311,20 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 				return managedCompilation{}, err
 			}
 		}
+		if !preserve && !route.IsRaw() && route.BasicAuth != nil {
+			legacyAuthPath := strings.TrimSuffix(available, ".conf") + ".htpasswd"
+			legacyContent, legacyErr := a.renderRoute(route, certPath, keyPath, legacyAuthPath)
+			if legacyErr != nil {
+				return managedCompilation{}, legacyErr
+			}
+			preserve, err = exactUnmarkedManagedFile(available, []byte(legacyContent), a.ownerUID)
+			if err != nil {
+				return managedCompilation{}, err
+			}
+			if preserve {
+				content = legacyContent
+			}
+		}
 		compiledContent := []byte(proxy.StampManagedArtifact(content))
 		if preserve {
 			compiledContent = []byte(content)

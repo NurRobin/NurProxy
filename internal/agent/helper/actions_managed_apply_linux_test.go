@@ -414,6 +414,36 @@ func TestManagedApplyPreservesExactUnmarkedLegacyGeneratedConfiguration(t *testi
 	}
 }
 
+func TestManagedApplyPreservesExactLegacyGeneratedBasicAuthSidecarLayout(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	action.agentUID = uint32(os.Getuid()) + 1
+	intent.Routes[0].Route.BasicAuth = &proxymodel.BasicAuth{Username: "operator", PasswordHash: "$2a$10$abcdefghijklmnopqrstuuuuuuuuuuuuuuuuuuuuuuuuuuuu"}
+	available := filepath.Join(action.layout.AvailableDir, managedFileName("nginx", "app.example.com"))
+	legacyAuthPath := strings.TrimSuffix(available, ".conf") + ".htpasswd"
+	legacyContent, err := action.renderRoute(intent.Routes[0].Route, "", "", legacyAuthPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(available, []byte(legacyContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	enabled := filepath.Join(action.layout.EnabledDir, filepath.Base(available))
+	if err := os.Symlink(available, enabled); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyAuthPath, []byte("operator:hash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	material, err := action.Plan(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compilation, err := action.compile(intent)
+	if err != nil || len(compilation.Files) != 2 || !compilation.Files[1].Preserve || !compilation.Links[0].Preserve || material.ExecutionPlanHash == "" {
+		t.Fatalf("legacy auth sidecar route was not preserve-only: %+v, %v", compilation, err)
+	}
+}
+
 func TestManagedApplyRefusesPolicyForeignRawConfigurationWhenLiveBytesDiffer(t *testing.T) {
 	action, intent, _ := newManagedApplyTest(t)
 	action.agentUID = uint32(os.Getuid()) + 1
