@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"syscall"
 
@@ -117,17 +116,38 @@ func main() {
 	}
 
 	// Load or generate encryption key
-	cryptoKey, err := crypto.LoadOrGenerateKey(dataRoot.BoundPath("encryption.key"))
+	encryptionFile, encryptionCreated, err := dataRoot.OpenOrCreateRegular("encryption.key")
+	if err != nil {
+		log.Fatalf("failed to securely open encryption key: %v", err)
+	}
+	defer encryptionFile.Close()
+	cryptoKey, err := crypto.LoadOrGenerateKeyFile(encryptionFile, encryptionCreated)
 	if err != nil {
 		log.Fatalf("failed to load encryption key: %v", err)
 	}
+	if same, err := dataRoot.SameFile("encryption.key", encryptionFile); err != nil || !same {
+		log.Fatalf("encryption key name changed during startup")
+	}
 
 	// Open database
-	database, err := db.Open(dataRoot.BoundPath("nurproxy.db"), cryptoKey)
+	databaseFile, _, err := dataRoot.OpenOrCreateRegular("nurproxy.db")
+	if err != nil {
+		log.Fatalf("failed to securely open database file: %v", err)
+	}
+	defer databaseFile.Close()
+	databasePath, err := dataperms.BoundFilePath(databaseFile)
+	if err != nil {
+		log.Fatalf("failed to bind database file: %v", err)
+	}
+	database, err := db.Open(databasePath, cryptoKey)
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer database.Close()
+	if same, err := dataRoot.SameFile("nurproxy.db", databaseFile); err != nil || !same {
+		_ = database.Close()
+		log.Fatalf("database name changed during startup")
+	}
 	if _, err := dataRoot.Harden(); err != nil {
 		log.Fatalf("failed to harden runtime data files: %v", err)
 	}
@@ -181,7 +201,27 @@ func main() {
 	// inbound; certs ride the agent-initiated stream (§7). Started only when an
 	// ACME account can be constructed; failures here are non-fatal (the built-in
 	// Caddy self-ACME fallback keeps hosts served).
-	renewer := startRenewer(rootCtx, database, rec, dataRoot.BoundPath(""), dryRunConfig{dns: dnsDryRun, acme: acmeDryRun, failMode: acmeFailMode})
+	accountFile, accountCreated, accountErr := dataRoot.OpenOrCreateRegular("acme-account.key")
+	if accountErr != nil {
+		log.Printf("tls: renewal disabled: securely opening account key: %v", accountErr)
+	}
+	if accountFile != nil {
+		defer accountFile.Close()
+	}
+	var accountKey any
+	if accountFile != nil {
+		accountKey, accountErr = orchtls.LoadOrGenerateAccountKeyFile(accountFile, accountCreated)
+		if accountErr == nil {
+			if same, err := dataRoot.SameFile("acme-account.key", accountFile); err != nil || !same {
+				accountErr = fmt.Errorf("account key name changed during startup")
+			}
+		}
+		if accountErr != nil {
+			log.Printf("tls: renewal disabled: %v", accountErr)
+			accountKey = nil
+		}
+	}
+	renewer := startRenewer(rootCtx, database, rec, accountKey, dryRunConfig{dns: dnsDryRun, acme: acmeDryRun, failMode: acmeFailMode})
 
 	// Create API server, wiring in the hub + reconciler so the stream endpoint
 	// works and domain changes push to connected agents immediately.
@@ -350,10 +390,8 @@ type dryRunConfig struct {
 	failMode string
 }
 
-func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, dataDir string, dry dryRunConfig) *orchtls.Renewer {
-	accountKey, err := orchtls.LoadOrGenerateAccountKey(filepath.Join(dataDir, "acme-account.key"))
-	if err != nil {
-		log.Printf("tls: renewal disabled: %v", err)
+func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, accountKey any, dry dryRunConfig) *orchtls.Renewer {
+	if accountKey == nil {
 		return nil
 	}
 

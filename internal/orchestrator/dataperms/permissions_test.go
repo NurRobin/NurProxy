@@ -185,6 +185,45 @@ func TestBoundDirSurvivesPathReplacement(t *testing.T) {
 	}
 }
 
+func TestBoundFilePathSurvivesFinalNameReplacement(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dataDir, "encryption.key")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := OpenDir(dataDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	held, err := dir.OpenRegular("encryption.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := os.Rename(path, path+".old"); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, path); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := BoundFilePath(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(bound)
+	if err != nil || string(got) != "original" {
+		t.Fatalf("bound file = %q, %v", got, err)
+	}
+}
+
 func TestPrivateUmaskRestrictsNewFiles(t *testing.T) {
 	old := unix.Umask(0)
 	defer unix.Umask(old)
@@ -263,7 +302,19 @@ func TestSQLiteDatabaseAndLiveSidecarsConvergeToPrivateModes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dir.Close()
-	database, err := db.Open(dir.BoundPath("nurproxy.db"), key)
+	dbFile, created, err := dir.OpenOrCreateRegular("nurproxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbFile.Close()
+	if !created {
+		t.Fatal("new database was not reported created")
+	}
+	dbPath, err := BoundFilePath(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(dbPath, key)
 	if err != nil {
 		t.Fatal(err)
 	}

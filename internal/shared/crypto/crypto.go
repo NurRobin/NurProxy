@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -59,6 +60,41 @@ func LoadOrGenerateKey(path string) ([]byte, error) {
 	}
 	if err := SaveKey(key, path); err != nil {
 		return nil, fmt.Errorf("saving generated key: %w", err)
+	}
+	return key, nil
+}
+
+func LoadOrGenerateKeyFile(file *os.File, created bool) ([]byte, error) {
+	if err := file.Chmod(0o600); err != nil {
+		return nil, err
+	}
+	if !created {
+		key := make([]byte, keySize)
+		n, err := file.ReadAt(key, 0)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("loading key descriptor: %w", err)
+		}
+		info, statErr := file.Stat()
+		if statErr != nil {
+			return nil, statErr
+		}
+		if n != keySize || info.Size() != keySize {
+			return nil, fmt.Errorf("invalid key size: got %d bytes, want %d", info.Size(), keySize)
+		}
+		return key, nil
+	}
+	key, err := GenerateKey()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.WriteAt(key, 0); err != nil {
+		return nil, fmt.Errorf("saving generated key: %w", err)
+	}
+	if err := file.Truncate(int64(len(key))); err != nil {
+		return nil, err
+	}
+	if err := file.Sync(); err != nil {
+		return nil, err
 	}
 	return key, nil
 }

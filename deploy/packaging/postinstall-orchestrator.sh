@@ -10,7 +10,7 @@ if [ -r /etc/nurproxy/nurproxy.env ]; then
     data_dir=$configured_data_dir
   fi
 fi
-/usr/bin/nurproxy permissions --data-dir "$data_dir"
+/usr/bin/nurproxy permissions --data-dir "$data_dir" --systemd-drop-in /etc/systemd/system/nurproxy.service.d/data-dir.conf
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload

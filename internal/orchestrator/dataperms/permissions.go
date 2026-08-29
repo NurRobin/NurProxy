@@ -77,14 +77,6 @@ func (d *Dir) Close() error {
 	d.fd = -1
 	return err
 }
-func (d *Dir) BoundPath(name string) string {
-	root := "/proc/self/fd"
-	if _, err := os.Stat(root); err != nil {
-		root = "/dev/fd"
-	}
-	return fmt.Sprintf("%s/%d/%s", root, d.fd, name)
-}
-
 func (d *Dir) OpenRegular(name string) (*os.File, error) {
 	fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
@@ -100,6 +92,46 @@ func (d *Dir) OpenRegular(name string) (*os.File, error) {
 		return nil, fmt.Errorf("%s is not a unique regular file", name)
 	}
 	return os.NewFile(uintptr(fd), name), nil
+}
+
+func (d *Dir) OpenOrCreateRegular(name string) (*os.File, bool, error) {
+	for {
+		fd, err := unix.Openat(d.fd, name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+		created := false
+		if err == unix.ENOENT {
+			fd, err = unix.Openat(d.fd, name, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, FileMode)
+			created = err == nil
+			if err == unix.EEXIST {
+				continue
+			}
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			_ = unix.Close(fd)
+			return nil, false, err
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+			_ = unix.Close(fd)
+			return nil, false, fmt.Errorf("%s is not a unique regular file", name)
+		}
+		if err := unix.Fchmod(fd, FileMode); err != nil {
+			_ = unix.Close(fd)
+			return nil, false, err
+		}
+		return os.NewFile(uintptr(fd), name), created, nil
+	}
+}
+
+func BoundFilePath(file *os.File) (string, error) {
+	for _, root := range []string{"/proc/self/fd", "/dev/fd"} {
+		if info, err := os.Stat(root); err == nil && info.IsDir() {
+			return fmt.Sprintf("%s/%d", root, file.Fd()), nil
+		}
+	}
+	return "", fmt.Errorf("secure descriptor-backed file paths are unavailable on this platform")
 }
 
 func (d *Dir) SameFile(name string, opened *os.File) (bool, error) {

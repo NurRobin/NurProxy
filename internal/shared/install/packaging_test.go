@@ -27,7 +27,7 @@ func TestOrchestratorPostinstallHardensBeforeStarting(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(got)
-	command := "/usr/bin/nurproxy permissions --data-dir \"$data_dir\""
+	command := "/usr/bin/nurproxy permissions --data-dir \"$data_dir\" --systemd-drop-in /etc/systemd/system/nurproxy.service.d/data-dir.conf"
 	harden := strings.Index(script, command)
 	start := strings.Index(script, "systemctl enable --now nurproxy.service")
 	if harden < 0 || start < 0 || harden > start {

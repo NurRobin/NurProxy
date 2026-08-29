@@ -1,9 +1,57 @@
 package install
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestRenderDataDirDropInPinsExactWritablePath(t *testing.T) {
+	got, err := RenderDataDirDropIn("/srv/nurproxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "[Service]\nReadWritePaths=\nReadWritePaths=/srv/nurproxy\n"
+	if got != want {
+		t.Fatalf("drop-in = %q, want %q", got, want)
+	}
+}
+
+func TestRenderDataDirDropInRejectsUnsafeOrSandboxInaccessiblePaths(t *testing.T) {
+	for _, path := range []string{"relative/data", "/", "/srv/../etc", "/srv/bad path", "/home/main/data", "/root/data", "/tmp/data", "/var/tmp/data", "/proc/data", "/sys/data", "/dev/data", "/run/user/1000/data"} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := RenderDataDirDropIn(path); err == nil {
+				t.Fatalf("accepted unsafe data dir %q", path)
+			}
+		})
+	}
+}
+
+func TestWriteDataDirDropInAtomicallyReplacesLinkedDestination(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "data-dir.conf")
+	if err := os.Symlink(outside, dest); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteDataDirDropIn(dest, "/srv/nurproxy"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "unchanged" {
+		t.Fatalf("outside changed: %q", got)
+	}
+	info, err := os.Lstat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o644 {
+		t.Fatalf("drop-in mode/type = %v", info.Mode())
+	}
+}
 
 func TestRenderUnitHardening(t *testing.T) {
 	s := Service{

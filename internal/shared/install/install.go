@@ -158,6 +158,63 @@ func RenderEnv(env map[string]string) string {
 	return b.String()
 }
 
+func RenderDataDirDropIn(dataDir string) (string, error) {
+	if !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir || dataDir == string(filepath.Separator) {
+		return "", fmt.Errorf("data dir must be a canonical absolute non-root path")
+	}
+	for _, r := range dataDir {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '/' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return "", fmt.Errorf("data dir contains an unsafe character")
+	}
+	for _, blocked := range []string{"/home", "/root", "/tmp", "/var/tmp", "/proc", "/sys", "/dev", "/run/user"} {
+		if dataDir == blocked || strings.HasPrefix(dataDir, blocked+"/") {
+			return "", fmt.Errorf("data dir %s is inaccessible under the packaged service sandbox", dataDir)
+		}
+	}
+	return "[Service]\nReadWritePaths=\nReadWritePaths=" + dataDir + "\n", nil
+}
+
+func WriteDataDirDropIn(path, dataDir string) error {
+	body, err := RenderDataDirDropIn(dataDir)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating drop-in directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".data-dir.conf-*")
+	if err != nil {
+		return fmt.Errorf("creating data-dir drop-in: %w", err)
+	}
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := tmp.WriteString(body); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("installing data-dir drop-in: %w", err)
+	}
+	committed = true
+	return nil
+}
+
 // runTool runs an external service tool (systemctl, launchctl, rc-service,
 // sysrc, …), streaming output. It is a no-op with a warning when the tool
 // isn't present, so installs proceed up to the point of service activation on

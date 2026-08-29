@@ -76,6 +76,70 @@ func TestLoadKey_NotFound(t *testing.T) {
 	}
 }
 
+func TestLoadOrGenerateKeyFileFreshAndExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := LoadOrGenerateKeyFile(f, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(key) != 32 {
+		t.Fatalf("key length = %d", len(key))
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err = os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	loaded, err := LoadOrGenerateKeyFile(f, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(key, loaded) {
+		t.Fatal("existing descriptor key changed")
+	}
+}
+
+func TestLoadOrGenerateKeyFileDoesNotFollowFinalNameSwap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "key")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	held := path + ".held"
+	if err := os.Rename(path, held); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrGenerateKeyFile(f, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(external); string(got) != "external" {
+		t.Fatalf("external changed: %q", got)
+	}
+	info, err := os.Stat(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 32 {
+		t.Fatalf("held key size=%v", info.Size())
+	}
+}
+
 func TestLoadOrGenerateKey_New(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "new.key")

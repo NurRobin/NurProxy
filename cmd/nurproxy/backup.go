@@ -106,7 +106,11 @@ func backupDataDir(dataDir, outPath string) error {
 	}
 	defer func() { _ = os.RemoveAll(snapDir) }()
 	snapPath := filepath.Join(snapDir, dbFileName)
-	if err := db.SnapshotTo(source.BoundPath(dbFileName), snapPath); err != nil {
+	boundDBPath, err := dataperms.BoundFilePath(dbFile)
+	if err != nil {
+		return fmt.Errorf("binding database snapshot source: %w", err)
+	}
+	if err := db.SnapshotTo(boundDBPath, snapPath); err != nil {
 		return err
 	}
 	if same, err := source.SameFile(dbFileName, dbFile); err != nil || !same {
