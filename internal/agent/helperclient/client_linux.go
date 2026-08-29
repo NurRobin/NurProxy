@@ -249,8 +249,10 @@ func (c *Client) exchange(ctx context.Context, payload []byte) ([]byte, error) {
 	if err != nil || credentials.UID != c.expectedRootUID {
 		return nil, fmt.Errorf("root helper peer credentials are invalid")
 	}
-	if err := c.verifyPeerExecutable(credentials.PID); err != nil {
-		return nil, fmt.Errorf("root helper executable identity is invalid: %w", err)
+	if credentials.PID != 1 {
+		if err := c.verifyPeerExecutable(credentials.PID); err != nil {
+			return nil, fmt.Errorf("root helper executable identity is invalid: %w", err)
+		}
 	}
 	deadline := time.Now().Add(requestTimeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/agent/helper"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -238,6 +239,43 @@ func TestClientHelloRejectsNonRootPeerBeforeProtocol(t *testing.T) {
 	defer cancel()
 	if _, err := client.Hello(ctx); err == nil {
 		t.Fatal("non-root helper peer was accepted")
+	}
+}
+
+func TestClientHelloTrustsRootPIDOneSocketActivatorWithoutProcfsLookup(t *testing.T) {
+	client := helloClientFixture(t, nil)
+	client.expectedRootUID = 0
+	client.peerCredentials = func(net.Conn) (helper.Credentials, error) {
+		return helper.Credentials{PID: 1, UID: 0}, nil
+	}
+	client.verifyPeerExecutable = func(int32) error {
+		t.Fatal("PID 1 executable lookup must not be required through restricted procfs")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := client.SignedHello(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientHelloStillVerifiesEveryNonInitRootPeerExecutable(t *testing.T) {
+	client := helloClientFixture(t, nil)
+	client.expectedRootUID = 0
+	client.peerCredentials = func(net.Conn) (helper.Credentials, error) {
+		return helper.Credentials{PID: 2, UID: 0}, nil
+	}
+	sentinel := errors.New("unexpected executable")
+	client.verifyPeerExecutable = func(pid int32) error {
+		if pid != 2 {
+			t.Fatalf("pid = %d", pid)
+		}
+		return sentinel
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := client.SignedHello(ctx); !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v", err)
 	}
 }
 
