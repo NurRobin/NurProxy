@@ -30,6 +30,17 @@ type safeAutoRepairRequest struct {
 	Mode string `json:"mode"`
 }
 
+type recoveryBreakerView struct {
+	Open      bool       `json:"open"`
+	Reason    string     `json:"reason,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+type recoveryDiagnosticView struct {
+	recoverymodel.Diagnostic
+	Breaker recoveryBreakerView `json:"breaker"`
+}
+
 func (request *manualRepairRequest) UnmarshalJSON(data []byte) error {
 	type plain manualRepairRequest
 	var decoded plain
@@ -79,7 +90,21 @@ func (s *Server) handleListRecoveryDiagnostics(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, "failed to list recovery diagnostics")
 		return
 	}
-	writeJSON(w, http.StatusOK, diagnostics)
+	views := make([]recoveryDiagnosticView, 0, len(diagnostics))
+	now := time.Now().UTC()
+	for _, diagnostic := range diagnostics {
+		view := recoveryDiagnosticView{Diagnostic: diagnostic}
+		if diagnostic.ProposedAction.Valid() {
+			status, err := s.db.GetRepairBreakerStatus(id, diagnostic.ProposedAction, diagnostic.ResourceFingerprint, now)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to inspect recovery circuit breaker")
+				return
+			}
+			view.Breaker = recoveryBreakerView{Open: status.Open, Reason: status.Reason, ExpiresAt: status.ExpiresAt}
+		}
+		views = append(views, view)
+	}
+	writeJSON(w, http.StatusOK, views)
 }
 
 func (s *Server) handleListRepairs(w http.ResponseWriter, r *http.Request) {

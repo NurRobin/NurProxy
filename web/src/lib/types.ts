@@ -215,6 +215,13 @@ export interface RecoveryDiagnostic {
   first_seen_at: string;
   last_seen_at: string;
   occurrences: number;
+  breaker: RecoveryBreaker;
+}
+
+export interface RecoveryBreaker {
+  open: boolean;
+  reason?: 'failure_threshold' | 'rollback_failed_latched';
+  expires_at?: string;
 }
 
 export interface RecoveryStep {

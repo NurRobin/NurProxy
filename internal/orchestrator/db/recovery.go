@@ -911,26 +911,41 @@ func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fing
 	return repairBreakerOpen(d.read, agentID, action, fingerprint, now)
 }
 
+type RepairBreakerStatus struct {
+	Open      bool
+	Reason    string
+	ExpiresAt *time.Time
+}
+
+func (d *DB) GetRepairBreakerStatus(agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (RepairBreakerStatus, error) {
+	return repairBreakerStatus(d.read, agentID, action, fingerprint, now)
+}
+
 type recoveryQueryer interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 	QueryRow(query string, args ...any) *sql.Row
 }
 
 func repairBreakerOpen(q recoveryQueryer, agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (bool, error) {
+	status, err := repairBreakerStatus(q, agentID, action, fingerprint, now)
+	return status.Open, err
+}
+
+func repairBreakerStatus(q recoveryQueryer, agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (RepairBreakerStatus, error) {
 	if strings.TrimSpace(agentID) == "" || !action.Valid() || strings.TrimSpace(fingerprint) == "" || now.IsZero() {
-		return false, fmt.Errorf("agent, valid action, fingerprint, and current time are required")
+		return RepairBreakerStatus{}, fmt.Errorf("agent, valid action, fingerprint, and current time are required")
 	}
 	nowNanos, err := recoveryUnixNano(now)
 	if err != nil {
-		return false, fmt.Errorf("encoding repair breaker time: %w", err)
+		return RepairBreakerStatus{}, fmt.Errorf("encoding repair breaker time: %w", err)
 	}
 
 	latched, err := repairRollbackFailedLatched(q, agentID, action, fingerprint)
 	if err != nil {
-		return false, err
+		return RepairBreakerStatus{}, err
 	}
 	if latched {
-		return true, nil
+		return RepairBreakerStatus{Open: true, Reason: "rollback_failed_latched"}, nil
 	}
 
 	var latestReceipt int64
@@ -941,7 +956,7 @@ func repairBreakerOpen(q recoveryQueryer, agentID string, action recoverymodel.A
 		string(recoverymodel.OperationStateSucceeded),
 	).Scan(&latestReceipt)
 	if err != nil && err != sql.ErrNoRows {
-		return false, fmt.Errorf("reading latest repair breaker outcome: %w", err)
+		return RepairBreakerStatus{}, fmt.Errorf("reading latest repair breaker outcome: %w", err)
 	}
 	afterSuccess := int64(math.MinInt64)
 	if err == nil {
@@ -966,28 +981,33 @@ func repairBreakerOpen(q recoveryQueryer, agentID string, action recoverymodel.A
 		string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed), oldest,
 	)
 	if err != nil {
-		return false, fmt.Errorf("reading repair breaker failures: %w", err)
+		return RepairBreakerStatus{}, fmt.Errorf("reading repair breaker failures: %w", err)
 	}
 	defer rows.Close()
 	receiptsDesc := make([]int64, 0, 16)
 	for rows.Next() {
 		var receipt int64
 		if err := rows.Scan(&receipt); err != nil {
-			return false, fmt.Errorf("scanning repair breaker failure: %w", err)
+			return RepairBreakerStatus{}, fmt.Errorf("scanning repair breaker failure: %w", err)
 		}
 		receiptsDesc = append(receiptsDesc, receipt)
 	}
 	if err := rows.Err(); err != nil {
-		return false, fmt.Errorf("reading repair breaker failures: %w", err)
+		return RepairBreakerStatus{}, fmt.Errorf("reading repair breaker failures: %w", err)
 	}
 	for i := len(receiptsDesc) - 3; i >= 0; i-- {
 		third := receiptsDesc[i]
 		first := receiptsDesc[i+2]
 		if third >= openSince && third-first <= failureWindow {
-			return true, nil
+			thirdAt, err := recoveryTimeFromUnixNano(third)
+			if err != nil {
+				return RepairBreakerStatus{}, fmt.Errorf("decoding repair breaker expiry: %w", err)
+			}
+			expiresAt := thirdAt.Add(time.Hour)
+			return RepairBreakerStatus{Open: true, Reason: "failure_threshold", ExpiresAt: &expiresAt}, nil
 		}
 	}
-	return false, nil
+	return RepairBreakerStatus{}, nil
 }
 
 func (d *DB) RepairRollbackFailedLatched(agentID string, action recoverymodel.Action, fingerprint string) (bool, error) {

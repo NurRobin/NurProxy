@@ -5,6 +5,10 @@ export interface RepairAvailability {
   reason?: string;
 }
 
+export function diagnosticActionVisible(diagnostic: RecoveryDiagnostic): boolean {
+  return diagnostic.proposed_action !== '' || diagnostic.hard_change || diagnostic.ownership !== 'nurproxy';
+}
+
 export function recoveryHistory(operations: RecoveryOperation[], diagnosticID: string): RecoveryOperation[] {
   return operations.filter((operation) => operation.diagnostic_id === diagnosticID);
 }
@@ -17,6 +21,13 @@ export function diagnosticLocation(diagnostic: RecoveryDiagnostic): string | nul
     const suffix = diagnostic.evidence.slice(offset + marker.length);
     const line = /^(\d+)(?::\d+)?/.exec(suffix)?.[0];
     if (line) return `${path}:${line}`;
+
+    const apacheMarker = ` of ${path}:`;
+    const apacheOffset = diagnostic.evidence.indexOf(apacheMarker);
+    if (apacheOffset < 0) continue;
+    const apachePrefix = diagnostic.evidence.slice(0, apacheOffset);
+    const apacheLine = /Syntax error on line (\d+)\s*$/i.exec(apachePrefix)?.[1];
+    if (apacheLine) return `${path}:${apacheLine}`;
   }
   return null;
 }
@@ -37,6 +48,9 @@ export function repairAvailability(
   }
   if (_operations.some((operation) => operation.diagnostic_id === _diagnostic.id && !recoveryOperationTerminal(operation))) {
     return { enabled: false, reason: 'operation_active' };
+  }
+  if (_diagnostic.breaker?.open && _diagnostic.breaker.reason !== 'rollback_failed_latched') {
+    return { enabled: false, reason: 'circuit_breaker_open' };
   }
   if (_agent.status === 'offline' || _agent.status === 'pending') {
     return { enabled: false, reason: 'agent_disconnected' };

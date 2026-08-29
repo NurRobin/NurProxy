@@ -120,6 +120,10 @@ func TestRepairBreakerOpenPersistsOneHourFromThirdClusteredFailure(t *testing.T)
 	if err != nil || !open {
 		t.Fatalf("breaker open = %t, err=%v, want true", open, err)
 	}
+	status, err := d.GetRepairBreakerStatus(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now)
+	if err != nil || !status.Open || status.Reason != "failure_threshold" || status.ExpiresAt == nil || !status.ExpiresAt.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("breaker status = %#v, err=%v", status, err)
+	}
 	open, err = d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now.Add(6*time.Minute))
 	if err != nil || open {
 		t.Fatalf("expired breaker open = %t, err=%v, want false", open, err)
@@ -160,6 +164,10 @@ func TestRepairBreakerOpenRequiresClusterAndSuccessClears(t *testing.T) {
 	open, err = d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now)
 	if err != nil || !open {
 		t.Fatalf("rollback_failed open = %t, err=%v, want true", open, err)
+	}
+	status, err := d.GetRepairBreakerStatus(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now)
+	if err != nil || !status.Open || status.Reason != "rollback_failed_latched" || status.ExpiresAt != nil {
+		t.Fatalf("latched breaker status = %#v, err=%v", status, err)
 	}
 
 	success := newUserOperation("op-breaker-success", diag, recoveryTime(5))

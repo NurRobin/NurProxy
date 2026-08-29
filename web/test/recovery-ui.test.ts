@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   diagnosticLocation,
+  diagnosticActionVisible,
   recoveryErrorCode,
   recoveryHistory,
   recoveryOperationTerminal,
   repairAvailability,
 } from '../src/lib/recovery-ui.ts';
+import { pollingActive } from '../src/lib/usePolling.ts';
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../src/lib/types.ts';
 
 const agent = {
@@ -34,6 +36,19 @@ test('only final recovery states stop progress polling', () => {
 
 test('safe typed repairs are executable when the capable agent is available', () => {
   assert.deepEqual(repairAvailability(agent, diagnostic, []), { enabled: true });
+});
+
+test('authoritative open breaker disables a safe manual repair', () => {
+  assert.deepEqual(repairAvailability(agent, { ...diagnostic, breaker: { open: true, reason: 'failure_threshold' } }, []), {
+    enabled: false,
+    reason: 'circuit_breaker_open',
+  });
+});
+
+test('rollback-failed latch keeps the explicit manual validation escape available', () => {
+  assert.deepEqual(repairAvailability(agent, { ...diagnostic, breaker: { open: true, reason: 'rollback_failed_latched' } }, []), {
+    enabled: true,
+  });
 });
 
 test('hard changes stay visible but disabled in stage one', () => {
@@ -64,9 +79,32 @@ test('file and line are extracted only for an affected path', () => {
   assert.equal(diagnosticLocation({
     ...diagnostic,
     affected_paths: ['/etc/nginx/sites-enabled/app.conf'],
-    evidence: 'nginx: [emerg] unexpected } in /etc/nginx/sites-enabled/app.conf:42',
-  }), '/etc/nginx/sites-enabled/app.conf:42');
+    evidence: 'nginx: [emerg] unexpected } in /etc/nginx/sites-enabled/app.conf:42:9',
+  }), '/etc/nginx/sites-enabled/app.conf:42:9');
+  assert.equal(diagnosticLocation({
+    ...diagnostic,
+    affected_paths: ['/etc/apache2/sites-enabled/app.conf'],
+    evidence: 'Syntax error on line 17 of /etc/apache2/sites-enabled/app.conf:\nInvalid command',
+  }), '/etc/apache2/sites-enabled/app.conf:17');
   assert.equal(diagnosticLocation({ ...diagnostic, affected_paths: [], evidence: 'somewhere:7' }), null);
+});
+
+test('production-shaped hard, operator, and system diagnoses stay visible without a typed action', () => {
+  for (const candidate of [
+    { ownership: 'nurproxy', hard_change: true, reason: 'hard_change' },
+    { ownership: 'operator', hard_change: false, reason: 'ownership_not_nurproxy' },
+    { ownership: 'system', hard_change: false, reason: 'ownership_not_nurproxy' },
+  ] as const) {
+    const shaped = {
+      ...diagnostic,
+      ownership: candidate.ownership,
+      hard_change: candidate.hard_change,
+      auto_repair_eligible: false,
+      proposed_action: '',
+    } as RecoveryDiagnostic;
+    assert.equal(diagnosticActionVisible(shaped), true, candidate.ownership);
+    assert.deepEqual(repairAvailability(agent, shaped, []), { enabled: false, reason: candidate.reason });
+  }
 });
 
 test('repair history is scoped to the selected diagnostic', () => {
@@ -76,4 +114,10 @@ test('repair history is scoped to the selected diagnostic', () => {
     { operation_id: 'old', diagnostic_id: 'diag-1' },
   ] as RecoveryOperation[];
   assert.deepEqual(recoveryHistory(history, 'diag-1').map((item) => item.operation_id), ['new', 'old']);
+});
+
+test('hidden polling continues only while a recovery operation is active', () => {
+  assert.equal(pollingActive('hidden', true), true);
+  assert.equal(pollingActive('hidden', false), false);
+  assert.equal(pollingActive('visible', false), true);
 });

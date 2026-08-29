@@ -766,6 +766,25 @@ func TestManualRepairCircuitBreakerRejectsFourthRecentFailure(t *testing.T) {
 		operation = ackRecoveryState(t, h, operation, recoverymodel.OperationStateRollingBack, recoveryAgentToken)
 		_ = ackRecoveryState(t, h, operation, recoverymodel.OperationStateRolledBack, recoveryAgentToken)
 	}
+	diagnosticsResponse := doRequest(t, h, http.MethodGet, "/api/v1/agents/agent-1/diagnostics", nil, cookie)
+	if diagnosticsResponse.Code != http.StatusOK {
+		t.Fatalf("list diagnostics with breaker = %d: %s", diagnosticsResponse.Code, diagnosticsResponse.Body.String())
+	}
+	var diagnostics []struct {
+		ID      string `json:"id"`
+		Breaker struct {
+			Open      bool       `json:"open"`
+			Reason    string     `json:"reason"`
+			ExpiresAt *time.Time `json:"expires_at"`
+		} `json:"breaker"`
+	}
+	if err := json.NewDecoder(diagnosticsResponse.Body).Decode(&diagnostics); err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 1 || diagnostics[0].ID != d.ID || !diagnostics[0].Breaker.Open ||
+		diagnostics[0].Breaker.Reason != "failure_threshold" || diagnostics[0].Breaker.ExpiresAt == nil || !diagnostics[0].Breaker.ExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("diagnostic breaker projection = %#v", diagnostics)
+	}
 	w := doRequest(t, h, http.MethodPost, "/api/v1/agents/agent-1/repairs", map[string]any{"diagnostic_id": d.ID, "action": d.ProposedAction}, cookie)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("fourth repair = %d, want 409: %s", w.Code, w.Body.String())

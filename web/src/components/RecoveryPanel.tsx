@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../lib/types';
 import { api } from '../lib/api';
 import { formatRelativeTime } from '../lib/utils';
-import { diagnosticLocation, recoveryErrorCode, recoveryHistory, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
+import { diagnosticActionVisible, diagnosticLocation, recoveryErrorCode, recoveryHistory, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
 import { usePolling } from '../lib/usePolling';
 import { useToast, errMessage } from './toast-context';
 import Button from './Button';
@@ -18,6 +18,34 @@ interface RecoveryPanelProps {
 
 const severityTone = (severity: RecoveryDiagnostic['severity']) =>
   severity === 'critical' || severity === 'error' ? 'danger' : severity === 'warning' ? 'warning' : 'info';
+
+function OperationDetails({ operation }: { operation: RecoveryOperation }) {
+  const { t } = useTranslation();
+  return (
+    <div className="mt-2 pl-3">
+      <dl className="grid gap-2 text-xs sm:grid-cols-2">
+        <div><dt className="text-fg-faint">{t('recovery.action')}</dt><dd className="text-fg-muted">{t(`recovery.actions.${operation.action}`)}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.operationId')}</dt><dd className="break-all font-mono text-fg-muted">{operation.operation_id}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.started')}</dt><dd className="text-fg-muted">{new Date(operation.started_at).toLocaleString()}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.finished')}</dt><dd className="text-fg-muted">{operation.finished_at ? new Date(operation.finished_at).toLocaleString() : t('recovery.inProgress')}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.snapshot')}</dt><dd className="break-all text-fg-muted">{operation.snapshot_reference || '—'}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.validation')}</dt><dd className="text-fg-muted">{operation.validation_outcome || '—'}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.rollback')}</dt><dd className="text-fg-muted">{operation.rollback_outcome || '—'}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.operationError')}</dt><dd className={operation.error ? 'text-danger-fg' : 'text-fg-muted'}>{operation.error || '—'}</dd></div>
+      </dl>
+      <p className="mt-3 text-xs font-medium text-fg-muted">{t('recovery.steps')}</p>
+      {operation.steps.length > 0 ? (
+        <ol className="mt-1 space-y-1 border-l border-border pl-3">
+          {operation.steps.map((step, index) => (
+            <li key={`${step.at}-${index}`} className="text-xs text-fg-muted">
+              <span className="font-medium text-fg">{t(`recovery.states.${step.state}`)}</span> — {step.summary} · {new Date(step.at).toLocaleString()}
+            </li>
+          ))}
+        </ol>
+      ) : <p className="mt-1 text-xs text-fg-faint">—</p>}
+    </div>
+  );
+}
 
 export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelProps) {
   const { t } = useTranslation();
@@ -50,10 +78,10 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
     }
   }, [agent.id, t]);
 
-  usePolling(fetchRecovery, 3000);
+  const nonTerminal = operations.some((operation) => !recoveryOperationTerminal(operation));
+  usePolling(fetchRecovery, 3000, { keepAliveWhenHidden: nonTerminal });
 
   const activeIDs = useMemo(() => new Set(active.map((diagnostic) => diagnostic.id)), [active]);
-  const nonTerminal = operations.some((operation) => !recoveryOperationTerminal(operation));
 
   async function confirmRepair() {
     if (!repair || !repair.proposed_action) return;
@@ -137,11 +165,11 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
           {diagnostics.map((diagnostic) => {
             const isActive = activeIDs.has(diagnostic.id);
             const related = recoveryHistory(operations, diagnostic.id);
-            const latest = related[0];
             const availability = isActive
               ? repairAvailability(agent, diagnostic, operations)
               : { enabled: false, reason: 'diagnostic_resolved' };
             const location = diagnosticLocation(diagnostic);
+            const validationEscape = diagnostic.breaker.open && diagnostic.breaker.reason === 'rollback_failed_latched';
             return (
               <article key={diagnostic.id} className="rounded-lg border border-border bg-surface-2 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -158,11 +186,15 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                     <p className="mt-1 text-xs text-fg-faint">
                       {t('recovery.ownership')}: {t(`recovery.ownershipValues.${diagnostic.ownership}`)} · {diagnostic.subsystem} · {formatRelativeTime(diagnostic.last_seen_at)} · {t('recovery.occurrences', { count: diagnostic.occurrences })}
                     </p>
+                    <p className="mt-1 text-xs text-fg-faint">{t('recovery.firstSeen')}: {new Date(diagnostic.first_seen_at).toLocaleString()}</p>
+                    <p className="mt-1 break-all font-mono text-xs text-fg-faint">{t('recovery.fingerprint')}: {diagnostic.resource_fingerprint}</p>
                     {location && <p className="mt-1 break-all font-mono text-xs text-fg-muted">{t('recovery.location')}: {location}</p>}
                   </div>
-                  {diagnostic.proposed_action && (
+                  {diagnosticActionVisible(diagnostic) && (
                     <Button size="sm" disabled={!availability.enabled} onClick={() => setRepair(diagnostic)} title={availability.reason ? t(`recovery.reasons.${availability.reason}`) : undefined}>
-                      {diagnostic.hard_change ? t('recovery.hardDisabled') : t('recovery.repair')}
+                      {diagnostic.hard_change || diagnostic.ownership !== 'nurproxy' || !diagnostic.proposed_action
+                        ? t('recovery.hardDisabled')
+                        : validationEscape ? t('recovery.validateRepair') : t('recovery.repair')}
                     </Button>
                   )}
                 </div>
@@ -180,39 +212,31 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                   <p className="mt-3 text-xs text-fg-faint">{t(`recovery.reasons.${availability.reason}`)}</p>
                 )}
 
-                {latest && (
-                  <div className="mt-4 border-t border-border pt-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-sm font-medium text-fg">{t('recovery.latestOperation')}</p>
-                      <code className="font-mono text-xs text-fg-faint">{latest.operation_id}</code>
-                    </div>
-                    <p className="mt-1 text-sm text-fg-muted">{t(`recovery.states.${latest.state}`)} · {t(`recovery.sources.${latest.source}`)}</p>
-                    {latest.steps.length > 0 && (
-                      <ol className="mt-2 space-y-1 border-l border-border pl-3">
-                        {latest.steps.map((step, index) => <li key={`${step.at}-${index}`} className="text-xs text-fg-muted"><span className="font-medium text-fg">{t(`recovery.states.${step.state}`)}</span> — {step.summary}</li>)}
-                      </ol>
-                    )}
-                    <dl className="mt-2 grid gap-1 text-xs sm:grid-cols-3">
-                      {latest.snapshot_reference && <div><dt className="text-fg-faint">{t('recovery.snapshot')}</dt><dd className="break-all text-fg-muted">{latest.snapshot_reference}</dd></div>}
-                      {latest.validation_outcome && <div><dt className="text-fg-faint">{t('recovery.validation')}</dt><dd className="text-fg-muted">{latest.validation_outcome}</dd></div>}
-                      {latest.rollback_outcome && <div><dt className="text-fg-faint">{t('recovery.rollback')}</dt><dd className="text-fg-muted">{latest.rollback_outcome}</dd></div>}
-                    </dl>
-                    {latest.error && <p className="mt-2 text-xs text-danger-fg">{latest.error}</p>}
-                    {latest.state === 'rollback_failed' && <p className="mt-2 text-xs font-medium text-danger-fg">{t('recovery.breakerOpen')}</p>}
-                  </div>
+                {diagnostic.breaker.open && (
+                  <div className="mt-3"><Callout tone="danger" title={t('recovery.breakerOpen')}>
+                    <p>{t(`recovery.breakerReasons.${diagnostic.breaker.reason ?? 'failure_threshold'}`)}</p>
+                    {diagnostic.breaker.expires_at && <p className="mt-1 text-xs">{t('recovery.breakerExpires', { time: new Date(diagnostic.breaker.expires_at).toLocaleString() })}</p>}
+                    {validationEscape && <p className="mt-1 font-semibold">{t('recovery.manualValidationEscape')}</p>}
+                  </Callout></div>
                 )}
-                {related.length > 1 && (
-                  <details className="mt-3 border-t border-border pt-3">
-                    <summary className="cursor-pointer text-sm font-medium text-fg-muted">{t('recovery.history', { count: related.length })}</summary>
-                    <ol className="mt-2 space-y-2">
-                      {related.map((operation) => (
-                        <li key={operation.operation_id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                          <span className="text-fg-muted">{t(`recovery.states.${operation.state}`)} · {t(`recovery.sources.${operation.source}`)} · {formatRelativeTime(operation.started_at)}</span>
-                          <code className="font-mono text-fg-faint">{operation.operation_id}</code>
-                        </li>
+
+                {related.length > 0 && (
+                  <div className="mt-4 border-t border-border pt-3">
+                    <p className="text-sm font-medium text-fg">{t('recovery.history', { count: related.length })}</p>
+                    <div className="mt-2 space-y-2">
+                      {related.map((operation, index) => index === 0 ? (
+                        <div key={operation.operation_id} className="rounded border border-border bg-surface p-3">
+                          <p className="text-sm font-medium text-fg">{t(`recovery.states.${operation.state}`)} · {t(`recovery.sources.${operation.source}`)}</p>
+                          <OperationDetails operation={operation} />
+                        </div>
+                      ) : (
+                        <details key={operation.operation_id} className="rounded border border-border bg-surface p-3">
+                          <summary className="cursor-pointer text-sm font-medium text-fg-muted">{t(`recovery.states.${operation.state}`)} · {t(`recovery.actions.${operation.action}`)} · {formatRelativeTime(operation.started_at)}</summary>
+                          <OperationDetails operation={operation} />
+                        </details>
                       ))}
-                    </ol>
-                  </details>
+                    </div>
+                  </div>
                 )}
               </article>
             );
@@ -224,12 +248,12 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
         open={repair !== null}
         onClose={() => !repairing && setRepair(null)}
         onConfirm={confirmRepair}
-        title={t('recovery.confirmTitle')}
-        message={t('recovery.confirmMessage', {
+        title={t(repair?.breaker.reason === 'rollback_failed_latched' ? 'recovery.confirmValidationTitle' : 'recovery.confirmTitle')}
+        message={t(repair?.breaker.reason === 'rollback_failed_latched' ? 'recovery.confirmValidationMessage' : 'recovery.confirmMessage', {
           action: repair?.proposed_action ? t(`recovery.actions.${repair.proposed_action}`) : '',
           paths: repair?.affected_paths.join(', ') || t('recovery.noPaths'),
         })}
-        confirmLabel={t('recovery.repair')}
+        confirmLabel={t(repair?.breaker.reason === 'rollback_failed_latched' ? 'recovery.validateRepair' : 'recovery.repair')}
         loading={repairing}
       />
     </section>
