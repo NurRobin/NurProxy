@@ -48,6 +48,7 @@ type Failure struct {
 	MissingRuntimeKey  bool
 	RuntimeKeyMismatch bool
 	BinaryMissing      bool
+	ReferencedPaths    []string
 	Err                error
 }
 
@@ -111,6 +112,22 @@ func (f *Failure) SetLocation(file string, line int, managedHint bool) {
 	f.ManagedHint = managedHint
 }
 
+func (f *Failure) SetReferencedPaths(paths ...string) bool {
+	f.ReferencedPaths = nil
+	if len(paths) == 0 || len(paths) > 2 {
+		return false
+	}
+	validated := make([]string, len(paths))
+	for i, path := range paths {
+		if !ValidFailurePath(path) {
+			return false
+		}
+		validated[i] = path
+	}
+	f.ReferencedPaths = validated
+	return true
+}
+
 func (f *Failure) Error() string {
 	if f == nil {
 		return "proxy operation failed"
@@ -169,6 +186,10 @@ var nginxEmergLine = regexp.MustCompile(`(?i)^(?:nginx: \[emerg\]|[0-9]{4}/[0-9]
 var nginxPermissionLine = regexp.MustCompile(`(?i)^(?:nginx: \[(?:emerg|alert)\]|[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]+ \[(?:emerg|alert)\] [0-9]+#[0-9]+:) `)
 var apachePermissionLine = regexp.MustCompile(`(?i)^\([0-9]+\)(?:permission denied|operation not permitted): ah00091: (?:apache2|httpd): .+$`)
 var wrappedCommandOutputLine = regexp.MustCompile(`(?i)^exit status [0-9]+: (.+)$`)
+var nginxMissingCertBody = regexp.MustCompile(`(?i)^cannot load certificate "([^"]+)": .+no such file or directory.*$`)
+var nginxMissingRuntimeKeyBody = regexp.MustCompile(`(?i)^cannot load certificate key "([^"]+)": .+no such file or directory.*$`)
+var nginxRuntimeKeyMismatchBody = regexp.MustCompile(`(?i)^ssl_ctx_use_privatekey\("([^"]+)"\) failed \(ssl: .+key values mismatch\)$`)
+var apacheRuntimeKeyMismatchLine = regexp.MustCompile(`(?i)^ah02565: certificate and private key \S+ from (\S+) and (\S+) do not match$`)
 
 func (f *Failure) classifyKnownOutput(output string) {
 	apacheSyntaxHeader := false
@@ -180,30 +201,49 @@ func (f *Failure) classifyKnownOutput(output string) {
 			if !nginxEmergLine.MatchString(line) {
 				continue
 			}
+			body := nginxEmergLine.ReplaceAllString(line, "")
 			switch {
-			case strings.Contains(lower, "ssl_ctx_use_privatekey(") && strings.Contains(lower, "key values mismatch"):
-				f.RuntimeKeyMismatch = true
-			case strings.Contains(lower, "cannot load certificate key \"") && strings.Contains(lower, "no such file or directory"):
-				f.MissingRuntimeKey = true
-			case strings.Contains(lower, "cannot load certificate \"") && strings.Contains(lower, "no such file or directory"):
-				f.MissingCert = true
+			case nginxRuntimeKeyMismatchBody.MatchString(body):
+				match := nginxRuntimeKeyMismatchBody.FindStringSubmatch(body)
+				if f.SetReferencedPaths(match[1]) {
+					f.RuntimeKeyMismatch = true
+				}
+			case nginxMissingRuntimeKeyBody.MatchString(body):
+				match := nginxMissingRuntimeKeyBody.FindStringSubmatch(body)
+				if f.SetReferencedPaths(match[1]) {
+					f.MissingRuntimeKey = true
+				}
+			case nginxMissingCertBody.MatchString(body):
+				match := nginxMissingCertBody.FindStringSubmatch(body)
+				if f.SetReferencedPaths(match[1]) {
+					f.MissingCert = true
+				}
 			}
 		case KindApache:
 			switch {
-			case strings.HasPrefix(lower, "ah02565: certificate and private key ") && strings.HasSuffix(lower, " do not match"):
-				f.RuntimeKeyMismatch = true
-			case apacheSyntaxHeader && apacheMissingDirectiveLine(lower, "sslcertificatekeyfile: file '"):
-				f.MissingRuntimeKey = true
-			case apacheSyntaxHeader && apacheMissingDirectiveLine(lower, "sslcertificatefile: file '"):
-				f.MissingCert = true
+			case apacheRuntimeKeyMismatchLine.MatchString(line):
+				match := apacheRuntimeKeyMismatchLine.FindStringSubmatch(line)
+				if f.SetReferencedPaths(match[1], match[2]) {
+					f.RuntimeKeyMismatch = true
+				}
+			case apacheSyntaxHeader:
+				if path, ok := apacheMissingDirectivePath(line, "SSLCertificateKeyFile: file '"); ok && f.SetReferencedPaths(path) {
+					f.MissingRuntimeKey = true
+				} else if path, ok := apacheMissingDirectivePath(line, "SSLCertificateFile: file '"); ok && f.SetReferencedPaths(path) {
+					f.MissingCert = true
+				}
 			}
 			apacheSyntaxHeader = strings.HasPrefix(lower, "ah00526: syntax error on line ") && strings.HasSuffix(lower, ":")
 		}
 	}
 }
 
-func apacheMissingDirectiveLine(line, directive string) bool {
-	return strings.HasPrefix(line, directive) && strings.HasSuffix(line, "' does not exist or is empty")
+func apacheMissingDirectivePath(line, directive string) (string, bool) {
+	const suffix = "' does not exist or is empty"
+	if len(line) <= len(directive)+len(suffix) || !strings.EqualFold(line[:len(directive)], directive) || !strings.HasSuffix(strings.ToLower(line), suffix) {
+		return "", false
+	}
+	return line[len(directive) : len(line)-len(suffix)], true
 }
 
 func isBinaryMissing(backend Kind, output string, err error) bool {
@@ -289,7 +329,11 @@ func permissionOutput(output string) bool {
 }
 
 func validFailureLocation(file string, line int) bool {
-	if line <= 0 || file == "" || len(file) > MaxFailurePathBytes || !utf8.ValidString(file) || !filepath.IsAbs(file) || filepath.Clean(file) != file {
+	return line > 0 && ValidFailurePath(file)
+}
+
+func ValidFailurePath(file string) bool {
+	if file == "" || len(file) > MaxFailurePathBytes || !utf8.ValidString(file) || !filepath.IsAbs(file) || filepath.Clean(file) != file {
 		return false
 	}
 	for _, r := range file {

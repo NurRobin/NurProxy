@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -23,42 +24,49 @@ func TestNewFailureRecognizesOnlyKnownBackendMessages(t *testing.T) {
 		wantMissingRuntimeKey  bool
 		wantRuntimeKeyMismatch bool
 		wantBinaryMissing      bool
+		wantReferencedPaths    []string
 	}{
 		{
-			name:            "nginx missing certificate",
-			backend:         KindNginx,
-			output:          `nginx: [emerg] cannot load certificate "/var/lib/nurproxy/certs/app.crt": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`,
-			wantMissingCert: true,
+			name:                "nginx missing certificate",
+			backend:             KindNginx,
+			output:              `nginx: [emerg] cannot load certificate "/var/lib/nurproxy/certs/app.crt": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`,
+			wantMissingCert:     true,
+			wantReferencedPaths: []string{"/var/lib/nurproxy/certs/app.crt"},
 		},
 		{
 			name:                  "nginx missing runtime key",
 			backend:               KindNginx,
 			output:                `nginx: [emerg] cannot load certificate key "/var/lib/nurproxy/certs/app.key.plain": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`,
 			wantMissingRuntimeKey: true,
+			wantReferencedPaths:   []string{"/var/lib/nurproxy/certs/app.key.plain"},
 		},
 		{
 			name:                   "nginx runtime key mismatch",
 			backend:                KindNginx,
 			output:                 `nginx: [emerg] SSL_CTX_use_PrivateKey("/var/lib/nurproxy/certs/app.key.plain") failed (SSL: error:05800074:x509 certificate routines::key values mismatch)`,
 			wantRuntimeKeyMismatch: true,
+			wantReferencedPaths:    []string{"/var/lib/nurproxy/certs/app.key.plain"},
 		},
 		{
-			name:            "apache missing certificate",
-			backend:         KindApache,
-			output:          "AH00526: Syntax error on line 12 of /etc/apache2/sites-enabled/app.conf:\nSSLCertificateFile: file '/var/lib/nurproxy/certs/app.crt' does not exist or is empty",
-			wantMissingCert: true,
+			name:                "apache missing certificate",
+			backend:             KindApache,
+			output:              "AH00526: Syntax error on line 12 of /etc/apache2/sites-enabled/app.conf:\nSSLCertificateFile: file '/var/lib/nurproxy/certs/app.crt' does not exist or is empty",
+			wantMissingCert:     true,
+			wantReferencedPaths: []string{"/var/lib/nurproxy/certs/app.crt"},
 		},
 		{
 			name:                  "apache missing runtime key",
 			backend:               KindApache,
 			output:                "AH00526: Syntax error on line 13 of /etc/apache2/sites-enabled/app.conf:\nSSLCertificateKeyFile: file '/var/lib/nurproxy/certs/app.key.plain' does not exist or is empty",
 			wantMissingRuntimeKey: true,
+			wantReferencedPaths:   []string{"/var/lib/nurproxy/certs/app.key.plain"},
 		},
 		{
 			name:                   "apache runtime key mismatch",
 			backend:                KindApache,
 			output:                 `AH02565: Certificate and private key app.example.com:443:0 from /var/lib/nurproxy/certs/app.crt and /var/lib/nurproxy/certs/app.key.plain do not match`,
 			wantRuntimeKeyMismatch: true,
+			wantReferencedPaths:    []string{"/var/lib/nurproxy/certs/app.crt", "/var/lib/nurproxy/certs/app.key.plain"},
 		},
 		{
 			name:    "untyped binary error has no identity",
@@ -102,11 +110,48 @@ func TestNewFailureRecognizesOnlyKnownBackendMessages(t *testing.T) {
 			if got.BinaryMissing != tt.wantBinaryMissing {
 				t.Errorf("BinaryMissing = %v, want %v", got.BinaryMissing, tt.wantBinaryMissing)
 			}
+			if !slices.Equal(got.ReferencedPaths, tt.wantReferencedPaths) {
+				t.Errorf("ReferencedPaths = %q, want %q", got.ReferencedPaths, tt.wantReferencedPaths)
+			}
 			if !tt.wantMissingCert && !tt.wantMissingRuntimeKey && !tt.wantRuntimeKeyMismatch && !tt.wantBinaryMissing &&
 				(got.Permission || got.ManagedHint) {
 				t.Errorf("unknown/near-miss output gained a repair hint: %#v", got)
 			}
 		})
+	}
+}
+
+func TestNewFailureRejectsUnsafeReferencedPathsFromOtherwiseRecognizedLines(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend Kind
+		output  string
+	}{
+		{"nginx traversal", KindNginx, `nginx: [emerg] cannot load certificate "/var/lib/nurproxy/certs/../secret.crt": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`},
+		{"nginx secret assignment", KindNginx, `nginx: [emerg] cannot load certificate key "/var/lib/nurproxy/token=secret": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`},
+		{"apache relative", KindApache, "AH00526: Syntax error on line 1 of /etc/apache2/a.conf:\nSSLCertificateFile: file 'relative.crt' does not exist or is empty"},
+		{"apache mismatch outside syntax", KindApache, `AH02565: Certificate and private key app:443:0 from /safe/app.crt and ../app.key do not match`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewFailure(tt.backend, FailurePhaseValidate, tt.output, errors.New("exit 1"))
+			if got.MissingCert || got.MissingRuntimeKey || got.RuntimeKeyMismatch || len(got.ReferencedPaths) != 0 {
+				t.Fatalf("unsafe referenced path retained a repair hint: %#v", got)
+			}
+		})
+	}
+}
+
+func TestFailureSetReferencedPathsIsBoundedAndAtomic(t *testing.T) {
+	failure := NewFailure(KindNginx, FailurePhaseValidate, "unknown", errors.New("exit 1"))
+	if !failure.SetReferencedPaths("/var/lib/nurproxy/certs/app.crt", "/var/lib/nurproxy/certs/app.key.plain") {
+		t.Fatal("safe referenced paths rejected")
+	}
+	if failure.SetReferencedPaths("/safe.crt", "/safe.key", "/extra") || len(failure.ReferencedPaths) != 0 {
+		t.Fatalf("too many referenced paths were retained: %q", failure.ReferencedPaths)
+	}
+	if failure.SetReferencedPaths("/safe.crt", "/unsafe/../key") || len(failure.ReferencedPaths) != 0 {
+		t.Fatalf("unsafe referenced path was retained: %q", failure.ReferencedPaths)
 	}
 }
 

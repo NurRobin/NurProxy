@@ -13,28 +13,32 @@ import (
 )
 
 func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
-	root := t.TempDir()
-	managed := filepath.Join(root, "nurproxy-app.example.conf")
-	operator := filepath.Join(root, "operator.conf")
-	temp := filepath.Join(root, "nurproxy-stale.example.conf.nurproxy-tmp")
-	orphan := filepath.Join(root, "nurproxy-orphan.example.conf")
-	for _, path := range []string{managed, operator, temp, orphan} {
+	fixture := newRecoveryFixture(t, proxy.KindNginx)
+	managed := filepath.Join(fixture.available, "nurproxy-app.example.conf")
+	operator := filepath.Join(fixture.available, "operator.conf")
+	temp := filepath.Join(fixture.available, "nurproxy-stale.example.conf.nurproxy-tmp")
+	orphan := filepath.Join(fixture.available, "nurproxy-orphan.example.conf")
+	certPath := filepath.Join(fixture.certs, "missing.crt")
+	keyPath := filepath.Join(fixture.certs, "missing.key.plain")
+	mismatchCert := filepath.Join(fixture.certs, "mismatch.crt")
+	mismatchKey := filepath.Join(fixture.certs, "mismatch.key.plain")
+	mismatchTarget := filepath.Join(fixture.available, "nurproxy-mismatch.example.conf")
+	for _, path := range []string{managed, operator, temp, orphan, mismatchCert, mismatchKey, mismatchTarget} {
 		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	generated := DesiredResource{
 		ArtifactID: "artifact-generated", Host: "app.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: managed},
-		Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateApplyFailed, ValidBundle: true,
+		Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateApplyFailed, ValidBundle: true, CertPath: certPath, RuntimeKeyPath: keyPath,
 	}
+	mismatch := DesiredResource{ArtifactID: "artifact-mismatch", Host: "mismatch.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: mismatchTarget}, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateLive, ValidBundle: true, CertPath: mismatchCert, RuntimeKeyPath: mismatchKey}
 	manual := DesiredResource{
 		ArtifactID: "artifact-manual", Host: "operator.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: operator},
 		Source: models.ArtifactSourceManual, ApplyState: models.ArtifactStateLive,
 	}
-	ctx := Context{
-		AgentID: "agent-1", ProxyInfo: proxy.Info{Kind: proxy.KindNginx, ConfigDir: root},
-		ManagedRoots: []string{root}, AgentDataRoot: filepath.Join(filepath.Dir(root), "data"), DesiredResources: []DesiredResource{generated, manual},
-	}
+	ctx := fixture.ctx
+	ctx.DesiredResources = []DesiredResource{generated, mismatch, manual}
 
 	tests := []struct {
 		name       string
@@ -47,9 +51,9 @@ func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
 	}{
 		{"managed orphan", locatedFailure(proxy.FailurePhaseValidate, orphan), recoverymodel.CodeManagedOrphanConfig, recoverymodel.OwnershipNurProxy, recoverymodel.ActionPruneManagedOrphan, true, false},
 		{"managed stale temp", locatedFailure(proxy.FailurePhaseValidate, temp), recoverymodel.CodeManagedStaleTemp, recoverymodel.OwnershipNurProxy, recoverymodel.ActionRemoveManagedTemp, true, false},
-		{"managed cert missing", flaggedFailure(managed, func(f *proxy.Failure) { f.MissingCert = true }), recoverymodel.CodeManagedCertFileMissing, recoverymodel.OwnershipNurProxy, recoverymodel.ActionRematerializeCertBundle, true, false},
-		{"managed runtime key missing", flaggedFailure(managed, func(f *proxy.Failure) { f.MissingRuntimeKey = true }), recoverymodel.CodeManagedRuntimeKeyMissing, recoverymodel.OwnershipNurProxy, recoverymodel.ActionRematerializeRuntimeKey, true, false},
-		{"managed runtime key mismatch", flaggedFailure(managed, func(f *proxy.Failure) { f.RuntimeKeyMismatch = true }), recoverymodel.CodeManagedRuntimeKeyMismatch, recoverymodel.OwnershipNurProxy, recoverymodel.ActionRematerializeRuntimeKey, true, false},
+		{"managed cert missing", proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, `nginx: [emerg] cannot load certificate "`+certPath+`": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`, errors.New("exit 1")), recoverymodel.CodeManagedCertFileMissing, recoverymodel.OwnershipNurProxy, recoverymodel.ActionRematerializeCertBundle, true, false},
+		{"managed runtime key missing", proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, `nginx: [emerg] cannot load certificate key "`+keyPath+`": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`, errors.New("exit 1")), recoverymodel.CodeManagedRuntimeKeyMissing, recoverymodel.OwnershipNurProxy, recoverymodel.ActionRematerializeRuntimeKey, true, false},
+		{"managed runtime key mismatch", proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, `nginx: [emerg] SSL_CTX_use_PrivateKey("`+mismatchKey+`") failed (SSL: error:05800074:x509 certificate routines::key values mismatch)`, errors.New("exit 1")), recoverymodel.CodeManagedRuntimeKeyMismatch, recoverymodel.OwnershipNurProxy, recoverymodel.ActionRematerializeRuntimeKey, true, false},
 		{"generated config invalid", locatedFailure(proxy.FailurePhaseValidate, managed), recoverymodel.CodeGeneratedConfigInvalid, recoverymodel.OwnershipNurProxy, "", false, false},
 		{"operator config invalid", locatedFailure(proxy.FailurePhaseValidate, operator), recoverymodel.CodeOperatorConfigInvalid, recoverymodel.OwnershipOperator, "", false, false},
 		{"permission denied", &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, Permission: true, Output: "permission denied", Err: os.ErrPermission}, recoverymodel.CodePermissionDenied, recoverymodel.OwnershipSystem, "", false, true},
@@ -77,28 +81,28 @@ func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
 }
 
 func TestClassifierFailsClosedForOwnershipAndBundlePredicates(t *testing.T) {
-	root := t.TempDir()
-	managed := filepath.Join(root, "nurproxy-app.example.conf")
+	fixture := newRecoveryFixture(t, proxy.KindNginx)
+	managed := filepath.Join(fixture.available, "nurproxy-app.example.conf")
 	if err := os.WriteFile(managed, []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	base := DesiredResource{ArtifactID: "art-1", Host: "app.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: managed}, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateApplyFailed, ValidBundle: true}
-	baseCtx := Context{AgentID: "agent-1", ProxyInfo: proxy.Info{Kind: proxy.KindNginx}, ManagedRoots: []string{root}, AgentDataRoot: filepath.Join(filepath.Dir(root), "data")}
+	certPath := filepath.Join(fixture.certs, "app.crt")
+	base := DesiredResource{ArtifactID: "art-1", Host: "app.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: managed}, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateApplyFailed, ValidBundle: true, CertPath: certPath, RuntimeKeyPath: filepath.Join(fixture.certs, "app.key")}
+	baseCtx := fixture.ctx
 
 	tests := []struct {
 		name      string
 		resource  *DesiredResource
-		path      string
-		mutate    func(*proxy.Failure)
+		err       error
 		wantOwner recoverymodel.Ownership
 	}{
-		{"manual", resourceWith(base, func(r *DesiredResource) { r.Source = models.ArtifactSourceManual }), managed, nil, recoverymodel.OwnershipOperator},
-		{"drifted", resourceWith(base, func(r *DesiredResource) { r.Drifted = true }), managed, nil, recoverymodel.OwnershipOperator},
-		{"review state", resourceWith(base, func(r *DesiredResource) { r.ApplyState = models.ArtifactStateDrifted }), managed, nil, recoverymodel.OwnershipOperator},
-		{"unknown apply state", resourceWith(base, func(r *DesiredResource) { r.ApplyState = "unexpected" }), managed, func(f *proxy.Failure) { f.MissingCert = true }, recoverymodel.OwnershipNurProxy},
-		{"absent bundle", resourceWith(base, func(r *DesiredResource) { r.ValidBundle = false }), managed, func(f *proxy.Failure) { f.MissingCert = true }, recoverymodel.OwnershipNurProxy},
-		{"outside root", nil, filepath.Join(filepath.Dir(root), "nurproxy-outside.conf"), nil, recoverymodel.OwnershipUnknown},
-		{"deceptive managed name", nil, filepath.Join(root, "nurproxy-fake.conf.backup"), nil, recoverymodel.OwnershipOperator},
+		{"manual", resourceWith(base, func(r *DesiredResource) { r.Source = models.ArtifactSourceManual }), locatedFailure(proxy.FailurePhaseValidate, managed), recoverymodel.OwnershipOperator},
+		{"drifted", resourceWith(base, func(r *DesiredResource) { r.Drifted = true }), locatedFailure(proxy.FailurePhaseValidate, managed), recoverymodel.OwnershipOperator},
+		{"review state", resourceWith(base, func(r *DesiredResource) { r.ApplyState = models.ArtifactStateDrifted }), locatedFailure(proxy.FailurePhaseValidate, managed), recoverymodel.OwnershipOperator},
+		{"unknown apply state", resourceWith(base, func(r *DesiredResource) { r.ApplyState = "unexpected" }), locatedFailure(proxy.FailurePhaseValidate, managed), recoverymodel.OwnershipUnknown},
+		{"absent bundle", resourceWith(base, func(r *DesiredResource) { r.ValidBundle = false }), proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, `nginx: [emerg] cannot load certificate "`+certPath+`": BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory)`, errors.New("exit 1")), recoverymodel.OwnershipNurProxy},
+		{"outside root", nil, locatedFailure(proxy.FailurePhaseValidate, filepath.Join(filepath.Dir(fixture.base), "nurproxy-outside.conf")), recoverymodel.OwnershipUnknown},
+		{"deceptive managed name", nil, locatedFailure(proxy.FailurePhaseValidate, filepath.Join(fixture.available, "nurproxy-fake.conf.backup")), recoverymodel.OwnershipOperator},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,11 +110,7 @@ func TestClassifierFailsClosedForOwnershipAndBundlePredicates(t *testing.T) {
 			if tt.resource != nil {
 				ctx.DesiredResources = []DesiredResource{*tt.resource}
 			}
-			failure := &proxy.Failure{Backend: proxy.KindNginx, Phase: proxy.FailurePhaseValidate, File: tt.path, Line: 1, Located: true, ManagedHint: true, Output: "token=secret", Err: errors.New("exit 1")}
-			if tt.mutate != nil {
-				tt.mutate(failure)
-			}
-			got := Classify(ctx, failure)
+			got := Classify(ctx, tt.err)
 			if got.Ownership != tt.wantOwner || got.AutoRepairEligible {
 				t.Fatalf("classification = owner=%q eligible=%v code=%q", got.Ownership, got.AutoRepairEligible, got.Code)
 			}
@@ -163,18 +163,18 @@ func TestClassifierRejectsSymlinkEscapeDespiteManagedHint(t *testing.T) {
 }
 
 func TestClassifierFingerprintIgnoresRawTextAndUsesEvidenceClass(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "nurproxy-app.conf")
+	fixture := newRecoveryFixture(t, proxy.KindNginx)
+	path := filepath.Join(fixture.available, "nurproxy-app.conf")
 	if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	resource := DesiredResource{ArtifactID: "art-1", Host: "app.example", Target: proxy.Target{Kind: proxy.TargetKindFile, Path: path}, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateApplyFailed, ValidBundle: true}
-	ctx := Context{AgentID: "agent-1", ProxyInfo: proxy.Info{Kind: proxy.KindNginx}, ManagedRoots: []string{root}, AgentDataRoot: filepath.Join(root, "data"), DesiredResources: []DesiredResource{resource}}
+	ctx := fixture.ctx
+	ctx.DesiredResources = []DesiredResource{resource}
 	first := locatedFailure(proxy.FailurePhaseValidate, path).(*proxy.Failure)
 	first.Output = "unknown directive alpha token=one"
 	second := locatedFailure(proxy.FailurePhaseValidate, path).(*proxy.Failure)
 	second.Output = "different raw detail token=two"
-	second.Backend = proxy.Kind("token=backend-secret")
 	a := Classify(ctx, first)
 	b := Classify(ctx, second)
 	if a.ResourceFingerprint != b.ResourceFingerprint || a.ID != b.ID {

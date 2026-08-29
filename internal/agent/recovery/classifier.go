@@ -5,24 +5,29 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy/apache"
+	"github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 type DesiredResource struct {
-	ArtifactID  string
-	Host        string
-	Target      proxy.Target
-	Source      models.ArtifactSource
-	Drifted     bool
-	ApplyState  models.ArtifactApplyState
-	ValidBundle bool
+	ArtifactID     string
+	Host           string
+	Target         proxy.Target
+	Source         models.ArtifactSource
+	Drifted        bool
+	ApplyState     models.ArtifactApplyState
+	ValidBundle    bool
+	CertPath       string
+	RuntimeKeyPath string
 }
 
 type Context struct {
@@ -40,6 +45,7 @@ type classification struct {
 	eligible      bool
 	hardChange    bool
 	evidenceClass string
+	paths         []GuardedPath
 }
 
 func Classify(ctx Context, err error) recoverymodel.Diagnostic {
@@ -48,7 +54,7 @@ func Classify(ctx Context, err error) recoverymodel.Diagnostic {
 	evidence := ""
 	var failure *proxy.Failure
 	if errors.As(err, &failure) && failure != nil {
-		if normalized := normalizedBackend(failure.Backend); normalized != proxy.KindUnknown {
+		if normalized := normalizedBackend(failure.Backend); normalized != proxy.KindUnknown && normalized == backend {
 			backend = normalized
 		}
 		evidence = failure.Output
@@ -58,11 +64,10 @@ func Classify(ctx Context, err error) recoverymodel.Diagnostic {
 	}
 	evidence = recoverymodel.SanitizeEvidence(evidence)
 
-	guarded, resource, markerInManagedLayout := resolveFailureResource(ctx, failure)
-	result := classifyFailure(failure, guarded, resource, markerInManagedLayout)
-	paths := make([]string, 0, 1)
-	fingerprintPaths := make([]string, 0, 1)
-	if guarded != nil {
+	result := classifyFailure(ctx, failure)
+	paths := make([]string, 0, len(result.paths))
+	fingerprintPaths := make([]string, 0, len(result.paths))
+	for _, guarded := range result.paths {
 		paths = append(paths, guarded.Path)
 		fingerprintPaths = append(fingerprintPaths, guarded.ResolvedPath)
 	}
@@ -81,125 +86,317 @@ func Classify(ctx Context, err error) recoverymodel.Diagnostic {
 	return diagnostic
 }
 
-func resolveFailureResource(ctx Context, failure *proxy.Failure) (*GuardedPath, *DesiredResource, bool) {
-	if failure == nil || !failure.Located || failure.File == "" {
-		return nil, nil, false
-	}
-	roots := append([]string(nil), ctx.ManagedRoots...)
-	if ctx.AgentDataRoot != "" {
-		roots = append(roots, ctx.AgentDataRoot)
-	}
-	guard, err := NewPathGuard(roots...)
-	if err != nil {
-		return nil, nil, false
-	}
-	checked, err := guard.Resolve(failure.File)
-	if err != nil {
-		return nil, nil, false
-	}
-	markerInManagedLayout := pathResolvesUnderRoots(failure.File, ctx.ManagedRoots)
-	for i := range ctx.DesiredResources {
-		desired := &ctx.DesiredResources[i]
-		if desired.Target.Kind != proxy.TargetKindFile || desired.Target.Path == "" {
-			continue
-		}
-		desiredPath, resolveErr := guard.Resolve(desired.Target.Path)
-		if resolveErr != nil {
-			continue
-		}
-		if pathsIdentifySameResource(checked, desiredPath) {
-			return &checked, desired, markerInManagedLayout
-		}
-	}
-	return &checked, nil, markerInManagedLayout
+type backendLayout struct {
+	available string
+	enabled   string
+	guard     *PathGuard
 }
 
-func pathResolvesUnderRoots(path string, roots []string) bool {
-	guard, err := NewPathGuard(roots...)
-	if err != nil {
+func classifyFailure(ctx Context, failure *proxy.Failure) classification {
+	if !validFailureMetadata(ctx, failure) {
+		return unknownClassification()
+	}
+	if failure.BinaryMissing {
+		return systemClassification(recoverymodel.CodeProxyBinaryMissing, "binary_missing")
+	}
+	if failure.Permission {
+		return systemClassification(recoverymodel.CodePermissionDenied, "permission_denied")
+	}
+	if systemdSandboxFailure(failure.Output) {
+		return systemClassification(recoverymodel.CodeSystemdSandboxDenied, "systemd_sandbox")
+	}
+	if portConflictFailure(failure.Output) {
+		return systemClassification(recoverymodel.CodePortConflict, "port_conflict")
+	}
+	if proxyNotRunningFailure(failure.Output) {
+		return systemClassification(recoverymodel.CodeProxyNotRunning, "proxy_not_running")
+	}
+	if failure.Phase == proxy.FailurePhaseReload {
+		return systemClassification(recoverymodel.CodeProxyReloadFailed, "reload_failed")
+	}
+	if failure.MissingCert || failure.MissingRuntimeKey || failure.RuntimeKeyMismatch {
+		return classifyReferencedFailure(ctx, failure)
+	}
+	return classifyLocatedFailure(ctx, failure)
+}
+
+func validFailureMetadata(ctx Context, failure *proxy.Failure) bool {
+	if failure == nil || (ctx.ProxyInfo.Kind != proxy.KindNginx && ctx.ProxyInfo.Kind != proxy.KindApache) || failure.Backend != ctx.ProxyInfo.Kind {
 		return false
 	}
-	_, err = guard.Resolve(path)
-	return err == nil
-}
-
-func pathsIdentifySameResource(a, b GuardedPath) bool {
-	return a.Path == b.Path || a.Path == b.ResolvedPath || a.ResolvedPath == b.Path || a.ResolvedPath == b.ResolvedPath
-}
-
-func classifyFailure(failure *proxy.Failure, path *GuardedPath, resource *DesiredResource, markerInManagedLayout bool) classification {
-	if failure != nil {
-		if failure.BinaryMissing {
-			return systemClassification(recoverymodel.CodeProxyBinaryMissing, "binary_missing")
-		}
-		if failure.Permission {
-			return systemClassification(recoverymodel.CodePermissionDenied, "permission_denied")
-		}
-		if systemdSandboxFailure(failure.Output) {
-			return systemClassification(recoverymodel.CodeSystemdSandboxDenied, "systemd_sandbox")
-		}
-		if portConflictFailure(failure.Output) {
-			return systemClassification(recoverymodel.CodePortConflict, "port_conflict")
-		}
-		if proxyNotRunningFailure(failure.Output) {
-			return systemClassification(recoverymodel.CodeProxyNotRunning, "proxy_not_running")
-		}
-		if failure.Phase == proxy.FailurePhaseReload {
-			return systemClassification(recoverymodel.CodeProxyReloadFailed, "reload_failed")
-		}
-	}
-
-	owner := ownershipFor(path, resource, markerInManagedLayout)
-	if owner == recoverymodel.OwnershipOperator {
-		return classification{code: recoverymodel.CodeOperatorConfigInvalid, ownership: owner, evidenceClass: "operator_config"}
-	}
-	if path == nil {
-		return unknownClassification()
-	}
-	if resource == nil {
-		if markerInManagedLayout && isManagedTemp(path.Path) {
-			return classification{code: recoverymodel.CodeManagedStaleTemp, ownership: recoverymodel.OwnershipNurProxy, action: recoverymodel.ActionRemoveManagedTemp, eligible: true, evidenceClass: "managed_temp"}
-		}
-		if markerInManagedLayout && isManagedConfig(path.Path) {
-			return classification{code: recoverymodel.CodeManagedOrphanConfig, ownership: recoverymodel.OwnershipNurProxy, action: recoverymodel.ActionPruneManagedOrphan, eligible: true, evidenceClass: "managed_orphan"}
-		}
-		return classification{code: recoverymodel.CodeOperatorConfigInvalid, ownership: recoverymodel.OwnershipOperator, evidenceClass: "operator_config"}
-	}
-	if owner != recoverymodel.OwnershipNurProxy {
-		return unknownClassification()
-	}
-
-	cleanResource := resource.Source == models.ArtifactSourceGenerated && !resource.Drifted &&
-		(resource.ApplyState == models.ArtifactStateLive || resource.ApplyState == models.ArtifactStateApplyFailed)
-	switch {
-	case failure != nil && failure.MissingCert:
-		return bundleClassification(recoverymodel.CodeManagedCertFileMissing, recoverymodel.ActionRematerializeCertBundle, "cert_missing", cleanResource && resource.ValidBundle)
-	case failure != nil && failure.MissingRuntimeKey:
-		return bundleClassification(recoverymodel.CodeManagedRuntimeKeyMissing, recoverymodel.ActionRematerializeRuntimeKey, "runtime_key_missing", cleanResource && resource.ValidBundle)
-	case failure != nil && failure.RuntimeKeyMismatch:
-		return bundleClassification(recoverymodel.CodeManagedRuntimeKeyMismatch, recoverymodel.ActionRematerializeRuntimeKey, "runtime_key_mismatch", cleanResource && resource.ValidBundle)
+	switch failure.Phase {
+	case proxy.FailurePhaseValidate, proxy.FailurePhaseReload, proxy.FailurePhaseCertInstall:
 	default:
-		return classification{
-			code: recoverymodel.CodeGeneratedConfigInvalid, ownership: recoverymodel.OwnershipNurProxy,
-			evidenceClass: "generated_config",
+		return false
+	}
+	primary := 0
+	for _, set := range []bool{failure.BinaryMissing, failure.Permission, failure.MissingCert, failure.MissingRuntimeKey, failure.RuntimeKeyMismatch} {
+		if set {
+			primary++
 		}
 	}
+	if primary > 1 || len(failure.ReferencedPaths) > 2 {
+		return false
+	}
+	certificateFailure := failure.MissingCert || failure.MissingRuntimeKey || failure.RuntimeKeyMismatch
+	if certificateFailure != (len(failure.ReferencedPaths) > 0) || (certificateFailure && failure.Phase != proxy.FailurePhaseValidate) {
+		return false
+	}
+	for _, path := range failure.ReferencedPaths {
+		if !proxy.ValidFailurePath(path) {
+			return false
+		}
+	}
+	if failure.Located {
+		return failure.Line > 0 && proxy.ValidFailurePath(failure.File)
+	}
+	return failure.File == "" && failure.Line == 0 && !failure.ManagedHint
 }
 
-func ownershipFor(path *GuardedPath, resource *DesiredResource, markerInManagedLayout bool) recoverymodel.Ownership {
-	if path == nil {
+func classifyLocatedFailure(ctx Context, failure *proxy.Failure) classification {
+	if !failure.Located {
+		return unknownClassification()
+	}
+	layout, ok := resolveBackendLayout(ctx)
+	if !ok {
+		return unknownClassification()
+	}
+	checked, err := layout.guard.Resolve(failure.File)
+	if err != nil {
+		return unknownClassification()
+	}
+	resource, ownership := matchDesiredTarget(ctx.DesiredResources, checked, layout)
+	if resource != nil {
+		if ownership == recoverymodel.OwnershipUnknown {
+			return unknownClassification()
+		}
+		code := recoverymodel.CodeGeneratedConfigInvalid
+		class := "generated_config"
+		if ownership == recoverymodel.OwnershipOperator {
+			code, class = recoverymodel.CodeOperatorConfigInvalid, "operator_config"
+		}
+		return classification{code: code, ownership: ownership, evidenceClass: class, paths: []GuardedPath{checked}}
+	}
+	if markerInExactLayout(checked, layout) {
+		if filepath.Dir(checked.Path) == layout.available && isManagedTemp(checked.Path) {
+			return classification{code: recoverymodel.CodeManagedStaleTemp, ownership: recoverymodel.OwnershipNurProxy, action: recoverymodel.ActionRemoveManagedTemp, eligible: true, evidenceClass: "managed_temp", paths: []GuardedPath{checked}}
+		}
+		if isManagedConfig(checked.Path) {
+			return classification{code: recoverymodel.CodeManagedOrphanConfig, ownership: recoverymodel.OwnershipNurProxy, action: recoverymodel.ActionPruneManagedOrphan, eligible: true, evidenceClass: "managed_orphan", paths: []GuardedPath{checked}}
+		}
+	}
+	return classification{code: recoverymodel.CodeOperatorConfigInvalid, ownership: recoverymodel.OwnershipOperator, evidenceClass: "operator_config", paths: []GuardedPath{checked}}
+}
+
+func resolveBackendLayout(ctx Context) (backendLayout, bool) {
+	if !proxy.ValidFailurePath(ctx.ProxyInfo.ConfigDir) {
+		return backendLayout{}, false
+	}
+	canonicalConfig, ok := canonicalExistingDir(ctx.ProxyInfo.ConfigDir)
+	if !ok {
+		return backendLayout{}, false
+	}
+	var available, enabled string
+	switch ctx.ProxyInfo.Kind {
+	case proxy.KindNginx:
+		layout := nginx.ResolveLayout(canonicalConfig)
+		available, enabled = layout.Available, layout.Enabled
+	case proxy.KindApache:
+		layout := apache.ResolveLayout(canonicalConfig)
+		available, enabled = layout.Available, layout.Enabled
+	default:
+		return backendLayout{}, false
+	}
+	canonicalAvailable, ok := canonicalExistingDir(available)
+	if !ok {
+		return backendLayout{}, false
+	}
+	if canonicalConfig != canonicalAvailable {
+		return backendLayout{}, false
+	}
+	canonicalEnabled := ""
+	if enabled != "" {
+		canonicalEnabled, ok = canonicalExistingDir(enabled)
+		if !ok || canonicalEnabled == canonicalAvailable {
+			return backendLayout{}, false
+		}
+	}
+	guard, err := NewPathGuard(ctx.ManagedRoots...)
+	if err != nil || !guard.containsDirectory(canonicalAvailable) || (canonicalEnabled != "" && !guard.containsDirectory(canonicalEnabled)) {
+		return backendLayout{}, false
+	}
+	return backendLayout{available: canonicalAvailable, enabled: canonicalEnabled, guard: guard}, true
+}
+
+func canonicalExistingDir(path string) (string, bool) {
+	if !proxy.ValidFailurePath(path) {
+		return "", false
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", false
+	}
+	info, err := os.Stat(canonical)
+	return canonical, err == nil && info.IsDir()
+}
+
+func markerInExactLayout(path GuardedPath, layout backendLayout) bool {
+	parent := filepath.Dir(path.Path)
+	if parent == layout.available {
+		return path.EntryType == GuardedPathRegular
+	}
+	if layout.enabled == "" || parent != layout.enabled || path.EntryType != GuardedPathSymlink {
+		return false
+	}
+	name := filepath.Base(path.Path)
+	return filepath.Base(path.ResolvedPath) == name && path.ResolvedPath == filepath.Join(layout.available, name)
+}
+
+func matchDesiredTarget(resources []DesiredResource, path GuardedPath, layout backendLayout) (*DesiredResource, recoverymodel.Ownership) {
+	var match *DesiredResource
+	for i := range resources {
+		resource := &resources[i]
+		if !validDesiredIdentity(*resource) || resource.Target.Kind != proxy.TargetKindFile || resource.Target.Path == "" {
+			continue
+		}
+		desired, err := layout.guard.Resolve(resource.Target.Path)
+		if err != nil || desired.EntryType == GuardedPathSymlink {
+			continue
+		}
+		exact := path.Path == desired.Path
+		activationAlias := markerInExactLayout(path, layout) && path.EntryType == GuardedPathSymlink && path.ResolvedPath == desired.Path
+		if !exact && !activationAlias {
+			continue
+		}
+		if match != nil {
+			return nil, recoverymodel.OwnershipUnknown
+		}
+		match = resource
+	}
+	if match == nil {
+		return nil, recoverymodel.OwnershipUnknown
+	}
+	return match, resourceOwnership(*match)
+}
+
+func resourceOwnership(resource DesiredResource) recoverymodel.Ownership {
+	if !validDesiredIdentity(resource) {
 		return recoverymodel.OwnershipUnknown
 	}
-	if resource == nil {
-		if markerInManagedLayout && (isManagedConfig(path.Path) || isManagedTemp(path.Path)) {
-			return recoverymodel.OwnershipNurProxy
+	if resource.Source == models.ArtifactSourceManual || resource.Drifted || resource.ApplyState == models.ArtifactStateDrifted {
+		return recoverymodel.OwnershipOperator
+	}
+	if resource.Source == models.ArtifactSourceGenerated && (resource.ApplyState == models.ArtifactStateLive || resource.ApplyState == models.ArtifactStateApplyFailed) {
+		return recoverymodel.OwnershipNurProxy
+	}
+	return recoverymodel.OwnershipUnknown
+}
+
+func validDesiredIdentity(resource DesiredResource) bool {
+	return strings.TrimSpace(resource.ArtifactID) != "" && strings.TrimSpace(resource.Host) != ""
+}
+
+func classifyReferencedFailure(ctx Context, failure *proxy.Failure) classification {
+	layout, ok := resolveBackendLayout(ctx)
+	if !ok {
+		return unknownClassification()
+	}
+	outer, err := NewPathGuard(ctx.ManagedRoots...)
+	if err != nil {
+		return unknownClassification()
+	}
+	dataRoot, ok := canonicalExistingDir(ctx.AgentDataRoot)
+	if !ok || !outer.containsDirectory(dataRoot) {
+		return unknownClassification()
+	}
+	guard, err := NewPathGuard(dataRoot)
+	if err != nil {
+		return unknownClassification()
+	}
+	references := make([]GuardedPath, 0, len(failure.ReferencedPaths))
+	for _, path := range failure.ReferencedPaths {
+		checked, resolveErr := guard.Resolve(path)
+		if resolveErr != nil || checked.EntryType == GuardedPathSymlink {
+			return unknownClassification()
 		}
-		return recoverymodel.OwnershipOperator
+		references = append(references, checked)
 	}
-	if resource.Source != models.ArtifactSourceGenerated || resource.Drifted || resource.ApplyState == models.ArtifactStateDrifted {
-		return recoverymodel.OwnershipOperator
+
+	var matched *DesiredResource
+	for i := range ctx.DesiredResources {
+		resource := &ctx.DesiredResources[i]
+		if !referencesMatchResource(failure, references, *resource, guard, layout) {
+			continue
+		}
+		if matched != nil {
+			return unknownClassification()
+		}
+		matched = resource
 	}
-	return recoverymodel.OwnershipNurProxy
+	if matched == nil {
+		return unknownClassification()
+	}
+	code, action, evidenceClass := referencedFailureKind(failure)
+	ownership := resourceOwnership(*matched)
+	if ownership == recoverymodel.OwnershipUnknown {
+		return unknownClassification()
+	}
+	result := classification{code: code, ownership: ownership, evidenceClass: evidenceClass, paths: references}
+	if ownership == recoverymodel.OwnershipNurProxy && matched.ValidBundle {
+		result.action = action
+		result.eligible = true
+	}
+	return result
+}
+
+func referencesMatchResource(failure *proxy.Failure, references []GuardedPath, resource DesiredResource, guard *PathGuard, layout backendLayout) bool {
+	if !validDesiredIdentity(resource) || !validDesiredTarget(resource, layout) {
+		return false
+	}
+	cert, certOK := resolveExpectedPath(guard, resource.CertPath)
+	key, keyOK := resolveExpectedPath(guard, resource.RuntimeKeyPath)
+	if certOK && keyOK && cert.Path == key.Path {
+		return false
+	}
+	switch {
+	case failure.MissingCert:
+		return len(references) == 1 && certOK && references[0].EntryType == GuardedPathAbsent && references[0].Path == cert.Path
+	case failure.MissingRuntimeKey:
+		return len(references) == 1 && keyOK && references[0].EntryType == GuardedPathAbsent && references[0].Path == key.Path
+	case failure.RuntimeKeyMismatch && len(references) == 1:
+		return failure.Backend == proxy.KindNginx && certOK && keyOK && cert.EntryType == GuardedPathRegular && key.EntryType == GuardedPathRegular && references[0].Path == key.Path
+	case failure.RuntimeKeyMismatch && len(references) == 2:
+		return certOK && keyOK && cert.EntryType == GuardedPathRegular && key.EntryType == GuardedPathRegular && references[0].Path == cert.Path && references[1].Path == key.Path
+	default:
+		return false
+	}
+}
+
+func validDesiredTarget(resource DesiredResource, layout backendLayout) bool {
+	if resource.Target.Kind != proxy.TargetKindFile || resource.Target.Path == "" {
+		return false
+	}
+	checked, err := layout.guard.Resolve(resource.Target.Path)
+	return err == nil && filepath.Dir(checked.Path) == layout.available && isManagedConfig(checked.Path) && checked.EntryType != GuardedPathSymlink
+}
+
+func resolveExpectedPath(guard *PathGuard, path string) (GuardedPath, bool) {
+	if !proxy.ValidFailurePath(path) {
+		return GuardedPath{}, false
+	}
+	checked, err := guard.Resolve(path)
+	return checked, err == nil && checked.EntryType != GuardedPathSymlink
+}
+
+func referencedFailureKind(failure *proxy.Failure) (recoverymodel.Code, recoverymodel.Action, string) {
+	switch {
+	case failure.MissingCert:
+		return recoverymodel.CodeManagedCertFileMissing, recoverymodel.ActionRematerializeCertBundle, "cert_missing"
+	case failure.MissingRuntimeKey:
+		return recoverymodel.CodeManagedRuntimeKeyMissing, recoverymodel.ActionRematerializeRuntimeKey, "runtime_key_missing"
+	default:
+		return recoverymodel.CodeManagedRuntimeKeyMismatch, recoverymodel.ActionRematerializeRuntimeKey, "runtime_key_mismatch"
+	}
 }
 
 func isManagedConfig(path string) bool {
@@ -211,15 +408,6 @@ func isManagedTemp(path string) bool {
 	const suffix = ".conf.nurproxy-tmp"
 	name := filepath.Base(path)
 	return strings.HasPrefix(name, "nurproxy-") && strings.HasSuffix(name, suffix) && len(name) > len("nurproxy-")+len(suffix)
-}
-
-func bundleClassification(code recoverymodel.Code, action recoverymodel.Action, evidenceClass string, eligible bool) classification {
-	result := classification{code: code, ownership: recoverymodel.OwnershipNurProxy, evidenceClass: evidenceClass}
-	if eligible {
-		result.action = action
-		result.eligible = true
-	}
-	return result
 }
 
 func systemClassification(code recoverymodel.Code, evidenceClass string) classification {

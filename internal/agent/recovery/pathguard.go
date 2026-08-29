@@ -15,16 +15,26 @@ type PathGuard struct {
 	roots []string
 }
 
+type GuardedPathEntryType string
+
+const (
+	GuardedPathAbsent  GuardedPathEntryType = "absent"
+	GuardedPathRegular GuardedPathEntryType = "regular"
+	GuardedPathSymlink GuardedPathEntryType = "symlink"
+)
+
 type GuardedPath struct {
 	Path         string
 	ResolvedPath string
+	EntryType    GuardedPathEntryType
 
-	owner        *PathGuard
-	root         string
-	parentInfo   os.FileInfo
-	finalInfo    os.FileInfo
-	resolvedInfo os.FileInfo
-	finalExists  bool
+	owner          *PathGuard
+	root           string
+	parentInfo     os.FileInfo
+	finalInfo      os.FileInfo
+	resolvedInfo   os.FileInfo
+	resolvedExists bool
+	finalExists    bool
 }
 
 func NewPathGuard(roots ...string) (*PathGuard, error) {
@@ -70,7 +80,7 @@ func (g *PathGuard) Resolve(path string) (GuardedPath, error) {
 	}
 
 	checked := GuardedPath{
-		Path: canonical, ResolvedPath: canonical, owner: g, root: root,
+		Path: canonical, ResolvedPath: canonical, EntryType: GuardedPathAbsent, owner: g, root: root,
 		parentInfo: parentInfo,
 	}
 	finalInfo, err := os.Lstat(canonical)
@@ -80,20 +90,48 @@ func (g *PathGuard) Resolve(path string) (GuardedPath, error) {
 		}
 		return GuardedPath{}, fmt.Errorf("lstat path: %w", err)
 	}
+	switch {
+	case finalInfo.Mode().IsRegular():
+		checked.EntryType = GuardedPathRegular
+	case finalInfo.Mode()&os.ModeSymlink != 0:
+		checked.EntryType = GuardedPathSymlink
+	default:
+		return GuardedPath{}, fmt.Errorf("path is not a regular file or symlink")
+	}
 	resolved, err := filepath.EvalSymlinks(canonical)
 	if err != nil {
-		return GuardedPath{}, fmt.Errorf("resolve final path: %w", err)
+		if checked.EntryType != GuardedPathSymlink || !errors.Is(err, os.ErrNotExist) {
+			return GuardedPath{}, fmt.Errorf("resolve final path: %w", err)
+		}
+		linkTarget, readErr := os.Readlink(canonical)
+		if readErr != nil {
+			return GuardedPath{}, fmt.Errorf("read final symlink: %w", readErr)
+		}
+		if !filepath.IsAbs(linkTarget) {
+			linkTarget = filepath.Join(canonicalParent, linkTarget)
+		}
+		resolved, err = canonicalizeAllowMissing(filepath.Clean(linkTarget))
+		if err != nil {
+			return GuardedPath{}, fmt.Errorf("resolve missing symlink target: %w", err)
+		}
 	}
 	if !withinRoot(root, resolved) {
 		return GuardedPath{}, fmt.Errorf("final path escapes managed root")
 	}
 	resolvedInfo, err := os.Stat(canonical)
 	if err != nil {
-		return GuardedPath{}, fmt.Errorf("stat resolved final path: %w", err)
+		if !errors.Is(err, os.ErrNotExist) {
+			return GuardedPath{}, fmt.Errorf("stat resolved final path: %w", err)
+		}
+	} else {
+		if !resolvedInfo.Mode().IsRegular() {
+			return GuardedPath{}, fmt.Errorf("resolved path is not a regular file")
+		}
+		checked.resolvedInfo = resolvedInfo
+		checked.resolvedExists = true
 	}
 	checked.ResolvedPath = resolved
 	checked.finalInfo = finalInfo
-	checked.resolvedInfo = resolvedInfo
 	checked.finalExists = true
 	return checked, nil
 }
@@ -118,7 +156,7 @@ func (g *PathGuard) Recheck(path GuardedPath) error {
 	if err != nil {
 		return err
 	}
-	if current.root != path.root || current.Path != path.Path || current.ResolvedPath != path.ResolvedPath || current.finalExists != path.finalExists {
+	if current.root != path.root || current.Path != path.Path || current.ResolvedPath != path.ResolvedPath || current.EntryType != path.EntryType || current.finalExists != path.finalExists || current.resolvedExists != path.resolvedExists {
 		return fmt.Errorf("path identity changed")
 	}
 	if !os.SameFile(current.parentInfo, path.parentInfo) {
@@ -127,7 +165,7 @@ func (g *PathGuard) Recheck(path GuardedPath) error {
 	if path.finalExists && !os.SameFile(current.finalInfo, path.finalInfo) {
 		return fmt.Errorf("path final identity changed")
 	}
-	if path.finalExists && !os.SameFile(current.resolvedInfo, path.resolvedInfo) {
+	if path.resolvedExists && !os.SameFile(current.resolvedInfo, path.resolvedInfo) {
 		return fmt.Errorf("path resolved target identity changed")
 	}
 	return nil
@@ -143,6 +181,18 @@ func (g *PathGuard) containingRoot(path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (g *PathGuard) containsDirectory(path string) bool {
+	if g == nil {
+		return false
+	}
+	for _, root := range g.roots {
+		if withinRoot(root, path) {
+			return true
+		}
+	}
+	return false
 }
 
 func withinRoot(root, path string) bool {

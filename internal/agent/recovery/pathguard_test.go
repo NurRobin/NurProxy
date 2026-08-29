@@ -178,3 +178,71 @@ func TestPathGuardRechecksParentForInitiallyAbsentEntry(t *testing.T) {
 		t.Fatal("replaced parent retained a valid identity token")
 	}
 }
+
+func TestPathGuardExposesSafeEntryTypeAndRejectsDirectories(t *testing.T) {
+	root := t.TempDir()
+	regular := filepath.Join(root, "regular.conf")
+	hardlink := filepath.Join(root, "hardlink.conf")
+	symlink := filepath.Join(root, "symlink.conf")
+	directorySymlink := filepath.Join(root, "directory-symlink.conf")
+	directory := filepath.Join(root, "directory.conf")
+	if err := os.WriteFile(regular, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(regular, hardlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(regular, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(directory, directorySymlink); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := NewPathGuard(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{regular, hardlink} {
+		checked, err := guard.Resolve(path)
+		if err != nil || checked.EntryType != GuardedPathRegular {
+			t.Fatalf("regular entry %q = type %q err %v", path, checked.EntryType, err)
+		}
+	}
+	hardlinkIdentity := mustResolvePath(t, guard, hardlink)
+	checked, err := guard.Resolve(symlink)
+	if err != nil || checked.EntryType != GuardedPathSymlink {
+		t.Fatalf("symlink entry = type %q err %v", checked.EntryType, err)
+	}
+	if _, err := guard.Resolve(directory); err == nil {
+		t.Fatal("directory accepted as a mutation entry")
+	}
+	if _, err := guard.Resolve(directorySymlink); err == nil {
+		t.Fatal("symlink to a directory accepted as a mutation entry")
+	}
+	absent, err := guard.Resolve(filepath.Join(root, "absent.conf"))
+	if err != nil || absent.EntryType != GuardedPathAbsent {
+		t.Fatalf("absent entry = type %q err %v", absent.EntryType, err)
+	}
+	old := hardlink + ".old"
+	if err := os.Rename(hardlink, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hardlink, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Recheck(hardlinkIdentity); err == nil {
+		t.Fatal("replaced hardlink entry retained a valid identity token")
+	}
+}
+
+func mustResolvePath(t *testing.T, guard *PathGuard, path string) GuardedPath {
+	t.Helper()
+	checked, err := guard.Resolve(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return checked
+}
