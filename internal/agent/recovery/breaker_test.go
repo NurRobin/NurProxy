@@ -68,6 +68,7 @@ func TestBreakerPersistsWindowAndRollbackFailedLatchAcrossRestart(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer b.Close()
 	windowKey := BreakerKey{Action: recoverymodel.ActionRemoveManagedTemp, Fingerprint: "window"}
 	for i := 0; i < 3; i++ {
 		if err := b.Record(windowKey, recoverymodel.OperationStateRolledBack, now.Add(time.Duration(i)*time.Minute), false); err != nil {
@@ -82,6 +83,7 @@ func TestBreakerPersistsWindowAndRollbackFailedLatchAcrossRestart(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer restarted.Close()
 	if restarted.Allow(windowKey, recoverymodel.RequestSourceAutomatic, now.Add(3*time.Minute)).Allowed {
 		t.Fatal("time breaker lost across restart")
 	}
@@ -97,15 +99,18 @@ func TestBreakerPersistsAfterFailedManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer b.Close()
 	key := BreakerKey{Action: recoverymodel.ActionRemoveManagedTemp, Fingerprint: "manual"}
 	for i := 0; i < 4; i++ {
 		if err := b.Record(key, recoverymodel.OperationStateRolledBack, now.Add(time.Duration(i)*time.Minute), false); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := NewPersistentBreaker(root); err != nil {
+	restarted, err := NewPersistentBreaker(root)
+	if err != nil {
 		t.Fatalf("failed manual retry made durable breaker unreadable: %v", err)
 	}
+	defer restarted.Close()
 }
 
 func TestPersistentBreakerAtomicallyReplacesStateSymlinkWithoutFollowingIt(t *testing.T) {
@@ -114,6 +119,7 @@ func TestPersistentBreakerAtomicallyReplacesStateSymlinkWithoutFollowingIt(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer b.Close()
 	external := filepath.Join(root, "external")
 	if err := os.WriteFile(external, []byte("sentinel"), 0o600); err != nil {
 		t.Fatal(err)
@@ -134,6 +140,50 @@ func TestPersistentBreakerAtomicallyReplacesStateSymlinkWithoutFollowingIt(t *te
 	matches, err := filepath.Glob(filepath.Join(root, "recovery", ".nurproxy-atomic-*"))
 	if err != nil || len(matches) != 0 {
 		t.Fatalf("breaker temp files remain: %v, %v", matches, err)
+	}
+}
+
+func TestPersistentBreakerRejectsRecoverySymlinkWithoutTouchingTarget(t *testing.T) {
+	root := t.TempDir()
+	data, external := filepath.Join(root, "data"), filepath.Join(root, "external")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(external, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(data, "recovery")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewPersistentBreaker(data); err == nil {
+		t.Fatal("recovery symlink accepted")
+	}
+	assertMode(t, external, 0o755)
+	if _, err := os.Stat(filepath.Join(external, breakerFilename)); !os.IsNotExist(err) {
+		t.Fatalf("external breaker target mutated: %v", err)
+	}
+}
+
+func TestPersistentBreakerCloseIsIdempotentAndReleasesFD(t *testing.T) {
+	before := countFDs(t)
+	for i := 0; i < 40; i++ {
+		breaker, err := NewPersistentBreaker(filepath.Join(t.TempDir(), "data"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := breaker.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := breaker.Close(); err != nil {
+			t.Fatalf("second close: %v", err)
+		}
+		if err := breaker.Record(BreakerKey{Action: recoverymodel.ActionRemoveManagedTemp, Fingerprint: "closed"}, recoverymodel.OperationStateRolledBack, testTime(), false); err == nil {
+			t.Fatal("closed persistent breaker accepted a mutation")
+		}
+	}
+	after := countFDs(t)
+	if after > before+4 {
+		t.Fatalf("breakers leaked descriptors: before=%d after=%d", before, after)
 	}
 }
 

@@ -34,6 +34,10 @@ func testCertificatePair(t *testing.T, host string) ([]byte, []byte) {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 }
 
+func testRecoveryWriter(path string, data []byte, mode os.FileMode) error {
+	return os.WriteFile(path, data, mode)
+}
+
 func TestInspectAndRefreshRuntimeKeyCryptographically(t *testing.T) {
 	host := "app.example.com"
 	certPEM, keyPEM := testCertificatePair(t, host)
@@ -54,7 +58,7 @@ func TestInspectAndRefreshRuntimeKeyCryptographically(t *testing.T) {
 	if !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyMissing || inspection.RuntimeKeyPath == "" {
 		t.Fatalf("missing runtime inspection = %+v", inspection)
 	}
-	if err := store.RefreshRuntimeKey(host); err != nil {
+	if err := store.RefreshRuntimeKey(host, testRecoveryWriter); err != nil {
 		t.Fatal(err)
 	}
 	inspection, err = store.InspectRecovery(host)
@@ -69,7 +73,7 @@ func TestInspectAndRefreshRuntimeKeyCryptographically(t *testing.T) {
 	if err != nil || !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyMismatch {
 		t.Fatalf("mismatched runtime inspection = %+v, err=%v", inspection, err)
 	}
-	if err := store.RefreshRuntimeKey(host); err != nil {
+	if err := store.RefreshRuntimeKey(host, testRecoveryWriter); err != nil {
 		t.Fatal(err)
 	}
 	if inspection, err = store.InspectRecovery(host); err != nil || inspection.RuntimeKeyState != RuntimeKeyValid {
@@ -98,12 +102,32 @@ func TestInspectRecoveryAbsentBundleAndSymlinkFailClosed(t *testing.T) {
 	}
 }
 
+func TestInspectRecoveryUndecryptableOwnedSourceIsPresentButInvalid(t *testing.T) {
+	host := "app.example.com"
+	certPEM, keyPEM := testCertificatePair(t, host)
+	store := New(t.TempDir(), []byte("01234567890123456789012345678901"))
+	if _, err := store.Install(Bundle{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	inspection := store.RecoveryPaths(host)
+	if err := os.WriteFile(inspection.SourceKeyPath, []byte("bounded-but-not-valid-ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.InspectRecovery(host)
+	if err != nil {
+		t.Fatalf("invalid owned source should be classifiable: %v", err)
+	}
+	if !inspection.BundlePresent || inspection.BundleValid {
+		t.Fatalf("invalid source inspection = %+v", inspection)
+	}
+}
+
 func TestInstallRecoveryBundleRejectsCryptographicMismatch(t *testing.T) {
 	host := "app.example.com"
 	certPEM, _ := testCertificatePair(t, host)
 	_, wrongKey := testCertificatePair(t, "wrong.example.com")
 	store := New(t.TempDir(), nil)
-	if err := store.InstallRecoveryBundle(Bundle{Host: host, CertPEM: certPEM, KeyPEM: wrongKey}); err == nil {
+	if err := store.InstallRecoveryBundle(Bundle{Host: host, CertPEM: certPEM, KeyPEM: wrongKey}, testRecoveryWriter); err == nil {
 		t.Fatal("mismatched recovery bundle was installed")
 	}
 	if inspection, err := store.InspectRecovery(host); err != nil || inspection.BundlePresent {

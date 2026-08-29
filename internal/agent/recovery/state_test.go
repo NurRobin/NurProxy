@@ -28,6 +28,7 @@ func TestConcurrentConflictingTransitionsHaveOneWinner(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer store.Close()
 		id := fmt.Sprintf("op-concurrent-%d", attempt)
 		if err := persistTestManifest(store, id, recoverymodel.OperationStateApplying, testTime()); err != nil {
 			t.Fatal(err)
@@ -76,6 +77,7 @@ func TestPrepareRestartConvertsApplyingToRollingBackDurably(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	if err := persistTestManifest(store, "op-restart", recoverymodel.OperationStateApplying, testTime()); err != nil {
 		t.Fatal(err)
 	}
@@ -97,6 +99,7 @@ func TestTransitionRetryIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	if err := persistTestManifest(store, "op-idempotent", recoverymodel.OperationStateApplying, testTime()); err != nil {
 		t.Fatal(err)
 	}

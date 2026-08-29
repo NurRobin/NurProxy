@@ -53,8 +53,16 @@ func TestBackend_Detect_alwaysAvailable(t *testing.T) {
 func TestRecoveryAdapterSupportsOnlyCertificateAndRuntimeKeyActions(t *testing.T) {
 	store := certstore.New(t.TempDir(), []byte("01234567890123456789012345678901"))
 	b := New(agentcaddy.NewMockClient()).WithCertStore(store)
-	candidates, err := b.InspectRecovery(context.Background(), proxy.RecoveryDesired{KeepCertHosts: []string{"app.example.com"}})
-	if err != nil || len(candidates) != 1 || candidates[0].Action != recoverymodel.ActionRematerializeCertBundle {
+	invalidHost := "invalid-key.example.com"
+	invalidPaths := store.RecoveryPaths(invalidHost)
+	if err := os.WriteFile(invalidPaths.CertPath, []byte("present-cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalidPaths.SourceKeyPath, []byte("invalid-encrypted-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := b.InspectRecovery(context.Background(), proxy.RecoveryDesired{KeepCertHosts: []string{"app.example.com", invalidHost}})
+	if err != nil || len(candidates) != 2 || candidates[0].Action != recoverymodel.ActionRematerializeCertBundle || candidates[1].Action != recoverymodel.ActionRematerializeCertBundle {
 		t.Fatalf("caddy candidates = %+v, err=%v", candidates, err)
 	}
 	if err := b.ExecuteRecovery(context.Background(), proxy.RecoveryCandidate{Action: recoverymodel.ActionPruneManagedOrphan, Host: "app.example.com", Paths: []string{"/tmp/nurproxy.conf"}}, nil); !errors.Is(err, proxy.ErrRecoveryUnsupported) {

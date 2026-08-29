@@ -58,6 +58,81 @@ func TestRecoveryPathCaptureAndNoFollowRemoval(t *testing.T) {
 	}
 }
 
+func TestRecoveryMutationPreflightsEveryPathBeforeUnlink(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "enabled.conf")
+	second := filepath.Join(dir, "available.conf")
+	if err := os.WriteFile(second, []byte("owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, first); err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := CaptureRecoveryPath(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := CaptureRecoveryPath(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidate := NewRecoveryCandidate(recoverymodel.ActionPruneManagedOrphan, "app.example.com", firstID, secondID)
+	if err := RemoveRecoveryCandidatePaths(candidate); err == nil {
+		t.Fatal("candidate with a late identity mismatch was removed")
+	}
+	for _, path := range []string{first, second} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("preflight failure removed %q: %v", path, err)
+		}
+	}
+}
+
+func TestReplaceRecoveryPathRejectsDestinationAndParentSwap(t *testing.T) {
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "app.crt")
+	if err := os.WriteFile(destination, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := CaptureRecoveryPath(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(destination, destination+".old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("operator"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceRecoveryPath(identity, []byte("new"), 0o600); err == nil {
+		t.Fatal("destination replacement passed guarded write")
+	}
+	if got, _ := os.ReadFile(destination); string(got) != "operator" {
+		t.Fatalf("replacement destination changed to %q", got)
+	}
+
+	absent := filepath.Join(dir, "runtime.key")
+	absentIdentity, err := CaptureRecoveryPath(absent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := dir + ".moved"
+	if err := os.Rename(dir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceRecoveryPath(absentIdentity, []byte("secret"), 0o600); err == nil {
+		t.Fatal("parent replacement passed guarded write")
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "runtime.key")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement parent received runtime key: %v", err)
+	}
+}
+
 type recordingRecoveryBackend struct {
 	*recordingBackend
 	candidates []RecoveryCandidate

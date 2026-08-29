@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
@@ -58,11 +59,12 @@ func (b *Backend) ExecuteRecovery(ctx context.Context, candidate proxy.RecoveryC
 		if !ok || bundle.Host != candidate.Host {
 			return fmt.Errorf("caddy recovery bundle unavailable")
 		}
-		if err := b.certs.InstallRecoveryBundle(certstore.Bundle{Host: bundle.Host, CertPEM: bundle.CertPEM, KeyPEM: bundle.KeyPEM, MaterializePlain: bundle.MaterializeKey}); err != nil {
+		materialize := bundle.MaterializeKey || recoveryCandidatePathExists(candidate, b.certs.RecoveryPaths(candidate.Host).RuntimeKeyPath)
+		if err := b.certs.InstallRecoveryBundle(certstore.Bundle{Host: bundle.Host, CertPEM: bundle.CertPEM, KeyPEM: bundle.KeyPEM, MaterializePlain: materialize}, recoveryCandidateWriter(candidate)); err != nil {
 			return err
 		}
 	case recoverymodel.ActionRematerializeRuntimeKey:
-		if err := b.certs.RefreshRuntimeKey(candidate.Host); err != nil {
+		if err := b.certs.RefreshRuntimeKey(candidate.Host, recoveryCandidateWriter(candidate)); err != nil {
 			return err
 		}
 	}
@@ -99,4 +101,27 @@ func recheckRecoveryIdentities(candidate proxy.RecoveryCandidate) error {
 		}
 	}
 	return nil
+}
+
+func recoveryCandidateWriter(candidate proxy.RecoveryCandidate) certstore.RecoveryWriteFunc {
+	identities := make(map[string]proxy.RecoveryPathIdentity, len(candidate.Identities))
+	for _, identity := range candidate.Identities {
+		identities[identity.Path] = identity
+	}
+	return func(path string, data []byte, mode os.FileMode) error {
+		identity, ok := identities[path]
+		if !ok {
+			return fmt.Errorf("caddy recovery destination was not authorized")
+		}
+		return proxy.ReplaceRecoveryPath(identity, data, mode)
+	}
+}
+
+func recoveryCandidatePathExists(candidate proxy.RecoveryCandidate, path string) bool {
+	for _, identity := range candidate.Identities {
+		if identity.Path == path {
+			return identity.Exists
+		}
+	}
+	return false
 }

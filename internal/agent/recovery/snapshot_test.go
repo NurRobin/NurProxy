@@ -34,6 +34,7 @@ func TestSnapshotAndRollbackPreserveRegularAbsentAndSymlinkState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	now := time.Date(2026, 8, 29, 1, 2, 3, 0, time.UTC)
 	manifest, err := store.Create("op-1", recoverymodel.ActionPruneManagedOrphan, "fingerprint", paths, now)
 	if err != nil {
@@ -105,6 +106,7 @@ func TestSnapshotStoreRemainsBoundWhenOperationsPathIsSwapped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	original := filepath.Join(root, "original-operations")
 	if err := os.Rename(store.operationsDir, original); err != nil {
 		t.Fatal(err)
@@ -137,6 +139,7 @@ func TestSnapshotManifestIsTypedSecretFreeAndAtomicallyPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	manifest, err := store.Create("op-atomic", recoverymodel.ActionRematerializeCertBundle, "fp", checked, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
@@ -167,8 +170,27 @@ func TestSnapshotRejectsAnEmptyMutationSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	if _, err := store.Create("op-empty", recoverymodel.ActionRemoveManagedTemp, "fp", nil, testTime()); err == nil {
 		t.Fatal("empty snapshot accepted")
+	}
+}
+
+func TestSnapshotStoreRejectsRecoverySymlinkWithoutTouchingTarget(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	external := filepath.Join(root, "external")
+	mustMkdir(t, data, 0o700)
+	mustMkdir(t, external, 0o755)
+	if err := os.Symlink(external, filepath.Join(data, "recovery")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSnapshotStore(data); err == nil {
+		t.Fatal("recovery symlink accepted")
+	}
+	assertMode(t, external, 0o755)
+	if _, err := os.Stat(filepath.Join(external, "operations")); !os.IsNotExist(err) {
+		t.Fatalf("external target mutated: %v", err)
 	}
 }
 
@@ -183,6 +205,7 @@ func TestRollbackRejectsSnapshotBlobSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	manifest, err := store.Create("op-blob", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, path), testTime())
 	if err != nil {
 		t.Fatal(err)
@@ -219,6 +242,7 @@ func TestRollbackRejectsTamperedSymlinkTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	manifest, err := store.Create("op-link", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, link), testTime())
 	if err != nil {
 		t.Fatal(err)
@@ -253,6 +277,7 @@ func TestRollbackPrevalidatesEverySnapshotBeforeMutation(t *testing.T) {
 	mustWrite(t, second, []byte("second-before"), 0o600)
 	guard, _ := NewPathGuard(managed)
 	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	defer store.Close()
 	manifest, err := store.Create("op-prevalidate", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, first, second), testTime())
 	if err != nil {
 		t.Fatal(err)
@@ -273,7 +298,7 @@ func TestRollbackPrevalidatesEverySnapshotBeforeMutation(t *testing.T) {
 	assertContents(t, second, "second-after")
 }
 
-func TestRollbackContinuesIndependentRestoresAfterRuntimeFailure(t *testing.T) {
+func TestRollbackPreflightsUnsupportedEntryBeforeAnyRestore(t *testing.T) {
 	root := t.TempDir()
 	one, two := filepath.Join(root, "one"), filepath.Join(root, "two")
 	mustMkdir(t, one, 0o700)
@@ -283,6 +308,7 @@ func TestRollbackContinuesIndependentRestoresAfterRuntimeFailure(t *testing.T) {
 	mustWrite(t, second, []byte("second-before"), 0o600)
 	guard, _ := NewPathGuard(one, two)
 	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	defer store.Close()
 	if _, err := store.Create("op-partial", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, first, second), testTime()); err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +325,49 @@ func TestRollbackContinuesIndependentRestoresAfterRuntimeFailure(t *testing.T) {
 	if err := store.Rollback("op-partial"); err == nil {
 		t.Fatal("partial restore failure not reported")
 	}
+	assertContents(t, first, "first-after")
+}
+
+func TestRestoreAllContinuesAfterRuntimeFailure(t *testing.T) {
+	root := t.TempDir()
+	one, two := filepath.Join(root, "one"), filepath.Join(root, "two")
+	mustMkdir(t, one, 0o700)
+	mustMkdir(t, two, 0o700)
+	first, second := filepath.Join(one, "first"), filepath.Join(two, "second")
+	mustWrite(t, first, []byte("first-after"), 0o600)
+	mustWrite(t, second, []byte("second-after"), 0o600)
+	firstInfo, _ := os.Stat(one)
+	secondInfo, _ := os.Stat(two)
+	fd1, _, dev1, ino1, typ1, err := preflightTarget(snapshotEntryForTest(t, first, firstInfo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2, _, dev2, ino2, typ2, err := preflightTarget(snapshotEntryForTest(t, second, secondInfo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := []preparedSnapshot{
+		{entry: snapshotEntryForTest(t, first, firstInfo), data: []byte("first-before"), parent: fd1, exists: true, device: dev1, inode: ino1, entryType: typ1},
+		{entry: snapshotEntryForTest(t, second, secondInfo), data: []byte("second-before"), parent: fd2, exists: true, device: dev2, inode: ino2, entryType: typ2},
+	}
+	if err := fd2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer fd1.Close()
+	if err := restoreAll(items); err == nil {
+		t.Fatal("runtime restore failure not aggregated")
+	}
 	assertContents(t, first, "first-before")
+	assertContents(t, second, "second-after")
+}
+
+func snapshotEntryForTest(t *testing.T, path string, parent os.FileInfo) SnapshotEntry {
+	t.Helper()
+	device, inode, ok := fileIdentity(parent)
+	if !ok {
+		t.Fatal("parent identity unavailable")
+	}
+	return SnapshotEntry{Path: path, ResolvedPath: path, Kind: SnapshotRegular, Mode: 0o600, ParentDevice: device, ParentInode: inode}
 }
 
 func TestRollbackRequiresRollingBackManifestState(t *testing.T) {
@@ -310,6 +378,7 @@ func TestRollbackRequiresRollingBackManifestState(t *testing.T) {
 	mustWrite(t, path, []byte("before"), 0o600)
 	guard, _ := NewPathGuard(managed)
 	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	defer store.Close()
 	if _, err := store.Create("op-state", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, path), testTime()); err != nil {
 		t.Fatal(err)
 	}
@@ -326,6 +395,7 @@ func TestRollbackRejectsReplacedParentDirectory(t *testing.T) {
 	mustWrite(t, path, []byte("before"), 0o600)
 	guard, _ := NewPathGuard(managed)
 	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	defer store.Close()
 	if _, err := store.Create("op-parent", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, path), testTime()); err != nil {
 		t.Fatal(err)
 	}
@@ -343,12 +413,64 @@ func TestRollbackRejectsReplacedParentDirectory(t *testing.T) {
 	assertContents(t, path, "replacement")
 }
 
+func TestRollbackPreflightsAllTargetParentsBeforeAnyMutation(t *testing.T) {
+	root := t.TempDir()
+	one, two := filepath.Join(root, "one"), filepath.Join(root, "two")
+	mustMkdir(t, one, 0o700)
+	mustMkdir(t, two, 0o700)
+	first, second := filepath.Join(one, "first"), filepath.Join(two, "second")
+	mustWrite(t, first, []byte("first-before"), 0o600)
+	mustWrite(t, second, []byte("second-before"), 0o600)
+	guard, _ := NewPathGuard(one, two)
+	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	defer store.Close()
+	if _, err := store.Create("op-target-preflight", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, first, second), testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition("op-target-preflight", recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack, testTime()); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, first, []byte("first-after"), 0o600)
+	mustWrite(t, second, []byte("second-after"), 0o600)
+	if err := os.Rename(one, one+"-original"); err != nil {
+		t.Fatal(err)
+	}
+	mustMkdir(t, one, 0o700)
+	mustWrite(t, first, []byte("replacement"), 0o600)
+	if err := store.Rollback("op-target-preflight"); err == nil {
+		t.Fatal("replaced target parent accepted")
+	}
+	assertContents(t, first, "replacement")
+	assertContents(t, second, "second-after")
+}
+
+func TestSnapshotStoreCloseIsIdempotentAndReleasesFD(t *testing.T) {
+	before := countFDs(t)
+	for i := 0; i < 40; i++ {
+		store, err := NewSnapshotStore(filepath.Join(t.TempDir(), "data"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("second close: %v", err)
+		}
+	}
+	after := countFDs(t)
+	if after > before+4 {
+		t.Fatalf("snapshot stores leaked descriptors: before=%d after=%d", before, after)
+	}
+}
+
 func TestRetentionKeepsNewestTwentyRecentAndActiveWithoutFollowingSymlinks(t *testing.T) {
 	root := t.TempDir()
 	store, err := NewSnapshotStore(filepath.Join(root, "data"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 25; i++ {
 		id := operationID(i)
@@ -401,6 +523,7 @@ func TestRetentionRemovesOnlyOldIncompleteOperationDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	oldDir, freshDir := store.OperationDir("op-incomplete-old"), store.OperationDir("op-incomplete-fresh")
 	mustMkdir(t, oldDir, 0o700)
 	mustMkdir(t, freshDir, 0o700)
@@ -425,6 +548,7 @@ func TestRetentionPreservesOldOperationWithCorruptManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	dir := store.OperationDir("op-corrupt")
 	mustMkdir(t, dir, 0o700)
 	mustWrite(t, filepath.Join(dir, manifestFilename), []byte("not-json"), 0o600)
@@ -446,6 +570,7 @@ func TestRetentionRemovalRequiresSelectedDirectoryIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
 	selected, replacement := store.OperationDir("op-selected"), store.OperationDir("op-replacement")
 	mustMkdir(t, selected, 0o700)
 	mustMkdir(t, replacement, 0o700)
@@ -525,6 +650,15 @@ func stringContains(s, sub string) bool {
 	return false
 }
 func operationID(i int) string { return "op-" + string(rune('0'+i/10)) + string(rune('0'+i%10)) }
+
+func countFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("fd accounting unavailable: %v", err)
+	}
+	return len(entries)
+}
 
 func persistTestManifest(store *SnapshotStore, id string, state recoverymodel.OperationState, created time.Time) error {
 	if err := os.Mkdir(store.OperationDir(id), 0o700); err != nil {

@@ -194,6 +194,37 @@ func TestPrune_removesOrphanedGeneratedKeepsOperatorAndDesired(t *testing.T) {
 	}
 }
 
+func TestWildcardRecoveryDecodesHostAndRoutinePruneStillConverges(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout := newBackend(t, r)
+	ctx := context.Background()
+	wildcard := sampleArtifact(b, "*.example.com", "server { listen 80; }\n")
+	if err := b.Apply(ctx, []proxy.Artifact{wildcard}); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := b.InspectRecovery(ctx, proxy.RecoveryDesired{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].Host != "*.example.com" || candidates[0].Action != recoverymodel.ActionPruneManagedOrphan {
+		t.Fatalf("wildcard candidates = %+v", candidates)
+	}
+	if n, err := b.Prune(ctx, nil); err != nil || n != 1 {
+		t.Fatalf("wildcard routine prune = %d, %v", n, err)
+	}
+	if _, err := os.Lstat(wildcard.Target.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wildcard config survived routine prune: %v", err)
+	}
+	temp := layout.AvailablePath("*.temp.example.com") + tempSuffix
+	if err := os.WriteFile(temp, []byte(proxy.StampManagedArtifact("staged\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err = b.InspectRecovery(ctx, proxy.RecoveryDesired{})
+	if err != nil || len(candidates) != 1 || candidates[0].Host != "*.temp.example.com" || candidates[0].Action != recoverymodel.ActionRemoveManagedTemp {
+		t.Fatalf("wildcard temp candidates = %+v err=%v", candidates, err)
+	}
+}
+
 func TestApply_success_writesFileSymlinkAndReloads(t *testing.T) {
 	r := &fakeRunner{}
 	b, layout := newBackend(t, r)
@@ -409,7 +440,15 @@ func TestRecoveryAdapterInspectsAndExecutesOwnedFileCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	candidates, err := b.InspectRecovery(context.Background(), proxy.RecoveryDesired{ActiveOperationPaths: []string{activeTemp}, KeepCertHosts: []string{"missing.example.com"}})
+	invalidHost := "invalid-key.example.com"
+	invalidPaths := b.certs.RecoveryPaths(invalidHost)
+	if err := os.WriteFile(invalidPaths.CertPath, []byte("present-cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalidPaths.SourceKeyPath, []byte("invalid-encrypted-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := b.InspectRecovery(context.Background(), proxy.RecoveryDesired{ActiveOperationPaths: []string{activeTemp}, KeepCertHosts: []string{"missing.example.com", invalidHost}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +462,13 @@ func TestRecoveryAdapterInspectsAndExecutesOwnedFileCandidates(t *testing.T) {
 	orphan := byAction[recoverymodel.ActionPruneManagedOrphan]
 	stale := byAction[recoverymodel.ActionRemoveManagedTemp]
 	missingCert := byAction[recoverymodel.ActionRematerializeCertBundle]
-	if orphan.Host != host || len(orphan.Paths) < 3 || stale.Host != "stale.example.com" || missingCert.Host != "missing.example.com" {
+	certHosts := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.Action == recoverymodel.ActionRematerializeCertBundle {
+			certHosts[candidate.Host] = true
+		}
+	}
+	if orphan.Host != host || len(orphan.Paths) < 3 || stale.Host != "stale.example.com" || !certHosts["missing.example.com"] || !certHosts[invalidHost] || missingCert.Host == "" {
 		t.Fatalf("candidates = %+v", candidates)
 	}
 	if err := b.ExecuteRecovery(context.Background(), stale, nil); err != nil {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -50,11 +51,140 @@ func RemoveRecoveryCandidatePaths(candidate RecoveryCandidate) error {
 		if identity.Path != candidate.Paths[i] {
 			return fmt.Errorf("recovery candidate identity path mismatch")
 		}
+		if err := identity.Recheck(); err != nil {
+			return err
+		}
+	}
+	ordered := append([]RecoveryPathIdentity(nil), candidate.Identities...)
+	for i := 1; i < len(ordered); i++ {
+		for j := i; j > 0 && ordered[j].SymlinkTarget != "" && ordered[j-1].SymlinkTarget == ""; j-- {
+			ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
+		}
+	}
+	for _, identity := range ordered {
 		if identity.Exists {
 			if err := RemoveRecoveryPath(identity); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func ReplaceRecoveryPath(identity RecoveryPathIdentity, data []byte, mode os.FileMode) error {
+	if identity.Path == "" || !mode.IsRegular() {
+		return fmt.Errorf("invalid recovery replacement")
+	}
+	parent := filepath.Dir(identity.Path)
+	dirfd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open recovery parent: %w", err)
+	}
+	defer unix.Close(dirfd)
+	if err := recheckRecoveryParent(dirfd, parent, identity); err != nil {
+		return err
+	}
+	name := filepath.Base(identity.Path)
+	if err := recheckRecoveryEntry(dirfd, name, identity); err != nil {
+		return err
+	}
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return fmt.Errorf("create recovery temporary name: %w", err)
+	}
+	tempName := ".nurproxy-recovery-" + hex.EncodeToString(random[:])
+	fd, err := unix.Openat(dirfd, tempName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(mode.Perm()))
+	if err != nil {
+		return fmt.Errorf("create recovery temporary file: %w", err)
+	}
+	temp := os.NewFile(uintptr(fd), tempName)
+	removeTemp := true
+	defer func() {
+		_ = temp.Close()
+		if removeTemp {
+			_ = unix.Unlinkat(dirfd, tempName, 0)
+		}
+	}()
+	if _, err := temp.Write(data); err != nil {
+		return fmt.Errorf("write recovery temporary file: %w", err)
+	}
+	if err := temp.Chmod(mode.Perm()); err != nil {
+		return fmt.Errorf("chmod recovery temporary file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync recovery temporary file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close recovery temporary file: %w", err)
+	}
+	if err := recheckRecoveryParent(dirfd, parent, identity); err != nil {
+		return err
+	}
+	if err := recheckRecoveryEntry(dirfd, name, identity); err != nil {
+		return err
+	}
+	if !identity.Exists {
+		err = unix.Renameat2(dirfd, tempName, dirfd, name, unix.RENAME_NOREPLACE)
+	} else {
+		err = unix.Renameat(dirfd, tempName, dirfd, name)
+	}
+	if err != nil {
+		return fmt.Errorf("replace recovery entry: %w", err)
+	}
+	removeTemp = false
+	return nil
+}
+
+func recheckRecoveryParent(dirfd int, parent string, identity RecoveryPathIdentity) error {
+	var held unix.Stat_t
+	if err := unix.Fstat(dirfd, &held); err != nil || uint64(held.Dev) != identity.parentDevice || held.Ino != identity.parentInode {
+		return fmt.Errorf("recovery parent identity changed")
+	}
+	currentfd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("reopen recovery parent: %w", err)
+	}
+	defer unix.Close(currentfd)
+	var current unix.Stat_t
+	if err := unix.Fstat(currentfd, &current); err != nil || current.Dev != held.Dev || current.Ino != held.Ino {
+		return fmt.Errorf("recovery parent path changed")
+	}
+	return nil
+}
+
+func recheckRecoveryEntry(dirfd int, name string, identity RecoveryPathIdentity) error {
+	var current unix.Stat_t
+	err := unix.Fstatat(dirfd, name, &current, unix.AT_SYMLINK_NOFOLLOW)
+	if !identity.Exists {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return fmt.Errorf("recovery destination appeared or cannot be checked")
+	}
+	if err != nil || uint64(current.Dev) != identity.Device || current.Ino != identity.Inode {
+		return fmt.Errorf("recovery entry identity changed")
+	}
+	if identity.SymlinkTarget != "" {
+		return fmt.Errorf("recovery replacement destination is a symlink")
+	}
+	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open recovery entry: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	var opened unix.Stat_t
+	if err := unix.Fstat(fd, &opened); err != nil || uint64(opened.Dev) != identity.Device || opened.Ino != identity.Inode {
+		_ = file.Close()
+		return fmt.Errorf("recovery entry identity changed while opening")
+	}
+	digest, hashErr := hashBounded(file)
+	closeErr := file.Close()
+	if hashErr != nil || closeErr != nil || digest != identity.SHA256 {
+		return fmt.Errorf("recovery entry content changed")
+	}
+	var final unix.Stat_t
+	if err := unix.Fstatat(dirfd, name, &final, unix.AT_SYMLINK_NOFOLLOW); err != nil || final.Dev != opened.Dev || final.Ino != opened.Ino {
+		return fmt.Errorf("recovery entry identity changed before replacement")
 	}
 	return nil
 }

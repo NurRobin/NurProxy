@@ -70,15 +70,32 @@ func NewSnapshotStore(agentDataDir string) (*SnapshotStore, error) {
 	if !safeAbsoluteCleanPath(agentDataDir) {
 		return nil, fmt.Errorf("agent data directory must be an absolute clean path")
 	}
-	operations := filepath.Join(agentDataDir, "recovery", "operations")
-	if err := mkdirPrivate(operations); err != nil {
+	recoveryDir := filepath.Join(agentDataDir, "recovery")
+	recovery, err := ensurePrivateDirectory(recoveryDir)
+	if err != nil {
 		return nil, err
 	}
-	dir, err := openDirNoSymlinks(operations)
+	defer recovery.Close()
+	dir, err := openOrCreatePrivateDirAt(recovery, "operations")
 	if err != nil {
 		return nil, fmt.Errorf("open recovery operations directory: %w", err)
 	}
+	operations := filepath.Join(recoveryDir, "operations")
 	return &SnapshotStore{operationsDir: operations, operations: dir}, nil
+}
+
+func (s *SnapshotStore) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.operations == nil {
+		return nil
+	}
+	err := s.operations.Close()
+	s.operations = nil
+	return err
 }
 
 func (s *SnapshotStore) OperationDir(operationID string) string {
@@ -89,11 +106,14 @@ func (s *SnapshotStore) OperationDir(operationID string) string {
 }
 
 func (s *SnapshotStore) Create(operationID string, action recoverymodel.Action, fingerprint string, paths []GuardedPath, now time.Time) (*SnapshotManifest, error) {
-	if s == nil || s.operations == nil || !validOperationID(operationID) || !action.Valid() || !validOpaqueID(fingerprint) || now.IsZero() || len(paths) == 0 {
+	if s == nil || !validOperationID(operationID) || !action.Valid() || !validOpaqueID(fingerprint) || now.IsZero() || len(paths) == 0 {
 		return nil, fmt.Errorf("invalid snapshot metadata")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.operations == nil {
+		return nil, fmt.Errorf("snapshot store is closed")
+	}
 	if err := unix.Mkdirat(int(s.operations.Fd()), operationID, 0o700); err != nil {
 		return nil, fmt.Errorf("create operation directory: %w", err)
 	}
@@ -227,11 +247,14 @@ func readValidatedSource(checked GuardedPath) ([]byte, error) {
 }
 
 func (s *SnapshotStore) Load(operationID string) (*SnapshotManifest, error) {
-	if s == nil || s.operations == nil || !validOperationID(operationID) {
+	if s == nil || !validOperationID(operationID) {
 		return nil, fmt.Errorf("invalid operation ID")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.operations == nil {
+		return nil, fmt.Errorf("snapshot store is closed")
+	}
 	return s.loadUnlocked(operationID)
 }
 
@@ -245,11 +268,14 @@ func (s *SnapshotStore) loadUnlocked(operationID string) (*SnapshotManifest, err
 }
 
 func (s *SnapshotStore) Transition(operationID string, expected, next recoverymodel.OperationState, now time.Time) (*SnapshotManifest, error) {
-	if s == nil || s.operations == nil || !validOperationID(operationID) {
+	if s == nil || !validOperationID(operationID) {
 		return nil, fmt.Errorf("invalid operation ID")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.operations == nil {
+		return nil, fmt.Errorf("snapshot store is closed")
+	}
 	manifest, err := s.loadUnlocked(operationID)
 	if err != nil {
 		return nil, err
@@ -291,16 +317,24 @@ func (s *SnapshotStore) PrepareRestart(operationID string) (RestartDisposition, 
 }
 
 type preparedSnapshot struct {
-	entry SnapshotEntry
-	data  []byte
+	entry     SnapshotEntry
+	data      []byte
+	parent    *os.File
+	exists    bool
+	device    uint64
+	inode     uint64
+	entryType uint32
 }
 
 func (s *SnapshotStore) Rollback(operationID string) error {
-	if s == nil || s.operations == nil || !validOperationID(operationID) {
+	if s == nil || !validOperationID(operationID) {
 		return fmt.Errorf("invalid operation ID")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.operations == nil {
+		return fmt.Errorf("snapshot store is closed")
+	}
 	opDir, err := openDirAt(int(s.operations.Fd()), operationID)
 	if err != nil {
 		return err
@@ -314,6 +348,13 @@ func (s *SnapshotStore) Rollback(operationID string) error {
 		return fmt.Errorf("rollback requires rolling_back state")
 	}
 	prepared := make([]preparedSnapshot, 0, len(manifest.Entries))
+	defer func() {
+		for i := range prepared {
+			if prepared[i].parent != nil {
+				prepared[i].parent.Close()
+			}
+		}
+	}()
 	for _, entry := range manifest.Entries {
 		item := preparedSnapshot{entry: entry}
 		switch entry.Kind {
@@ -330,8 +371,16 @@ func (s *SnapshotStore) Rollback(operationID string) error {
 		if err != nil {
 			return fmt.Errorf("prevalidate %s: %w", entry.Path, err)
 		}
+		item.parent, item.exists, item.device, item.inode, item.entryType, err = preflightTarget(entry)
+		if err != nil {
+			return fmt.Errorf("preflight %s: %w", entry.Path, err)
+		}
 		prepared = append(prepared, item)
 	}
+	return restoreAll(prepared)
+}
+
+func restoreAll(prepared []preparedSnapshot) error {
 	var restoreErrors []error
 	for i := len(prepared) - 1; i >= 0; i-- {
 		if err := restorePrepared(prepared[i]); err != nil {
@@ -343,11 +392,7 @@ func (s *SnapshotStore) Rollback(operationID string) error {
 
 func restorePrepared(item preparedSnapshot) error {
 	entry := item.entry
-	parent, err := openDirNoSymlinks(filepath.Dir(entry.Path))
-	if err != nil {
-		return fmt.Errorf("open snapshot parent: %w", err)
-	}
-	defer parent.Close()
+	parent := item.parent
 	parentInfo, err := parent.Stat()
 	if err != nil {
 		return err
@@ -359,11 +404,12 @@ func restorePrepared(item preparedSnapshot) error {
 	name := filepath.Base(entry.Path)
 	var stat unix.Stat_t
 	err = unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
-	if err != nil && !errors.Is(err, unix.ENOENT) {
-		return err
-	}
-	if err == nil && stat.Mode&unix.S_IFMT != unix.S_IFREG && stat.Mode&unix.S_IFMT != unix.S_IFLNK {
-		return fmt.Errorf("refusing to replace unsupported entry type")
+	if item.exists {
+		if err != nil || uint64(stat.Dev) != item.device || stat.Ino != item.inode || stat.Mode&unix.S_IFMT != item.entryType {
+			return fmt.Errorf("target identity changed after preflight")
+		}
+	} else if !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("absent target changed after preflight")
 	}
 	switch entry.Kind {
 	case SnapshotAbsent:
@@ -382,6 +428,38 @@ func restorePrepared(item preparedSnapshot) error {
 	}
 }
 
+func preflightTarget(entry SnapshotEntry) (*os.File, bool, uint64, uint64, uint32, error) {
+	parent, err := openDirNoSymlinks(filepath.Dir(entry.Path))
+	if err != nil {
+		return nil, false, 0, 0, 0, err
+	}
+	info, err := parent.Stat()
+	if err != nil {
+		parent.Close()
+		return nil, false, 0, 0, 0, err
+	}
+	device, inode, ok := fileIdentity(info)
+	if !ok || device != entry.ParentDevice || inode != entry.ParentInode {
+		parent.Close()
+		return nil, false, 0, 0, 0, fmt.Errorf("snapshot parent identity changed")
+	}
+	var stat unix.Stat_t
+	err = unix.Fstatat(int(parent.Fd()), filepath.Base(entry.Path), &stat, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return parent, false, 0, 0, 0, nil
+	}
+	if err != nil {
+		parent.Close()
+		return nil, false, 0, 0, 0, err
+	}
+	entryType := stat.Mode & unix.S_IFMT
+	if entryType != unix.S_IFREG && entryType != unix.S_IFLNK {
+		parent.Close()
+		return nil, false, 0, 0, 0, fmt.Errorf("refusing to replace unsupported entry type")
+	}
+	return parent, true, uint64(stat.Dev), stat.Ino, entryType, nil
+}
+
 func validateSymlinkSnapshot(entry SnapshotEntry) error {
 	if digest([]byte(entry.SymlinkTarget)) != entry.SHA256 {
 		return fmt.Errorf("snapshot symlink hash mismatch")
@@ -398,11 +476,14 @@ func validateSymlinkSnapshot(entry SnapshotEntry) error {
 }
 
 func (s *SnapshotStore) Prune(now time.Time) error {
-	if s == nil || s.operations == nil || now.IsZero() {
+	if s == nil || now.IsZero() {
 		return fmt.Errorf("invalid retention input")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.operations == nil {
+		return fmt.Errorf("snapshot store is closed")
+	}
 	dup, err := unix.Dup(int(s.operations.Fd()))
 	if err != nil {
 		return err
@@ -468,11 +549,14 @@ func (s *SnapshotStore) Prune(now time.Time) error {
 }
 
 func (s *SnapshotStore) persist(manifest *SnapshotManifest) error {
-	if s == nil || s.operations == nil || manifest == nil {
+	if s == nil || manifest == nil {
 		return fmt.Errorf("invalid snapshot manifest")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.operations == nil {
+		return fmt.Errorf("snapshot store is closed")
+	}
 	return s.persistUnlocked(manifest)
 }
 
@@ -607,18 +691,74 @@ func fileIdentity(info os.FileInfo) (uint64, uint64, bool) {
 	return uint64(stat.Dev), stat.Ino, stat.Dev != 0 && stat.Ino != 0
 }
 
-func mkdirPrivate(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return fmt.Errorf("create private directory: %w", err)
+func ensurePrivateDirectory(path string) (*os.File, error) {
+	if !safeAbsoluteCleanPath(path) {
+		return nil, fmt.Errorf("private directory must be an absolute clean path")
 	}
-	for current := path; filepath.Dir(current) != current; current = filepath.Dir(current) {
-		if strings.HasSuffix(current, filepath.Join("recovery", "operations")) || filepath.Base(current) == "recovery" {
-			if err := os.Chmod(current, 0o700); err != nil {
-				return err
+	rootFD, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	current := os.NewFile(uintptr(rootFD), "/")
+	components := strings.Split(strings.TrimPrefix(path, "/"), string(filepath.Separator))
+	for i, component := range components {
+		if component == "" {
+			continue
+		}
+		next, openErr := openDirAt(int(current.Fd()), component)
+		created := false
+		if errors.Is(openErr, unix.ENOENT) {
+			if err := unix.Mkdirat(int(current.Fd()), component, 0o700); err != nil {
+				current.Close()
+				return nil, err
+			}
+			created = true
+			next, openErr = openDirAt(int(current.Fd()), component)
+		}
+		if openErr != nil {
+			current.Close()
+			return nil, openErr
+		}
+		if created || i == len(components)-1 {
+			if err := next.Chmod(0o700); err != nil {
+				next.Close()
+				current.Close()
+				return nil, err
 			}
 		}
+		info, err := next.Stat()
+		if err != nil || !info.IsDir() || ((created || i == len(components)-1) && info.Mode().Perm() != 0o700) {
+			next.Close()
+			current.Close()
+			return nil, fmt.Errorf("invalid private directory component")
+		}
+		current.Close()
+		current = next
 	}
-	return nil
+	return current, nil
+}
+
+func openOrCreatePrivateDirAt(parent *os.File, name string) (*os.File, error) {
+	dir, err := openDirAt(int(parent.Fd()), name)
+	if errors.Is(err, unix.ENOENT) {
+		if err := unix.Mkdirat(int(parent.Fd()), name, 0o700); err != nil {
+			return nil, err
+		}
+		dir, err = openDirAt(int(parent.Fd()), name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := dir.Chmod(0o700); err != nil {
+		dir.Close()
+		return nil, err
+	}
+	info, err := dir.Stat()
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		dir.Close()
+		return nil, fmt.Errorf("invalid private directory")
+	}
+	return dir, nil
 }
 
 func openDirNoSymlinks(path string) (*os.File, error) {

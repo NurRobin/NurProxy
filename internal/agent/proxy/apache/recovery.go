@@ -46,7 +46,7 @@ func (b *Backend) InspectRecovery(_ context.Context, desired proxy.RecoveryDesir
 			if captureErr != nil || !marked {
 				continue
 			}
-			host := strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix+tempSuffix)
+			host := recoveryHostFromFileBase(strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix+tempSuffix))
 			candidates = append(candidates, proxy.NewRecoveryCandidate(recoverymodel.ActionRemoveManagedTemp, host, identity))
 			continue
 		}
@@ -60,7 +60,7 @@ func (b *Backend) InspectRecovery(_ context.Context, desired proxy.RecoveryDesir
 		if _, wanted := keep[path]; wanted {
 			continue
 		}
-		host := strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix)
+		host := recoveryHostFromFileBase(strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix))
 		identities := []proxy.RecoveryPathIdentity{identity}
 		if enabled != "" {
 			linkPath := filepath.Join(enabled, name)
@@ -101,7 +101,8 @@ func (b *Backend) ExecuteRecovery(ctx context.Context, candidate proxy.RecoveryC
 		if b.certs == nil {
 			return proxy.ErrRecoveryUnsupported
 		}
-		if err := b.certs.InstallRecoveryBundle(certstore.Bundle{Host: bundle.Host, CertPEM: bundle.CertPEM, KeyPEM: bundle.KeyPEM, MaterializePlain: bundle.MaterializeKey}); err != nil {
+		materialize := bundle.MaterializeKey || recoveryCandidatePathExists(candidate, b.certs.RecoveryPaths(candidate.Host).RuntimeKeyPath)
+		if err := b.certs.InstallRecoveryBundle(certstore.Bundle{Host: bundle.Host, CertPEM: bundle.CertPEM, KeyPEM: bundle.KeyPEM, MaterializePlain: materialize}, recoveryCandidateWriter(candidate)); err != nil {
 			return err
 		}
 	case recoverymodel.ActionRematerializeRuntimeKey:
@@ -111,7 +112,7 @@ func (b *Backend) ExecuteRecovery(ctx context.Context, candidate proxy.RecoveryC
 		if err := recheckRecoveryIdentities(candidate); err != nil {
 			return err
 		}
-		if err := b.certs.RefreshRuntimeKey(candidate.Host); err != nil {
+		if err := b.certs.RefreshRuntimeKey(candidate.Host, recoveryCandidateWriter(candidate)); err != nil {
 			return err
 		}
 	default:
@@ -208,6 +209,13 @@ func recoveryLinkTargets(identity proxy.RecoveryPathIdentity, parent, target str
 	return filepath.Clean(resolved) == target
 }
 
+func recoveryHostFromFileBase(base string) string {
+	if strings.HasPrefix(base, "_wildcard.") {
+		return "*." + strings.TrimPrefix(base, "_wildcard.")
+	}
+	return base
+}
+
 func appendExistingRecoveryPaths(identities []proxy.RecoveryPathIdentity, paths ...string) []proxy.RecoveryPathIdentity {
 	seen := make(map[string]struct{}, len(identities)+len(paths))
 	for _, identity := range identities {
@@ -256,4 +264,27 @@ func recheckRecoveryIdentities(candidate proxy.RecoveryCandidate) error {
 		}
 	}
 	return nil
+}
+
+func recoveryCandidateWriter(candidate proxy.RecoveryCandidate) certstore.RecoveryWriteFunc {
+	identities := make(map[string]proxy.RecoveryPathIdentity, len(candidate.Identities))
+	for _, identity := range candidate.Identities {
+		identities[identity.Path] = identity
+	}
+	return func(path string, data []byte, mode os.FileMode) error {
+		identity, ok := identities[path]
+		if !ok {
+			return fmt.Errorf("apache recovery destination was not authorized")
+		}
+		return proxy.ReplaceRecoveryPath(identity, data, mode)
+	}
+}
+
+func recoveryCandidatePathExists(candidate proxy.RecoveryCandidate, path string) bool {
+	for _, identity := range candidate.Identities {
+		if identity.Path == path {
+			return identity.Exists
+		}
+	}
+	return false
 }

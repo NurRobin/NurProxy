@@ -49,6 +49,8 @@ type RecoveryInspection struct {
 	RuntimeKeyState RuntimeKeyState
 }
 
+type RecoveryWriteFunc func(path string, data []byte, mode os.FileMode) error
+
 const (
 	// certSuffix is appended to the sanitized host for the public leaf+chain file.
 	certSuffix = ".crt"
@@ -187,18 +189,34 @@ func (s *Store) Install(b Bundle) (InstalledPaths, error) {
 	return InstalledPaths{CertPath: certPath, KeyPath: keyPath, Encrypted: encrypted}, nil
 }
 
-func (s *Store) InstallRecoveryBundle(b Bundle) error {
+func (s *Store) InstallRecoveryBundle(b Bundle, write RecoveryWriteFunc) error {
 	if _, err := tls.X509KeyPair(b.CertPEM, b.KeyPEM); err != nil {
 		return fmt.Errorf("certstore: recovery bundle for %q is not a matching certificate/key pair", b.Host)
 	}
-	canonical, err := filepath.EvalSymlinks(s.dir)
-	if err != nil {
-		return fmt.Errorf("certstore: resolving recovery directory: %w", err)
+	if write == nil {
+		return fmt.Errorf("certstore: recovery writer unavailable")
 	}
-	clone := *s
-	clone.dir = canonical
-	_, err = clone.Install(b)
-	return err
+	paths := s.recoveryPaths(b.Host)
+	keyBytes := b.KeyPEM
+	if len(s.encryptKey) > 0 {
+		var err error
+		keyBytes, err = crypto.Encrypt(s.encryptKey, b.KeyPEM)
+		if err != nil {
+			return fmt.Errorf("certstore: encrypting recovery key for %q: %w", b.Host, err)
+		}
+	}
+	if err := write(paths.CertPath, b.CertPEM, certMode); err != nil {
+		return fmt.Errorf("certstore: writing recovery cert for %q: %w", b.Host, err)
+	}
+	if err := write(paths.SourceKeyPath, keyBytes, keyMode); err != nil {
+		return fmt.Errorf("certstore: writing recovery key for %q: %w", b.Host, err)
+	}
+	if len(s.encryptKey) > 0 && b.MaterializePlain {
+		if err := write(paths.RuntimeKeyPath, b.KeyPEM, keyMode); err != nil {
+			return fmt.Errorf("certstore: materializing recovery key for %q: %w", b.Host, err)
+		}
+	}
+	return nil
 }
 
 // ReadKey reads back a host's private key, decrypting it if it was stored
@@ -281,13 +299,20 @@ func (s *Store) InspectRecovery(host string) (RecoveryInspection, error) {
 	if err != nil {
 		return inspection, fmt.Errorf("certstore: inspecting certificate for %q: %w", host, err)
 	}
-	keyPEM, keyPresent, err := s.readRecoverySourceKey(inspection.SourceKeyPath)
+	onDiskKey, keyPresent, err := readRegularBounded(inspection.SourceKeyPath, maxRecoveryPEMBytes)
 	if err != nil {
 		return inspection, fmt.Errorf("certstore: inspecting source key for %q: %w", host, err)
 	}
 	inspection.BundlePresent = certPresent && keyPresent
 	if !inspection.BundlePresent {
 		return inspection, nil
+	}
+	keyPEM := onDiskKey
+	if len(s.encryptKey) > 0 {
+		keyPEM, err = crypto.Decrypt(s.encryptKey, onDiskKey)
+		if err != nil {
+			return inspection, nil
+		}
 	}
 	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 		return inspection, nil
@@ -313,7 +338,7 @@ func (s *Store) InspectRecovery(host string) (RecoveryInspection, error) {
 	return inspection, nil
 }
 
-func (s *Store) RefreshRuntimeKey(host string) error {
+func (s *Store) RefreshRuntimeKey(host string, write RecoveryWriteFunc) error {
 	inspection := s.recoveryPaths(host)
 	certPEM, certPresent, err := readRegularBounded(inspection.CertPath, maxRecoveryPEMBytes)
 	if err != nil || !certPresent {
@@ -329,7 +354,10 @@ func (s *Store) RefreshRuntimeKey(host string) error {
 	if len(s.encryptKey) == 0 {
 		return nil
 	}
-	if err := writeAtomic(inspection.RuntimeKeyPath, keyPEM, keyMode); err != nil {
+	if write == nil {
+		return fmt.Errorf("certstore: recovery writer unavailable")
+	}
+	if err := write(inspection.RuntimeKeyPath, keyPEM, keyMode); err != nil {
 		return fmt.Errorf("certstore: refreshing runtime key for %q: %w", host, err)
 	}
 	return nil

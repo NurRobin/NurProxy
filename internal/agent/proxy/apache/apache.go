@@ -488,7 +488,7 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 		if !marked {
 			continue
 		}
-		host := strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix)
+		host := recoveryHostFromFileBase(strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix))
 		identities := []proxy.RecoveryPathIdentity{identity}
 		if !b.layout.IsConfD() {
 			link := b.enabledLinkFor(path)

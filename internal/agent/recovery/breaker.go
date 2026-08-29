@@ -40,9 +40,11 @@ type breakerState struct {
 }
 
 type Breaker struct {
-	mu     sync.Mutex
-	states map[BreakerKey]*breakerState
-	dir    *os.File
+	mu         sync.Mutex
+	states     map[BreakerKey]*breakerState
+	dir        *os.File
+	persistent bool
+	closed     bool
 }
 
 func NewBreaker() *Breaker { return &Breaker{states: make(map[BreakerKey]*breakerState)} }
@@ -67,14 +69,11 @@ func NewPersistentBreaker(agentDataDir string) (*Breaker, error) {
 		return nil, fmt.Errorf("agent data directory must be an absolute clean path")
 	}
 	recoveryDir := filepath.Join(agentDataDir, "recovery")
-	if err := mkdirPrivate(recoveryDir); err != nil {
-		return nil, err
-	}
-	dir, err := openDirNoSymlinks(recoveryDir)
+	dir, err := ensurePrivateDirectory(recoveryDir)
 	if err != nil {
 		return nil, err
 	}
-	b := &Breaker{states: make(map[BreakerKey]*breakerState), dir: dir}
+	b := &Breaker{states: make(map[BreakerKey]*breakerState), dir: dir, persistent: true}
 	raw, err := readRegularAt(dir, breakerFilename, 0o600)
 	if errors.Is(err, unix.ENOENT) {
 		return b, nil
@@ -120,12 +119,33 @@ func NewPersistentBreaker(agentDataDir string) (*Breaker, error) {
 	return b, nil
 }
 
+func (b *Breaker) Close() error {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+	if b.dir == nil {
+		return nil
+	}
+	err := b.dir.Close()
+	b.dir = nil
+	return err
+}
+
 func (b *Breaker) Allow(key BreakerKey, source recoverymodel.RequestSource, now time.Time) BreakerDecision {
 	if b == nil || !key.Action.Valid() || !validOpaqueID(key.Fingerprint) || !source.Valid() || now.IsZero() {
 		return BreakerDecision{Reason: "invalid breaker input"}
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return BreakerDecision{Reason: "breaker is closed"}
+	}
 	state := b.states[key]
 	if state == nil {
 		return BreakerDecision{Allowed: true}
@@ -153,6 +173,9 @@ func (b *Breaker) Record(key BreakerKey, outcome recoverymodel.OperationState, a
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return fmt.Errorf("breaker is closed")
+	}
 	before := cloneBreakerStates(b.states)
 	state := b.states[key]
 	if state == nil {
@@ -183,8 +206,12 @@ func (b *Breaker) Record(key BreakerKey, outcome recoverymodel.OperationState, a
 }
 
 func (b *Breaker) persistOrRestore(before map[BreakerKey]*breakerState) error {
-	if b.dir == nil {
+	if !b.persistent {
 		return nil
+	}
+	if b.dir == nil {
+		b.states = before
+		return fmt.Errorf("persistent breaker is closed")
 	}
 	entries := make([]breakerDiskEntry, 0, len(b.states))
 	for key, state := range b.states {
