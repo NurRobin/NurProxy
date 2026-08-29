@@ -42,6 +42,7 @@ type Coordinator struct {
 	baseContext Context
 	policy      bool
 	policyKnown bool
+	privileged  bool
 	diagnostics map[string]recoverymodel.Diagnostic
 	candidates  map[string]proxy.RecoveryCandidate
 	operations  map[string]recoverymodel.OperationReport
@@ -84,6 +85,12 @@ func (c *Coordinator) Policy() (enabled, known bool) {
 	return c.policy, c.policyKnown
 }
 
+func (c *Coordinator) SetPrivilegedRecoveryAvailable(available bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.privileged = available
+}
+
 func (c *Coordinator) ActiveDiagnostics() []recoverymodel.Diagnostic {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -105,7 +112,11 @@ func (c *Coordinator) ReconcileSucceeded(ctx context.Context) error {
 func (c *Coordinator) Capability() recoverymodel.Capability {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return recoverymodel.Capability{Stage: 1, Actions: []recoverymodel.Action{
+	stage := 1
+	if c.privileged {
+		stage = 3
+	}
+	return recoverymodel.Capability{Stage: stage, Actions: []recoverymodel.Action{
 		recoverymodel.ActionPruneManagedOrphan,
 		recoverymodel.ActionRemoveManagedTemp,
 		recoverymodel.ActionRematerializeCertBundle,

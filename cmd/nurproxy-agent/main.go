@@ -18,6 +18,7 @@ import (
 	agentconfig "github.com/NurRobin/NurProxy/internal/agent/config"
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/helperclient"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/apache" // registers the apache backend in the proxy registry
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
@@ -26,6 +27,7 @@ import (
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"   // registers the nginx backend in the proxy registry
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
@@ -473,6 +475,9 @@ func main() {
 			recoveryReporter.Enqueue(proxymodel.RecoveryReport{Capability: &capability})
 			streamClient.WithRecovery(recoveryCoordinator)
 			go recoveryReporter.Run(ctx)
+			if existingMode && !cfg.DryRun {
+				go runHardRecoveryControl(ctx, cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, recoveryCoordinator)
+			}
 		}
 	}
 
@@ -658,6 +663,60 @@ func toRuntimeEnv(env runtimeenv.Env) *models.RuntimeEnv {
 		Sandboxed:  env.Sandboxed,
 		User:       env.User,
 		IsRoot:     env.IsRoot,
+	}
+}
+
+func runHardRecoveryControl(ctx context.Context, orchestratorURL, agentID, token, buildID string, coordinator *recovery.Coordinator) {
+	remote, err := recoverycontrol.NewHTTP(orchestratorURL, agentID, token, nil)
+	if err != nil {
+		log.Printf("WARNING: privileged recovery control is unavailable: %v", err)
+		return
+	}
+	var controller *recoverycontrol.Controller
+	retry := time.NewTicker(30 * time.Second)
+	defer retry.Stop()
+	for controller == nil {
+		pin, pinErr := remote.HelperPin(ctx)
+		if pinErr == nil {
+			client, clientErr := helperclient.New(agentID, buildID, pin)
+			if clientErr == nil {
+				_, clientErr = client.Hello(ctx)
+			}
+			if clientErr == nil {
+				controller = recoverycontrol.New(client, remote)
+				coordinator.SetPrivilegedRecoveryAvailable(true)
+				log.Printf("Privileged recovery helper identity verified")
+				break
+			}
+			pinErr = clientErr
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("Privileged recovery helper pending: %v", pinErr)
+		select {
+		case <-ctx.Done():
+			return
+		case <-retry.C:
+		}
+	}
+	reconcile := func() {
+		reconcileCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		defer cancel()
+		if err := controller.Reconcile(reconcileCtx, coordinator.ActiveDiagnostics()); err != nil && ctx.Err() == nil {
+			log.Printf("WARNING: privileged recovery reconciliation failed: %v", err)
+		}
+	}
+	reconcile()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcile()
+		}
 	}
 }
 

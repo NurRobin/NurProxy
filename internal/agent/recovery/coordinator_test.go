@@ -300,6 +300,11 @@ func TestCoordinatorCapabilityIsStableAndCrashRecoveryNeverRepeatsMutation(t *te
 	if err := capability.Validate(); err != nil || capability.Stage != 1 {
 		t.Fatalf("capability=%+v err=%v", capability, err)
 	}
+	c.SetPrivilegedRecoveryAvailable(true)
+	capability = c.Capability()
+	if err := capability.Validate(); err != nil || capability.Stage != 3 {
+		t.Fatalf("privileged capability=%+v err=%v", capability, err)
+	}
 	c.SetPolicy(true)
 	diagnostics, _ := c.Inspect(context.Background())
 	// A request that already completed is replayed from memory without mutation.
