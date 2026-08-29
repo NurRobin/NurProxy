@@ -189,11 +189,12 @@ wizard. Shell
 interpreters are rejected unless the operator separately allowlists that exact
 interpreter locally, in which case the UI labels the action high risk.
 
-An operator may request an actual hook test only as a separate high-impact
-operation after confirmation. It uses the same snapshot, timeout, audit,
-serialization, failure, and rollback contract as deployment. Systemd preflight
-is limited to typed read-only unit/status/capability queries; reload is likewise
-never used as a planning probe.
+There is no generic live-hook test button: an arbitrary allowed program can
+have side effects NurProxy cannot undo. The first execution therefore happens
+only as part of a confirmed deployment, where NurProxy can at least restore its
+own generation and destinations and report that external hook side effects may
+remain. Systemd preflight is limited to typed read-only unit/status/capability
+queries; reload is likewise never used as a planning probe.
 
 Output is captured with the existing bounded/sanitized command-capture
 contract. Hooks never run concurrently for the same export. A failed hook makes
@@ -261,8 +262,7 @@ The Certificates page separates three concerns:
 - **Certificate:** host, zone/provider, issuance and renewal status;
 - **Download:** PEM ZIP or PFX, password choice, one-time secret handling;
 - **Deployments:** agent, paths/directory preset, symlink/copy mode,
-  permissions, reload action, static preflight, explicitly confirmed live hook
-  test, current generation, and history.
+  permissions, reload action, static preflight, current generation, and history.
 
 The default wizard chooses symlink mode, the agent's standard export root,
 safe permissions, and no hook. Advanced paths, copy mode, custom ownership, and

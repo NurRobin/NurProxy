@@ -129,8 +129,8 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - [ ] Implement typed systemd reload plus active-status check and absolute argv command execution without a shell. Supply only documented path environment variables. Static planning may resolve/check allowlists and read systemd status, but must never run the hook.
 - [ ] Reuse bounded sanitized command capture. Serialize actions per export, time out process groups, reject control characters and non-allowlisted service/executable values, and label allowlisted shell interpreters high risk.
 - [ ] On action failure restore the previous generation/destination snapshot and invoke the previous-generation action once. Depend on a small `Breaker` interface local to certexport; add a REQ-228 adapter only after that package's exported contract exists.
-- [ ] Model an actual hook test as a separately confirmed high-impact transaction using the same snapshot/audit/rollback contract as deployment; it is never triggered by opening or refreshing the wizard.
-- [ ] Test allowlist boundaries, plan-does-not-execute, confirmed live test, argv preservation, environment contents, timeout/kill, bounded output, secret redaction, serialization, rollback action, and breaker behavior.
+- [ ] Do not expose a generic live-hook test: arbitrary program side effects cannot be rolled back. Execute the hook first during confirmed deployment, restore NurProxy-owned generation/destinations on failure, and report that external side effects may remain.
+- [ ] Test allowlist boundaries, plan-does-not-execute, argv preservation, environment contents, timeout/kill, bounded output, secret redaction, serialization, rollback action, and breaker behavior.
 - [ ] Verify: `go test -race ./internal/agent/certexport ./internal/agent/config && go vet ./internal/agent/certexport ./internal/agent/config`.
 
 ## Task 8: Reconcile exports over the existing outbound agent stream
@@ -158,7 +158,7 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - [ ] Strictly decode and validate both ends, reject unknown fields/duplicates/oversized aggregates, and chunk revision-bound snapshots when the bounded SSE frame would be exceeded. Never partially apply an incomplete chunk set.
 - [ ] In `cmd/nurproxy-agent/main.go`, instantiate the export store/transaction manager/local breaker, inject local roots and allowlists, attach plan/apply/report handlers to the stream client, and use a REQ-228 breaker adapter only when its stable interface is available. Add constructor seams so composition is testable without root or systemd.
 - [ ] Test missing/offline agent, absent cert, duplicate/unknown/oversized stream data, incomplete/reordered chunks and ACKs, mixed success, multi-agent renewal fan-out, last-domain deletion with active export, disabled/deleted reconnect cleanup, legacy capability fallback, and no private material in reports.
-- [ ] Verify: `go test -race ./internal/orchestrator/reconciler ./internal/orchestrator/api ./internal/agent/stream && go vet ./internal/orchestrator/reconciler ./internal/orchestrator/api ./internal/agent/stream`.
+- [ ] Verify: `go test -race ./internal/orchestrator/reconciler ./internal/orchestrator/api ./internal/orchestrator/agenthub ./internal/agent/stream ./cmd/nurproxy-agent && go vet ./internal/orchestrator/reconciler ./internal/orchestrator/api ./internal/orchestrator/agenthub ./internal/agent/stream ./cmd/nurproxy-agent`.
 
 ## Task 8A: Add typed host-presence configuration widening
 
@@ -172,7 +172,6 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - Modify: `internal/agent/config/persist_test.go`
 - Modify: `cmd/nurproxy-agent/apply.go`
 - Modify: `cmd/nurproxy-agent/apply_test.go`
-- Modify: `web/src/pages/Certificates.tsx`
 
 - [ ] Add a closed `set_certificate_export_policy` admin-op payload containing complete replacement root/service/executable allowlists with strict absolute-path, service-name, count, size, and duplicate validation. It never accepts raw YAML, shell strings, or an export definition.
 - [ ] Reuse the existing short-lived one-time host claim code: the UI prepares and previews the operation, then displays the exact local claim command. Normal export CRUD can never widen policy.
@@ -203,7 +202,7 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - [ ] Build deployment wizard defaults for symlink mode, directory preset, safe permissions, no action, plus progressive disclosure for copy, custom paths/ownership, systemd, and argv. Request an agent plan, review every resolved path/action, and submit its one-time UI confirmation nonce for hard choices. Provide the typed prepare/claim UI for root/allowlist widening and explain that the generated command must be claimed on the host.
 - [ ] Add accessible pending/error/success states and German/English copy that explains rollback and compatibility tradeoffs.
 - [ ] Before the first component test, add the repository's missing lightweight Vitest + jsdom + Testing Library harness and a `test` script. Keep production dependencies unchanged.
-- [ ] Test random-password lifecycle, custom password request handling, blob download cleanup, default-safe wizard, plan freshness/expiry, ordinary UI confirmation versus host-only root widening, static plan never runs commands, separately confirmed live hook test, path preview, no key/password persistence, and status/history rendering.
+- [ ] Test random-password lifecycle, custom password request handling, blob download cleanup, default-safe wizard, plan freshness/expiry, ordinary UI confirmation versus host-only root widening, static plan never runs commands, path preview, no key/password persistence, and status/history rendering.
 - [ ] Verify: `cd web && npm test -- --run && npm run build && npm run lint`.
 
 ## Task 10: Add integration, browser, and negative-security coverage
