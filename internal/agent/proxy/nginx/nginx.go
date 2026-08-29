@@ -253,8 +253,8 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 // drift checks (§4, §11). It reads ALL files (no whitelist): Existing-mode
 // adoption tracks the operator's hand-written vhosts too — there is nothing to
 // guard against by scoping, because NurProxy never auto-overwrites a file
-// without an explicit Accept. Files NurProxy generated (the nurproxy- prefix)
-// are returned with Adopted=false for drift comparison; every other file is an
+// without an explicit Accept. Files with both the managed filename and exact
+// on-disk provenance marker are returned with Adopted=false; every other file is an
 // operator-authored config, returned with Adopted=true so the orchestrator
 // stores it as Source: manual, version 1. Enabled reports whether the
 // sites-enabled symlink is present.
@@ -278,8 +278,11 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 			continue
 		}
 		path := filepath.Join(b.layout.Available, name)
-		data, err := os.ReadFile(path)
+		data, marked, _, err := proxy.ReadManagedArtifactFile(path)
 		if err != nil {
+			if errors.Is(err, proxy.ErrManagedArtifactNotRegular) {
+				continue
+			}
 			return nil, fmt.Errorf("reading nginx config %q: %w", path, err)
 		}
 		// Debian: activation is an entry in sites-enabled — a symlink (canonical) or
@@ -294,7 +297,7 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 			Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: path},
 			Content: string(data),
 			Enabled: enabled,
-			Adopted: !IsManagedFile(name),
+			Adopted: !IsManagedFile(name) || !marked,
 		})
 	}
 	return arts, nil
@@ -459,12 +462,12 @@ func (b *Backend) removeCerts(ctx context.Context, configPath string) {
 	}
 }
 
-// Prune removes every NurProxy-generated vhost (the nurproxy- prefix) in
+// Prune removes every marker-proven NurProxy-generated vhost in
 // sites-available whose path is not in keep, then reloads once if anything was
 // removed (§3, no ghost vhosts on domain delete). It rides the agent's dial-out
 // stream — applyIntents calls it with the full desired set, so a deleted domain's
 // file is gone on the next push without any inbound probe (invariant #2). Operator
-// configs (no nurproxy- prefix) are never touched. A missing file is not an error.
+// unproven configs are never touched. A missing file is not an error.
 func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 	wanted := make(map[string]bool, len(keep))
 	for _, t := range keep {
@@ -493,14 +496,27 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 		if wanted[path] {
 			continue
 		}
+		marked, identity, err := proxy.ProbeManagedArtifactFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, proxy.ErrManagedArtifactNotRegular) {
+				continue
+			}
+			return removed, fmt.Errorf("checking orphan config %q: %w", path, err)
+		}
+		if !marked {
+			continue
+		}
+		if err := identity.Recheck(); err != nil {
+			return removed, fmt.Errorf("rechecking orphan config %q: %w", path, err)
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removed, fmt.Errorf("removing orphan config %q: %w", path, err)
+		}
 		if !b.layout.IsConfD() {
 			link := b.enabledLinkFor(path)
 			if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return removed, fmt.Errorf("removing orphan symlink %q: %w", link, err)
 			}
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return removed, fmt.Errorf("removing orphan config %q: %w", path, err)
 		}
 		// Drop the orphaned vhost's htpasswd sidecar too, if any.
 		_ = os.Remove(strings.TrimSuffix(path, confSuffix) + htpasswdSuffix)

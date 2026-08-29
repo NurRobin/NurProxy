@@ -57,6 +57,14 @@ A `CertificateExport` belongs to one certificate host and one agent and has:
   generation;
 - health, last error, validation result, and rollback outcome.
 
+The orchestrator sends each agent a full desired export inventory, not merely
+the enabled rows. Every snapshot has a monotonically increasing revision and a
+keep set. Disabled or deleted exports are represented by durable cleanup
+intents until that agent acknowledges removal. Consequently an offline agent
+converges on reconnect instead of retaining an export forever. Cleanup removes
+only destinations whose protected provenance still matches, records a recovery
+snapshot, and reports preserved operator replacements separately.
+
 Destination paths are individual file paths so existing services such as
 Postfix can retain their conventional configuration. The UI also offers a
 directory preset that fills all four names below one directory.
@@ -97,6 +105,16 @@ symlink mode is the recommended default.
 Generation creation is idempotent by certificate fingerprint. Retention keeps
 the current and previous successful generation plus any generation referenced
 by an active rollback operation. Other generations expire after seven days.
+The same no-follow retention pass keeps the newest 20 inactive generations as
+a second safety bound and never removes an active transaction, cleanup
+tombstone, or snapshot younger than seven days.
+
+Generation creation and publication are separate operations. A transaction
+stages and validates a generation, records the previous `current` identity,
+deploys destinations, switches `current`, validates destinations, and runs the
+hook under one per-export lock. Only then is the new generation committed.
+Failure restores the previous `current` link and destination set before the
+prior hook is retried.
 
 ## Path ownership and permissions
 
@@ -122,6 +140,15 @@ Arbitrary existing files remain diagnosis-only. Mutation uses opened parent
 directory descriptors with no-follow and identity checks; a pathname recheck
 alone is insufficient.
 
+Copy-mode ownership is recorded in the protected export manifest as a binding
+of export ID, canonical destination, deployed generation, content hash,
+device/inode identity, mode, uid/gid, and link count. Before replacement the
+agent opens the destination without following links, requires a regular file
+with link count one, recomputes its content hash, and compares identity and
+metadata with that binding. After atomic rename it records the new identity in
+the same transaction. A stale/spoofed manifest, hardlink, or operator
+replacement breaks provenance and is preserved.
+
 The normal UI offers presets:
 
 - root-only;
@@ -131,6 +158,16 @@ The normal UI offers presets:
 Advanced owner, group, and modes are validated on the agent and require a
 second confirmation. User/group names are resolved to numeric IDs during
 planning and rechecked during apply.
+
+Planning is an agent round trip. The orchestrator sends a typed, non-mutating
+plan/test request over the outbound stream. The agent returns resolved roots,
+canonical destinations, uid/gid, modes, action allowlist result, risks, and a
+short-lived freshness token bound to the exact normalized export specification
+and local capability revision. Saving the definition presents this result in a
+second in-UI confirmation and submits the token; apply still revalidates every
+predicate fail-closed. Widening the agent-local root or allowlists is different:
+it remains a host-presence admin operation and cannot be authorized solely in
+the browser.
 
 ## Post-deploy actions
 
@@ -152,6 +189,12 @@ contract. Hooks never run concurrently for the same export. A failed hook makes
 the deployment fail and triggers rollback; the previous-generation hook is
 then run once. Repeated failures open the recovery circuit breaker.
 
+The export package owns its filesystem transaction store and a small breaker
+interface. It does not import operation-specific recovery internals. Once the
+safe-recovery engine is present, an adapter supplies its breaker implementation;
+until then a compatible local implementation keeps the package independently
+testable.
+
 ## Browser downloads
 
 Only an authenticated administrator can download private material. The API
@@ -170,19 +213,35 @@ key, archive, or password.
 There is no persistent downloadable archive. A later download creates a fresh
 archive from the currently stored certificate.
 
+Certificate list/detail queries select public metadata only and never read or
+decrypt the encrypted key column. Only a request for one exact authenticated
+download fetches and decrypts that certificate's key.
+
 ## Data flow
 
 1. The administrator creates or selects a cert-only certificate.
 2. Central issuance and renewal continue through the existing DNS-01 manager.
-3. The reconciler includes certificate bundles plus typed export specifications
-   in the existing outbound agent stream.
-4. The agent validates paths, ownership, capabilities, permissions, and actions
+3. Before save, a typed plan/test exchange lets the agent resolve paths,
+   ownership, capabilities, and actions and returns a spec-bound freshness token.
+4. The reconciler includes certificate bundles plus a revisioned full desired
+   export inventory, including durable cleanup tombstones, in the existing
+   outbound agent stream.
+5. The agent validates paths, ownership, capabilities, permissions, and actions
    and reports a diagnosis without mutation if any predicate fails.
-5. The agent snapshots, deploys one complete generation, post-validates, runs
+6. The agent snapshots, deploys one complete generation, post-validates, runs
    the post-deploy action, and reports structured progress and history.
-6. Renewal repeats the same idempotent flow for every enabled export target.
-7. Offline agents converge on reconnect; one failed target does not block other
-   agents or exports for the same certificate.
+7. Renewal repeats the same idempotent flow and fans out to every distinct agent
+   with an enabled export. Active exports count as certificate consumers for
+   renewal and prevent last-domain teardown from deleting their certificate.
+8. Offline agents converge cleanup and deployment on reconnect; one failed
+   target does not block other agents or exports for the same certificate.
+
+Stream JSON is decoded strictly and every envelope is validated. The contract
+sets aggregate limits for exports, destinations, certificate bundles, PEM bytes,
+argv and total event bytes; duplicate export IDs, hosts, and destinations are
+rejected. When the bounded SSE frame would be exceeded, the orchestrator emits
+revision-bound chunks that the agent assembles under a total cap before apply.
+Older peers negotiate capability and receive only the legacy intent payload.
 
 ## UI
 
@@ -198,6 +257,11 @@ safe permissions, and no hook. Advanced paths, copy mode, custom ownership, and
 commands are progressively disclosed. A review screen shows every filesystem
 path, resolved owner/mode, executable/service, and rollback behavior before the
 request is saved.
+
+Ordinary high-impact choices use a one-time, short-lived server nonce bound to
+the reviewed plan and are confirmed entirely in the UI. This is distinct from
+the existing agent admin-op claim code. Only widening local export roots or
+allowlists uses the host-presence claim workflow.
 
 ## Failure handling and recovery
 

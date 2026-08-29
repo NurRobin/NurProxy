@@ -19,8 +19,10 @@ Add a dedicated Certificates workflow that can stream the current central certif
 
 - [ ] Add typed `CertificateExport`, `Destination`, `PermissionPolicy`, `PostDeployAction`, `ExportStatus`, `ExportDeployment`, and agent capability models. Keep private material out of every status/history type.
 - [ ] Add strict enums and `Validate` methods: bounded IDs/names, canonical host, absolute clean destination paths, unique destination kinds and paths, octal modes, owner/group syntax, bounded argv/timeout, and mutually exclusive systemd/command actions.
-- [ ] Extend `IntentSet` with export specifications that refer to an existing `CertBundle` by host; add an export acknowledgement envelope with per-export desired fingerprint, phase, rollback result, and sanitized error code.
-- [ ] Write negative tests first for traversal, duplicate targets, shell strings, relative executables, unknown enums, oversized fields, control characters, and accidental JSON serialization of key/password fields.
+- [ ] Extend `IntentSet` with a revisioned full export inventory, keep set, and durable cleanup intents that refer to an existing `CertBundle` by host; add replay-safe deployment/cleanup acknowledgements with per-export desired fingerprint, phase, rollback result, and sanitized error code.
+- [ ] Add typed plan/test request and result envelopes: normalized spec hash, local capability revision, resolved path/uid/gid/mode/action, risks, and short-lived freshness token. The token authorizes only the reviewed spec; apply always revalidates.
+- [ ] Define aggregate maxima for exports, destinations, bundles, PEM bytes, argv, chunks, and total assembled snapshot size. Add strict unknown-field decoding helpers, duplicate-ID/host/path rejection, and capability negotiation for legacy peers.
+- [ ] Write negative tests first for traversal, duplicates, shell strings, relative executables, unknown fields/enums, oversized fields/aggregates/chunks, control characters, stale plan tokens, and accidental JSON serialization of key/password fields.
 - [ ] Verify: `go test -race ./internal/shared/certmodel ./internal/shared/proxymodel && go vet ./internal/shared/certmodel ./internal/shared/proxymodel`.
 
 ## Task 2: Persist export definitions and deployment history
@@ -33,10 +35,12 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - Create: `internal/orchestrator/db/certificate_exports_test.go`
 - Modify: `internal/shared/models/models.go`
 
-- [ ] Add a migration for `certificate_exports` and append-only `certificate_export_deployments`; use foreign keys to certificates/agents, unique host+agent+name, timestamps, desired/applied fingerprints, and bounded status/error columns.
+- [ ] Add a migration for `certificate_exports`, durable per-agent export cleanup tombstones/revisions, and append-only `certificate_export_deployments`; use foreign keys to certificates/agents, unique host+agent+name, timestamps, desired/applied fingerprints, and bounded status/error columns.
 - [ ] Store destinations, permissions, and post-deploy argv as validated JSON. Never store archive bytes, plaintext private keys, PFX passwords, or command output containing secrets.
-- [ ] Implement create/get/list/update/disable/delete and replay-safe deployment upsert/list methods. Updating or deleting an export must preserve history.
-- [ ] Test migration from the immediately preceding schema, FK behavior, deterministic ordering, malformed stored JSON fail-closed, concurrent status updates, and disabled-export selection.
+- [ ] Implement create/get/list/update/disable/delete, per-agent full-inventory revision/keep selection, tombstone acknowledgement/GC, and replay-safe deployment upsert/list methods. Updating or deleting an export must preserve history until agent cleanup is acknowledged.
+- [ ] Add `ListCertificateMetadata`/public-detail queries that never select or decrypt `key_pem_enc`; only the exact download lookup may decrypt one key.
+- [ ] Count enabled exports as certificate consumers in renewal and teardown queries so last-domain deletion cannot remove a still-exported certificate.
+- [ ] Test migration from the immediately preceding schema, FK behavior, deterministic ordering, malformed stored JSON fail-closed, concurrent/reordered status updates, disabled/deleted tombstone selection, metadata queries without key decryption, and active-export certificate retention.
 - [ ] Verify: `go test -race ./internal/orchestrator/db -run 'Migration|CertificateExport' && go vet ./internal/orchestrator/db`.
 
 ## Task 3: Build in-memory PEM ZIP and PFX downloads
@@ -62,10 +66,10 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - Create: `internal/orchestrator/api/certificates_test.go`
 - Modify: `internal/orchestrator/api/server.go`
 
-- [ ] Register authenticated list/detail/download routes under `/api/v1/certificates` and CRUD/history routes under `/api/v1/certificate-exports`.
+- [ ] Register authenticated list/detail/download routes under `/api/v1/certificates`, CRUD/history routes under `/api/v1/certificate-exports`, and plan/test/result routes scoped to the selected agent.
 - [ ] Accept the PFX password only in the download request body, set `Cache-Control: no-store`, `Pragma: no-cache`, `X-Content-Type-Options: nosniff`, and a sanitized attachment name, then stream without logging the body.
-- [ ] Return public certificate metadata without `KeyPEM`. Audit format and export-definition changes without recording key material, password, or archive bytes.
-- [ ] Require an explicit confirmation token for copy mode, advanced ownership, new destination roots, and advanced commands; reuse the existing admin-op confirmation model rather than adding another package.
+- [ ] Return public certificate metadata from metadata-only DB queries without loading `KeyPEM`. Audit format and export-definition changes without recording key material, password, or archive bytes.
+- [ ] Mint a short-lived single-use UI confirmation nonce bound to the exact fresh agent plan for copy mode, advanced ownership, and advanced commands. Do not reuse the local-shell `agent_admin_ops` claim code. Root/allowlist widening remains a separate host-presence admin op and is never directly granted by this API.
 - [ ] Test auth, CSRF/session behavior, headers, safe error bodies, audit redaction, malformed requests, unavailable certs, and confirmation enforcement.
 - [ ] Verify: `go test -race ./internal/orchestrator/api -run 'Certificate|Export|Download' && go vet ./internal/orchestrator/api`.
 
@@ -80,9 +84,10 @@ Add a dedicated Certificates workflow that can stream the current central certif
 
 - [ ] Write `cert.pem`, `chain.pem`, `fullchain.pem`, `privkey.pem`, and a non-secret manifest below `<agent-data>/cert-exports/<export-id>/generations/<fingerprint>` using 0700 directories and safe file defaults.
 - [ ] Validate X.509 parse, hostname coverage, validity window, chain structure, and key-pair equality before publishing. Fingerprint the canonical public certificate, not secret key bytes.
-- [ ] Persist each file and manifest through create-exclusive temporary files, fsync, rename, and parent sync. Atomically switch a relative `current` symlink only after a complete generation is durable.
+- [ ] Persist each file and manifest through create-exclusive temporary files, fsync, rename, and parent sync. Expose explicit `Stage`, `Publish`, `RestorePrevious`, and `Commit` operations; staging returns the previous-current identity and does not switch it.
 - [ ] Reject symlink/hardlink/non-regular store entries and identity changes; make same-fingerprint creation idempotent.
-- [ ] Test interrupted writes, restart discovery, tampered manifests/files, symlink swaps, hardlinks, modes, relative-current target, and concurrent same-export attempts.
+- [ ] Implement no-follow retention here: preserve current, previous successful, active transaction/rollback/cleanup references, newest 20 inactive generations, and anything younger than seven days.
+- [ ] Test interrupted writes, restart discovery, staged-vs-committed recovery, tampered manifests/files, symlink swaps, hardlinks, modes, relative-current target, retention/restart/concurrency, and concurrent same-export attempts.
 - [ ] Verify: `go test -race ./internal/agent/certexport -run 'Store|Generation|Manifest' && go vet ./internal/agent/certexport`.
 
 ## Task 6: Safely deploy symlink and copy destinations
@@ -93,14 +98,18 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - Create: `internal/agent/certexport/pathguard_test.go`
 - Create: `internal/agent/certexport/deploy.go`
 - Create: `internal/agent/certexport/deploy_test.go`
-- Reuse: `internal/agent/recovery/snapshot.go`
+- Create: `internal/agent/certexport/transaction.go`
+- Create: `internal/agent/certexport/transaction_test.go`
 
 - [ ] Enforce agent-local export roots after parent canonicalization. Resolve owner/group to numeric IDs during planning and recheck immediately before mutation.
 - [ ] Mutate through opened parent directory descriptors with no-follow and inode/device checks. Never use a pathname-only recheck as the final authorization.
 - [ ] In symlink mode create/replace only absent paths or links carrying the same export provenance and point stable destination links through that export's `current` link.
-- [ ] In copy mode snapshot the complete destination set and metadata, write same-directory temporary files, apply uid/gid/mode, atomically rename, and restore all destinations on any failure.
+- [ ] In copy mode use certexport's own transaction store to snapshot the complete destination set and metadata, write same-directory temporary files, apply uid/gid/mode, atomically rename, and restore all destinations on any failure. Do not couple this package to REQ-228's operation-specific snapshot representation.
+- [ ] Bind copy provenance in the protected manifest to export ID, canonical destination, generation, content hash, dev/inode, uid/gid/mode, and link count. Require an opened regular file with link count one and an exact binding immediately before replace; record the post-rename identity atomically.
 - [ ] Preserve unrelated/operator files. Add explicit adoption as a separate snapshot-backed operation; a matching filename is not provenance.
-- [ ] Test traversal, parent/final symlink races, hardlinks, device/socket/FIFO paths, cross-export links, unrelated regular files, partial rename failure, rollback, ownership/modes, and idempotent renewal.
+- [ ] Implement disabled/deleted cleanup as a snapshot-backed provenance-only transaction for both modes; preserve operator replacements, acknowledge each outcome idempotently, and retain recovery snapshots for seven days.
+- [ ] Hold one per-export lock across stage, destination deployment, `current` publication, validation, hook, commit, and rollback.
+- [ ] Test traversal, parent/final symlink races, hardlinks, stale/spoofed provenance, operator replacement, device/socket/FIFO paths, cross-export links, unrelated regular files, partial rename failure, cleanup/reconnect idempotency, rollback, ownership/modes, and renewal.
 - [ ] Verify: `go test -race ./internal/agent/certexport -run 'Path|Deploy|Copy|Symlink|Adopt|Rollback' && go vet ./internal/agent/certexport`.
 
 ## Task 7: Add allowlisted post-deploy actions
@@ -117,7 +126,7 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - [ ] Add local-only export roots, systemd service allowlist, executable allowlist, and bounded timeout settings. Orchestrator data cannot widen these lists.
 - [ ] Implement typed systemd reload plus active-status check and absolute argv command execution without a shell. Supply only documented path environment variables.
 - [ ] Reuse bounded sanitized command capture. Serialize actions per export, time out process groups, reject control characters and non-allowlisted service/executable values, and label allowlisted shell interpreters high risk.
-- [ ] On action failure restore the previous generation/destination snapshot and invoke the previous-generation action once. Feed repeated failures into the recovery breaker.
+- [ ] On action failure restore the previous generation/destination snapshot and invoke the previous-generation action once. Depend on a small `Breaker` interface local to certexport; add a REQ-228 adapter only after that package's exported contract exists.
 - [ ] Test allowlist boundaries, argv preservation, environment contents, timeout/kill, bounded output, secret redaction, serialization, rollback action, and breaker behavior.
 - [ ] Verify: `go test -race ./internal/agent/certexport ./internal/agent/config && go vet ./internal/agent/certexport ./internal/agent/config`.
 
@@ -134,11 +143,13 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - Modify: `internal/agent/stream/report.go`
 - Modify: `internal/agent/stream/report_test.go`
 
-- [ ] Gather enabled exports per agent and attach only exports whose host has a matching pushed certificate bundle. Keep normal proxy installation behavior unchanged.
-- [ ] Apply exports independently after certificate intake, report structured validating/applying/rolling-back outcomes, and persist acknowledgements replay-safely.
+- [ ] Gather a revisioned full desired export inventory per agent, including pending cleanup tombstones. Attach certificate material only for enabled exports whose host has a matching bundle. Keep normal proxy installation behavior unchanged.
+- [ ] Add a stream plan/test exchange and API rendezvous: agent-authoritative capability/allowlist-safe metadata, resolved preview, non-mutating action test, spec-bound freshness token, expiry, and fail-closed apply revalidation.
+- [ ] Apply or clean exports independently after certificate intake, report structured validating/applying/rolling-back/cleaning outcomes, and persist acknowledgements replay-safely. Retain tombstones until cleanup ACK, including across offline reconnects.
 - [ ] Ensure a failed export cannot block other exports, proxy intent application, or renewal delivery. Reconnect must converge stale fingerprints idempotently.
-- [ ] Trigger `PushAgentRoutes` after export CRUD and after renewal save so new certificate generations deploy without waiting for the periodic cycle.
-- [ ] Test missing/offline agent, absent cert, duplicate stream event, stale/reordered ack, mixed success, renewal fingerprint change, disabled export, and no private material in reports.
+- [ ] Trigger `PushAgentRoutes` after export CRUD and after renewal save. Fan renewal/deployment to every distinct enabled-export agent, deduplicate agents, and prevent certificate teardown while any export consumes it.
+- [ ] Strictly decode and validate both ends, reject unknown fields/duplicates/oversized aggregates, and chunk revision-bound snapshots when the bounded SSE frame would be exceeded. Never partially apply an incomplete chunk set.
+- [ ] Test missing/offline agent, absent cert, duplicate/unknown/oversized stream data, incomplete/reordered chunks and ACKs, mixed success, multi-agent renewal fan-out, last-domain deletion with active export, disabled/deleted reconnect cleanup, legacy capability fallback, and no private material in reports.
 - [ ] Verify: `go test -race ./internal/orchestrator/reconciler ./internal/orchestrator/api ./internal/agent/stream && go vet ./internal/orchestrator/reconciler ./internal/orchestrator/api ./internal/agent/stream`.
 
 ## Task 9: Build the Certificates UI and API client
@@ -161,10 +172,10 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - [ ] Add a Certificates navigation entry and page showing issuance/expiry, download, deployment health, generation, last error, rollback, and history.
 - [ ] Reuse the cert-only domain creation fields but present them as a certificate wizard. Do not expose server/port fields.
 - [ ] Download PEM ZIP directly. For PFX generate a cryptographically random password with Web Crypto or accept a custom password; show generated passwords once and clear them after download/dialog close.
-- [ ] Build deployment wizard defaults for symlink mode, directory preset, safe permissions, no action, plus progressive disclosure for copy, custom paths/ownership, systemd, and argv. Review every resolved path/action before submit and use the existing second-confirmation flow for hard changes.
+- [ ] Build deployment wizard defaults for symlink mode, directory preset, safe permissions, no action, plus progressive disclosure for copy, custom paths/ownership, systemd, and argv. Request an agent plan/test, review every resolved path/action, and submit its one-time UI confirmation nonce for hard choices. Explain that widening a local root/allowlist still requires host confirmation.
 - [ ] Add accessible pending/error/success states and German/English copy that explains rollback and compatibility tradeoffs.
 - [ ] Before the first component test, add the repository's missing lightweight Vitest + jsdom + Testing Library harness and a `test` script. Keep production dependencies unchanged.
-- [ ] Test random-password lifecycle, custom password request handling, blob download cleanup, default-safe wizard, confirmation gates, path preview, no key/password persistence, and status/history rendering.
+- [ ] Test random-password lifecycle, custom password request handling, blob download cleanup, default-safe wizard, plan freshness/expiry, ordinary UI confirmation versus host-only root widening, non-mutating command test, path preview, no key/password persistence, and status/history rendering.
 - [ ] Verify: `cd web && npm test -- --run && npm run build && npm run lint`.
 
 ## Task 10: Add integration, browser, and negative-security coverage
@@ -176,7 +187,7 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - Modify: `docs/qa/25-fixtures-and-gotchas.md`
 - Modify: `docs/qa/30-manual-integration-checklist.md`
 
-- [ ] Exercise real RSA/ECDSA material, disposable filesystem roots, renewal-equivalent generation changes, symlink and copy installs, hook success/failure, rollback, retention, and unrelated-file preservation.
+- [ ] Exercise real RSA/ECDSA material, disposable filesystem roots, renewal-equivalent generation changes, multi-agent fan-out, symlink and copy installs, hook success/failure, rollback, retention, delete/disable while offline then reconnect, and unrelated-file preservation.
 - [ ] Add tagged Go full-stack E2E for the API/agent path. Browser-test certificate creation, PEM/PFX downloads, one-time password display, deployment review, both confirmations, status, and history through the shared T3 browser against the isolated stack; retain screenshots/recorded observations in the QA evidence rather than introducing a second browser-runner package.
 - [ ] Add adversarial fixtures for traversal, symlink swaps, hardlinks, FIFOs, oversized command output, wrong key, malformed certificate, and secret-search assertions over logs/audit/API responses.
 - [ ] Verify: `go test -race -count=1 -tags=integration ./test/integration -run CertificateExport`; `go test -race -count=1 -tags=e2e ./test/e2e -run CertificateExport`; run the shared-browser flow against the isolated stack and record exact evidence in the QA docs.

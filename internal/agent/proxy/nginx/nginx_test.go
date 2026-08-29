@@ -95,7 +95,7 @@ func newBackend(t *testing.T, r Runner) (*Backend, Layout) {
 func sampleArtifact(b *Backend, host, content string) proxy.Artifact {
 	return proxy.Artifact{
 		Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: b.layout.AvailablePath(host)},
-		Content: content,
+		Content: proxy.StampManagedArtifact(content),
 		Enabled: true,
 	}
 }
@@ -292,7 +292,7 @@ func TestReadManaged_confDLayout_filePresenceIsEnabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	managed := b.layout.AvailablePath("app.example.com")
-	if err := os.WriteFile(managed, []byte("server {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(managed, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	arts, err := b.ReadManaged(context.Background())
@@ -304,6 +304,68 @@ func TestReadManaged_confDLayout_filePresenceIsEnabled(t *testing.T) {
 	}
 	if !arts[0].Enabled {
 		t.Error("on the conf.d layout a present file is enabled by definition")
+	}
+}
+
+func TestManagedProvenanceControlsReadAndPrune(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout := newBackend(t, r)
+	if err := os.MkdirAll(layout.Available, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stamped := layout.AvailablePath("stamped.example.com")
+	unmarked := layout.AvailablePath("unmarked.example.com")
+	malformed := layout.AvailablePath("malformed.example.com")
+	late := layout.AvailablePath("late.example.com")
+	for path, content := range map[string]string{
+		stamped:   proxy.StampManagedArtifact("server {}\n"),
+		unmarked:  "server {}\n",
+		malformed: proxy.ManagedArtifactMarker + " trailing\nserver {}\n",
+		late:      strings.Repeat("x", proxy.MaxManagedArtifactMarkerProbeBytes+1) + "\n" + proxy.ManagedArtifactMarker + "\n",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	symlink := layout.AvailablePath("symlink.example.com")
+	if err := os.Symlink(stamped, symlink); err != nil {
+		t.Fatal(err)
+	}
+
+	arts, err := b.ReadManaged(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := make(map[string]proxy.Artifact, len(arts))
+	for _, art := range arts {
+		byPath[art.Target.Path] = art
+	}
+	if art, ok := byPath[stamped]; !ok || art.Adopted {
+		t.Fatalf("stamped artifact = %+v, present=%v", art, ok)
+	}
+	for _, path := range []string{unmarked, malformed, late} {
+		if art, ok := byPath[path]; !ok || !art.Adopted {
+			t.Errorf("unsafe artifact %q = %+v, present=%v", path, art, ok)
+		}
+	}
+	if _, ok := byPath[symlink]; ok {
+		t.Error("ReadManaged followed a symlink entry")
+	}
+
+	removed, err := b.Prune(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d, want stamped artifact only", removed)
+	}
+	if _, err := os.Lstat(stamped); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stamped artifact survived prune: %v", err)
+	}
+	for _, path := range []string{unmarked, malformed, late, symlink} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("unsafe entry %q was pruned: %v", path, err)
+		}
 	}
 }
 
@@ -682,7 +744,7 @@ func TestReadManaged_adoptsAllFiles_taggingManagedVsOperator(t *testing.T) {
 	// One NurProxy-managed file, one operator file: adoption reads BOTH (§4, no
 	// whitelist), tagging only the operator file Adopted.
 	managed := b.layout.AvailablePath("app.example.com")
-	if err := os.WriteFile(managed, []byte("server {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(managed, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	operator := filepath.Join(b.layout.Available, "operator-site.conf")
@@ -1016,7 +1078,7 @@ func TestPrune_scrubsCertArtifacts(t *testing.T) {
 	orphanConf := layout.AvailablePath(orphanHost)
 	keepConf := layout.AvailablePath(keepHost)
 	for _, p := range []string{orphanConf, keepConf} {
-		if err := os.WriteFile(p, []byte("server {}\n"), 0o644); err != nil {
+		if err := os.WriteFile(p, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
