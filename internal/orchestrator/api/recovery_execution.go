@@ -8,9 +8,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverypolicy"
@@ -21,6 +23,7 @@ type recoveryConfirmationRequest struct {
 	Phase               int    `json:"phase"`
 	ConfirmationEventID string `json:"confirmation_event_id"`
 	DisplayPlanHash     string `json:"display_plan_hash"`
+	FreshPassword       string `json:"fresh_password,omitempty"`
 }
 
 func (s *Server) handleSubmitRecoveryExecutionPlan(w http.ResponseWriter, r *http.Request) {
@@ -119,12 +122,48 @@ func (s *Server) handleListRecoveryExecutionPlans(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, plans)
 }
 
+func (s *Server) handleListRecoveryExecutionPlansAdmin(w http.ResponseWriter, r *http.Request) {
+	agentID := pathParam(r, "id")
+	if _, err := s.db.GetAgent(agentID); err != nil {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	plans, err := s.db.ListRecoveryExecutionPlans(agentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list recovery execution plans")
+		return
+	}
+	writeJSON(w, http.StatusOK, plans)
+}
+
 func (s *Server) handleConfirmRecoveryExecutionPlan(w http.ResponseWriter, r *http.Request) {
 	agentID, planID := pathParam(r, "id"), pathParam(r, "planId")
 	var request recoveryConfirmationRequest
 	if err := readRecoveryJSON(r, &request); err != nil {
 		writeRecoveryError(w, http.StatusBadRequest, "invalid_confirmation", err.Error())
 		return
+	}
+	if request.Phase == 2 {
+		plan, err := s.db.GetRecoveryExecutionPlan(agentID, planID)
+		if err != nil {
+			writeRecoveryError(w, http.StatusNotFound, "helper_plan_not_found", "helper plan not found")
+			return
+		}
+		if hardActionNeedsFreshAuthentication(plan.Action) && r.Context().Value(ctxSource) == models.AuditSourceUI {
+			ip := clientIP(r)
+			if ok, retryAfter := s.loginLimiter.Allow(ip); !ok {
+				w.Header().Set("Retry-After", stringDurationSeconds(retryAfter))
+				writeRecoveryError(w, http.StatusTooManyRequests, "fresh_authentication_rate_limited", "too many failed authentication attempts")
+				return
+			}
+			hash, hashErr := s.db.GetSetting("admin_password_hash")
+			if request.FreshPassword == "" || hashErr != nil || auth.CheckPassword(hash, request.FreshPassword) != nil {
+				s.loginLimiter.Fail(ip)
+				writeRecoveryError(w, http.StatusForbidden, "fresh_authentication_required", "the current admin password is required for package and firewall changes")
+				return
+			}
+			s.loginLimiter.Reset(ip)
+		}
 	}
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
@@ -182,6 +221,15 @@ func (s *Server) handleConfirmRecoveryExecutionPlan(w http.ResponseWriter, r *ht
 		s.audit(r, "recovery_plan", planID, "grant_issued", "agent="+agentID+" operation="+confirmed.OperationID)
 	}
 	writeJSON(w, http.StatusOK, confirmed)
+}
+
+func hardActionNeedsFreshAuthentication(action helperprotocol.Action) bool {
+	return action == helperprotocol.ActionInstallSupportedPackage || action == helperprotocol.ActionOpenProxyFirewallPorts
+}
+
+func stringDurationSeconds(duration time.Duration) string {
+	seconds := int(duration.Seconds()) + 1
+	return strconv.Itoa(seconds)
 }
 
 func (s *Server) handleGetRecoveryExecutionGrant(w http.ResponseWriter, r *http.Request) {

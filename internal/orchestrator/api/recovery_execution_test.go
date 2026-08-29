@@ -14,6 +14,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/recoveryauth"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverypolicy"
 )
 
 func hardRecoveryDiagnostic(agentID string) recoverymodel.Diagnostic {
@@ -43,9 +44,13 @@ func enrollAndSignRecoveryPlan(t *testing.T, database *db.DB, diagnostic recover
 	if err := database.EnrollRecoveryHelper("agent-1", hello, strings.Repeat("e", 64), time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
+	action, target, ok := recoverypolicy.HardActionForDiagnostic(diagnostic.Code, diagnostic.RepairScope)
+	if !ok {
+		t.Fatalf("diagnostic has no hard action: %#v", diagnostic)
+	}
 	plan := helperprotocol.HelperPlan{
 		HelperPlanID: "helper-plan-1", HelperInstanceID: hello.HelperInstanceID, DiagnosticID: diagnostic.ID,
-		Action: helperprotocol.ActionValidateReloadProxy, LogicalTarget: helperprotocol.LogicalTargetDetectedProxy,
+		Action: action, LogicalTarget: target,
 		ExecutionPlanHash: strings.Repeat("a", 64), ResourceFingerprint: diagnostic.ResourceFingerprint,
 		RollbackCoverage: helperprotocol.RollbackCoverageFull,
 		Steps:            []helperprotocol.PlanStep{{Kind: "validate", Summary: "Validate and reload nginx"}},
@@ -60,6 +65,49 @@ func enrollAndSignRecoveryPlan(t *testing.T, database *db.DB, diagnostic recover
 		t.Fatal(err)
 	}
 	return signed, privateKey
+}
+
+func TestSensitiveHardRecoveryRequiresFreshPasswordForDashboardGrant(t *testing.T) {
+	srv, database, handler, cookie := recoveryFixture(t)
+	authority, err := recoveryauth.New(make([]byte, ed25519.SeedSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetRecoveryAuthority(authority)
+	diagnostic := hardRecoveryDiagnostic("agent-1")
+	diagnostic.Code = recoverymodel.CodeProxyBinaryMissing
+	diagnostic.RepairScope = recoverymodel.RepairScopeSupportedPackage
+	diagnostic.ID = recoverymodel.StableDiagnosticID("agent-1", diagnostic.Code, diagnostic.ResourceFingerprint)
+	if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	signedPlan, _ := enrollAndSignRecoveryPlan(t, database, diagnostic)
+	basePath := "/api/v1/agents/agent-1/recovery/plans"
+	if w := doRequestWithAuth(t, handler, http.MethodPost, basePath, signedPlan, recoveryAgentToken); w.Code != http.StatusCreated {
+		t.Fatalf("attested plan = %d: %s", w.Code, w.Body.String())
+	}
+	confirmPath := basePath + "/helper-plan-1/confirm"
+	first := map[string]any{"phase": 1, "confirmation_event_id": "sensitive-1", "display_plan_hash": signedPlan.Envelope.Payload.DisplayPlanHash}
+	if w := doRequest(t, handler, http.MethodPost, confirmPath, first, cookie); w.Code != http.StatusOK {
+		t.Fatalf("first confirmation = %d: %s", w.Code, w.Body.String())
+	}
+	second := map[string]any{"phase": 2, "confirmation_event_id": "sensitive-2", "display_plan_hash": signedPlan.Envelope.Payload.DisplayPlanHash}
+	if w := doRequest(t, handler, http.MethodPost, confirmPath, second, cookie); w.Code != http.StatusForbidden {
+		t.Fatalf("second confirmation without fresh password = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	second["fresh_password"] = "wrong-password"
+	if w := doRequest(t, handler, http.MethodPost, confirmPath, second, cookie); w.Code != http.StatusForbidden {
+		t.Fatalf("second confirmation with wrong password = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	second["fresh_password"] = "testpassword123"
+	w := doRequest(t, handler, http.MethodPost, confirmPath, second, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("second confirmation with fresh password = %d: %s", w.Code, w.Body.String())
+	}
+	var stored db.RecoveryExecutionPlan
+	if err := json.Unmarshal(w.Body.Bytes(), &stored); err != nil || stored.SignedGrant == nil {
+		t.Fatalf("fresh-authenticated confirmation did not mint grant: %#v err=%v", stored, err)
+	}
 }
 
 func TestHardRecoveryPlanRequiresAttestedDiagnosticAndTwoAdminConfirmations(t *testing.T) {
@@ -85,6 +133,15 @@ func TestHardRecoveryPlanRequiresAttestedDiagnosticAndTwoAdminConfirmations(t *t
 	}
 	if stored.OperationID == "" || stored.HelperPlanID != "helper-plan-1" {
 		t.Fatalf("stored plan = %#v", stored)
+	}
+	adminListPath := "/api/v1/agents/agent-1/recovery/hard-plans"
+	if w := doRequestWithAuth(t, handler, http.MethodGet, adminListPath, nil, recoveryAgentToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("agent accessed admin plan list: %d", w.Code)
+	}
+	w = doRequest(t, handler, http.MethodGet, adminListPath, nil, cookie)
+	var adminPlans []db.RecoveryExecutionPlan
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &adminPlans) != nil || len(adminPlans) != 1 || adminPlans[0].DisplayPlanHash != stored.DisplayPlanHash {
+		t.Fatalf("admin plan list = %d %#v: %s", w.Code, adminPlans, w.Body.String())
 	}
 	confirmPath := basePath + "/helper-plan-1/confirm"
 	confirmation1 := map[string]any{"phase": 1, "confirmation_event_id": "confirmation-1", "display_plan_hash": signedPlan.Envelope.Payload.DisplayPlanHash}

@@ -33,6 +33,13 @@ func TestRecoveryHelperEnrollmentRequiresAdminAndVerifiesAttestation(t *testing.
 	_, database, handler, cookie := recoveryFixture(t)
 	signed := signedHelperHello(t, "helper-1")
 	path := "/api/v1/agents/agent-1/recovery/helper"
+	statusPath := "/api/v1/agents/agent-1/recovery/helper-status"
+	if w := doRequestWithAuth(t, handler, http.MethodGet, statusPath, nil, recoveryAgentToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("agent accessed admin helper status = %d, want 401", w.Code)
+	}
+	if w := doRequest(t, handler, http.MethodGet, statusPath, nil, cookie); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"enrolled":false`) {
+		t.Fatalf("unenrolled helper status = %d: %s", w.Code, w.Body.String())
+	}
 	w := doRequestWithAuth(t, handler, http.MethodPut, path, signed, recoveryAgentToken)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("agent enrollment = %d, want 401", w.Code)
@@ -46,6 +53,9 @@ func TestRecoveryHelperEnrollmentRequiresAdminAndVerifiesAttestation(t *testing.
 	w = doRequest(t, handler, http.MethodPut, path, signed, cookie)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("valid enrollment = %d: %s", w.Code, w.Body.String())
+	}
+	if w := doRequest(t, handler, http.MethodGet, statusPath, nil, cookie); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"helper_instance_id":"helper-1"`) {
+		t.Fatalf("enrolled helper status = %d: %s", w.Code, w.Body.String())
 	}
 	stored, err := database.GetRecoveryHelper("agent-1")
 	if err != nil || stored.HelperInstanceID != "helper-1" || stored.AttestationPublicKey != signed.Envelope.Payload.AttestationPublicKey {

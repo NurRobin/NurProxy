@@ -1,10 +1,31 @@
 import { createElement } from 'react';
-import type { Agent, RecoveryDiagnostic, RecoveryOperation } from './types';
+import type { Agent, HardRecoveryPlan, RecoveryDiagnostic, RecoveryOperation } from './types';
 import type { RecoveryBreaker } from './types';
 
 export interface RepairAvailability {
   enabled: boolean;
   reason?: string;
+}
+
+export interface HardPlanAvailability extends RepairAvailability {
+  phase?: 1 | 2;
+}
+
+export function newestHardPlan(plans: HardRecoveryPlan[], diagnosticID: string): HardRecoveryPlan | undefined {
+  return plans
+    .filter((plan) => plan.diagnostic_id === diagnosticID)
+    .sort((left, right) => Date.parse(right.received_at) - Date.parse(left.received_at))[0];
+}
+
+export function hardPlanAvailability(diagnostic: RecoveryDiagnostic, plan: HardRecoveryPlan | undefined, now = new Date()): HardPlanAvailability {
+  if (!diagnostic.hard_change || !diagnostic.repair_eligible) {
+    return { enabled: false, reason: diagnostic.repair_refusal_code || 'hard_change' };
+  }
+  if (!plan) return { enabled: false, reason: 'hard_plan_pending' };
+  if (plan.signed_helper_receipt) return { enabled: false, reason: 'hard_execution_complete' };
+  if (Date.parse(plan.expires_at) <= now.getTime()) return { enabled: false, reason: 'hard_plan_expired' };
+  if (plan.signed_execution_grant || plan.confirmation_event_ids.length >= 2) return { enabled: false, reason: 'hard_execution_active' };
+  return { enabled: true, phase: plan.confirmation_event_ids.length === 0 ? 1 : 2 };
 }
 
 export function diagnosticActionVisible(diagnostic: RecoveryDiagnostic): boolean {

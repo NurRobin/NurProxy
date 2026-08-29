@@ -73,3 +73,21 @@ func (s *Server) handleGetRecoveryHelper(w http.ResponseWriter, r *http.Request)
 	}
 	writeJSON(w, http.StatusOK, instance)
 }
+
+func (s *Server) handleGetRecoveryHelperAdmin(w http.ResponseWriter, r *http.Request) {
+	agentID := pathParam(r, "id")
+	if _, err := s.db.GetAgent(agentID); err != nil {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	instance, err := s.db.GetRecoveryHelper(agentID)
+	if errors.Is(err, db.ErrRecoveryHelperNotEnrolled) {
+		writeJSON(w, http.StatusOK, map[string]any{"enrolled": false})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read helper enrollment")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enrolled": true, "helper": instance})
+}

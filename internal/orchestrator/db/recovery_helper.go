@@ -10,7 +10,10 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 )
 
-var ErrRecoveryHelperEnrollmentConflict = errors.New("recovery helper enrollment conflicts with existing identity")
+var (
+	ErrRecoveryHelperEnrollmentConflict = errors.New("recovery helper enrollment conflicts with existing identity")
+	ErrRecoveryHelperNotEnrolled        = errors.New("recovery helper not enrolled")
+)
 
 type RecoveryHelperInstance struct {
 	AgentID              string    `json:"agent_id"`
@@ -95,7 +98,7 @@ func (d *DB) GetRecoveryHelper(agentID string) (*RecoveryHelperInstance, error) 
 	}
 	instance, err := scanRecoveryHelper(d.read.QueryRow(recoveryHelperSelect+` WHERE agent_id = ?`, agentID))
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("recovery helper not enrolled for agent: %s", agentID)
+		return nil, fmt.Errorf("%w for agent: %s", ErrRecoveryHelperNotEnrolled, agentID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query recovery helper enrollment: %w", err)

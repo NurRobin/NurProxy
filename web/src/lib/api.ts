@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
 
 const BASE = '/api/v1';
 
@@ -145,6 +145,18 @@ export const api = {
   setAgentSafeAutoRepair: (id: string, mode: 'inherit' | 'enabled' | 'disabled') =>
     request<{ mode: string; safe_auto_repair_effective: boolean }>(`/agents/${id}/safe-auto-repair`, {
       method: 'PUT', body: JSON.stringify({ mode }),
+    }),
+  listHardRecoveryPlans: (id: string) =>
+    request<HardRecoveryPlan[]>(`/agents/${id}/recovery/hard-plans`),
+  getRecoveryHelperStatus: (id: string) =>
+    request<RecoveryHelperStatus>(`/agents/${id}/recovery/helper-status`),
+  enrollRecoveryHelper: (id: string, signedHello: unknown) =>
+    request<RecoveryHelperInstance>(`/agents/${id}/recovery/helper`, {
+      method: 'PUT', body: JSON.stringify(signedHello),
+    }),
+  confirmHardRecoveryPlan: (id: string, planId: string, phase: 1 | 2, confirmationEventId: string, displayPlanHash: string, freshPassword?: string) =>
+    request<HardRecoveryPlan>(`/agents/${id}/recovery/plans/${planId}/confirm`, {
+      method: 'POST', body: JSON.stringify({ phase, confirmation_event_id: confirmationEventId, display_plan_hash: displayPlanHash, fresh_password: freshPassword }),
     }),
 
   // Servers

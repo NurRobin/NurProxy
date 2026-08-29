@@ -1,15 +1,15 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../lib/types';
+import type { Agent, HardRecoveryPlan, RecoveryDiagnostic, RecoveryHelperStatus, RecoveryOperation } from '../lib/types';
 import { api } from '../lib/api';
 import { formatRelativeTime } from '../lib/utils';
-import { diagnosticActionVisible, diagnosticBreaker, diagnosticLocation, recoveryErrorCode, recoveryHistory, RecoveryHistoryCardSummary, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
+import { diagnosticActionVisible, diagnosticBreaker, diagnosticLocation, hardPlanAvailability, newestHardPlan, recoveryErrorCode, recoveryHistory, RecoveryHistoryCardSummary, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
 import { usePolling } from '../lib/usePolling';
 import { useToast, errMessage } from './toast-context';
 import Button from './Button';
 import Callout from './Callout';
 import ConfirmDialog from './ConfirmDialog';
-import { Select } from './Field';
+import { Select, Textarea } from './Field';
 
 interface RecoveryPanelProps {
   agent: Agent;
@@ -55,23 +55,33 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
   const [active, setActive] = useState<RecoveryDiagnostic[]>([]);
   const [diagnostics, setDiagnostics] = useState<RecoveryDiagnostic[]>([]);
   const [operations, setOperations] = useState<RecoveryOperation[]>([]);
+  const [hardPlans, setHardPlans] = useState<HardRecoveryPlan[]>([]);
+  const [helperStatus, setHelperStatus] = useState<RecoveryHelperStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [repair, setRepair] = useState<RecoveryDiagnostic | null>(null);
   const [repairing, setRepairing] = useState(false);
   const [operationError, setOperationError] = useState<{ code: string; message: string } | null>(null);
   const [policySaving, setPolicySaving] = useState(false);
+  const [hardConfirm, setHardConfirm] = useState<{ plan: HardRecoveryPlan; phase: 1 | 2 } | null>(null);
+  const [hardConfirming, setHardConfirming] = useState(false);
+  const [helperHello, setHelperHello] = useState('');
+  const [helperEnrolling, setHelperEnrolling] = useState(false);
 
   const fetchRecovery = useCallback(async () => {
     try {
-      const [activeList, allList, operationList] = await Promise.all([
+      const [activeList, allList, operationList, hardPlanList, currentHelperStatus] = await Promise.all([
         api.listRecoveryDiagnostics(agent.id, false),
         api.listRecoveryDiagnostics(agent.id, true, 100),
         api.listRecoveryOperations(agent.id),
+        api.listHardRecoveryPlans(agent.id),
+        api.getRecoveryHelperStatus(agent.id),
       ]);
       setActive(activeList);
       setDiagnostics(allList);
       setOperations(operationList);
+      setHardPlans(hardPlanList);
+      setHelperStatus(currentHelperStatus);
       setLoadError('');
     } catch (error) {
       setLoadError(errMessage(error, t('recovery.loadFailed')));
@@ -80,7 +90,8 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
     }
   }, [agent.id, t]);
 
-  const nonTerminal = operations.some((operation) => !recoveryOperationTerminal(operation));
+  const hardExecutionActive = hardPlans.some((plan) => !plan.signed_helper_receipt && (!!plan.signed_execution_grant || plan.confirmation_event_ids.length > 0));
+  const nonTerminal = operations.some((operation) => !recoveryOperationTerminal(operation)) || hardExecutionActive;
   usePolling(fetchRecovery, 3000, { keepAliveWhenHidden: nonTerminal });
 
   const activeIDs = useMemo(() => new Set(active.map((diagnostic) => diagnostic.id)), [active]);
@@ -117,6 +128,47 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
     }
   }
 
+  async function confirmHardRepair(freshPassword?: string) {
+    if (!hardConfirm) return;
+    setHardConfirming(true);
+    setOperationError(null);
+    try {
+      const updated = await api.confirmHardRecoveryPlan(
+        agent.id,
+        hardConfirm.plan.helper_plan_id,
+        hardConfirm.phase,
+        crypto.randomUUID(),
+        hardConfirm.plan.display_plan_hash,
+        freshPassword,
+      );
+      setHardPlans((current) => [updated, ...current.filter((plan) => plan.helper_plan_id !== updated.helper_plan_id)]);
+      setHardConfirm(null);
+      toast.success(t(hardConfirm.phase === 1 ? 'recovery.hardFirstConfirmed' : 'recovery.hardExecutionAuthorized'));
+      await fetchRecovery();
+    } catch (error) {
+      setOperationError({ code: recoveryErrorCode(error), message: errMessage(error, t('recovery.hardConfirmFailed')) });
+      setHardConfirm(null);
+    } finally {
+      setHardConfirming(false);
+    }
+  }
+
+  async function enrollHelper() {
+    setHelperEnrolling(true);
+    setOperationError(null);
+    try {
+      const signedHello = JSON.parse(helperHello) as unknown;
+      await api.enrollRecoveryHelper(agent.id, signedHello);
+      setHelperHello('');
+      toast.success(t('recovery.helperEnrolled'));
+      await fetchRecovery();
+    } catch (error) {
+      setOperationError({ code: recoveryErrorCode(error), message: errMessage(error, t('recovery.helperEnrollFailed')) });
+    } finally {
+      setHelperEnrolling(false);
+    }
+  }
+
   const overrideMode = agent.safe_auto_repair_override == null
     ? 'inherit'
     : agent.safe_auto_repair_override ? 'enabled' : 'disabled';
@@ -150,6 +202,28 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
       {!agent.recovery_capability && (
         <div className="mt-4"><Callout tone="warning" title={t('recovery.upgradeRequired')}>{t('recovery.upgradeRequiredBody')}</Callout></div>
       )}
+      {helperStatus?.enrolled ? (
+        <div className="mt-4 rounded-lg border border-success-border bg-success-soft p-3 text-xs text-success-fg">
+          <p className="font-medium">{t('recovery.helperEnrolled')}</p>
+          <p className="mt-1 font-mono">{helperStatus.helper.helper_instance_id} · {helperStatus.helper.helper_build_id} · {helperStatus.helper.attestation_key_id}</p>
+        </div>
+      ) : helperStatus ? (
+        <div className="mt-4 rounded-lg border border-warning-border bg-warning-soft p-4">
+          <h4 className="font-medium text-warning-fg">{t('recovery.helperEnrollmentTitle')}</h4>
+          <p className="mt-1 text-sm text-fg-muted">{t('recovery.helperEnrollmentBody')}</p>
+          <Textarea
+            value={helperHello}
+            onChange={(event) => setHelperHello(event.target.value)}
+            rows={5}
+            className="mt-3 font-mono text-xs"
+            spellCheck={false}
+            placeholder={t('recovery.helperEnrollmentPlaceholder')}
+          />
+          <Button className="mt-3" size="sm" disabled={helperHello.trim() === ''} loading={helperEnrolling} onClick={enrollHelper}>
+            {t('recovery.helperEnrollAction')}
+          </Button>
+        </div>
+      ) : null}
       {operationError && (
         <div className="mt-4"><Callout tone="danger" title={t('recovery.repairFailed')}>
           <p>{operationError.message}</p>
@@ -173,6 +247,8 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
             const location = diagnosticLocation(diagnostic);
             const breaker = diagnosticBreaker(diagnostic);
             const validationEscape = breaker.open && breaker.reason === 'rollback_failed_latched';
+            const hardPlan = newestHardPlan(hardPlans, diagnostic.id);
+            const hardAvailability = hardPlanAvailability(diagnostic, hardPlan);
             return (
               <article key={diagnostic.id} className="rounded-lg border border-border bg-surface-2 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -194,11 +270,24 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                     {location && <p className="mt-1 break-all font-mono text-xs text-fg-muted">{t('recovery.location')}: {location}</p>}
                   </div>
                   {diagnosticActionVisible(diagnostic) && (
-                    <Button size="sm" disabled={!availability.enabled} onClick={() => setRepair(diagnostic)} title={availability.reason ? t(`recovery.reasons.${availability.reason}`) : undefined}>
-                      {diagnostic.hard_change || diagnostic.ownership !== 'nurproxy' || !diagnostic.proposed_action
-                        ? t('recovery.hardDisabled')
-                        : validationEscape ? t('recovery.validateRepair') : t('recovery.repair')}
-                    </Button>
+                    diagnostic.hard_change ? (
+                      <Button
+                        size="sm"
+                        disabled={!hardAvailability.enabled || !hardPlan || !hardAvailability.phase}
+                        onClick={() => hardPlan && hardAvailability.phase && setHardConfirm({ plan: hardPlan, phase: hardAvailability.phase })}
+                        title={hardAvailability.reason ? t(`recovery.reasons.${hardAvailability.reason}`, { defaultValue: hardAvailability.reason }) : undefined}
+                      >
+                        {hardPlan && hardAvailability.phase
+                          ? t(hardAvailability.phase === 1 ? `recovery.hardActions.${hardPlan.action}` : 'recovery.hardConfirmAction', { action: t(`recovery.hardActions.${hardPlan.action}`) })
+                          : t('recovery.hardDisabled')}
+                      </Button>
+                    ) : (
+                      <Button size="sm" disabled={!availability.enabled} onClick={() => setRepair(diagnostic)} title={availability.reason ? t(`recovery.reasons.${availability.reason}`) : undefined}>
+                        {diagnostic.ownership !== 'nurproxy' || !diagnostic.proposed_action
+                          ? t('recovery.hardDisabled')
+                          : validationEscape ? t('recovery.validateRepair') : t('recovery.repair')}
+                      </Button>
+                    )
                   )}
                 </div>
 
@@ -211,8 +300,23 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                     <ul className="mt-1 space-y-1">{diagnostic.affected_paths.map((path) => <li key={path}><code className="break-all font-mono text-xs text-fg-faint">{path}</code></li>)}</ul>
                   </div>
                 )}
-                {!availability.enabled && availability.reason && isActive && (
+                {isActive && diagnostic.hard_change && !hardAvailability.enabled && hardAvailability.reason && (
+                  <p className="mt-3 text-xs text-fg-faint">{t(`recovery.reasons.${hardAvailability.reason}`, { defaultValue: diagnostic.repair_refusal_code || hardAvailability.reason })}</p>
+                )}
+                {isActive && !diagnostic.hard_change && !availability.enabled && availability.reason && (
                   <p className="mt-3 text-xs text-fg-faint">{t(`recovery.reasons.${availability.reason}`)}</p>
+                )}
+
+                {diagnostic.hard_change && hardPlan && (
+                  <div className="mt-3 rounded border border-warning-border bg-warning-soft p-3 text-xs">
+                    <p className="font-semibold text-warning-fg">{t(`recovery.hardActions.${hardPlan.action}`)}</p>
+                    <p className="mt-1 text-fg-muted">{t('recovery.hardTarget')}: <code>{hardPlan.logical_target}</code> · {t('recovery.rollback')}: {hardPlan.rollback_coverage}</p>
+                    <ol className="mt-2 list-decimal space-y-1 pl-5 text-fg-muted">
+                      {hardPlan.signed_plan.envelope.payload.steps.map((step, index) => <li key={`${step.kind}-${index}`}>{step.summary}</li>)}
+                    </ol>
+                    <p className="mt-2 break-all font-mono text-fg-faint">{t('recovery.planHash')}: {hardPlan.display_plan_hash}</p>
+                    <p className="mt-1 text-fg-faint">{t('recovery.planExpires')}: {new Date(hardPlan.expires_at).toLocaleString()} · {t('recovery.confirmations')}: {hardPlan.confirmation_event_ids.length}/2</p>
+                  </div>
                 )}
 
                 {breaker.open && (
@@ -258,6 +362,25 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
         })}
         confirmLabel={t(repair && diagnosticBreaker(repair).reason === 'rollback_failed_latched' ? 'recovery.validateRepair' : 'recovery.repair')}
         loading={repairing}
+      />
+      <ConfirmDialog
+        open={hardConfirm !== null}
+        onClose={() => !hardConfirming && setHardConfirm(null)}
+        onConfirm={confirmHardRepair}
+        title={hardConfirm ? t(hardConfirm.phase === 1 ? 'recovery.hardConfirmTitle' : 'recovery.hardFinalConfirmTitle', { action: t(`recovery.hardActions.${hardConfirm.plan.action}`) }) : ''}
+        message={hardConfirm ? t(hardConfirm.phase === 1 ? 'recovery.hardConfirmMessage' : 'recovery.hardFinalConfirmMessage', {
+          action: t(`recovery.hardActions.${hardConfirm.plan.action}`),
+          target: hardConfirm.plan.logical_target,
+          coverage: hardConfirm.plan.rollback_coverage,
+          steps: hardConfirm.plan.signed_plan.envelope.payload.steps.map((step) => step.summary).join(' → '),
+        }) : ''}
+        confirmLabel={hardConfirm ? (hardConfirm.phase === 1
+          ? t(`recovery.hardActions.${hardConfirm.plan.action}`)
+          : t('recovery.hardConfirmAction', { action: t(`recovery.hardActions.${hardConfirm.plan.action}`) })) : ''}
+        loading={hardConfirming}
+        freshPasswordLabel={hardConfirm?.phase === 2 && (hardConfirm.plan.action === 'install_supported_proxy_package' || hardConfirm.plan.action === 'open_proxy_firewall_ports')
+          ? t('recovery.freshPasswordLabel')
+          : undefined}
       />
     </section>
   );

@@ -11,9 +11,11 @@ import {
   RecoveryHistoryCardSummary,
   recoveryOperationTerminal,
   repairAvailability,
+  hardPlanAvailability,
+  newestHardPlan,
 } from '../src/lib/recovery-ui.ts';
 import { pollingActive } from '../src/lib/usePolling.ts';
-import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../src/lib/types.ts';
+import type { Agent, HardRecoveryPlan, RecoveryDiagnostic, RecoveryOperation } from '../src/lib/types.ts';
 
 const agent = {
   id: 'agent-1',
@@ -64,6 +66,27 @@ test('hard changes stay visible but disabled in stage one', () => {
     enabled: false,
     reason: 'hard_change',
   });
+});
+
+test('hard repair plans require two distinct visible confirmation turns', () => {
+  const hard = { ...diagnostic, hard_change: true, repair_eligible: true } as RecoveryDiagnostic;
+  const base = {
+    diagnostic_id: hard.id, helper_plan_id: 'plan-new', expires_at: '2026-08-29T22:00:00Z',
+    confirmation_event_ids: [],
+  } as unknown as HardRecoveryPlan;
+  assert.deepEqual(hardPlanAvailability(hard, base, new Date('2026-08-29T21:00:00Z')), { enabled: true, phase: 1 });
+  assert.deepEqual(hardPlanAvailability(hard, { ...base, confirmation_event_ids: ['confirm-1'] }, new Date('2026-08-29T21:00:00Z')), { enabled: true, phase: 2 });
+  assert.deepEqual(hardPlanAvailability(hard, { ...base, confirmation_event_ids: ['confirm-1', 'confirm-2'], signed_execution_grant: {} }, new Date('2026-08-29T21:00:00Z')), { enabled: false, reason: 'hard_execution_active' });
+  assert.deepEqual(hardPlanAvailability(hard, base, new Date('2026-08-29T23:00:00Z')), { enabled: false, reason: 'hard_plan_expired' });
+});
+
+test('newest hard plan is selected only for its exact diagnostic', () => {
+  const plans = [
+    { helper_plan_id: 'old', diagnostic_id: 'diag-1', received_at: '2026-08-29T20:00:00Z' },
+    { helper_plan_id: 'other', diagnostic_id: 'diag-2', received_at: '2026-08-29T22:00:00Z' },
+    { helper_plan_id: 'new', diagnostic_id: 'diag-1', received_at: '2026-08-29T21:00:00Z' },
+  ] as HardRecoveryPlan[];
+  assert.equal(newestHardPlan(plans, 'diag-1')?.helper_plan_id, 'new');
 });
 
 test('active repairs and missing capabilities disable duplicate execution', () => {

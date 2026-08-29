@@ -212,11 +212,65 @@ export interface RecoveryDiagnostic {
   proposed_action: RecoveryAction | '';
   auto_repair_eligible: boolean;
   hard_change: boolean;
+  repair_scope?: string;
+  repair_eligible?: boolean;
+  repair_refusal_code?: string;
   first_seen_at: string;
   last_seen_at: string;
   occurrences: number;
   breaker?: RecoveryBreaker;
 }
+
+export type HardRecoveryAction =
+  | 'repair_agent_sandbox_paths' | 'repair_managed_path_access'
+  | 'validate_reload_proxy' | 'start_proxy' | 'restart_proxy'
+  | 'install_supported_proxy_package' | 'open_proxy_firewall_ports';
+
+export interface HardRecoveryPlanStep {
+  kind: string;
+  summary: string;
+}
+
+export interface HardRecoveryPlan {
+  agent_id: string;
+  operation_id: string;
+  helper_plan_id: string;
+  helper_instance_id: string;
+  diagnostic_id: string;
+  action: HardRecoveryAction;
+  logical_target: string;
+  display_plan_hash: string;
+  execution_plan_hash: string;
+  resource_fingerprint: string;
+  rollback_coverage: 'full' | 'partial' | 'none';
+  signed_plan: {
+    envelope: {
+      payload: {
+        steps: HardRecoveryPlanStep[];
+        expires_at: string;
+      };
+    };
+  };
+  received_at: string;
+  expires_at: string;
+  confirmation_event_ids: string[];
+  confirmation_times: string[];
+  signed_execution_grant?: unknown;
+  signed_helper_receipt?: { envelope: { payload: { state: string; sanitized_result: string } } };
+}
+
+export interface RecoveryHelperInstance {
+  agent_id: string;
+  helper_instance_id: string;
+  helper_build_id: string;
+  attestation_key_id: string;
+  hello_digest: string;
+  enrolled_at: string;
+}
+
+export type RecoveryHelperStatus =
+  | { enrolled: false }
+  | { enrolled: true; helper: RecoveryHelperInstance };
 
 export interface RecoveryBreaker {
   open: boolean;
