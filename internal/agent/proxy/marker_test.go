@@ -68,6 +68,25 @@ func TestManagedArtifactFileSnapshotRequiresRegularFileAndRechecksIdentity(t *te
 		t.Fatal("replacement retained the prior identity")
 	}
 
+	_, managed, inPlaceIdentity, err := ReadManagedArtifactFile(path)
+	if err != nil || !managed {
+		t.Fatalf("read in-place snapshot: managed=%v err=%v", managed, err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unmarked := strings.Repeat("x", len(content))
+	if err := os.WriteFile(path, []byte(unmarked), before.Mode().Perm()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := inPlaceIdentity.Recheck(); err == nil {
+		t.Fatal("same-size in-place marker removal retained the prior identity")
+	}
+
 	symlink := filepath.Join(dir, "nurproxy-link.conf")
 	if err := os.Symlink(path, symlink); err != nil {
 		t.Fatal(err)
