@@ -3,12 +3,91 @@ package main
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"os/user"
+	"reflect"
 	"strconv"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 )
+
+func TestDropHelperBootstrapPrivilegesRejectsRootIdentity(t *testing.T) {
+	ops := helperBootstrapPrivilegeOps{}
+	for _, identity := range [][2]uint32{{0, 1000}, {1000, 0}} {
+		if err := dropHelperBootstrapPrivilegesWith(identity[0], identity[1], ops); err == nil {
+			t.Fatalf("dropHelperBootstrapPrivilegesWith(%d, %d) succeeded", identity[0], identity[1])
+		}
+	}
+}
+
+func TestDropHelperBootstrapPrivilegesDropsGroupsBeforeUser(t *testing.T) {
+	var calls []string
+	ops := helperBootstrapPrivilegeOps{
+		setGroups: func(groups []int) error {
+			if !reflect.DeepEqual(groups, []int{987}) {
+				t.Fatalf("groups = %v", groups)
+			}
+			calls = append(calls, "groups")
+			return nil
+		},
+		setResGID: func(real, effective, saved int) error {
+			if real != 987 || effective != 987 || saved != 987 {
+				t.Fatalf("gid tuple = %d/%d/%d", real, effective, saved)
+			}
+			calls = append(calls, "gid")
+			return nil
+		},
+		setResUID: func(real, effective, saved int) error {
+			if real != 1234 || effective != 1234 || saved != 1234 {
+				t.Fatalf("uid tuple = %d/%d/%d", real, effective, saved)
+			}
+			calls = append(calls, "uid")
+			return nil
+		},
+		getUID:  func() int { return 1234 },
+		getEUID: func() int { return 1234 },
+		getGID:  func() int { return 987 },
+		getEGID: func() int { return 987 },
+	}
+	if err := dropHelperBootstrapPrivilegesWith(1234, 987, ops); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, []string{"groups", "gid", "uid"}) {
+		t.Fatalf("calls = %v", calls)
+	}
+}
+
+func TestDropHelperBootstrapPrivilegesFailsClosed(t *testing.T) {
+	sentinel := errors.New("setgroups denied")
+	ops := helperBootstrapPrivilegeOps{
+		setGroups: func([]int) error { return sentinel },
+		setResGID: func(int, int, int) error { t.Fatal("setresgid called after failure"); return nil },
+		setResUID: func(int, int, int) error { t.Fatal("setresuid called after failure"); return nil },
+		getUID:    func() int { return 0 },
+		getEUID:   func() int { return 0 },
+		getGID:    func() int { return 0 },
+		getEGID:   func() int { return 0 },
+	}
+	if err := dropHelperBootstrapPrivilegesWith(1234, 987, ops); !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDropHelperBootstrapPrivilegesVerifiesIdentity(t *testing.T) {
+	ops := helperBootstrapPrivilegeOps{
+		setGroups: func([]int) error { return nil },
+		setResGID: func(int, int, int) error { return nil },
+		setResUID: func(int, int, int) error { return nil },
+		getUID:    func() int { return 0 },
+		getEUID:   func() int { return 1234 },
+		getGID:    func() int { return 987 },
+		getEGID:   func() int { return 987 },
+	}
+	if err := dropHelperBootstrapPrivilegesWith(1234, 987, ops); err == nil {
+		t.Fatal("identity verification unexpectedly succeeded")
+	}
+}
 
 func TestBuildRootHelperConfigCompilesOnlyPinnedBackendLayouts(t *testing.T) {
 	current, err := user.Current()

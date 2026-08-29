@@ -70,6 +70,10 @@ func cmdHelperBootstrap(args []string) {
 	if err != nil || uid == 0 {
 		log.Fatalf("Root helper bootstrap dedicated user identity is invalid")
 	}
+	gid, err := strconv.ParseUint(account.Gid, 10, 32)
+	if err != nil || gid == 0 {
+		log.Fatalf("Root helper bootstrap dedicated group identity is invalid")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -135,6 +139,9 @@ func cmdHelperBootstrap(args []string) {
 	}
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	pin := helperclient.Pin{HelperInstanceID: config.HelperInstanceID, AttestationKeyID: config.AttestationKeyID, AttestationPublicKey: base64.RawURLEncoding.EncodeToString(publicKey)}
+	if err := dropHelperBootstrapPrivileges(uint32(uid), uint32(gid)); err != nil {
+		log.Fatalf("Root helper bootstrap cannot enter dedicated agent identity: %v", err)
+	}
 	client, err := helperclient.New(agentID, version, pin)
 	if err != nil {
 		log.Fatalf("Root helper bootstrap cannot create verified local client: %v", err)
