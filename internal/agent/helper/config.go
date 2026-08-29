@@ -304,7 +304,7 @@ func loadRootConfig(path string, expectedOwnerUID uint32, lookup func(string) (*
 		return zero, fmt.Errorf("resolve configured agent user: %w", err)
 	}
 	uid, err := strconv.ParseUint(account.Uid, 10, 32)
-	if err != nil || uint32(uid) != cfg.AgentUID {
+	if err != nil || uid != uint64(cfg.AgentUID) {
 		return zero, fmt.Errorf("configured agent user and uid do not match")
 	}
 	return cfg, nil
@@ -383,7 +383,7 @@ func validConfigID(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._:-", r)) {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("._:-", r) {
 			return false
 		}
 	}

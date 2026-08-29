@@ -260,7 +260,7 @@ func validPackageName(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || strings.ContainsRune("+.-", r)) {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && !strings.ContainsRune("+.-", r) {
 			return false
 		}
 	}

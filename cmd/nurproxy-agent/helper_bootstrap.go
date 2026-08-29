@@ -158,7 +158,8 @@ func cmdHelperBootstrap(args []string) {
 }
 
 func buildRootHelperConfig(input helperBootstrapConfigInput) (helper.RootConfig, error) {
-	available, enabled, unit, pkg, roots := "", "", "", "", []string{}
+	var available, enabled, unit, pkg string
+	var roots []string
 	switch input.ProxyKind {
 	case "nginx":
 		unit, pkg, roots = "nginx.service", "nginx", []string{"/etc/nginx"}

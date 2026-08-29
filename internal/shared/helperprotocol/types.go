@@ -647,7 +647,7 @@ func (i ApplyIntent) Validate() error {
 }
 
 func ManagedApplyDigests(intent ApplyIntent) (logical, artifacts, deletions, certificates string, err error) {
-	if err = intent.Validate(); err != nil {
+	if err := intent.Validate(); err != nil {
 		return "", "", "", "", err
 	}
 	logical, err = Digest(struct {
@@ -956,7 +956,7 @@ func validID(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._:-", r)) {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("._:-", r) {
 			return false
 		}
 	}
@@ -968,9 +968,7 @@ func validLogicalName(value string) bool {
 }
 
 func validCertificateName(value string) bool {
-	if strings.HasPrefix(value, "*.") {
-		value = strings.TrimPrefix(value, "*.")
-	}
+	value = strings.TrimPrefix(value, "*.")
 	if value == "" || len(value) > 253 || strings.TrimSpace(value) != value || strings.Contains(value, "..") {
 		return false
 	}
@@ -979,7 +977,7 @@ func validCertificateName(value string) bool {
 			return false
 		}
 		for _, r := range label {
-			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' {
 				return false
 			}
 		}
@@ -992,7 +990,7 @@ func validDigest(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return false
 		}
 	}

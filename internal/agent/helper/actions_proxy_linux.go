@@ -397,7 +397,7 @@ func proxyConfigDigest(roots []string, agentUID uint32) (string, error) {
 	h := sha256.New()
 	for _, item := range entries {
 		for _, value := range []string{item.path, item.mode.String(), fmt.Sprint(item.size), item.link} {
-			_, _ = h.Write([]byte(fmt.Sprintf("%d:", len(value))))
+			_, _ = fmt.Fprintf(h, "%d:", len(value))
 			_, _ = h.Write([]byte(value))
 		}
 		_, _ = h.Write(item.data)

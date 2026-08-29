@@ -740,7 +740,7 @@ func readStagedArtifact(root, operationID, name string, artifact helperprotocol.
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(rootFD)
+	defer func() { _ = unix.Close(rootFD) }()
 	var rootStat unix.Stat_t
 	if err := unix.Fstat(rootFD, &rootStat); err != nil || rootStat.Uid != stagingRootUID || rootStat.Mode&unix.S_IFMT != unix.S_IFDIR || rootStat.Mode&0o007 != 0 {
 		return nil, fmt.Errorf("staging root is not root-owned and bounded")
@@ -749,7 +749,7 @@ func readStagedArtifact(root, operationID, name string, artifact helperprotocol.
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(operationFD)
+	defer func() { _ = unix.Close(operationFD) }()
 	var operationStat unix.Stat_t
 	if err := unix.Fstat(operationFD, &operationStat); err != nil || operationStat.Uid != agentUID || operationStat.Mode&unix.S_IFMT != unix.S_IFDIR || operationStat.Mode&0o077 != 0 {
 		return nil, fmt.Errorf("staged artifact directory is not private to the agent")
@@ -950,7 +950,7 @@ func installManagedLink(link managedCompiledLink, ownerUID uint32) (bool, error)
 	if err := os.Symlink(link.Target, tmp); err != nil {
 		return false, err
 	}
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 	if err := os.Rename(tmp, link.Path); err != nil {
 		return false, err
 	}
@@ -977,7 +977,7 @@ func restoreManagedSnapshot(snapshot managedFileSnapshot, ownerUID uint32) error
 		if err := os.Symlink(snapshot.LinkTarget, tmp); err != nil {
 			return err
 		}
-		defer os.Remove(tmp)
+		defer func() { _ = os.Remove(tmp) }()
 		if err := os.Lchown(tmp, int(snapshot.UID), int(snapshot.GID)); err != nil {
 			return err
 		}

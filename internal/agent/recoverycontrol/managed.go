@@ -127,7 +127,7 @@ func (c *ManagedController) stage(envelope helperprotocol.ManagedIntentSetEnvelo
 	operationID := envelope.Intent.Envelope.Payload.OperationID
 	_ = root.RemoveAll(operationID)
 	if err := root.Mkdir(operationID, 0o700); err != nil {
-		root.Close()
+		_ = root.Close()
 		if errors.Is(err, fs.ErrPermission) {
 			return nil, fmt.Errorf("%w: create staging operation: %w", ErrManagedStagingAccess, err)
 		}
@@ -179,12 +179,12 @@ func (c *ManagedController) stage(envelope helperprotocol.ManagedIntentSetEnvelo
 			return nil, fmt.Errorf("create staged artifact: %w", err)
 		}
 		if _, err := file.Write(data); err != nil {
-			file.Close()
+			_ = file.Close()
 			cleanup()
 			return nil, fmt.Errorf("write staged artifact: %w", err)
 		}
 		if err := file.Sync(); err != nil {
-			file.Close()
+			_ = file.Close()
 			cleanup()
 			return nil, fmt.Errorf("sync staged artifact: %w", err)
 		}

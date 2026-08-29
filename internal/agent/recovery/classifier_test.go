@@ -91,7 +91,7 @@ func TestClassifierMapsEveryDiagnosticCodeAndOwnershipClass(t *testing.T) {
 	}
 	for _, code := range recoverymodel.AllCodes() {
 		if !seen[code] {
-			t.Errorf("diagnostic catalogue code %q has no classifier fixture", code)
+			t.Errorf("diagnostic catalog code %q has no classifier fixture", code)
 		}
 	}
 }
