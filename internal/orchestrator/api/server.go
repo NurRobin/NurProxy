@@ -70,6 +70,9 @@ type Server struct {
 	// tokenBackfilled guards the once-per-agent encrypted-token backfill in
 	// requireAgentAuth (see backfillAgentToken).
 	tokenBackfilled sync.Map
+	// recoveryMu serializes report transitions and manual repair admission so
+	// two requests cannot create competing active operations from one diagnosis.
+	recoveryMu sync.Mutex
 
 	// dnsDryRun / acmeDryRun reflect sandbox mode so the health endpoint can tell
 	// the dashboard to show a "dry-run — no external calls" banner (#93).
@@ -257,6 +260,12 @@ func (s *Server) registerRoutes() {
 	// rejects any id that is not the caller's own.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAgentAuth(s.handleAgentStatus))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", s.requireAgentAuth(s.handleAgentHeartbeat))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/diagnostics", s.requireAuth(s.handleListRecoveryDiagnostics))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/repairs", s.requireAuth(s.handleListRepairs))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs", s.requireAuth(s.handleCreateRepair))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/report", s.requireAgentAuth(s.handleRecoveryReport))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs/{opId}/ack", s.requireAgentAuth(s.handleRepairAck))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/safe-auto-repair", s.requireAuth(s.handleSetSafeAutoRepair))
 	// Live push channel: the agent dials out and holds this open; the
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))

@@ -5,7 +5,54 @@ import (
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
+
+func TestPublishRecoveryPolicyTyped(t *testing.T) {
+	h := New()
+	ch, unsub := h.Subscribe("a1")
+	defer unsub()
+
+	if !h.PublishRecoveryPolicy("a1", true) {
+		t.Fatal("policy should be delivered")
+	}
+	ev := <-ch
+	if ev.Type != EventRecoveryPolicy {
+		t.Fatalf("event type = %q, want %q", ev.Type, EventRecoveryPolicy)
+	}
+	var got proxymodel.RecoveryPolicyEnvelope
+	if err := json.Unmarshal(ev.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Policy.SafeAutoRepair {
+		t.Fatal("safe auto repair policy was not preserved")
+	}
+}
+
+func TestPublishRepairRequestTyped(t *testing.T) {
+	h := New()
+	ch, unsub := h.Subscribe("a1")
+	defer unsub()
+	want := recoverymodel.RepairRequest{OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionRemoveManagedTemp}
+
+	if !h.PublishRepairRequest("a1", want) {
+		t.Fatal("repair request should be delivered")
+	}
+	ev := <-ch
+	if ev.Type != EventRepairRequest {
+		t.Fatalf("event type = %q, want %q", ev.Type, EventRepairRequest)
+	}
+	var got proxymodel.RepairRequestEnvelope
+	if err := json.Unmarshal(ev.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Request != want {
+		t.Fatalf("request = %#v, want %#v", got.Request, want)
+	}
+	if h.PublishRepairRequest("a1", recoverymodel.RepairRequest{}) {
+		t.Fatal("invalid repair request must fail closed")
+	}
+}
 
 func TestPublishToSubscriber(t *testing.T) {
 	h := New()

@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // Event is a single message pushed to an agent over its stream.
@@ -37,7 +38,9 @@ const (
 	EventLogTail = "log_tail"
 	// EventLogTailStop asks the agent to stop a tail session (§15). The payload is a
 	// proxymodel.LogTailStop. Pushed when the operator closes the dashboard log view.
-	EventLogTailStop = "log_tail_stop"
+	EventLogTailStop    = "log_tail_stop"
+	EventRecoveryPolicy = "recovery_policy"
+	EventRepairRequest  = "repair_request"
 )
 
 // maxStreamsPerAgent caps how many concurrent SSE streams a single agent may
@@ -176,4 +179,25 @@ func (h *Hub) PublishIntentSet(agentID string, set proxymodel.IntentSet) bool {
 		return false
 	}
 	return h.Publish(agentID, Event{Type: EventRoutes, Data: data})
+}
+
+func (h *Hub) PublishRecoveryPolicy(agentID string, enabled bool) bool {
+	envelope := proxymodel.RecoveryPolicyEnvelope{Policy: proxymodel.RecoveryPolicy{SafeAutoRepair: enabled}}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return false
+	}
+	return h.Publish(agentID, Event{Type: EventRecoveryPolicy, Data: data})
+}
+
+func (h *Hub) PublishRepairRequest(agentID string, request recoverymodel.RepairRequest) bool {
+	envelope := proxymodel.RepairRequestEnvelope{Request: request}
+	if err := envelope.Validate(); err != nil {
+		return false
+	}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return false
+	}
+	return h.Publish(agentID, Event{Type: EventRepairRequest, Data: data})
 }

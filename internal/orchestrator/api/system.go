@@ -194,6 +194,10 @@ func (s *Server) handleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if key == "safe_auto_repair" && req.Value != "true" && req.Value != "false" {
+		writeError(w, http.StatusBadRequest, "safe_auto_repair must be true or false")
+		return
+	}
 
 	if err := s.db.SetSetting(key, req.Value); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update setting")
@@ -201,6 +205,16 @@ func (s *Server) handleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "setting", key, "update", "")
+	if key == "safe_auto_repair" {
+		agents, err := s.db.ListAgents()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to publish recovery policy")
+			return
+		}
+		for _, agent := range agents {
+			s.publishRecoveryPolicy(agent.ID, agent.SafeAutoRepairEffective)
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"key":   key,

@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -12,6 +13,8 @@ import (
 )
 
 const maxActiveDiagnosticIDs = 500
+
+var ErrActiveRepairOperation = errors.New("active repair operation already exists for diagnostic")
 
 func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnostic) error {
 	if strings.TrimSpace(agentID) == "" {
@@ -188,6 +191,14 @@ func scanDiagnostic(scanner interface{ Scan(...any) error }) (recoverymodel.Diag
 }
 
 func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.OperationReport, fingerprint string) error {
+	return d.createRepairOperation(agentID, report, fingerprint, false)
+}
+
+func (d *DB) CreateRepairOperationIfNoActive(agentID string, report recoverymodel.OperationReport, fingerprint string) error {
+	return d.createRepairOperation(agentID, report, fingerprint, true)
+}
+
+func (d *DB) createRepairOperation(agentID string, report recoverymodel.OperationReport, fingerprint string, rejectActive bool) error {
 	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(fingerprint) == "" {
 		return fmt.Errorf("operation agent ID and fingerprint are required")
 	}
@@ -260,6 +271,21 @@ func (d *DB) CreateRepairOperation(agentID string, report recoverymodel.Operatio
 	}
 	if proposedAction != string(report.Action) {
 		return fmt.Errorf("repair operation action does not match diagnostic")
+	}
+	if rejectActive {
+		var active int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM recovery_operations
+			WHERE agent_id = ? AND diagnostic_id = ? AND state NOT IN (?, ?, ?, ?, ?)`,
+			agentID, report.DiagnosticID,
+			string(recoverymodel.OperationStateDiagnosisOnly), string(recoverymodel.OperationStateSucceeded),
+			string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed),
+			string(recoverymodel.OperationStateSuppressed),
+		).Scan(&active); err != nil {
+			return fmt.Errorf("checking active repair operations: %w", err)
+		}
+		if active != 0 {
+			return ErrActiveRepairOperation
+		}
 	}
 	createdAt, err := nextRecoveryCreatedAt(tx, agentID)
 	if err != nil {
@@ -592,6 +618,20 @@ func (d *DB) ListRepairOperations(agentID string, limit int) ([]recoverymodel.Op
 	return reports, rows.Err()
 }
 
+func (d *DB) GetRepairOperation(agentID, operationID string) (*recoverymodel.OperationReport, error) {
+	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(operationID) == "" {
+		return nil, fmt.Errorf("repair operation agent and ID are required")
+	}
+	report, _, err := scanRepairOperation(d.read.QueryRow(operationSelect+` WHERE agent_id = ? AND id = ?`, agentID, operationID))
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("repair operation not found %s: %w", operationID, sql.ErrNoRows)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying repair operation: %w", err)
+	}
+	return &report, nil
+}
+
 func (d *DB) CountRecentRepairFailures(agentID string, action recoverymodel.Action, fingerprint string, since time.Time) (int, error) {
 	if !action.Valid() || since.IsZero() || strings.TrimSpace(fingerprint) == "" {
 		return 0, fmt.Errorf("valid action, fingerprint, and since time are required")
@@ -617,6 +657,83 @@ func (d *DB) CountRecentRepairFailures(agentID string, action recoverymodel.Acti
 		return 0, fmt.Errorf("counting recent repair failures: %w", err)
 	}
 	return count, nil
+}
+
+func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (bool, error) {
+	if strings.TrimSpace(agentID) == "" || !action.Valid() || strings.TrimSpace(fingerprint) == "" || now.IsZero() {
+		return false, fmt.Errorf("agent, valid action, fingerprint, and current time are required")
+	}
+	nowNanos, err := recoveryUnixNano(now)
+	if err != nil {
+		return false, fmt.Errorf("encoding repair breaker time: %w", err)
+	}
+
+	var latestState string
+	var latestReceipt int64
+	err = d.read.QueryRow(`SELECT state, received_at FROM recovery_operations
+		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
+		AND state IN (?, ?) ORDER BY received_at DESC LIMIT 1`,
+		agentID, string(action), fingerprint,
+		string(recoverymodel.OperationStateSucceeded), string(recoverymodel.OperationStateRollbackFailed),
+	).Scan(&latestState, &latestReceipt)
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Errorf("reading latest repair breaker outcome: %w", err)
+	}
+	if err == nil && latestState == string(recoverymodel.OperationStateRollbackFailed) {
+		return true, nil
+	}
+	afterSuccess := int64(math.MinInt64)
+	if err == nil && latestState == string(recoverymodel.OperationStateSucceeded) {
+		afterSuccess = latestReceipt
+	}
+
+	const (
+		failureWindow = int64(15 * time.Minute)
+		openDuration  = int64(time.Hour)
+		lookback      = failureWindow + openDuration
+	)
+	oldest := subtractRecoveryDuration(nowNanos, lookback)
+	openSince := subtractRecoveryDuration(nowNanos, openDuration)
+	if afterSuccess > oldest {
+		oldest = afterSuccess
+	}
+	rows, err := d.read.Query(`SELECT received_at FROM recovery_operations
+		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
+		AND state IN (?, ?) AND received_at > ?
+		ORDER BY received_at DESC LIMIT 256`,
+		agentID, string(action), fingerprint,
+		string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed), oldest,
+	)
+	if err != nil {
+		return false, fmt.Errorf("reading repair breaker failures: %w", err)
+	}
+	defer rows.Close()
+	receiptsDesc := make([]int64, 0, 16)
+	for rows.Next() {
+		var receipt int64
+		if err := rows.Scan(&receipt); err != nil {
+			return false, fmt.Errorf("scanning repair breaker failure: %w", err)
+		}
+		receiptsDesc = append(receiptsDesc, receipt)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("reading repair breaker failures: %w", err)
+	}
+	for i := len(receiptsDesc) - 3; i >= 0; i-- {
+		third := receiptsDesc[i]
+		first := receiptsDesc[i+2]
+		if third >= openSince && third-first <= failureWindow {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func subtractRecoveryDuration(value, duration int64) int64 {
+	if value < math.MinInt64+duration {
+		return math.MinInt64
+	}
+	return value - duration
 }
 
 const operationSelect = `SELECT id, diagnostic_id, action, request_source, state,

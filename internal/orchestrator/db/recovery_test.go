@@ -2,10 +2,12 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
@@ -94,6 +96,84 @@ func TestRecoveryDiagnosticUpsertResolveAndList(t *testing.T) {
 	}
 }
 
+func TestRepairBreakerOpenPersistsOneHourFromThirdClusteredFailure(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diag := testDiagnostic(a.ID, "fp-breaker-open")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	for i, ago := range []time.Duration{70 * time.Minute, 60 * time.Minute, 55 * time.Minute} {
+		op := newUserOperation(fmt.Sprintf("op-breaker-%d", i), diag, recoveryTime(i))
+		if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		op = advanceOperationToTerminal(t, d, a.ID, op, recoverymodel.OperationStateRolledBack)
+		if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, now.Add(-ago).UnixNano(), op.OperationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open, err := d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now)
+	if err != nil || !open {
+		t.Fatalf("breaker open = %t, err=%v, want true", open, err)
+	}
+	open, err = d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now.Add(6*time.Minute))
+	if err != nil || open {
+		t.Fatalf("expired breaker open = %t, err=%v, want false", open, err)
+	}
+}
+
+func TestRepairBreakerOpenRequiresClusterAndSuccessClears(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diag := testDiagnostic(a.ID, "fp-breaker-cluster")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	for i, ago := range []time.Duration{50 * time.Minute, 30 * time.Minute, 10 * time.Minute} {
+		op := newUserOperation(fmt.Sprintf("op-spread-%d", i), diag, recoveryTime(i))
+		if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		op = advanceOperationToTerminal(t, d, a.ID, op, recoverymodel.OperationStateRolledBack)
+		if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, now.Add(-ago).UnixNano(), op.OperationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open, err := d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now)
+	if err != nil || open {
+		t.Fatalf("spread failures open = %t, err=%v, want false", open, err)
+	}
+
+	failure := newUserOperation("op-rollback-failed", diag, recoveryTime(4))
+	if err := d.CreateRepairOperation(a.ID, failure, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	failure = advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRollbackFailed)
+	if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, now.Add(-2*time.Hour).UnixNano(), failure.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	open, err = d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now)
+	if err != nil || !open {
+		t.Fatalf("rollback_failed open = %t, err=%v, want true", open, err)
+	}
+
+	success := newUserOperation("op-breaker-success", diag, recoveryTime(5))
+	if err := d.CreateRepairOperation(a.ID, success, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	success = advanceOperationToTerminal(t, d, a.ID, success, recoverymodel.OperationStateSucceeded)
+	if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, now.Add(-time.Minute).UnixNano(), success.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	open, err = d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now)
+	if err != nil || open {
+		t.Fatalf("breaker after success open = %t, err=%v, want false", open, err)
+	}
+}
+
 func TestRecoveryDiagnosticValidationAndStrictStoredJSON(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
@@ -176,6 +256,51 @@ func TestRecoveryOperationTransitionsIdempotencyAndHistory(t *testing.T) {
 	})
 	if err := d.AdvanceRepairOperation(a.ID, illegal); err == nil || !strings.Contains(err.Error(), "illegal") {
 		t.Fatalf("terminal regression error = %v, want illegal transition", err)
+	}
+}
+
+func TestGetRepairOperationIsExactlyAgentScoped(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	other := &models.Agent{ID: "agent-other", Name: "Other", FQDN: "other.example.com", Status: models.AgentStatusPending}
+	if err := d.CreateAgent(other); err != nil {
+		t.Fatal(err)
+	}
+	diag := testDiagnostic(a.ID, "fp-get-op")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+	op := newUserOperation("op-get-exact", diag, recoveryTime(0))
+	if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetRepairOperation(a.ID, op.OperationID)
+	if err != nil || got.OperationID != op.OperationID || got.State != op.State {
+		t.Fatalf("operation = %#v, err=%v", got, err)
+	}
+	if _, err := d.GetRepairOperation(other.ID, op.OperationID); err == nil {
+		t.Fatal("cross-agent operation lookup succeeded")
+	}
+}
+
+func TestCreateRepairOperationIfNoActiveIsAtomicPerDiagnostic(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diag := testDiagnostic(a.ID, "fp-active-create")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+	first := newUserOperation("op-active-first", diag, recoveryTime(0))
+	if err := d.CreateRepairOperationIfNoActive(a.ID, first, diag.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	second := newUserOperation("op-active-second", diag, recoveryTime(1))
+	if err := d.CreateRepairOperationIfNoActive(a.ID, second, diag.ResourceFingerprint); err == nil {
+		t.Fatal("second active operation was created")
+	}
+	advanceOperationToTerminal(t, d, a.ID, first, recoverymodel.OperationStateSucceeded)
+	if err := d.CreateRepairOperationIfNoActive(a.ID, second, diag.ResourceFingerprint); err != nil {
+		t.Fatalf("operation after terminal predecessor: %v", err)
 	}
 }
 
