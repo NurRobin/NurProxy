@@ -647,6 +647,22 @@ var migrations = []string{
 	UPDATE recovery_diagnostics SET resolution_reason = 'condition_no_longer_observed'
 		WHERE resolved_at IS NOT NULL AND resolution_reason = '';
 	`,
+
+	// Migration 27: root-helper attestation identities are explicitly enrolled
+	// per agent and cannot be silently rebound across hosts.
+	`
+	CREATE TABLE recovery_helper_instances (
+		agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+		helper_instance_id TEXT NOT NULL UNIQUE,
+		helper_build_id TEXT NOT NULL,
+		attestation_key_id TEXT NOT NULL,
+		attestation_public_key TEXT NOT NULL,
+		hello_digest TEXT NOT NULL,
+		enrolled_at INTEGER NOT NULL
+	);
+	CREATE UNIQUE INDEX idx_recovery_helper_attestation_key
+		ON recovery_helper_instances(attestation_key_id);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

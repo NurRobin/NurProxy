@@ -268,6 +268,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs", s.requireAuth(s.handleCreateRepair))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/report", s.requireAgentAuth(s.handleRecoveryReport))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/authority", s.requireAgentAuth(s.handleGetRecoveryAuthority))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/recovery/helper", s.requireAuth(s.handleEnrollRecoveryHelper))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/helper", s.requireAgentAuth(s.handleGetRecoveryHelper))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs/{opId}/ack", s.requireAgentAuth(s.handleRepairAck))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/safe-auto-repair", s.requireAuth(s.handleSetSafeAutoRepair))
 	// Live push channel: the agent dials out and holds this open; the
