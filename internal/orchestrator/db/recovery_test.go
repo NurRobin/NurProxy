@@ -532,3 +532,123 @@ func TestRecoveryLookupMissing(t *testing.T) {
 		t.Fatalf("missing diagnostic error = %v", err)
 	}
 }
+
+func TestRecoveryAggregatesUseDurableBoundedDimensions(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	now := time.Date(2026, 8, 29, 3, 30, 0, 0, time.UTC)
+
+	active := testDiagnostic(a.ID, "fp-metrics-active")
+	if err := d.UpsertDiagnostic(a.ID, active); err != nil {
+		t.Fatal(err)
+	}
+	resolved := testDiagnostic(a.ID, "fp-metrics-resolved")
+	resolved.Severity = recoverymodel.SeverityError
+	resolved.ID = recoverymodel.StableDiagnosticID(a.ID, resolved.Code, resolved.ResourceFingerprint)
+	if err := d.UpsertDiagnostic(a.ID, resolved); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ResolveMissingDiagnostics(a.ID, []string{active.ID}, recoveryTime(2)); err != nil {
+		t.Fatal(err)
+	}
+
+	succeeded := newUserOperation("op-metrics-success", active, recoveryTime(3))
+	if err := d.CreateRepairOperation(a.ID, succeeded, active.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	advanceOperationToTerminal(t, d, a.ID, succeeded, recoverymodel.OperationStateSucceeded)
+
+	inProgress := testOperation("op-metrics-progress", active.ID, recoverymodel.OperationStateDetected)
+	if err := d.CreateRepairOperation(a.ID, inProgress, active.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+
+	breakerDiagnostic := testDiagnostic(a.ID, "fp-metrics-breaker")
+	if err := d.UpsertDiagnostic(a.ID, breakerDiagnostic); err != nil {
+		t.Fatal(err)
+	}
+	failed := newUserOperation("op-metrics-breaker", breakerDiagnostic, recoveryTime(4))
+	if err := d.CreateRepairOperation(a.ID, failed, breakerDiagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	advanceOperationToTerminal(t, d, a.ID, failed, recoverymodel.OperationStateRollbackFailed)
+
+	got, err := d.RecoveryAggregates(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DiagnosticsActive) != 1 || got.DiagnosticsActive[0].Code != active.Code ||
+		got.DiagnosticsActive[0].Severity != active.Severity || got.DiagnosticsActive[0].Ownership != active.Ownership ||
+		got.DiagnosticsActive[0].Count != 2 {
+		t.Fatalf("active diagnostic aggregates = %#v", got.DiagnosticsActive)
+	}
+	wantOperations := map[string]int{
+		"remove_managed_temp/succeeded/user":       1,
+		"remove_managed_temp/rollback_failed/user": 1,
+	}
+	for _, aggregate := range got.OperationsTotal {
+		key := string(aggregate.Action) + "/" + string(aggregate.Outcome) + "/" + string(aggregate.RequestSource)
+		if wantOperations[key] != aggregate.Count {
+			t.Fatalf("unexpected operation aggregate %#v", aggregate)
+		}
+		delete(wantOperations, key)
+	}
+	if len(wantOperations) != 0 {
+		t.Fatalf("missing operation aggregates: %#v (all=%#v)", wantOperations, got.OperationsTotal)
+	}
+	if len(got.OperationsInProgress) != 1 || got.OperationsInProgress[0].Action != active.ProposedAction || got.OperationsInProgress[0].Count != 1 {
+		t.Fatalf("in-progress aggregates = %#v", got.OperationsInProgress)
+	}
+	if len(got.CircuitBreakersOpen) != 1 || got.CircuitBreakersOpen[0].Action != active.ProposedAction || got.CircuitBreakersOpen[0].Count != 1 {
+		t.Fatalf("breaker aggregates = %#v", got.CircuitBreakersOpen)
+	}
+}
+
+func TestRecoveryAggregatesRejectUnknownStoredEnums(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diagnostic := testDiagnostic(a.ID, "fp-metrics-corrupt")
+	if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.sql.Exec(`PRAGMA ignore_check_constraints = ON`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.sql.Exec(`UPDATE recovery_diagnostics SET code = 'attacker-controlled-label' WHERE id = ?`, diagnostic.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RecoveryAggregates(recoveryTime(5)); err == nil || !strings.Contains(err.Error(), "unknown diagnostic aggregate") {
+		t.Fatalf("aggregate corruption error = %v", err)
+	}
+}
+
+func TestRecoveryAggregatesAreSafeForConcurrentScrapes(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diagnostic := testDiagnostic(a.ID, "fp-metrics-concurrent")
+	if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+
+	const scrapes = 16
+	start := make(chan struct{})
+	errs := make(chan error, scrapes)
+	var wg sync.WaitGroup
+	for i := 0; i < scrapes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := d.RecoveryAggregates(recoveryTime(6))
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent aggregate: %v", err)
+		}
+	}
+}

@@ -12,6 +12,9 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func testDB(t *testing.T) *db.DB {
@@ -70,6 +73,20 @@ func TestHandler_authAndContent(t *testing.T) {
 	if err := d.UpsertCertBackoff(&db.CertBackoff{Host: "held.example.com", Attempts: 1, NextAttemptAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatalf("UpsertCertBackoff: %v", err)
 	}
+	diagnostic := recoveryMetricDiagnostic("a1", "fp-metrics")
+	if err := d.UpsertDiagnostic("a1", diagnostic); err != nil {
+		t.Fatalf("UpsertDiagnostic: %v", err)
+	}
+	operation := recoverymodel.OperationReport{
+		OperationID: "op-metrics", DiagnosticID: diagnostic.ID, Action: diagnostic.ProposedAction,
+		Source: recoverymodel.RequestSourceUser, State: recoverymodel.OperationStatePlanned,
+		StartedAt: time.Now().UTC(),
+		Steps:     []recoverymodel.Step{{Name: "planned", Summary: "requested", State: recoverymodel.OperationStatePlanned, At: time.Now().UTC()}},
+	}
+	operation.Steps[0].At = operation.StartedAt
+	if err := d.CreateRepairOperation("a1", operation, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatalf("CreateRepairOperation: %v", err)
+	}
 
 	code, body := scrape(t, h, key)
 	if code != http.StatusOK {
@@ -79,10 +96,57 @@ func TestHandler_authAndContent(t *testing.T) {
 		`nurproxy_agents_total{status="adopted"} 1`,
 		`nurproxy_certificate_expiry_seconds{host="app.example.com"}`,
 		`nurproxy_certificate_backoff{host="held.example.com"} 1`,
+		`nurproxy_recovery_diagnostics_active{code="managed_stale_temp",ownership="nurproxy",severity="warning"} 1`,
+		`nurproxy_recovery_operations_in_progress{action="remove_managed_temp"} 1`,
 		`nurproxy_metrics_scrape_errors 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("scrape output missing %q\n%s", want, body)
 		}
+	}
+}
+
+func recoveryMetricDiagnostic(agentID, fingerprint string) recoverymodel.Diagnostic {
+	now := time.Now().UTC()
+	return recoverymodel.Diagnostic{
+		ID:   recoverymodel.StableDiagnosticID(agentID, recoverymodel.CodeManagedStaleTemp, fingerprint),
+		Code: recoverymodel.CodeManagedStaleTemp, Subsystem: "nginx",
+		Severity: recoverymodel.SeverityWarning, Ownership: recoverymodel.OwnershipNurProxy,
+		Summary: "managed temp", Evidence: "managed temp exists",
+		ResourceFingerprint: fingerprint, ProposedAction: recoverymodel.ActionRemoveManagedTemp,
+		AutoRepairEligible: true, FirstSeenAt: now, LastSeenAt: now, Occurrences: 1,
+	}
+}
+
+func TestRecoveryMetricDescriptorsStayBounded(t *testing.T) {
+	descriptors := []string{
+		recoveryDiagnosticsActiveDesc.String(), recoveryOperationsTotalDesc.String(),
+		recoveryOperationsInProgressDesc.String(), recoveryCircuitBreakersOpenDesc.String(),
+	}
+	for _, descriptor := range descriptors {
+		for _, forbidden := range []string{"host", "path", "id", "error", "diagnostic", "fingerprint"} {
+			if strings.Contains(strings.ToLower(descriptor), `variableLabels: {`+forbidden) ||
+				strings.Contains(strings.ToLower(descriptor), `,`+forbidden) {
+				t.Fatalf("recovery descriptor contains forbidden label %q: %s", forbidden, descriptor)
+			}
+		}
+	}
+}
+
+func TestRecoveryMetricsFailClosedWhenDatabaseIsUnavailable(t *testing.T) {
+	d := testDB(t)
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(&collector{db: d})
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	promhttp.HandlerFor(registry, promhttp.HandlerOpts{}).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	if strings.Contains(body, "nurproxy_recovery_") {
+		t.Fatalf("closed DB leaked recovery metrics: %s", body)
+	}
+	if !strings.Contains(body, `nurproxy_metrics_scrape_errors 5`) {
+		t.Fatalf("closed DB scrape errors missing aggregate failure: %s", body)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +16,171 @@ import (
 const maxActiveDiagnosticIDs = 500
 
 var ErrActiveRepairOperation = errors.New("active repair operation already exists for action and fingerprint")
+
+type RecoveryDiagnosticAggregate struct {
+	Code      recoverymodel.Code
+	Severity  recoverymodel.Severity
+	Ownership recoverymodel.Ownership
+	Count     int
+}
+
+type RecoveryOperationAggregate struct {
+	Action        recoverymodel.Action
+	Outcome       recoverymodel.OperationState
+	RequestSource recoverymodel.RequestSource
+	Count         int
+}
+
+type RecoveryActionAggregate struct {
+	Action recoverymodel.Action
+	Count  int
+}
+
+type RecoveryMetricAggregates struct {
+	DiagnosticsActive    []RecoveryDiagnosticAggregate
+	OperationsTotal      []RecoveryOperationAggregate
+	OperationsInProgress []RecoveryActionAggregate
+	CircuitBreakersOpen  []RecoveryActionAggregate
+}
+
+func (d *DB) RecoveryAggregates(now time.Time) (RecoveryMetricAggregates, error) {
+	if now.IsZero() {
+		return RecoveryMetricAggregates{}, fmt.Errorf("recovery aggregate time is required")
+	}
+	tx, err := d.read.Begin()
+	if err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("beginning recovery aggregate read: %w", err)
+	}
+	defer tx.Rollback()
+
+	var result RecoveryMetricAggregates
+	rows, err := tx.Query(`SELECT code, severity, ownership, COUNT(*)
+		FROM recovery_diagnostics WHERE resolved_at IS NULL
+		GROUP BY code, severity, ownership ORDER BY code, severity, ownership`)
+	if err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("aggregating active recovery diagnostics: %w", err)
+	}
+	for rows.Next() {
+		var code, severity, ownership string
+		var count int
+		if err := rows.Scan(&code, &severity, &ownership, &count); err != nil {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("scanning active recovery diagnostic aggregate: %w", err)
+		}
+		aggregate := RecoveryDiagnosticAggregate{Code: recoverymodel.Code(code), Severity: recoverymodel.Severity(severity), Ownership: recoverymodel.Ownership(ownership), Count: count}
+		if !aggregate.Code.Valid() || !aggregate.Severity.Valid() || !aggregate.Ownership.Valid() || aggregate.Count < 1 {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("unknown diagnostic aggregate dimensions")
+		}
+		result.DiagnosticsActive = append(result.DiagnosticsActive, aggregate)
+	}
+	if err := rows.Close(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("closing active recovery diagnostic aggregates: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("reading active recovery diagnostic aggregates: %w", err)
+	}
+
+	rows, err = tx.Query(`SELECT action, state, request_source, COUNT(*)
+		FROM recovery_operations GROUP BY action, state, request_source
+		ORDER BY action, state, request_source`)
+	if err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("aggregating recovery operations: %w", err)
+	}
+	inProgress := make(map[recoverymodel.Action]int)
+	for rows.Next() {
+		var action, state, source string
+		var count int
+		if err := rows.Scan(&action, &state, &source, &count); err != nil {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("scanning recovery operation aggregate: %w", err)
+		}
+		a, outcome, requestSource := recoverymodel.Action(action), recoverymodel.OperationState(state), recoverymodel.RequestSource(source)
+		if !a.Valid() || !outcome.Valid() || !requestSource.Valid() || count < 1 {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("unknown recovery operation aggregate dimensions")
+		}
+		if recoveryOperationTerminal(outcome) {
+			result.OperationsTotal = append(result.OperationsTotal, RecoveryOperationAggregate{Action: a, Outcome: outcome, RequestSource: requestSource, Count: count})
+		} else {
+			inProgress[a] += count
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("closing recovery operation aggregates: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("reading recovery operation aggregates: %w", err)
+	}
+	result.OperationsInProgress = sortedRecoveryActionAggregates(inProgress)
+
+	type breakerKey struct {
+		agentID, fingerprint string
+		action               recoverymodel.Action
+	}
+	rows, err = tx.Query(`SELECT DISTINCT agent_id, action, resource_fingerprint FROM recovery_operations ORDER BY action, agent_id, resource_fingerprint`)
+	if err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("listing recovery circuit breaker keys: %w", err)
+	}
+	keys := make([]breakerKey, 0)
+	for rows.Next() {
+		var key breakerKey
+		if err := rows.Scan(&key.agentID, &key.action, &key.fingerprint); err != nil {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("scanning recovery circuit breaker key: %w", err)
+		}
+		if strings.TrimSpace(key.agentID) == "" || !key.action.Valid() || strings.TrimSpace(key.fingerprint) == "" {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("unknown recovery circuit breaker dimensions")
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Close(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("closing recovery circuit breaker keys: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("reading recovery circuit breaker keys: %w", err)
+	}
+	openByAction := make(map[recoverymodel.Action]int)
+	for _, key := range keys {
+		open, err := repairBreakerOpen(tx, key.agentID, key.action, key.fingerprint, now)
+		if err != nil {
+			return RecoveryMetricAggregates{}, err
+		}
+		if open {
+			openByAction[key.action]++
+		}
+	}
+	result.CircuitBreakersOpen = sortedRecoveryActionAggregates(openByAction)
+	if err := tx.Commit(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("committing recovery aggregate read: %w", err)
+	}
+	return result, nil
+}
+
+func recoveryOperationTerminal(state recoverymodel.OperationState) bool {
+	switch state {
+	case recoverymodel.OperationStateDiagnosisOnly, recoverymodel.OperationStateSucceeded,
+		recoverymodel.OperationStateRolledBack, recoverymodel.OperationStateRollbackFailed,
+		recoverymodel.OperationStateSuppressed:
+		return true
+	default:
+		return false
+	}
+}
+
+func sortedRecoveryActionAggregates(counts map[recoverymodel.Action]int) []RecoveryActionAggregate {
+	actions := make([]string, 0, len(counts))
+	for action := range counts {
+		actions = append(actions, string(action))
+	}
+	sort.Strings(actions)
+	result := make([]RecoveryActionAggregate, 0, len(actions))
+	for _, action := range actions {
+		result = append(result, RecoveryActionAggregate{Action: recoverymodel.Action(action), Count: counts[recoverymodel.Action(action)]})
+	}
+	return result
+}
 
 func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnostic) error {
 	if strings.TrimSpace(agentID) == "" {
@@ -688,6 +854,15 @@ func (d *DB) CountRecentRepairFailures(agentID string, action recoverymodel.Acti
 }
 
 func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (bool, error) {
+	return repairBreakerOpen(d.read, agentID, action, fingerprint, now)
+}
+
+type recoveryQueryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func repairBreakerOpen(q recoveryQueryer, agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (bool, error) {
 	if strings.TrimSpace(agentID) == "" || !action.Valid() || strings.TrimSpace(fingerprint) == "" || now.IsZero() {
 		return false, fmt.Errorf("agent, valid action, fingerprint, and current time are required")
 	}
@@ -696,7 +871,7 @@ func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fing
 		return false, fmt.Errorf("encoding repair breaker time: %w", err)
 	}
 
-	latched, err := d.RepairRollbackFailedLatched(agentID, action, fingerprint)
+	latched, err := repairRollbackFailedLatched(q, agentID, action, fingerprint)
 	if err != nil {
 		return false, err
 	}
@@ -705,7 +880,7 @@ func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fing
 	}
 
 	var latestReceipt int64
-	err = d.read.QueryRow(`SELECT received_at FROM recovery_operations
+	err = q.QueryRow(`SELECT received_at FROM recovery_operations
 		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
 		AND state = ? ORDER BY received_at DESC LIMIT 1`,
 		agentID, string(action), fingerprint,
@@ -729,7 +904,7 @@ func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fing
 	if afterSuccess > oldest {
 		oldest = afterSuccess
 	}
-	rows, err := d.read.Query(`SELECT received_at FROM recovery_operations
+	rows, err := q.Query(`SELECT received_at FROM recovery_operations
 		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
 		AND state IN (?, ?) AND received_at > ?
 		ORDER BY received_at DESC LIMIT 256`,
@@ -762,11 +937,15 @@ func (d *DB) RepairBreakerOpen(agentID string, action recoverymodel.Action, fing
 }
 
 func (d *DB) RepairRollbackFailedLatched(agentID string, action recoverymodel.Action, fingerprint string) (bool, error) {
+	return repairRollbackFailedLatched(d.read, agentID, action, fingerprint)
+}
+
+func repairRollbackFailedLatched(q recoveryQueryer, agentID string, action recoverymodel.Action, fingerprint string) (bool, error) {
 	if strings.TrimSpace(agentID) == "" || !action.Valid() || strings.TrimSpace(fingerprint) == "" {
 		return false, fmt.Errorf("agent, valid action, and fingerprint are required")
 	}
 	var state string
-	err := d.read.QueryRow(`SELECT state FROM recovery_operations
+	err := q.QueryRow(`SELECT state FROM recovery_operations
 		WHERE agent_id = ? AND action = ? AND resource_fingerprint = ?
 		AND (state = ? OR (state = ? AND request_source = ?))
 		ORDER BY received_at DESC LIMIT 1`,

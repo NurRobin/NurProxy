@@ -40,6 +40,26 @@ var (
 		"1 while issuance for host is held after an ACME rate limit (#70).",
 		[]string{"host"}, nil,
 	)
+	recoveryDiagnosticsActiveDesc = prometheus.NewDesc(
+		"nurproxy_recovery_diagnostics_active",
+		"Number of unresolved recovery diagnostics by bounded classification.",
+		[]string{"code", "severity", "ownership"}, nil,
+	)
+	recoveryOperationsTotalDesc = prometheus.NewDesc(
+		"nurproxy_recovery_operations_total",
+		"Number of durably completed recovery operations by bounded outcome.",
+		[]string{"action", "outcome", "request_source"}, nil,
+	)
+	recoveryOperationsInProgressDesc = prometheus.NewDesc(
+		"nurproxy_recovery_operations_in_progress",
+		"Number of nonterminal recovery operations by action.",
+		[]string{"action"}, nil,
+	)
+	recoveryCircuitBreakersOpenDesc = prometheus.NewDesc(
+		"nurproxy_recovery_circuit_breakers_open",
+		"Number of open recovery circuit breakers by action.",
+		[]string{"action"}, nil,
+	)
 	scrapeErrDesc = prometheus.NewDesc(
 		"nurproxy_metrics_scrape_errors",
 		"Database read failures during this scrape (0 on a clean scrape).",
@@ -58,6 +78,10 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- domainsDesc
 	ch <- certExpiryDesc
 	ch <- certBackoffDesc
+	ch <- recoveryDiagnosticsActiveDesc
+	ch <- recoveryOperationsTotalDesc
+	ch <- recoveryOperationsInProgressDesc
+	ch <- recoveryCircuitBreakersOpenDesc
 	ch <- scrapeErrDesc
 }
 
@@ -112,6 +136,26 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	} else {
 		scrapeErrs++
 		log.Printf("metrics: listing cert backoffs: %v", err)
+	}
+
+	if aggregates, err := c.db.RecoveryAggregates(time.Now().UTC()); err == nil {
+		for _, aggregate := range aggregates.DiagnosticsActive {
+			ch <- prometheus.MustNewConstMetric(recoveryDiagnosticsActiveDesc, prometheus.GaugeValue, float64(aggregate.Count),
+				string(aggregate.Code), string(aggregate.Severity), string(aggregate.Ownership))
+		}
+		for _, aggregate := range aggregates.OperationsTotal {
+			ch <- prometheus.MustNewConstMetric(recoveryOperationsTotalDesc, prometheus.CounterValue, float64(aggregate.Count),
+				string(aggregate.Action), string(aggregate.Outcome), string(aggregate.RequestSource))
+		}
+		for _, aggregate := range aggregates.OperationsInProgress {
+			ch <- prometheus.MustNewConstMetric(recoveryOperationsInProgressDesc, prometheus.GaugeValue, float64(aggregate.Count), string(aggregate.Action))
+		}
+		for _, aggregate := range aggregates.CircuitBreakersOpen {
+			ch <- prometheus.MustNewConstMetric(recoveryCircuitBreakersOpenDesc, prometheus.GaugeValue, float64(aggregate.Count), string(aggregate.Action))
+		}
+	} else {
+		scrapeErrs++
+		log.Printf("metrics: aggregating recovery health: %v", err)
 	}
 
 	ch <- prometheus.MustNewConstMetric(scrapeErrDesc, prometheus.GaugeValue, float64(scrapeErrs))
