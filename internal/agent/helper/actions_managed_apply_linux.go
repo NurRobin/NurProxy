@@ -578,8 +578,7 @@ func readStagedArtifact(root, operationID, name string, artifact helperprotocol.
 	if err := unix.Fstat(rootFD, &rootStat); err != nil || rootStat.Uid != stagingRootUID || rootStat.Mode&unix.S_IFMT != unix.S_IFDIR || rootStat.Mode&0o007 != 0 {
 		return nil, fmt.Errorf("staging root is not root-owned and bounded")
 	}
-	resolve := uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS)
-	operationFD, err := unix.Openat2(rootFD, operationID, &unix.OpenHow{Flags: uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: resolve})
+	operationFD, err := openManagedComponentAt(rootFD, operationID, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +587,7 @@ func readStagedArtifact(root, operationID, name string, artifact helperprotocol.
 	if err := unix.Fstat(operationFD, &operationStat); err != nil || operationStat.Uid != agentUID || operationStat.Mode&unix.S_IFMT != unix.S_IFDIR || operationStat.Mode&0o077 != 0 {
 		return nil, fmt.Errorf("staged artifact directory is not private to the agent")
 	}
-	fd, err := unix.Openat2(operationFD, name, &unix.OpenHow{Flags: uint64(unix.O_RDONLY | unix.O_CLOEXEC), Resolve: resolve})
+	fd, err := openManagedComponentAt(operationFD, name, unix.O_RDONLY|unix.O_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
@@ -615,6 +614,28 @@ func readStagedArtifact(root, operationID, name string, artifact helperprotocol.
 		return nil, fmt.Errorf("staged artifact changed while reading")
 	}
 	return data, nil
+}
+
+func openManagedComponentAt(dirFD int, component string, flags int) (int, error) {
+	return openManagedComponentAtWith(dirFD, component, flags, unix.Openat2, unix.Openat)
+}
+
+func openManagedComponentAtWith(
+	dirFD int,
+	component string,
+	flags int,
+	openat2 func(int, string, *unix.OpenHow) (int, error),
+	openat func(int, string, int, uint32) (int, error),
+) (int, error) {
+	if component == "" || component == "." || component == ".." || filepath.Base(component) != component || strings.ContainsRune(component, '\x00') {
+		return -1, fmt.Errorf("managed path component is invalid")
+	}
+	resolve := uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS)
+	fd, err := openat2(dirFD, component, &unix.OpenHow{Flags: uint64(flags), Resolve: resolve})
+	if err == nil || !errors.Is(err, unix.ENOSYS) {
+		return fd, err
+	}
+	return openat(dirFD, component, flags|unix.O_NOFOLLOW, 0)
 }
 
 func captureManagedSnapshot(compilation managedCompilation, ownerUID uint32) (managedApplySnapshot, error) {

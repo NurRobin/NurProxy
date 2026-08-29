@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -18,7 +19,56 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"golang.org/x/sys/unix"
 )
+
+func TestOpenManagedComponentFallsBackOnlyWhenOpenat2IsUnavailable(t *testing.T) {
+	openat2Calls, openatCalls := 0, 0
+	fd, err := openManagedComponentAtWith(9, "operation-1", unix.O_PATH|unix.O_DIRECTORY, func(dirFD int, path string, how *unix.OpenHow) (int, error) {
+		openat2Calls++
+		if dirFD != 9 || path != "operation-1" || how.Resolve != uint64(unix.RESOLVE_BENEATH|unix.RESOLVE_NO_MAGICLINKS|unix.RESOLVE_NO_SYMLINKS) {
+			t.Fatalf("openat2 = fd %d path %q how %+v", dirFD, path, how)
+		}
+		return -1, unix.ENOSYS
+	}, func(dirFD int, path string, flags int, mode uint32) (int, error) {
+		openatCalls++
+		if dirFD != 9 || path != "operation-1" || flags&unix.O_NOFOLLOW == 0 || mode != 0 {
+			t.Fatalf("openat = fd %d path %q flags %#x mode %#o", dirFD, path, flags, mode)
+		}
+		return 17, nil
+	})
+	if err != nil || fd != 17 || openat2Calls != 1 || openatCalls != 1 {
+		t.Fatalf("fd=%d err=%v openat2=%d openat=%d", fd, err, openat2Calls, openatCalls)
+	}
+}
+
+func TestOpenManagedComponentDoesNotFallbackOnPolicyErrors(t *testing.T) {
+	sentinel := unix.EACCES
+	_, err := openManagedComponentAtWith(9, "artifact.pem", unix.O_RDONLY, func(int, string, *unix.OpenHow) (int, error) {
+		return -1, sentinel
+	}, func(int, string, int, uint32) (int, error) {
+		t.Fatal("openat fallback called for non-ENOSYS failure")
+		return -1, nil
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestOpenManagedComponentRejectsPathSyntaxBeforeSyscalls(t *testing.T) {
+	for _, name := range []string{"", ".", "..", "nested/file", "/absolute"} {
+		_, err := openManagedComponentAtWith(9, name, unix.O_RDONLY, func(int, string, *unix.OpenHow) (int, error) {
+			t.Fatalf("openat2 called for %q", name)
+			return -1, nil
+		}, func(int, string, int, uint32) (int, error) {
+			t.Fatalf("openat called for %q", name)
+			return -1, nil
+		})
+		if err == nil {
+			t.Fatalf("invalid component %q accepted", name)
+		}
+	}
+}
 
 func newManagedApplyTest(t *testing.T) (*managedApplyAction, helperprotocol.ApplyIntent, *fakeProxyServiceHost) {
 	t.Helper()
