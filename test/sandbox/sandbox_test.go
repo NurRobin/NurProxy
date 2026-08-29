@@ -23,8 +23,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 const adminPassword = "sandbox-e2e-pass"
@@ -88,12 +92,13 @@ func TestSandboxEndToEnd(t *testing.T) {
 
 	// --- start the dry-run agent ---------------------------------------------
 	agentPort := freePort(t)
+	agentDataDir := filepath.Join(dataRoot, "agent1")
 	agent := startProcess(t, bin.agent, []string{
 		"-dry-run",
 		"-orchestrator", base,
 		"-fqdn", "edge1.sandbox.test",
 		"-api-port", fmt.Sprintf("%d", agentPort),
-		"-data-dir", filepath.Join(dataRoot, "agent1"),
+		"-data-dir", agentDataDir,
 	}, "")
 	defer agent.stop()
 
@@ -212,7 +217,29 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Error("no audit entry with source=dryrun for certificate issuance")
 	}
 
-	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun", dom.DNSRecordID)
+	rawToken, err := os.ReadFile(filepath.Join(agentDataDir, "token"))
+	if err != nil {
+		t.Fatalf("read sandbox agent token: %v", err)
+	}
+	agentAPI := &apiClient{base: base, key: strings.TrimSpace(string(rawToken)), t: t}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	unknown := recoverymodel.Diagnostic{
+		Code: recoverymodel.CodeUnknownProxyError, Subsystem: "proxy", Severity: recoverymodel.SeverityError,
+		Ownership: recoverymodel.OwnershipUnknown, Summary: "sandbox-injected unknown proxy failure",
+		Evidence: "dry backend has no native validator", ResourceFingerprint: "sandbox-unknown-proxy",
+		FirstSeenAt: now, LastSeenAt: now, Occurrences: 1,
+	}
+	unknown.ID = recoverymodel.StableDiagnosticID(agentID, unknown.Code, unknown.ResourceFingerprint)
+	agentAPI.post("/api/v1/agents/"+agentID+"/recovery/report", proxymodel.RecoveryReportEnvelope{
+		Report: proxymodel.RecoveryReport{Diagnostics: []recoverymodel.Diagnostic{unknown}},
+	}, nil)
+	var recoveryDiagnostics []recoverymodel.Diagnostic
+	api.get("/api/v1/agents/"+agentID+"/diagnostics", &recoveryDiagnostics)
+	if len(recoveryDiagnostics) != 1 || recoveryDiagnostics[0].ID != unknown.ID || recoveryDiagnostics[0].ProposedAction != "" || recoveryDiagnostics[0].AutoRepairEligible {
+		t.Fatalf("sandbox unknown failure was not diagnosis-only: %#v", recoveryDiagnostics)
+	}
+
+	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; unknown recovery failure remained diagnosis-only (native validation intentionally absent)", dom.DNSRecordID)
 }
 
 // ---------------------------------------------------------------------------
