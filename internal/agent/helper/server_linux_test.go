@@ -20,7 +20,7 @@ func TestServerAcceptsStrictHelloFromExpectedPeer(t *testing.T) {
 	fixture := newEngineFixture(t)
 	fixture.engine.config.AgentUID = uint32(os.Getuid())
 	path := filepath.Join(t.TempDir(), "helper.sock")
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: path, Net: "unixpacket"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func TestServerAcceptsStrictHelloFromExpectedPeer(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(ctx, listener) }()
 
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	conn, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,10 +41,10 @@ func TestServerAcceptsStrictHelloFromExpectedPeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := helperprotocol.WriteFrame(conn, payload); err != nil {
+	if err := writeConnectionFrame(conn, payload); err != nil {
 		t.Fatal(err)
 	}
-	responsePayload, err := helperprotocol.ReadFrame(conn)
+	responsePayload, err := readConnectionFrame(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,19 +73,19 @@ func TestServerRejectsWrongPeerBeforeDispatch(t *testing.T) {
 	fixture.engine.config.AgentUID = uint32(os.Getuid() + 1)
 	server := NewServer(fixture.engine)
 	path := filepath.Join(t.TempDir(), "helper.sock")
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: path, Net: "unixpacket"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	clientDone := make(chan error, 1)
 	go func() {
-		conn, dialErr := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+		conn, dialErr := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
 		if dialErr != nil {
 			clientDone <- dialErr
 			return
 		}
 		defer conn.Close()
-		response, readErr := helperprotocol.ReadFrame(conn)
+		response, readErr := readConnectionFrame(conn)
 		if readErr != nil {
 			clientDone <- readErr
 			return

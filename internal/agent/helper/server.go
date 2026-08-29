@@ -95,7 +95,7 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) {
 		s.writeError(conn, "unknown", protocolFailure(helperprotocol.ErrorBuildIDMismatch, "peer and helper are not running the same executable", false))
 		return
 	}
-	payload, err := helperprotocol.ReadFrame(conn)
+	payload, err := readConnectionFrame(conn)
 	if err != nil {
 		s.writeError(conn, "unknown", protocolFailure(helperprotocol.ErrorRequestConflict, "invalid bounded protocol frame", false))
 		return
@@ -112,7 +112,7 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) {
 		s.writeError(conn, requestID, protocolFailure(helperprotocol.ErrorOutcomeIndeterminate, "helper could not encode its bounded response", false))
 		return
 	}
-	_ = helperprotocol.WriteFrame(conn, encoded)
+	_ = writeConnectionFrame(conn, encoded)
 }
 
 func (s *Server) dispatch(ctx context.Context, payload []byte) (any, string, error) {
@@ -185,6 +185,6 @@ func (s *Server) writeError(conn net.Conn, requestID string, err error) {
 	})
 	payload, encodeErr := helperprotocol.CanonicalBytes(response)
 	if encodeErr == nil {
-		_ = helperprotocol.WriteFrame(conn, payload)
+		_ = writeConnectionFrame(conn, payload)
 	}
 }

@@ -45,5 +45,9 @@ func SystemdListener() (*net.UnixListener, error) {
 		_ = listener.Close()
 		return nil, fmt.Errorf("socket activation descriptor is not a unix listener")
 	}
+	if unixListener.Addr().Network() != "unixpacket" {
+		_ = listener.Close()
+		return nil, fmt.Errorf("socket activation descriptor is not SOCK_SEQPACKET")
+	}
 	return unixListener, nil
 }
