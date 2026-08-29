@@ -9,6 +9,77 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 )
 
+func TestMigration24BackfillsRecoveryOperationTotals(t *testing.T) {
+	if len(migrations) < 24 {
+		t.Fatalf("expected recovery total rollup migration, have %d migrations", len(migrations))
+	}
+	dbPath := filepath.Join(t.TempDir(), "recovery-total-upgrade.db")
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", dbPath)
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.SetMaxOpenConns(1)
+	if _, err := raw.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 23; i++ {
+		if _, err := raw.Exec(migrations[i]); err != nil {
+			t.Fatalf("applying migration %d: %v", i+1, err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_version (version) VALUES (23)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO agents (id, name, fqdn) VALUES ('agent-backfill', 'Backfill', 'backfill.example.com')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO recovery_diagnostics (
+		id, agent_id, code, subsystem, severity, ownership, summary, evidence,
+		affected_paths, resource_fingerprint, proposed_action, auto_repair_eligible,
+		hard_change, first_seen_at, last_seen_at, occurrences
+	) VALUES (
+		'diagnostic-backfill', 'agent-backfill', 'managed_stale_temp', 'nginx', 'warning',
+		'nurproxy', 'stale temp', 'owned marker', '[]', 'fp-backfill',
+		'remove_managed_temp', 1, 0, 1, 1, 1
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO recovery_operations (
+		id, agent_id, diagnostic_id, action, resource_fingerprint, risk,
+		request_source, state, step_summaries, snapshot_reference,
+		validation_outcome, rollback_outcome, error, started_at, created_at,
+		received_at, finished_at
+	) VALUES (
+		'op-backfill', 'agent-backfill', 'diagnostic-backfill', 'remove_managed_temp',
+		'fp-backfill', 'safe', 'user', 'succeeded', '[]', 'recovery/op-backfill',
+		'valid', '', '', 1, 1, 1, 2
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(dbPath, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	var count int
+	if err := d.sql.QueryRow(`SELECT count FROM recovery_operation_totals
+		WHERE action = 'remove_managed_temp' AND outcome = 'succeeded' AND request_source = 'user'`).Scan(&count); err != nil {
+		t.Fatalf("reading backfilled recovery operation total: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("backfilled recovery operation total = %d, want 1", count)
+	}
+}
+
 // seedSchema14 opens a raw SQLite connection at dbPath, applies the first 14
 // migrations verbatim, records schema_version=14, and inserts one fully-linked
 // row chain (provider → zone → agent → server → domain) so the upgrade test can
@@ -94,8 +165,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 23 {
-		t.Fatalf("this test pins the schema target at 23 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 24 {
+		t.Fatalf("this test pins the schema target at 24 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---

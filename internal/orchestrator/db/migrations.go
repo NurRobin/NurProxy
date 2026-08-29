@@ -578,6 +578,29 @@ var migrations = []string{
 	CREATE INDEX idx_recovery_operations_breaker
 		ON recovery_operations(agent_id, action, resource_fingerprint, state, received_at);
 	`,
+
+	// Migration 24: monotonic recovery-operation counters survive receipt retention
+	// and agent deletion. Existing terminal receipts are folded into the rollup once
+	// while this migration and its schema-version record share one transaction.
+	`
+	CREATE TABLE recovery_operation_totals (
+		action TEXT NOT NULL CHECK (action IN (
+			'prune_managed_orphan', 'remove_managed_temp', 'rematerialize_cert_bundle',
+			'rematerialize_runtime_key', 'restore_last_live_artifact'
+		)),
+		outcome TEXT NOT NULL CHECK (outcome IN (
+			'diagnosis_only', 'succeeded', 'rolled_back', 'rollback_failed', 'suppressed'
+		)),
+		request_source TEXT NOT NULL CHECK (request_source IN ('automatic', 'user')),
+		count INTEGER NOT NULL CHECK (count >= 1),
+		PRIMARY KEY (action, outcome, request_source)
+	);
+	INSERT INTO recovery_operation_totals (action, outcome, request_source, count)
+		SELECT action, state, request_source, COUNT(*)
+		FROM recovery_operations
+		WHERE state IN ('diagnosis_only', 'succeeded', 'rolled_back', 'rollback_failed', 'suppressed')
+		GROUP BY action, state, request_source;
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

@@ -81,36 +81,61 @@ func (d *DB) RecoveryAggregates(now time.Time) (RecoveryMetricAggregates, error)
 		return RecoveryMetricAggregates{}, fmt.Errorf("reading active recovery diagnostic aggregates: %w", err)
 	}
 
-	rows, err = tx.Query(`SELECT action, state, request_source, COUNT(*)
-		FROM recovery_operations GROUP BY action, state, request_source
-		ORDER BY action, state, request_source`)
+	rows, err = tx.Query(`SELECT action, outcome, request_source, count
+		FROM recovery_operation_totals ORDER BY action, outcome, request_source`)
 	if err != nil {
-		return RecoveryMetricAggregates{}, fmt.Errorf("aggregating recovery operations: %w", err)
+		return RecoveryMetricAggregates{}, fmt.Errorf("reading recovery operation totals: %w", err)
+	}
+	for rows.Next() {
+		var action, outcome, source string
+		var count int
+		if err := rows.Scan(&action, &outcome, &source, &count); err != nil {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("scanning recovery operation total: %w", err)
+		}
+		a, terminalState, requestSource := recoverymodel.Action(action), recoverymodel.OperationState(outcome), recoverymodel.RequestSource(source)
+		if !a.Valid() || !recoveryOperationTerminal(terminalState) || !requestSource.Valid() || count < 1 {
+			rows.Close()
+			return RecoveryMetricAggregates{}, fmt.Errorf("unknown recovery operation total dimensions")
+		}
+		result.OperationsTotal = append(result.OperationsTotal, RecoveryOperationAggregate{Action: a, Outcome: terminalState, RequestSource: requestSource, Count: count})
+	}
+	if err := rows.Close(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("closing recovery operation totals: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("reading recovery operation totals: %w", err)
+	}
+
+	rows, err = tx.Query(`SELECT action, COUNT(*) FROM recovery_operations
+		WHERE state NOT IN (?, ?, ?, ?, ?)
+		GROUP BY action ORDER BY action`,
+		string(recoverymodel.OperationStateDiagnosisOnly), string(recoverymodel.OperationStateSucceeded),
+		string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed),
+		string(recoverymodel.OperationStateSuppressed))
+	if err != nil {
+		return RecoveryMetricAggregates{}, fmt.Errorf("aggregating in-progress recovery operations: %w", err)
 	}
 	inProgress := make(map[recoverymodel.Action]int)
 	for rows.Next() {
-		var action, state, source string
+		var action string
 		var count int
-		if err := rows.Scan(&action, &state, &source, &count); err != nil {
+		if err := rows.Scan(&action, &count); err != nil {
 			rows.Close()
-			return RecoveryMetricAggregates{}, fmt.Errorf("scanning recovery operation aggregate: %w", err)
+			return RecoveryMetricAggregates{}, fmt.Errorf("scanning in-progress recovery operation aggregate: %w", err)
 		}
-		a, outcome, requestSource := recoverymodel.Action(action), recoverymodel.OperationState(state), recoverymodel.RequestSource(source)
-		if !a.Valid() || !outcome.Valid() || !requestSource.Valid() || count < 1 {
+		a := recoverymodel.Action(action)
+		if !a.Valid() || count < 1 {
 			rows.Close()
-			return RecoveryMetricAggregates{}, fmt.Errorf("unknown recovery operation aggregate dimensions")
+			return RecoveryMetricAggregates{}, fmt.Errorf("unknown in-progress recovery operation dimensions")
 		}
-		if recoveryOperationTerminal(outcome) {
-			result.OperationsTotal = append(result.OperationsTotal, RecoveryOperationAggregate{Action: a, Outcome: outcome, RequestSource: requestSource, Count: count})
-		} else {
-			inProgress[a] += count
-		}
+		inProgress[a] = count
 	}
 	if err := rows.Close(); err != nil {
-		return RecoveryMetricAggregates{}, fmt.Errorf("closing recovery operation aggregates: %w", err)
+		return RecoveryMetricAggregates{}, fmt.Errorf("closing in-progress recovery operation aggregates: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return RecoveryMetricAggregates{}, fmt.Errorf("reading recovery operation aggregates: %w", err)
+		return RecoveryMetricAggregates{}, fmt.Errorf("reading in-progress recovery operation aggregates: %w", err)
 	}
 	result.OperationsInProgress = sortedRecoveryActionAggregates(inProgress)
 
@@ -586,6 +611,14 @@ func (d *DB) AdvanceRepairOperation(agentID string, report recoverymodel.Operati
 	n, _ := res.RowsAffected()
 	if n != 1 {
 		return fmt.Errorf("repair operation changed concurrently")
+	}
+	if recoveryOperationTerminal(report.State) {
+		if _, err := tx.Exec(`INSERT INTO recovery_operation_totals (action, outcome, request_source, count)
+			VALUES (?, ?, ?, 1)
+			ON CONFLICT(action, outcome, request_source) DO UPDATE SET count = count + 1`,
+			string(report.Action), string(report.State), string(report.Source)); err != nil {
+			return fmt.Errorf("incrementing recovery operation total: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing repair operation transition: %w", err)

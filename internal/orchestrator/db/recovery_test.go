@@ -604,6 +604,121 @@ func TestRecoveryAggregatesUseDurableBoundedDimensions(t *testing.T) {
 	}
 }
 
+func TestRecoveryOperationTotalsSurviveAgentDeletion(t *testing.T) {
+	d := testDB(t)
+	first := createTestAgent(t, d)
+	second := &models.Agent{ID: "agent-2", Name: "Agent Two", FQDN: "agent2.example.com", Status: models.AgentStatusPending}
+	if err := d.CreateAgent(second); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, agent := range []*models.Agent{first, second} {
+		diagnostic := testDiagnostic(agent.ID, fmt.Sprintf("fp-total-delete-%d", i))
+		if err := d.UpsertDiagnostic(agent.ID, diagnostic); err != nil {
+			t.Fatal(err)
+		}
+		operation := newUserOperation(fmt.Sprintf("op-total-delete-%d", i), diagnostic, recoveryTime(i+10))
+		if err := d.CreateRepairOperation(agent.ID, operation, diagnostic.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		advanceOperationToTerminal(t, d, agent.ID, operation, recoverymodel.OperationStateSucceeded)
+	}
+
+	if got := recoveryOperationTotal(t, d, recoverymodel.ActionRemoveManagedTemp, recoverymodel.OperationStateSucceeded, recoverymodel.RequestSourceUser); got != 2 {
+		t.Fatalf("operation total before deletion = %d, want 2", got)
+	}
+	if err := d.DeleteAgent(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := recoveryOperationTotal(t, d, recoverymodel.ActionRemoveManagedTemp, recoverymodel.OperationStateSucceeded, recoverymodel.RequestSourceUser); got != 2 {
+		t.Fatalf("operation total after deletion = %d, want 2", got)
+	}
+}
+
+func TestRecoveryOperationTotalTerminalReplayCountsOnce(t *testing.T) {
+	d := testDB(t)
+	agent := createTestAgent(t, d)
+	diagnostic := testDiagnostic(agent.ID, "fp-total-replay")
+	if err := d.UpsertDiagnostic(agent.ID, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	operation := newUserOperation("op-total-replay", diagnostic, recoveryTime(20))
+	if err := d.CreateRepairOperation(agent.ID, operation, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	terminal := advanceOperationToTerminal(t, d, agent.ID, operation, recoverymodel.OperationStateSucceeded)
+	if err := d.AdvanceRepairOperation(agent.ID, terminal); err != nil {
+		t.Fatalf("replaying terminal ACK: %v", err)
+	}
+	if err := d.DeleteAgent(agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := recoveryOperationTotal(t, d, recoverymodel.ActionRemoveManagedTemp, recoverymodel.OperationStateSucceeded, recoverymodel.RequestSourceUser); got != 1 {
+		t.Fatalf("operation total after replay and deletion = %d, want 1", got)
+	}
+}
+
+func TestRecoveryOperationTotalConcurrentTerminalACKCountsOnce(t *testing.T) {
+	d := testDB(t)
+	agent := createTestAgent(t, d)
+	diagnostic := testDiagnostic(agent.ID, "fp-total-concurrent")
+	if err := d.UpsertDiagnostic(agent.ID, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	operation := newUserOperation("op-total-concurrent", diagnostic, recoveryTime(30))
+	if err := d.CreateRepairOperation(agent.ID, operation, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	operation = advanceOperation(t, d, agent.ID, operation, recoverymodel.OperationStateSnapshotted)
+	operation = advanceOperation(t, d, agent.ID, operation, recoverymodel.OperationStateApplying)
+	operation = advanceOperation(t, d, agent.ID, operation, recoverymodel.OperationStateValidating)
+	finished := operation.StartedAt.Add(time.Duration(len(operation.Steps)) * time.Second)
+	operation.State = recoverymodel.OperationStateSucceeded
+	operation.Steps = appendStepAt(operation.Steps, operation.State, finished)
+	operation.FinishedAt = &finished
+
+	const acknowledgements = 16
+	start := make(chan struct{})
+	errs := make(chan error, acknowledgements)
+	var wg sync.WaitGroup
+	for i := 0; i < acknowledgements; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- d.AdvanceRepairOperation(agent.ID, operation)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent terminal ACK: %v", err)
+		}
+	}
+	if err := d.DeleteAgent(agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := recoveryOperationTotal(t, d, recoverymodel.ActionRemoveManagedTemp, recoverymodel.OperationStateSucceeded, recoverymodel.RequestSourceUser); got != 1 {
+		t.Fatalf("operation total after concurrent ACKs and deletion = %d, want 1", got)
+	}
+}
+
+func recoveryOperationTotal(t *testing.T, d *DB, action recoverymodel.Action, outcome recoverymodel.OperationState, source recoverymodel.RequestSource) int {
+	t.Helper()
+	aggregates, err := d.RecoveryAggregates(recoveryTime(59))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, aggregate := range aggregates.OperationsTotal {
+		if aggregate.Action == action && aggregate.Outcome == outcome && aggregate.RequestSource == source {
+			return aggregate.Count
+		}
+	}
+	return 0
+}
+
 func TestRecoveryAggregatesRejectUnknownStoredEnums(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
