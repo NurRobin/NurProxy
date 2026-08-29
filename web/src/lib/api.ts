@@ -134,8 +134,8 @@ export const api = {
     request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
   rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
   deleteAgent: (id: string, cascade = false) => request<{ message: string }>(`/agents/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
-  listRecoveryDiagnostics: (id: string, includeResolved = true) =>
-    request<RecoveryDiagnostic[]>(`/agents/${id}/diagnostics?include_resolved=${includeResolved}`),
+  listRecoveryDiagnostics: (id: string, includeResolved = true, resolvedLimit = 100) =>
+    request<RecoveryDiagnostic[]>(`/agents/${id}/diagnostics?include_resolved=${includeResolved}${includeResolved ? `&resolved_limit=${resolvedLimit}` : ''}`),
   listRecoveryOperations: (id: string, limit = 50) =>
     request<RecoveryOperation[]>(`/agents/${id}/repairs?limit=${limit}`),
   createRecoveryRepair: (id: string, diagnosticId: string, action: RecoveryAction) =>

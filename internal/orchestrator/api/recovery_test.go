@@ -190,6 +190,46 @@ func TestRecoveryReportFullSnapshotResolvesOnlyOmittedDiagnostics(t *testing.T) 
 	}
 }
 
+func TestRecoveryDiagnosticHistoryIsExplicitlyBounded(t *testing.T) {
+	_, database, h, cookie := recoveryFixture(t)
+	for i := 0; i < 205; i++ {
+		diagnostic := recoveryDiagnostic("agent-1")
+		diagnostic.ResourceFingerprint = fmt.Sprintf("fp-api-history-%03d", i)
+		diagnostic.ID = recoverymodel.StableDiagnosticID("agent-1", diagnostic.Code, diagnostic.ResourceFingerprint)
+		if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.ResolveMissingDiagnostics("agent-1", nil, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	active := recoveryDiagnostic("agent-1")
+	active.ResourceFingerprint = "fp-api-active"
+	active.ID = recoverymodel.StableDiagnosticID("agent-1", active.Code, active.ResourceFingerprint)
+	if err := database.UpsertDiagnostic("agent-1", active); err != nil {
+		t.Fatal(err)
+	}
+
+	for path, want := range map[string]int{
+		"/api/v1/agents/agent-1/diagnostics?include_resolved=true":                    101,
+		"/api/v1/agents/agent-1/diagnostics?include_resolved=true&resolved_limit=7":   8,
+		"/api/v1/agents/agent-1/diagnostics?include_resolved=true&resolved_limit=200": 201,
+	} {
+		w := doRequest(t, h, http.MethodGet, path, nil, cookie)
+		var got []json.RawMessage
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s = %d: %s", path, w.Code, w.Body.String())
+		}
+		if err := json.NewDecoder(w.Body).Decode(&got); err != nil || len(got) != want {
+			t.Fatalf("%s count = %d, err=%v, want %d", path, len(got), err, want)
+		}
+	}
+	w := doRequest(t, h, http.MethodGet, "/api/v1/agents/agent-1/diagnostics?include_resolved=true&resolved_limit=201", nil, cookie)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized resolved history = %d, want 400", w.Code)
+	}
+}
+
 func TestManualRepairPersistsBeforeTypedPublishAndRejectsInjectedFields(t *testing.T) {
 	srv, database, h, cookie := recoveryFixture(t)
 	d := recoveryDiagnostic("agent-1")

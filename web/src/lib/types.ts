@@ -215,7 +215,7 @@ export interface RecoveryDiagnostic {
   first_seen_at: string;
   last_seen_at: string;
   occurrences: number;
-  breaker: RecoveryBreaker;
+  breaker?: RecoveryBreaker;
 }
 
 export interface RecoveryBreaker {

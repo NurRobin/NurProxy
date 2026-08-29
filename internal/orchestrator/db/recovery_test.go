@@ -98,6 +98,34 @@ func TestRecoveryDiagnosticUpsertResolveAndList(t *testing.T) {
 	}
 }
 
+func TestListDiagnosticsForRecoveryViewBoundsResolvedHistory(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	for i := 0; i < 5; i++ {
+		diagnostic := testDiagnostic(a.ID, fmt.Sprintf("fp-resolved-%d", i))
+		if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.ResolveMissingDiagnostics(a.ID, nil, recoveryTime(10)); err != nil {
+		t.Fatal(err)
+	}
+	active := testDiagnostic(a.ID, "fp-active-view")
+	if err := d.UpsertDiagnostic(a.ID, active); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := d.ListDiagnosticsForRecoveryView(a.ID, 2)
+	if err != nil || len(got) != 3 || got[0].ID != active.ID {
+		t.Fatalf("bounded diagnostic view = %#v, err=%v", got, err)
+	}
+	for _, limit := range []int{-1, 201} {
+		if _, err := d.ListDiagnosticsForRecoveryView(a.ID, limit); err == nil {
+			t.Fatalf("resolved limit %d was accepted", limit)
+		}
+	}
+}
+
 func TestRepairBreakerOpenPersistsOneHourFromThirdClusteredFailure(t *testing.T) {
 	d := testDB(t)
 	a := createTestAgent(t, d)
@@ -127,6 +155,96 @@ func TestRepairBreakerOpenPersistsOneHourFromThirdClusteredFailure(t *testing.T)
 	open, err = d.RepairBreakerOpen(a.ID, diag.ProposedAction, diag.ResourceFingerprint, now.Add(6*time.Minute))
 	if err != nil || open {
 		t.Fatalf("expired breaker open = %t, err=%v, want false", open, err)
+	}
+}
+
+func TestRepairBreakerStatusUsesNewestQualifyingFailureAndClosesAtExpiry(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diag := testDiagnostic(a.ID, "fp-breaker-extension")
+	if err := d.UpsertDiagnostic(a.ID, diag); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 29, 5, 0, 0, 0, time.UTC)
+	for i, minute := range []int{0, 1, 2, 10} {
+		op := newUserOperation(fmt.Sprintf("op-extension-%d", i), diag, recoveryTime(i))
+		if err := d.CreateRepairOperation(a.ID, op, diag.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		op = advanceOperationToTerminal(t, d, a.ID, op, recoverymodel.OperationStateRolledBack)
+		if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, base.Add(time.Duration(minute)*time.Minute).UnixNano(), op.OperationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status, err := d.GetRepairBreakerStatus(a.ID, diag.ProposedAction, diag.ResourceFingerprint, base.Add(11*time.Minute))
+	wantExpiry := base.Add(70 * time.Minute)
+	if err != nil || !status.Open || status.ExpiresAt == nil || !status.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("extended breaker status = %#v, err=%v, want expiry %s", status, err, wantExpiry)
+	}
+	status, err = d.GetRepairBreakerStatus(a.ID, diag.ProposedAction, diag.ResourceFingerprint, wantExpiry)
+	if err != nil || status.Open || status.ExpiresAt != nil {
+		t.Fatalf("breaker at expiry = %#v, err=%v, want closed", status, err)
+	}
+}
+
+func TestRepairBreakerStatusesBatchProjectsActiveKeys(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	base := time.Date(2026, 8, 29, 5, 0, 0, 0, time.UTC)
+	threshold := testDiagnostic(a.ID, "fp-batch-threshold")
+	latched := testDiagnostic(a.ID, "fp-batch-latched")
+	for _, diagnostic := range []recoverymodel.Diagnostic{threshold, latched} {
+		if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		op := newUserOperation(fmt.Sprintf("op-batch-%d", i), threshold, recoveryTime(i))
+		if err := d.CreateRepairOperation(a.ID, op, threshold.ResourceFingerprint); err != nil {
+			t.Fatal(err)
+		}
+		op = advanceOperationToTerminal(t, d, a.ID, op, recoverymodel.OperationStateRolledBack)
+		if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, base.Add(time.Duration(i)*time.Minute).UnixNano(), op.OperationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failure := newUserOperation("op-batch-latched", latched, recoveryTime(4))
+	if err := d.CreateRepairOperation(a.ID, failure, latched.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	failure = advanceOperationToTerminal(t, d, a.ID, failure, recoverymodel.OperationStateRollbackFailed)
+	if _, err := d.sql.Exec(`UPDATE recovery_operations SET received_at = ? WHERE id = ?`, base.Add(3*time.Minute).UnixNano(), failure.OperationID); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses, err := d.GetRepairBreakerStatuses(a.ID, []recoverymodel.Diagnostic{threshold, latched}, base.Add(4*time.Minute))
+	if err != nil || len(statuses) != 2 {
+		t.Fatalf("batch statuses = %#v, err=%v", statuses, err)
+	}
+	thresholdStatus := statuses[RepairBreakerKey{Action: threshold.ProposedAction, ResourceFingerprint: threshold.ResourceFingerprint}]
+	latchedStatus := statuses[RepairBreakerKey{Action: latched.ProposedAction, ResourceFingerprint: latched.ResourceFingerprint}]
+	if !thresholdStatus.Open || thresholdStatus.Reason != "failure_threshold" || thresholdStatus.ExpiresAt == nil || !thresholdStatus.ExpiresAt.Equal(base.Add(62*time.Minute)) {
+		t.Fatalf("threshold batch status = %#v", thresholdStatus)
+	}
+	if !latchedStatus.Open || latchedStatus.Reason != "rollback_failed_latched" || latchedStatus.ExpiresAt != nil {
+		t.Fatalf("latched batch status = %#v", latchedStatus)
+	}
+}
+
+func TestRepairBreakerStatusesBatchBoundsWholeProjection(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diagnostics := make([]recoverymodel.Diagnostic, maxActiveDiagnosticIDs+200)
+	for i := range diagnostics {
+		diagnostics[i] = testDiagnostic(a.ID, fmt.Sprintf("fp-batch-bound-%d", i))
+	}
+	statuses, err := d.GetRepairBreakerStatuses(a.ID, diagnostics, recoveryTime(10))
+	if err != nil || len(statuses) != len(diagnostics) {
+		t.Fatalf("max bounded batch count = %d, err=%v, want %d", len(statuses), err, len(diagnostics))
+	}
+	diagnostics = append(diagnostics, testDiagnostic(a.ID, "fp-batch-overflow"))
+	if _, err := d.GetRepairBreakerStatuses(a.ID, diagnostics, recoveryTime(10)); err == nil {
+		t.Fatal("oversized breaker projection was accepted")
 	}
 }
 

@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../lib/types';
 import { api } from '../lib/api';
 import { formatRelativeTime } from '../lib/utils';
-import { diagnosticActionVisible, diagnosticLocation, recoveryErrorCode, recoveryHistory, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
+import { diagnosticActionVisible, diagnosticBreaker, diagnosticLocation, recoveryErrorCode, recoveryHistory, recoveryOperationDetails, recoveryOperationTerminal, repairAvailability } from '../lib/recovery-ui';
 import { usePolling } from '../lib/usePolling';
 import { useToast, errMessage } from './toast-context';
 import Button from './Button';
@@ -21,22 +21,24 @@ const severityTone = (severity: RecoveryDiagnostic['severity']) =>
 
 function OperationDetails({ operation }: { operation: RecoveryOperation }) {
   const { t } = useTranslation();
+  const details = recoveryOperationDetails(operation);
   return (
     <div className="mt-2 pl-3">
       <dl className="grid gap-2 text-xs sm:grid-cols-2">
-        <div><dt className="text-fg-faint">{t('recovery.action')}</dt><dd className="text-fg-muted">{t(`recovery.actions.${operation.action}`)}</dd></div>
-        <div><dt className="text-fg-faint">{t('recovery.operationId')}</dt><dd className="break-all font-mono text-fg-muted">{operation.operation_id}</dd></div>
-        <div><dt className="text-fg-faint">{t('recovery.started')}</dt><dd className="text-fg-muted">{new Date(operation.started_at).toLocaleString()}</dd></div>
-        <div><dt className="text-fg-faint">{t('recovery.finished')}</dt><dd className="text-fg-muted">{operation.finished_at ? new Date(operation.finished_at).toLocaleString() : t('recovery.inProgress')}</dd></div>
-        <div><dt className="text-fg-faint">{t('recovery.snapshot')}</dt><dd className="break-all text-fg-muted">{operation.snapshot_reference || '—'}</dd></div>
-        <div><dt className="text-fg-faint">{t('recovery.validation')}</dt><dd className="text-fg-muted">{operation.validation_outcome || '—'}</dd></div>
-        <div><dt className="text-fg-faint">{t('recovery.rollback')}</dt><dd className="text-fg-muted">{operation.rollback_outcome || '—'}</dd></div>
-        <div><dt className="text-fg-faint">{t('recovery.operationError')}</dt><dd className={operation.error ? 'text-danger-fg' : 'text-fg-muted'}>{operation.error || '—'}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.action')}</dt><dd className="text-fg-muted">{t(`recovery.actions.${details.action}`)}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.source')}</dt><dd className="text-fg-muted">{t(`recovery.sources.${details.source}`)}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.operationId')}</dt><dd className="break-all font-mono text-fg-muted">{details.operation_id}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.started')}</dt><dd className="text-fg-muted">{new Date(details.started_at).toLocaleString()}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.finished')}</dt><dd className="text-fg-muted">{details.finished_at ? new Date(details.finished_at).toLocaleString() : t('recovery.inProgress')}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.snapshot')}</dt><dd className="break-all text-fg-muted">{details.snapshot_reference || '—'}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.validation')}</dt><dd className="text-fg-muted">{details.validation_outcome || '—'}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.rollback')}</dt><dd className="text-fg-muted">{details.rollback_outcome || '—'}</dd></div>
+        <div><dt className="text-fg-faint">{t('recovery.operationError')}</dt><dd className={details.error ? 'text-danger-fg' : 'text-fg-muted'}>{details.error || '—'}</dd></div>
       </dl>
       <p className="mt-3 text-xs font-medium text-fg-muted">{t('recovery.steps')}</p>
-      {operation.steps.length > 0 ? (
+      {details.steps.length > 0 ? (
         <ol className="mt-1 space-y-1 border-l border-border pl-3">
-          {operation.steps.map((step, index) => (
+          {details.steps.map((step, index) => (
             <li key={`${step.at}-${index}`} className="text-xs text-fg-muted">
               <span className="font-medium text-fg">{t(`recovery.states.${step.state}`)}</span> — {step.summary} · {new Date(step.at).toLocaleString()}
             </li>
@@ -64,7 +66,7 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
     try {
       const [activeList, allList, operationList] = await Promise.all([
         api.listRecoveryDiagnostics(agent.id, false),
-        api.listRecoveryDiagnostics(agent.id, true),
+        api.listRecoveryDiagnostics(agent.id, true, 100),
         api.listRecoveryOperations(agent.id),
       ]);
       setActive(activeList);
@@ -169,7 +171,8 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
               ? repairAvailability(agent, diagnostic, operations)
               : { enabled: false, reason: 'diagnostic_resolved' };
             const location = diagnosticLocation(diagnostic);
-            const validationEscape = diagnostic.breaker.open && diagnostic.breaker.reason === 'rollback_failed_latched';
+            const breaker = diagnosticBreaker(diagnostic);
+            const validationEscape = breaker.open && breaker.reason === 'rollback_failed_latched';
             return (
               <article key={diagnostic.id} className="rounded-lg border border-border bg-surface-2 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -212,10 +215,10 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
                   <p className="mt-3 text-xs text-fg-faint">{t(`recovery.reasons.${availability.reason}`)}</p>
                 )}
 
-                {diagnostic.breaker.open && (
+                {breaker.open && (
                   <div className="mt-3"><Callout tone="danger" title={t('recovery.breakerOpen')}>
-                    <p>{t(`recovery.breakerReasons.${diagnostic.breaker.reason ?? 'failure_threshold'}`)}</p>
-                    {diagnostic.breaker.expires_at && <p className="mt-1 text-xs">{t('recovery.breakerExpires', { time: new Date(diagnostic.breaker.expires_at).toLocaleString() })}</p>}
+                    <p>{t(`recovery.breakerReasons.${breaker.reason ?? 'failure_threshold'}`)}</p>
+                    {breaker.expires_at && <p className="mt-1 text-xs">{t('recovery.breakerExpires', { time: new Date(breaker.expires_at).toLocaleString() })}</p>}
                     {validationEscape && <p className="mt-1 font-semibold">{t('recovery.manualValidationEscape')}</p>}
                   </Callout></div>
                 )}
@@ -248,12 +251,12 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
         open={repair !== null}
         onClose={() => !repairing && setRepair(null)}
         onConfirm={confirmRepair}
-        title={t(repair?.breaker.reason === 'rollback_failed_latched' ? 'recovery.confirmValidationTitle' : 'recovery.confirmTitle')}
-        message={t(repair?.breaker.reason === 'rollback_failed_latched' ? 'recovery.confirmValidationMessage' : 'recovery.confirmMessage', {
+        title={t(repair && diagnosticBreaker(repair).reason === 'rollback_failed_latched' ? 'recovery.confirmValidationTitle' : 'recovery.confirmTitle')}
+        message={t(repair && diagnosticBreaker(repair).reason === 'rollback_failed_latched' ? 'recovery.confirmValidationMessage' : 'recovery.confirmMessage', {
           action: repair?.proposed_action ? t(`recovery.actions.${repair.proposed_action}`) : '',
           paths: repair?.affected_paths.join(', ') || t('recovery.noPaths'),
         })}
-        confirmLabel={t(repair?.breaker.reason === 'rollback_failed_latched' ? 'recovery.validateRepair' : 'recovery.repair')}
+        confirmLabel={t(repair && diagnosticBreaker(repair).reason === 'rollback_failed_latched' ? 'recovery.validateRepair' : 'recovery.repair')}
         loading={repairing}
       />
     </section>

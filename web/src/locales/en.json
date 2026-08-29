@@ -296,6 +296,7 @@
     "latestOperation": "Latest operation",
     "history": "Repair history ({{count}})",
     "action": "Typed action",
+    "source": "Source",
     "operationId": "Operation ID",
     "started": "Started",
     "finished": "Finished",

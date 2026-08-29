@@ -1,4 +1,5 @@
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from './types';
+import type { RecoveryBreaker } from './types';
 
 export interface RepairAvailability {
   enabled: boolean;
@@ -7,6 +8,14 @@ export interface RepairAvailability {
 
 export function diagnosticActionVisible(diagnostic: RecoveryDiagnostic): boolean {
   return diagnostic.proposed_action !== '' || diagnostic.hard_change || diagnostic.ownership !== 'nurproxy';
+}
+
+export function diagnosticBreaker(diagnostic: RecoveryDiagnostic): RecoveryBreaker {
+  return diagnostic.breaker ?? { open: false };
+}
+
+export function recoveryOperationDetails(operation: RecoveryOperation): RecoveryOperation {
+  return operation;
 }
 
 export function recoveryHistory(operations: RecoveryOperation[], diagnosticID: string): RecoveryOperation[] {
@@ -49,7 +58,8 @@ export function repairAvailability(
   if (_operations.some((operation) => operation.diagnostic_id === _diagnostic.id && !recoveryOperationTerminal(operation))) {
     return { enabled: false, reason: 'operation_active' };
   }
-  if (_diagnostic.breaker?.open && _diagnostic.breaker.reason !== 'rollback_failed_latched') {
+  const breaker = diagnosticBreaker(_diagnostic);
+  if (breaker.open && breaker.reason !== 'rollback_failed_latched') {
     return { enabled: false, reason: 'circuit_breaker_open' };
   }
   if (_agent.status === 'offline' || _agent.status === 'pending') {

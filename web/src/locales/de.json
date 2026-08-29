@@ -296,6 +296,7 @@
     "latestOperation": "Letzte Operation",
     "history": "Reparaturverlauf ({{count}})",
     "action": "Typisierte Aktion",
+    "source": "Quelle",
     "operationId": "Operations-ID",
     "started": "Gestartet",
     "finished": "Beendet",

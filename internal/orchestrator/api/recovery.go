@@ -85,21 +85,33 @@ func (s *Server) handleListRecoveryDiagnostics(w http.ResponseWriter, r *http.Re
 		return
 	}
 	includeResolved := r.URL.Query().Get("include_resolved") == "true"
-	diagnostics, err := s.db.ListDiagnostics(id, includeResolved)
+	resolvedLimit := 0
+	if includeResolved {
+		resolvedLimit = 100
+		if raw := r.URL.Query().Get("resolved_limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 || parsed > 200 {
+				writeError(w, http.StatusBadRequest, "resolved_limit must be between 0 and 200")
+				return
+			}
+			resolvedLimit = parsed
+		}
+	}
+	diagnostics, err := s.db.ListDiagnosticsForRecoveryView(id, resolvedLimit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list recovery diagnostics")
 		return
 	}
+	statuses, err := s.db.GetRepairBreakerStatuses(id, diagnostics, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to inspect recovery circuit breakers")
+		return
+	}
 	views := make([]recoveryDiagnosticView, 0, len(diagnostics))
-	now := time.Now().UTC()
 	for _, diagnostic := range diagnostics {
 		view := recoveryDiagnosticView{Diagnostic: diagnostic}
 		if diagnostic.ProposedAction.Valid() {
-			status, err := s.db.GetRepairBreakerStatus(id, diagnostic.ProposedAction, diagnostic.ResourceFingerprint, now)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to inspect recovery circuit breaker")
-				return
-			}
+			status := statuses[db.RepairBreakerKey{Action: diagnostic.ProposedAction, ResourceFingerprint: diagnostic.ResourceFingerprint}]
 			view.Breaker = recoveryBreakerView{Open: status.Open, Reason: status.Reason, ExpiresAt: status.ExpiresAt}
 		}
 		views = append(views, view)

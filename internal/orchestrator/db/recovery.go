@@ -325,7 +325,28 @@ func (d *DB) ListDiagnostics(agentID string, includeResolved bool) ([]recoverymo
 		query += ` AND resolved_at IS NULL`
 	}
 	query += ` ORDER BY last_seen_at DESC, id`
-	rows, err := d.read.Query(query, agentID)
+	return d.queryDiagnostics(query, agentID)
+}
+
+func (d *DB) ListDiagnosticsForRecoveryView(agentID string, resolvedLimit int) ([]recoverymodel.Diagnostic, error) {
+	if strings.TrimSpace(agentID) == "" || resolvedLimit < 0 || resolvedLimit > 200 {
+		return nil, fmt.Errorf("agent ID is required and resolved limit must be between 0 and 200")
+	}
+	active, err := d.ListDiagnostics(agentID, false)
+	if err != nil || resolvedLimit == 0 {
+		return active, err
+	}
+	resolved, err := d.queryDiagnostics(diagnosticSelect+`
+		WHERE agent_id = ? AND resolved_at IS NOT NULL
+		ORDER BY resolved_at DESC, last_seen_at DESC, id LIMIT ?`, agentID, resolvedLimit)
+	if err != nil {
+		return nil, err
+	}
+	return append(active, resolved...), nil
+}
+
+func (d *DB) queryDiagnostics(query string, args ...any) ([]recoverymodel.Diagnostic, error) {
+	rows, err := d.read.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing recovery diagnostics: %w", err)
 	}
@@ -917,8 +938,124 @@ type RepairBreakerStatus struct {
 	ExpiresAt *time.Time
 }
 
+type RepairBreakerKey struct {
+	Action              recoverymodel.Action
+	ResourceFingerprint string
+}
+
 func (d *DB) GetRepairBreakerStatus(agentID string, action recoverymodel.Action, fingerprint string, now time.Time) (RepairBreakerStatus, error) {
 	return repairBreakerStatus(d.read, agentID, action, fingerprint, now)
+}
+
+func (d *DB) GetRepairBreakerStatuses(agentID string, diagnostics []recoverymodel.Diagnostic, now time.Time) (map[RepairBreakerKey]RepairBreakerStatus, error) {
+	const maxProjectedDiagnostics = maxActiveDiagnosticIDs + 200
+	if strings.TrimSpace(agentID) == "" || now.IsZero() || len(diagnostics) > maxProjectedDiagnostics {
+		return nil, fmt.Errorf("agent, current time, and at most %d diagnostics are required", maxProjectedDiagnostics)
+	}
+	nowNanos, err := recoveryUnixNano(now)
+	if err != nil {
+		return nil, fmt.Errorf("encoding repair breaker time: %w", err)
+	}
+	keys := make([]RepairBreakerKey, 0, len(diagnostics))
+	result := make(map[RepairBreakerKey]RepairBreakerStatus, len(diagnostics))
+	for _, diagnostic := range diagnostics {
+		if !diagnostic.ProposedAction.Valid() {
+			continue
+		}
+		key := RepairBreakerKey{Action: diagnostic.ProposedAction, ResourceFingerprint: diagnostic.ResourceFingerprint}
+		if strings.TrimSpace(key.ResourceFingerprint) == "" {
+			return nil, fmt.Errorf("diagnostic breaker fingerprint is required")
+		}
+		if _, exists := result[key]; !exists {
+			keys = append(keys, key)
+			result[key] = RepairBreakerStatus{}
+		}
+	}
+	type history struct {
+		failures      []int64
+		latestSuccess int64
+		latched       bool
+	}
+	histories := make(map[RepairBreakerKey]*history, len(keys))
+	for _, key := range keys {
+		histories[key] = &history{latestSuccess: math.MinInt64}
+	}
+	const batchSize = 250
+	oldest := subtractRecoveryDuration(nowNanos, int64(75*time.Minute))
+	for start := 0; start < len(keys); start += batchSize {
+		end := min(start+batchSize, len(keys))
+		predicates := make([]string, 0, end-start)
+		args := make([]any, 0, 2*(end-start)+8)
+		args = append(args, agentID)
+		for _, key := range keys[start:end] {
+			predicates = append(predicates, `(action = ? AND resource_fingerprint = ?)`)
+			args = append(args, string(key.Action), key.ResourceFingerprint)
+		}
+		args = append(args,
+			string(recoverymodel.OperationStateRolledBack), string(recoverymodel.OperationStateRollbackFailed), oldest,
+			string(recoverymodel.OperationStateRollbackFailed), string(recoverymodel.OperationStateSucceeded), string(recoverymodel.RequestSourceUser),
+			string(recoverymodel.OperationStateSucceeded),
+		)
+		query := `WITH selected AS (
+			SELECT action, resource_fingerprint, state, request_source, received_at
+			FROM recovery_operations WHERE agent_id = ? AND (` + strings.Join(predicates, ` OR `) + `)
+		), recent_ranked AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY action, resource_fingerprint ORDER BY received_at DESC) AS rn
+			FROM selected WHERE state IN (?, ?) AND received_at > ?
+		), latch_ranked AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY action, resource_fingerprint ORDER BY received_at DESC) AS rn
+			FROM selected WHERE state = ? OR (state = ? AND request_source = ?)
+		), success_ranked AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY action, resource_fingerprint ORDER BY received_at DESC) AS rn
+			FROM selected WHERE state = ?
+		)
+		SELECT action, resource_fingerprint, state, request_source, received_at, 'failure' FROM recent_ranked WHERE rn <= 256
+		UNION ALL SELECT action, resource_fingerprint, state, request_source, received_at, 'latch' FROM latch_ranked WHERE rn = 1
+		UNION ALL SELECT action, resource_fingerprint, state, request_source, received_at, 'success' FROM success_ranked WHERE rn = 1`
+		rows, err := d.read.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("reading batch repair breaker history: %w", err)
+		}
+		for rows.Next() {
+			var action, fingerprint, state, source, kind string
+			var receipt int64
+			if err := rows.Scan(&action, &fingerprint, &state, &source, &receipt, &kind); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scanning batch repair breaker history: %w", err)
+			}
+			key := RepairBreakerKey{Action: recoverymodel.Action(action), ResourceFingerprint: fingerprint}
+			h := histories[key]
+			if h == nil {
+				rows.Close()
+				return nil, fmt.Errorf("batch repair breaker returned an unknown key")
+			}
+			switch kind {
+			case "failure":
+				h.failures = append(h.failures, receipt)
+			case "latch":
+				h.latched = state == string(recoverymodel.OperationStateRollbackFailed)
+			case "success":
+				h.latestSuccess = receipt
+			default:
+				rows.Close()
+				return nil, fmt.Errorf("unknown batch repair breaker history kind")
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("closing batch repair breaker history: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("reading batch repair breaker history: %w", err)
+		}
+	}
+	for key, history := range histories {
+		sort.Slice(history.failures, func(i, j int) bool { return history.failures[i] > history.failures[j] })
+		result[key], err = repairBreakerStatusFromHistory(history.latched, history.latestSuccess, history.failures, nowNanos)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 type recoveryQueryer interface {
@@ -969,7 +1106,6 @@ func repairBreakerStatus(q recoveryQueryer, agentID string, action recoverymodel
 		lookback      = failureWindow + openDuration
 	)
 	oldest := subtractRecoveryDuration(nowNanos, lookback)
-	openSince := subtractRecoveryDuration(nowNanos, openDuration)
 	if afterSuccess > oldest {
 		oldest = afterSuccess
 	}
@@ -995,15 +1131,33 @@ func repairBreakerStatus(q recoveryQueryer, agentID string, action recoverymodel
 	if err := rows.Err(); err != nil {
 		return RepairBreakerStatus{}, fmt.Errorf("reading repair breaker failures: %w", err)
 	}
-	for i := len(receiptsDesc) - 3; i >= 0; i-- {
-		third := receiptsDesc[i]
-		first := receiptsDesc[i+2]
-		if third >= openSince && third-first <= failureWindow {
-			thirdAt, err := recoveryTimeFromUnixNano(third)
+	return repairBreakerStatusFromHistory(false, afterSuccess, receiptsDesc, nowNanos)
+}
+
+func repairBreakerStatusFromHistory(latched bool, latestSuccess int64, receiptsDesc []int64, nowNanos int64) (RepairBreakerStatus, error) {
+	if latched {
+		return RepairBreakerStatus{Open: true, Reason: "rollback_failed_latched"}, nil
+	}
+	const (
+		failureWindow = int64(15 * time.Minute)
+		openDuration  = int64(time.Hour)
+	)
+	openSince := subtractRecoveryDuration(nowNanos, openDuration)
+	filtered := receiptsDesc[:0]
+	for _, receipt := range receiptsDesc {
+		if receipt > latestSuccess {
+			filtered = append(filtered, receipt)
+		}
+	}
+	for i := 0; i <= len(filtered)-3; i++ {
+		openedAt := filtered[i]
+		first := filtered[i+2]
+		if openedAt > openSince && openedAt-first <= failureWindow {
+			opened, err := recoveryTimeFromUnixNano(openedAt)
 			if err != nil {
 				return RepairBreakerStatus{}, fmt.Errorf("decoding repair breaker expiry: %w", err)
 			}
-			expiresAt := thirdAt.Add(time.Hour)
+			expiresAt := opened.Add(time.Hour)
 			return RepairBreakerStatus{Open: true, Reason: "failure_threshold", ExpiresAt: &expiresAt}, nil
 		}
 	}

@@ -3,10 +3,12 @@ import test from 'node:test';
 import {
   diagnosticLocation,
   diagnosticActionVisible,
+  diagnosticBreaker,
   recoveryErrorCode,
   recoveryHistory,
   recoveryOperationTerminal,
   repairAvailability,
+  recoveryOperationDetails,
 } from '../src/lib/recovery-ui.ts';
 import { pollingActive } from '../src/lib/usePolling.ts';
 import type { Agent, RecoveryDiagnostic, RecoveryOperation } from '../src/lib/types.ts';
@@ -43,6 +45,10 @@ test('authoritative open breaker disables a safe manual repair', () => {
     enabled: false,
     reason: 'circuit_breaker_open',
   });
+});
+
+test('missing breaker projection is transitionally treated as closed', () => {
+  assert.deepEqual(diagnosticBreaker({ ...diagnostic, breaker: undefined }), { open: false });
 });
 
 test('rollback-failed latch keeps the explicit manual validation escape available', () => {
@@ -114,6 +120,16 @@ test('repair history is scoped to the selected diagnostic', () => {
     { operation_id: 'old', diagnostic_id: 'diag-1' },
   ] as RecoveryOperation[];
   assert.deepEqual(recoveryHistory(history, 'diag-1').map((item) => item.operation_id), ['new', 'old']);
+});
+
+test('historical operation details retain source and every audit field', () => {
+  const operation = {
+    operation_id: 'op-full', diagnostic_id: 'diag-1', action: 'remove_managed_temp', source: 'automatic', state: 'rolled_back',
+    steps: [{ name: 'rollback', summary: 'restored', state: 'rolled_back', at: '2026-08-29T05:00:02Z' }],
+    snapshot_reference: 'recovery/op-full', validation_outcome: 'invalid', rollback_outcome: 'restored', error: 'sanitized',
+    started_at: '2026-08-29T05:00:00Z', finished_at: '2026-08-29T05:00:02Z',
+  } as RecoveryOperation;
+  assert.deepEqual(recoveryOperationDetails(operation), operation);
 });
 
 test('hidden polling continues only while a recovery operation is active', () => {
