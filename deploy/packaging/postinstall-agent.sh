@@ -23,6 +23,35 @@ if ! id -u nurproxy >/dev/null 2>&1; then
   useradd --system --gid nurproxy --home-dir /var/lib/nurproxy-agent/state --shell "$nologin_shell" nurproxy
 fi
 
+legacy_dropin_backup=/var/backups/nurproxy-agent/legacy-dropins
+install -d -o root -g root -m 0700 "$legacy_dropin_backup"
+disable_legacy_dropin() {
+  legacy_path=$1
+  expected_digest=$2
+  if [ ! -e "$legacy_path" ] && [ ! -L "$legacy_path" ]; then
+    return
+  fi
+  if [ ! -f "$legacy_path" ] || [ -L "$legacy_path" ]; then
+    echo "NurProxy refuses non-regular legacy drop-in: $legacy_path" >&2
+    exit 1
+  fi
+  actual_digest=$(sha256sum "$legacy_path" | awk '{print $1}')
+  if [ "$actual_digest" != "$expected_digest" ]; then
+    echo "NurProxy refuses modified operator drop-in: $legacy_path" >&2
+    exit 1
+  fi
+  backup_path="$legacy_dropin_backup/${legacy_path##*/}"
+  if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+    echo "NurProxy legacy drop-in backup already exists: $backup_path" >&2
+    exit 1
+  fi
+  mv -- "$legacy_path" "$backup_path"
+}
+
+disable_legacy_dropin /etc/systemd/system/nurproxy-agent.service.d/10-cap-chown.conf 71c1b1e52be6db3695cae1bdd93d4099b5f6ef47ef8334e4d1b333729ff2e9e7
+disable_legacy_dropin /etc/systemd/system/nurproxy-agent.service.d/10-nurproxy-writepaths.conf 50aaeffd8375da927c66d2e9d22af9e5ee834ffb12b18f8db6125d27da4437de
+disable_legacy_dropin /etc/systemd/system/nurproxy-agent.service.d/20-nurproxy-caps.conf c39e4fa9d6b5f78b4a6e33d616e72acb9b4c8299377ad7f36f40a81359edc87a
+
 install -d -o root -g root -m 0755 /var/lib/nurproxy-agent
 install -d -o nurproxy -g nurproxy -m 0700 /var/lib/nurproxy-agent/state
 

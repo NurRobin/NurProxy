@@ -94,6 +94,7 @@ func TestAgentPostinstallCreatesUnprivilegedBoundaryBeforeRestart(t *testing.T) 
 	script := string(payload)
 	ordered := []string{
 		"useradd --system",
+		"disable_legacy_dropin /etc/systemd/system/nurproxy-agent.service.d/10-cap-chown.conf 71c1b1e52be6db3695cae1bdd93d4099b5f6ef47ef8334e4d1b333729ff2e9e7",
 		"install -d -o root -g nurproxy -m 0770 /var/lib/nurproxy-agent/helper-staging",
 		"install -d -o root -g root -m 0700 /var/lib/nurproxy-agent/helper",
 		"systemctl enable --now nurproxy-agent-helper.socket",
@@ -111,6 +112,18 @@ func TestAgentPostinstallCreatesUnprivilegedBoundaryBeforeRestart(t *testing.T) 
 		if strings.Contains(script, forbidden) {
 			t.Errorf("postinstall contains unsafe or swallowed boundary step %q", forbidden)
 		}
+	}
+	for _, expected := range []string{
+		"actual_digest=$(sha256sum \"$legacy_path\" | awk '{print $1}')",
+		"NurProxy refuses modified operator drop-in",
+		"mv -- \"$legacy_path\" \"$backup_path\"",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Errorf("postinstall does not preserve the legacy drop-in trust boundary %q", expected)
+		}
+	}
+	if strings.Contains(script, "rm -f /etc/systemd/system/nurproxy-agent.service.d") || strings.Contains(script, "rm -rf /etc/systemd/system/nurproxy-agent.service.d") {
+		t.Fatal("postinstall must not broadly delete operator drop-ins")
 	}
 }
 
