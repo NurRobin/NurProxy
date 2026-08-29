@@ -133,6 +133,27 @@ func TestReplaceRecoveryPathRejectsDestinationAndParentSwap(t *testing.T) {
 	}
 }
 
+func TestReplaceRecoveryPathRejectsPermissionChange(t *testing.T) {
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "runtime.key")
+	if err := os.WriteFile(destination, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := CaptureRecoveryPath(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(destination, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceRecoveryPath(identity, []byte("new"), 0o600); err == nil {
+		t.Fatal("permission-only identity change passed guarded write")
+	}
+	if got, _ := os.ReadFile(destination); string(got) != "old" {
+		t.Fatalf("chmod-changed destination was replaced with %q", got)
+	}
+}
+
 type recordingRecoveryBackend struct {
 	*recordingBackend
 	candidates []RecoveryCandidate

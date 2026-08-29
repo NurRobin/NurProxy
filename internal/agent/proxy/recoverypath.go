@@ -124,7 +124,7 @@ func ReplaceRecoveryPath(identity RecoveryPathIdentity, data []byte, mode os.Fil
 		return err
 	}
 	if !identity.Exists {
-		err = unix.Renameat2(dirfd, tempName, dirfd, name, unix.RENAME_NOREPLACE)
+		err = renameRecoveryNoReplace(dirfd, tempName, name)
 	} else {
 		err = unix.Renameat(dirfd, tempName, dirfd, name)
 	}
@@ -161,7 +161,7 @@ func recheckRecoveryEntry(dirfd int, name string, identity RecoveryPathIdentity)
 		}
 		return fmt.Errorf("recovery destination appeared or cannot be checked")
 	}
-	if err != nil || uint64(current.Dev) != identity.Device || current.Ino != identity.Inode {
+	if err != nil || uint64(current.Dev) != identity.Device || current.Ino != identity.Inode || !recoveryModeMatches(uint32(current.Mode), identity.Mode) {
 		return fmt.Errorf("recovery entry identity changed")
 	}
 	if identity.SymlinkTarget != "" {
@@ -173,7 +173,7 @@ func recheckRecoveryEntry(dirfd int, name string, identity RecoveryPathIdentity)
 	}
 	file := os.NewFile(uintptr(fd), name)
 	var opened unix.Stat_t
-	if err := unix.Fstat(fd, &opened); err != nil || uint64(opened.Dev) != identity.Device || opened.Ino != identity.Inode {
+	if err := unix.Fstat(fd, &opened); err != nil || uint64(opened.Dev) != identity.Device || opened.Ino != identity.Inode || !recoveryModeMatches(uint32(opened.Mode), identity.Mode) {
 		_ = file.Close()
 		return fmt.Errorf("recovery entry identity changed while opening")
 	}
@@ -183,7 +183,7 @@ func recheckRecoveryEntry(dirfd int, name string, identity RecoveryPathIdentity)
 		return fmt.Errorf("recovery entry content changed")
 	}
 	var final unix.Stat_t
-	if err := unix.Fstatat(dirfd, name, &final, unix.AT_SYMLINK_NOFOLLOW); err != nil || final.Dev != opened.Dev || final.Ino != opened.Ino {
+	if err := unix.Fstatat(dirfd, name, &final, unix.AT_SYMLINK_NOFOLLOW); err != nil || final.Dev != opened.Dev || final.Ino != opened.Ino || !recoveryModeMatches(uint32(final.Mode), identity.Mode) {
 		return fmt.Errorf("recovery entry identity changed before replacement")
 	}
 	return nil
@@ -273,7 +273,7 @@ func RemoveRecoveryPath(identity RecoveryPathIdentity) error {
 	if err := unix.Fstatat(dirfd, name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fmt.Errorf("recheck recovery entry: %w", err)
 	}
-	if uint64(current.Dev) != identity.Device || current.Ino != identity.Inode {
+	if uint64(current.Dev) != identity.Device || current.Ino != identity.Inode || !recoveryModeMatches(uint32(current.Mode), identity.Mode) {
 		return fmt.Errorf("recovery entry identity changed")
 	}
 	if identity.SymlinkTarget != "" {
@@ -300,7 +300,7 @@ func RemoveRecoveryPath(identity RecoveryPathIdentity) error {
 		}
 	}
 	var final unix.Stat_t
-	if err := unix.Fstatat(dirfd, name, &final, unix.AT_SYMLINK_NOFOLLOW); err != nil || uint64(final.Dev) != identity.Device || final.Ino != identity.Inode {
+	if err := unix.Fstatat(dirfd, name, &final, unix.AT_SYMLINK_NOFOLLOW); err != nil || uint64(final.Dev) != identity.Device || final.Ino != identity.Inode || !recoveryModeMatches(uint32(final.Mode), identity.Mode) {
 		return fmt.Errorf("recovery entry identity changed before unlink")
 	}
 	if err := unix.Unlinkat(dirfd, name, 0); err != nil {
@@ -346,4 +346,19 @@ func fileDeviceInode(info os.FileInfo) (uint64, uint64, bool) {
 		return 0, 0, false
 	}
 	return uint64(stat.Dev), stat.Ino, true
+}
+
+func recoveryModeMatches(unixMode uint32, captured uint32) bool {
+	expected := os.FileMode(captured)
+	if os.FileMode(unixMode).Perm() != expected.Perm() {
+		return false
+	}
+	switch {
+	case expected.IsRegular():
+		return unixMode&unix.S_IFMT == unix.S_IFREG
+	case expected&os.ModeSymlink != 0:
+		return unixMode&unix.S_IFMT == unix.S_IFLNK
+	default:
+		return false
+	}
 }
