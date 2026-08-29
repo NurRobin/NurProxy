@@ -225,8 +225,8 @@ func TestSandboxEndToEnd(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	unknown := recoverymodel.Diagnostic{
 		Code: recoverymodel.CodeUnknownProxyError, Subsystem: "proxy", Severity: recoverymodel.SeverityError,
-		Ownership: recoverymodel.OwnershipUnknown, Summary: "sandbox-injected unknown proxy failure",
-		Evidence: "dry backend has no native validator", ResourceFingerprint: "sandbox-unknown-proxy",
+		Ownership: recoverymodel.OwnershipUnknown, Summary: "test-posted preclassified unknown proxy failure",
+		Evidence: "authenticated report round-trip fixture", ResourceFingerprint: "sandbox-report-round-trip",
 		FirstSeenAt: now, LastSeenAt: now, Occurrences: 1,
 	}
 	unknown.ID = recoverymodel.StableDiagnosticID(agentID, unknown.Code, unknown.ResourceFingerprint)
@@ -236,10 +236,10 @@ func TestSandboxEndToEnd(t *testing.T) {
 	var recoveryDiagnostics []recoverymodel.Diagnostic
 	api.get("/api/v1/agents/"+agentID+"/diagnostics", &recoveryDiagnostics)
 	if len(recoveryDiagnostics) != 1 || recoveryDiagnostics[0].ID != unknown.ID || recoveryDiagnostics[0].ProposedAction != "" || recoveryDiagnostics[0].AutoRepairEligible {
-		t.Fatalf("sandbox unknown failure was not diagnosis-only: %#v", recoveryDiagnostics)
+		t.Fatalf("authenticated preclassified diagnostic round-trip changed diagnosis-only fields: %#v", recoveryDiagnostics)
 	}
 
-	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; unknown recovery failure remained diagnosis-only (native validation intentionally absent)", dom.DNSRecordID)
+	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; authenticated preclassified diagnostic report round-trip passed (classification, native validation, and recovery are not covered)", dom.DNSRecordID)
 }
 
 // ---------------------------------------------------------------------------

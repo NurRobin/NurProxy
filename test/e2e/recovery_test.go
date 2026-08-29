@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -103,11 +104,8 @@ func TestE2ERecoveryControlPlane(t *testing.T) {
 
 	var history []recoverymodel.OperationReport
 	getRecoveryJSON(t, base+"/api/v1/agents/"+recoveryE2EAgentID+"/repairs", cookie, http.StatusOK, &history)
-	if len(history) != 1 || history[0].OperationID != operation.OperationID || history[0].State != recoverymodel.OperationStateRolledBack {
-		t.Fatalf("repair history = %#v, want one rolled-back operation", history)
-	}
-	if history[0].SnapshotReference == "" || history[0].ValidationOutcome == "" || history[0].RollbackOutcome == "" {
-		t.Fatalf("rollback evidence missing from history: %#v", history[0])
+	if len(history) != 1 || !reflect.DeepEqual(history[0], operation) {
+		t.Fatalf("repair history after duplicate terminal ACK = %#v, want exact %#v", history, operation)
 	}
 
 	stored, err := database.GetAgent(recoveryE2EAgentID)
@@ -234,9 +232,12 @@ func assertRepairRequestIdentity(t *testing.T, raw json.RawMessage, operation re
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	request := envelope.Request
-	if request.OperationID != operation.OperationID || request.DiagnosticID != operation.DiagnosticID || request.Action != operation.Action || !request.StartedAt.Equal(operation.StartedAt) {
-		t.Fatalf("repair request identity = %#v, operation = %#v", request, operation)
+	expected := recoverymodel.RepairRequest{
+		OperationID: operation.OperationID, DiagnosticID: operation.DiagnosticID,
+		Action: operation.Action, StartedAt: operation.StartedAt, InitialStep: operation.Steps[0],
+	}
+	if !reflect.DeepEqual(envelope.Request, expected) {
+		t.Fatalf("repair request = %#v, want exact %#v", envelope.Request, expected)
 	}
 }
 
