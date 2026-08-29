@@ -160,14 +160,17 @@ second confirmation. User/group names are resolved to numeric IDs during
 planning and rechecked during apply.
 
 Planning is an agent round trip. The orchestrator sends a typed, non-mutating
-plan/test request over the outbound stream. The agent returns resolved roots,
+plan request over the outbound stream. The agent returns resolved roots,
 canonical destinations, uid/gid, modes, action allowlist result, risks, and a
 short-lived freshness token bound to the exact normalized export specification
 and local capability revision. Saving the definition presents this result in a
 second in-UI confirmation and submits the token; apply still revalidates every
 predicate fail-closed. Widening the agent-local root or allowlists is different:
-it remains a host-presence admin operation and cannot be authorized solely in
-the browser.
+the UI may prepare a typed host-presence admin operation and display its
+one-time claim command, but the operation is applied only when claimed locally
+on that agent. Its payload is a closed set, persisted atomically in the agent
+config, and never accepts raw config text or an implicit widening from export
+CRUD.
 
 ## Post-deploy actions
 
@@ -179,10 +182,18 @@ service name extracted from certificate or process error text.
 `advanced command` stores an argv vector, not a shell string. The executable
 must be absolute and agent-allowlisted. Arguments are fixed; certificate values
 are supplied only through documented environment variables containing paths,
-never private material. The UI provides parse preview, a non-mutating test,
-timeout selection within a bounded range, and a second confirmation. Shell
+never private material. The UI provides a static parse/allowlist/identity
+preview, timeout selection within a bounded range, and a second confirmation.
+It never executes user-supplied argv while merely planning or opening the
+wizard. Shell
 interpreters are rejected unless the operator separately allowlists that exact
 interpreter locally, in which case the UI labels the action high risk.
+
+An operator may request an actual hook test only as a separate high-impact
+operation after confirmation. It uses the same snapshot, timeout, audit,
+serialization, failure, and rollback contract as deployment. Systemd preflight
+is limited to typed read-only unit/status/capability queries; reload is likewise
+never used as a planning probe.
 
 Output is captured with the existing bounded/sanitized command-capture
 contract. Hooks never run concurrently for the same export. A failed hook makes
@@ -221,7 +232,7 @@ download fetches and decrypts that certificate's key.
 
 1. The administrator creates or selects a cert-only certificate.
 2. Central issuance and renewal continue through the existing DNS-01 manager.
-3. Before save, a typed plan/test exchange lets the agent resolve paths,
+3. Before save, a typed plan exchange lets the agent resolve paths,
    ownership, capabilities, and actions and returns a spec-bound freshness token.
 4. The reconciler includes certificate bundles plus a revisioned full desired
    export inventory, including durable cleanup tombstones, in the existing
@@ -250,7 +261,8 @@ The Certificates page separates three concerns:
 - **Certificate:** host, zone/provider, issuance and renewal status;
 - **Download:** PEM ZIP or PFX, password choice, one-time secret handling;
 - **Deployments:** agent, paths/directory preset, symlink/copy mode,
-  permissions, reload action, test, current generation, and history.
+  permissions, reload action, static preflight, explicitly confirmed live hook
+  test, current generation, and history.
 
 The default wizard chooses symlink mode, the agent's standard export root,
 safe permissions, and no hook. Advanced paths, copy mode, custom ownership, and
