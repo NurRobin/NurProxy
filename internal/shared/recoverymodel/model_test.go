@@ -68,6 +68,9 @@ func TestClosedEnumsRejectUnknownJSON(t *testing.T) {
 		{"code", new(Code)},
 		{"severity", new(Severity)},
 		{"ownership", new(Ownership)},
+		{"ownership confidence", new(OwnershipConfidence)},
+		{"repair scope", new(RepairScope)},
+		{"resolution reason", new(ResolutionReason)},
 		{"action", new(Action)},
 		{"operation state", new(OperationState)},
 		{"request source", new(RequestSource)},
@@ -89,13 +92,14 @@ func TestDiagnosticJSONRoundTrip(t *testing.T) {
 		Summary: "managed vhost is orphaned", Evidence: "nginx: file is missing",
 		AffectedPaths:       []string{"/etc/nginx/sites-available/nurproxy-app.conf"},
 		ResourceFingerprint: "sha256:resource", ProposedAction: ActionPruneManagedOrphan,
-		AutoRepairEligible: true, FirstSeenAt: now, LastSeenAt: now, Occurrences: 2,
+		OwnershipConfidence: OwnershipConfidenceCertain, RepairScope: RepairScopeExactProvenancedFile,
+		RepairEligible: true, AutoRepairEligible: true, FirstSeenAt: now, LastSeenAt: now, Occurrences: 2,
 	}
 	b, err := json.Marshal(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{`"affected_paths"`, `"resource_fingerprint"`, `"proposed_action"`, `"auto_repair_eligible"`, `"first_seen_at"`} {
+	for _, field := range []string{`"affected_paths"`, `"resource_fingerprint"`, `"proposed_action"`, `"ownership_confidence"`, `"repair_scope"`, `"repair_eligible"`, `"auto_repair_eligible"`, `"first_seen_at"`} {
 		if !strings.Contains(string(b), field) {
 			t.Errorf("JSON %s lacks %s", b, field)
 		}

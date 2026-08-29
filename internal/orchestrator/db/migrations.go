@@ -607,6 +607,46 @@ var migrations = []string{
 	CREATE INDEX idx_recovery_operations_breaker_source
 		ON recovery_operations(agent_id, action, resource_fingerprint, state, request_source, received_at DESC);
 	`,
+
+	// Migration 26: separate diagnosis, ownership confidence, repair scope and
+	// resolution mechanism so "resolved" never implies a repair succeeded.
+	`
+	ALTER TABLE recovery_diagnostics ADD COLUMN ownership_confidence TEXT NOT NULL DEFAULT 'unknown'
+		CHECK (ownership_confidence IN ('certain', 'inferred', 'unknown'));
+	ALTER TABLE recovery_diagnostics ADD COLUMN repair_scope TEXT NOT NULL DEFAULT 'ambiguous'
+		CHECK (repair_scope IN (
+			'exact_provenanced_file', 'exclusive_managed_directory', 'shared_backend_namespace',
+			'agent_sandbox', 'detected_proxy_service', 'supported_package', 'local_firewall',
+			'outside_managed_roots', 'ambiguous', 'unsupported_environment'
+		));
+	ALTER TABLE recovery_diagnostics ADD COLUMN repair_eligible INTEGER NOT NULL DEFAULT 0
+		CHECK (repair_eligible IN (0, 1));
+	ALTER TABLE recovery_diagnostics ADD COLUMN repair_refusal_code TEXT NOT NULL DEFAULT '';
+	ALTER TABLE recovery_diagnostics ADD COLUMN resolution_reason TEXT NOT NULL DEFAULT ''
+		CHECK (resolution_reason IN (
+			'', 'repaired', 'resource_disappeared', 'desired_state_changed',
+			'operator_resolved', 'superseded', 'condition_no_longer_observed'
+		));
+	ALTER TABLE recovery_diagnostics ADD COLUMN resolution_operation_id TEXT NOT NULL DEFAULT '';
+	UPDATE recovery_diagnostics SET repair_eligible = auto_repair_eligible;
+	UPDATE recovery_diagnostics SET
+		resolution_reason = 'repaired',
+		resolution_operation_id = COALESCE((
+			SELECT operation.id FROM recovery_operations AS operation
+			WHERE operation.agent_id = recovery_diagnostics.agent_id
+				AND operation.diagnostic_id = recovery_diagnostics.id
+				AND operation.state = 'succeeded'
+			ORDER BY operation.received_at DESC LIMIT 1
+		), '')
+		WHERE resolved_at IS NOT NULL AND EXISTS (
+			SELECT 1 FROM recovery_operations AS operation
+			WHERE operation.agent_id = recovery_diagnostics.agent_id
+				AND operation.diagnostic_id = recovery_diagnostics.id
+				AND operation.state = 'succeeded'
+		);
+	UPDATE recovery_diagnostics SET resolution_reason = 'condition_no_longer_observed'
+		WHERE resolved_at IS NOT NULL AND resolution_reason = '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

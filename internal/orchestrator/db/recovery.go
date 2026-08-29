@@ -235,6 +235,18 @@ func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnosti
 	if err := diagnostic.Validate(); err != nil {
 		return fmt.Errorf("validating diagnostic: %w", err)
 	}
+	if diagnostic.ResolvedAt != nil || diagnostic.ResolutionReason != "" || diagnostic.ResolutionOperationID != "" {
+		return fmt.Errorf("agent diagnostic cannot assert server-owned resolution state")
+	}
+	if diagnostic.OwnershipConfidence == "" {
+		diagnostic.OwnershipConfidence = recoverymodel.OwnershipConfidenceUnknown
+	}
+	if diagnostic.RepairScope == "" {
+		diagnostic.RepairScope = recoverymodel.RepairScopeAmbiguous
+	}
+	if diagnostic.AutoRepairEligible {
+		diagnostic.RepairEligible = true
+	}
 	expectedID := recoverymodel.StableDiagnosticID(agentID, diagnostic.Code, diagnostic.ResourceFingerprint)
 	if diagnostic.ID != expectedID {
 		return fmt.Errorf("diagnostic ID %q does not match stable identity %q", diagnostic.ID, expectedID)
@@ -255,8 +267,9 @@ func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnosti
 		INSERT INTO recovery_diagnostics (
 			id, agent_id, code, subsystem, severity, ownership, summary, evidence,
 			affected_paths, resource_fingerprint, proposed_action,
+			ownership_confidence, repair_scope, repair_eligible, repair_refusal_code,
 			auto_repair_eligible, hard_change, first_seen_at, last_seen_at, occurrences
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(agent_id, code, resource_fingerprint) DO UPDATE SET
 			subsystem = excluded.subsystem,
 			severity = excluded.severity,
@@ -265,17 +278,25 @@ func (d *DB) UpsertDiagnostic(agentID string, diagnostic recoverymodel.Diagnosti
 			evidence = excluded.evidence,
 			affected_paths = excluded.affected_paths,
 			proposed_action = excluded.proposed_action,
+			ownership_confidence = excluded.ownership_confidence,
+			repair_scope = excluded.repair_scope,
+			repair_eligible = excluded.repair_eligible,
+			repair_refusal_code = excluded.repair_refusal_code,
 			auto_repair_eligible = excluded.auto_repair_eligible,
 			hard_change = excluded.hard_change,
 			last_seen_at = excluded.last_seen_at,
 			occurrences = recovery_diagnostics.occurrences + 1,
-			resolved_at = NULL
+			resolved_at = NULL,
+			resolution_reason = '',
+			resolution_operation_id = ''
 		WHERE excluded.last_seen_at >= recovery_diagnostics.last_seen_at
 			AND (recovery_diagnostics.resolved_at IS NULL OR excluded.last_seen_at > recovery_diagnostics.resolved_at)`,
 		diagnostic.ID, agentID, string(diagnostic.Code), diagnostic.Subsystem,
 		string(diagnostic.Severity), string(diagnostic.Ownership), diagnostic.Summary,
 		diagnostic.Evidence, paths, diagnostic.ResourceFingerprint,
-		string(diagnostic.ProposedAction), boolToInt(diagnostic.AutoRepairEligible),
+		string(diagnostic.ProposedAction), string(diagnostic.OwnershipConfidence),
+		string(diagnostic.RepairScope), boolToInt(diagnostic.RepairEligible), diagnostic.RepairRefusalCode,
+		boolToInt(diagnostic.AutoRepairEligible),
 		boolToInt(diagnostic.HardChange), firstSeenAt, lastSeenAt, diagnostic.Occurrences,
 	)
 	if err != nil {
@@ -301,12 +322,31 @@ func (d *DB) ResolveMissingDiagnostics(agentID string, activeIDs []string, at ti
 		}
 		seen[id] = struct{}{}
 	}
-	query := `UPDATE recovery_diagnostics SET resolved_at = ? WHERE agent_id = ? AND resolved_at IS NULL AND last_seen_at <= ?`
+	query := `UPDATE recovery_diagnostics SET
+		resolved_at = ?,
+		resolution_reason = CASE WHEN EXISTS (
+			SELECT 1 FROM recovery_operations AS operation
+			WHERE operation.agent_id = recovery_diagnostics.agent_id
+				AND operation.diagnostic_id = recovery_diagnostics.id
+				AND operation.state = 'succeeded'
+				AND operation.finished_at IS NOT NULL
+				AND operation.finished_at >= recovery_diagnostics.last_seen_at
+		) THEN ? ELSE ? END,
+		resolution_operation_id = COALESCE((
+			SELECT operation.id FROM recovery_operations AS operation
+			WHERE operation.agent_id = recovery_diagnostics.agent_id
+				AND operation.diagnostic_id = recovery_diagnostics.id
+				AND operation.state = 'succeeded'
+				AND operation.finished_at IS NOT NULL
+				AND operation.finished_at >= recovery_diagnostics.last_seen_at
+			ORDER BY operation.received_at DESC LIMIT 1
+		), '')
+		WHERE agent_id = ? AND resolved_at IS NULL AND last_seen_at <= ?`
 	resolvedAt, err := recoveryUnixNano(at)
 	if err != nil {
 		return fmt.Errorf("encoding diagnostic resolution time: %w", err)
 	}
-	args := []any{resolvedAt, agentID, resolvedAt}
+	args := []any{resolvedAt, string(recoverymodel.ResolutionReasonRepaired), string(recoverymodel.ResolutionReasonConditionNoLongerObserved), agentID, resolvedAt}
 	if len(activeIDs) > 0 {
 		query += ` AND id NOT IN (` + strings.TrimRight(strings.Repeat("?,", len(activeIDs)), ",") + `)`
 		for _, id := range activeIDs {
@@ -376,30 +416,41 @@ func (d *DB) GetDiagnostic(agentID, diagnosticID string) (*recoverymodel.Diagnos
 
 const diagnosticSelect = `SELECT id, code, subsystem, severity, ownership, summary, evidence,
 	affected_paths, resource_fingerprint, proposed_action, auto_repair_eligible,
-	hard_change, first_seen_at, last_seen_at, occurrences, resolved_at
+	hard_change, first_seen_at, last_seen_at, occurrences, resolved_at,
+	ownership_confidence, repair_scope, repair_eligible, repair_refusal_code,
+	resolution_reason, resolution_operation_id
 	FROM recovery_diagnostics`
 
 func scanDiagnostic(scanner interface{ Scan(...any) error }) (recoverymodel.Diagnostic, error) {
 	var diagnostic recoverymodel.Diagnostic
 	var code, severity, ownership, action, pathsJSON string
 	var firstSeen, lastSeen int64
-	var eligible, hardChange int
+	var eligible, hardChange, repairEligible int
 	var resolvedAt sql.NullInt64
+	var ownershipConfidence, repairScope, repairRefusalCode, resolutionReason, resolutionOperationID string
 	if err := scanner.Scan(
 		&diagnostic.ID, &code, &diagnostic.Subsystem, &severity, &ownership,
 		&diagnostic.Summary, &diagnostic.Evidence, &pathsJSON,
 		&diagnostic.ResourceFingerprint, &action, &eligible, &hardChange,
 		&firstSeen, &lastSeen, &diagnostic.Occurrences, &resolvedAt,
+		&ownershipConfidence, &repairScope, &repairEligible, &repairRefusalCode,
+		&resolutionReason, &resolutionOperationID,
 	); err != nil {
 		return diagnostic, err
 	}
-	if eligible != 0 && eligible != 1 || hardChange != 0 && hardChange != 1 {
+	if eligible != 0 && eligible != 1 || hardChange != 0 && hardChange != 1 || repairEligible != 0 && repairEligible != 1 {
 		return diagnostic, fmt.Errorf("invalid stored diagnostic boolean")
 	}
 	diagnostic.Code = recoverymodel.Code(code)
 	diagnostic.Severity = recoverymodel.Severity(severity)
 	diagnostic.Ownership = recoverymodel.Ownership(ownership)
 	diagnostic.ProposedAction = recoverymodel.Action(action)
+	diagnostic.OwnershipConfidence = recoverymodel.OwnershipConfidence(ownershipConfidence)
+	diagnostic.RepairScope = recoverymodel.RepairScope(repairScope)
+	diagnostic.RepairEligible = repairEligible == 1
+	diagnostic.RepairRefusalCode = repairRefusalCode
+	diagnostic.ResolutionReason = recoverymodel.ResolutionReason(resolutionReason)
+	diagnostic.ResolutionOperationID = resolutionOperationID
 	diagnostic.AutoRepairEligible = eligible == 1
 	diagnostic.HardChange = hardChange == 1
 	if err := recoverymodel.DecodeStrict([]byte(pathsJSON), &diagnostic.AffectedPaths); err != nil {
@@ -413,9 +464,11 @@ func scanDiagnostic(scanner interface{ Scan(...any) error }) (recoverymodel.Diag
 		return diagnostic, fmt.Errorf("decoding diagnostic last-seen time: %w", err)
 	}
 	if resolvedAt.Valid {
-		if _, err := recoveryTimeFromUnixNano(resolvedAt.Int64); err != nil {
+		resolved, err := recoveryTimeFromUnixNano(resolvedAt.Int64)
+		if err != nil {
 			return diagnostic, fmt.Errorf("decoding diagnostic resolution time: %w", err)
 		}
+		diagnostic.ResolvedAt = &resolved
 	}
 	if err := diagnostic.Validate(); err != nil {
 		return diagnostic, fmt.Errorf("validating stored diagnostic: %w", err)

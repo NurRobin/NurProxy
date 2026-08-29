@@ -24,9 +24,11 @@ func testDiagnostic(agentID, fingerprint string) recoverymodel.Diagnostic {
 		ID:   recoverymodel.StableDiagnosticID(agentID, recoverymodel.CodeManagedStaleTemp, fingerprint),
 		Code: recoverymodel.CodeManagedStaleTemp, Subsystem: "nginx",
 		Severity: recoverymodel.SeverityWarning, Ownership: recoverymodel.OwnershipNurProxy,
-		Summary: "managed temporary file remains", Evidence: "temporary artifact survived restart",
+		OwnershipConfidence: recoverymodel.OwnershipConfidenceCertain,
+		Summary:             "managed temporary file remains", Evidence: "temporary artifact survived restart",
 		AffectedPaths:       []string{"/etc/nginx/sites-available/.nurproxy-app.conf.tmp"},
 		ResourceFingerprint: fingerprint, ProposedAction: recoverymodel.ActionRemoveManagedTemp,
+		RepairScope: recoverymodel.RepairScopeExactProvenancedFile, RepairEligible: true,
 		AutoRepairEligible: true, FirstSeenAt: at, LastSeenAt: at, Occurrences: 1,
 	}
 }
@@ -84,6 +86,11 @@ func TestRecoveryDiagnosticUpsertResolveAndList(t *testing.T) {
 	if len(all) != 2 {
 		t.Fatalf("all diagnostics count = %d, want 2", len(all))
 	}
+	for _, diagnostic := range all {
+		if diagnostic.ID == second.ID && (diagnostic.ResolvedAt == nil || diagnostic.ResolutionReason != recoverymodel.ResolutionReasonConditionNoLongerObserved || diagnostic.ResolutionOperationID != "") {
+			t.Fatalf("resolved diagnostic semantics = %#v", diagnostic)
+		}
+	}
 
 	// Seeing a resolved identity again must reactivate it and increment it.
 	second.LastSeenAt = recoveryTime(3)
@@ -96,6 +103,10 @@ func TestRecoveryDiagnosticUpsertResolveAndList(t *testing.T) {
 	}
 	if len(active) != 2 {
 		t.Fatalf("reactivated active count = %d, want 2", len(active))
+	}
+	reactivated, err := d.GetDiagnostic(a.ID, second.ID)
+	if err != nil || reactivated.ResolvedAt != nil || reactivated.ResolutionReason != "" || reactivated.ResolutionOperationID != "" {
+		t.Fatalf("reactivated diagnostic retained resolution state: %#v, err=%v", reactivated, err)
 	}
 }
 
@@ -124,6 +135,30 @@ func TestListDiagnosticsForRecoveryViewBoundsResolvedHistory(t *testing.T) {
 		if _, err := d.ListDiagnosticsForRecoveryView(a.ID, limit); err == nil {
 			t.Fatalf("resolved limit %d was accepted", limit)
 		}
+	}
+}
+
+func TestResolveMissingDiagnosticAttributesSuccessfulRepair(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	diagnostic := testDiagnostic(a.ID, "fp-repaired-resolution")
+	if err := d.UpsertDiagnostic(a.ID, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	operation := newUserOperation("op-repaired-resolution", diagnostic, recoveryTime(1))
+	if err := d.CreateRepairOperation(a.ID, operation, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	advanceOperationToTerminal(t, d, a.ID, operation, recoverymodel.OperationStateSucceeded)
+	if err := d.ResolveMissingDiagnostics(a.ID, nil, recoveryTime(10)); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := d.GetDiagnostic(a.ID, diagnostic.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ResolutionReason != recoverymodel.ResolutionReasonRepaired || resolved.ResolutionOperationID != operation.OperationID {
+		t.Fatalf("repair resolution attribution = %#v", resolved)
 	}
 }
 

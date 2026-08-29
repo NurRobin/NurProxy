@@ -114,6 +114,95 @@ func (v *Ownership) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type OwnershipConfidence string
+
+const (
+	OwnershipConfidenceCertain  OwnershipConfidence = "certain"
+	OwnershipConfidenceInferred OwnershipConfidence = "inferred"
+	OwnershipConfidenceUnknown  OwnershipConfidence = "unknown"
+)
+
+func (v OwnershipConfidence) Valid() bool {
+	return v == OwnershipConfidenceCertain || v == OwnershipConfidenceInferred || v == OwnershipConfidenceUnknown
+}
+
+func (v *OwnershipConfidence) UnmarshalJSON(data []byte) error {
+	raw, err := unmarshalClosedString(data, "ownership confidence", false, func(value string) bool { return OwnershipConfidence(value).Valid() })
+	if err != nil {
+		return err
+	}
+	*v = OwnershipConfidence(raw)
+	return nil
+}
+
+type RepairScope string
+
+const (
+	RepairScopeExactProvenancedFile      RepairScope = "exact_provenanced_file"
+	RepairScopeExclusiveManagedDirectory RepairScope = "exclusive_managed_directory"
+	RepairScopeSharedBackendNamespace    RepairScope = "shared_backend_namespace"
+	RepairScopeAgentSandbox              RepairScope = "agent_sandbox"
+	RepairScopeDetectedProxyService      RepairScope = "detected_proxy_service"
+	RepairScopeSupportedPackage          RepairScope = "supported_package"
+	RepairScopeLocalFirewall             RepairScope = "local_firewall"
+	RepairScopeOutsideManagedRoots       RepairScope = "outside_managed_roots"
+	RepairScopeAmbiguous                 RepairScope = "ambiguous"
+	RepairScopeUnsupportedEnvironment    RepairScope = "unsupported_environment"
+)
+
+func (v RepairScope) Valid() bool {
+	switch v {
+	case RepairScopeExactProvenancedFile, RepairScopeExclusiveManagedDirectory,
+		RepairScopeSharedBackendNamespace, RepairScopeAgentSandbox,
+		RepairScopeDetectedProxyService, RepairScopeSupportedPackage,
+		RepairScopeLocalFirewall, RepairScopeOutsideManagedRoots,
+		RepairScopeAmbiguous, RepairScopeUnsupportedEnvironment:
+		return true
+	default:
+		return false
+	}
+}
+
+func (v *RepairScope) UnmarshalJSON(data []byte) error {
+	raw, err := unmarshalClosedString(data, "repair scope", false, func(value string) bool { return RepairScope(value).Valid() })
+	if err != nil {
+		return err
+	}
+	*v = RepairScope(raw)
+	return nil
+}
+
+type ResolutionReason string
+
+const (
+	ResolutionReasonRepaired                  ResolutionReason = "repaired"
+	ResolutionReasonResourceDisappeared       ResolutionReason = "resource_disappeared"
+	ResolutionReasonDesiredStateChanged       ResolutionReason = "desired_state_changed"
+	ResolutionReasonOperatorResolved          ResolutionReason = "operator_resolved"
+	ResolutionReasonSuperseded                ResolutionReason = "superseded"
+	ResolutionReasonConditionNoLongerObserved ResolutionReason = "condition_no_longer_observed"
+)
+
+func (v ResolutionReason) Valid() bool {
+	switch v {
+	case ResolutionReasonRepaired, ResolutionReasonResourceDisappeared,
+		ResolutionReasonDesiredStateChanged, ResolutionReasonOperatorResolved,
+		ResolutionReasonSuperseded, ResolutionReasonConditionNoLongerObserved:
+		return true
+	default:
+		return false
+	}
+}
+
+func (v *ResolutionReason) UnmarshalJSON(data []byte) error {
+	raw, err := unmarshalClosedString(data, "resolution reason", false, func(value string) bool { return ResolutionReason(value).Valid() })
+	if err != nil {
+		return err
+	}
+	*v = ResolutionReason(raw)
+	return nil
+}
+
 type Action string
 
 const (
@@ -218,21 +307,28 @@ func unmarshalClosedString(data []byte, name string, allowEmpty bool, valid func
 }
 
 type Diagnostic struct {
-	ID                  string    `json:"id"`
-	Code                Code      `json:"code"`
-	Subsystem           string    `json:"subsystem"`
-	Severity            Severity  `json:"severity"`
-	Ownership           Ownership `json:"ownership"`
-	Summary             string    `json:"summary"`
-	Evidence            string    `json:"evidence"`
-	AffectedPaths       []string  `json:"affected_paths"`
-	ResourceFingerprint string    `json:"resource_fingerprint"`
-	ProposedAction      Action    `json:"proposed_action"`
-	AutoRepairEligible  bool      `json:"auto_repair_eligible"`
-	HardChange          bool      `json:"hard_change"`
-	FirstSeenAt         time.Time `json:"first_seen_at"`
-	LastSeenAt          time.Time `json:"last_seen_at"`
-	Occurrences         int       `json:"occurrences"`
+	ID                    string              `json:"id"`
+	Code                  Code                `json:"code"`
+	Subsystem             string              `json:"subsystem"`
+	Severity              Severity            `json:"severity"`
+	Ownership             Ownership           `json:"ownership"`
+	OwnershipConfidence   OwnershipConfidence `json:"ownership_confidence,omitempty"`
+	Summary               string              `json:"summary"`
+	Evidence              string              `json:"evidence"`
+	AffectedPaths         []string            `json:"affected_paths"`
+	ResourceFingerprint   string              `json:"resource_fingerprint"`
+	ProposedAction        Action              `json:"proposed_action"`
+	RepairScope           RepairScope         `json:"repair_scope,omitempty"`
+	RepairEligible        bool                `json:"repair_eligible"`
+	RepairRefusalCode     string              `json:"repair_refusal_code,omitempty"`
+	AutoRepairEligible    bool                `json:"auto_repair_eligible"`
+	HardChange            bool                `json:"hard_change"`
+	FirstSeenAt           time.Time           `json:"first_seen_at"`
+	LastSeenAt            time.Time           `json:"last_seen_at"`
+	Occurrences           int                 `json:"occurrences"`
+	ResolvedAt            *time.Time          `json:"resolved_at,omitempty"`
+	ResolutionReason      ResolutionReason    `json:"resolution_reason,omitempty"`
+	ResolutionOperationID string              `json:"resolution_operation_id,omitempty"`
 }
 
 type Capability struct {
@@ -286,6 +382,36 @@ func (d Diagnostic) Validate() error {
 	if !d.Ownership.Valid() {
 		return fmt.Errorf("invalid diagnostic ownership %q", d.Ownership)
 	}
+	if d.OwnershipConfidence != "" && !d.OwnershipConfidence.Valid() {
+		return fmt.Errorf("invalid ownership confidence %q", d.OwnershipConfidence)
+	}
+	if d.RepairScope != "" && !d.RepairScope.Valid() {
+		return fmt.Errorf("invalid repair scope %q", d.RepairScope)
+	}
+	if d.ResolutionReason != "" && !d.ResolutionReason.Valid() {
+		return fmt.Errorf("invalid resolution reason %q", d.ResolutionReason)
+	}
+	if d.ResolvedAt == nil && (d.ResolutionReason != "" || d.ResolutionOperationID != "") {
+		return fmt.Errorf("active diagnostic cannot contain resolution state")
+	}
+	if d.ResolvedAt != nil && d.ResolutionReason == "" {
+		return fmt.Errorf("resolved diagnostic requires a resolution reason")
+	}
+	if d.ResolutionReason == ResolutionReasonRepaired && strings.TrimSpace(d.ResolutionOperationID) == "" {
+		return fmt.Errorf("repaired diagnostic requires its operation identity")
+	}
+	if d.RepairEligible && d.RepairRefusalCode != "" {
+		return fmt.Errorf("repair-eligible diagnostic cannot contain a refusal code")
+	}
+	if d.RepairRefusalCode != "" && !validSemanticID(d.RepairRefusalCode) {
+		return fmt.Errorf("invalid repair refusal code")
+	}
+	if d.ResolutionOperationID != "" && !validSemanticID(d.ResolutionOperationID) {
+		return fmt.Errorf("invalid resolution operation identity")
+	}
+	if d.ResolvedAt != nil && d.ResolvedAt.Before(d.LastSeenAt) {
+		return fmt.Errorf("diagnostic resolution precedes last observation")
+	}
 	if strings.TrimSpace(d.ResourceFingerprint) == "" {
 		return fmt.Errorf("diagnostic resource fingerprint is required")
 	}
@@ -316,6 +442,18 @@ func (d Diagnostic) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validSemanticID(value string) bool {
+	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._:-", r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Capability) Validate() error {

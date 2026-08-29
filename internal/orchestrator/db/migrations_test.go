@@ -57,6 +57,9 @@ func TestMigration24BackfillsRecoveryOperationTotals(t *testing.T) {
 	)`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := raw.Exec(`UPDATE recovery_diagnostics SET resolved_at = 2 WHERE id = 'diagnostic-backfill'`); err != nil {
+		t.Fatal(err)
+	}
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +80,16 @@ func TestMigration24BackfillsRecoveryOperationTotals(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("backfilled recovery operation total = %d, want 1", count)
+	}
+	var confidence, scope, reason, operationID string
+	var repairEligible int
+	if err := d.sql.QueryRow(`SELECT ownership_confidence, repair_scope, repair_eligible,
+		resolution_reason, resolution_operation_id FROM recovery_diagnostics
+		WHERE id = 'diagnostic-backfill'`).Scan(&confidence, &scope, &repairEligible, &reason, &operationID); err != nil {
+		t.Fatal(err)
+	}
+	if confidence != "unknown" || scope != "ambiguous" || repairEligible != 1 || reason != "repaired" || operationID != "op-backfill" {
+		t.Fatalf("diagnostic semantic backfill = confidence=%q scope=%q eligible=%d reason=%q operation=%q", confidence, scope, repairEligible, reason, operationID)
 	}
 }
 
@@ -165,8 +178,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 25 {
-		t.Fatalf("this test pins the schema target at 25 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 26 {
+		t.Fatalf("this test pins the schema target at 26 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
