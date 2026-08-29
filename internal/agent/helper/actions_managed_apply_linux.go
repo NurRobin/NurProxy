@@ -189,19 +189,21 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		if file.Delete || file.Preserve {
 			continue
 		}
-		if err := installManagedFile(file, a.ownerUID); err != nil {
+		changed, err := installManagedFile(file, a.ownerUID)
+		if err != nil {
 			return ActionResult{Mutated: mutated}, err
 		}
-		mutated = true
+		mutated = mutated || changed
 	}
 	for _, link := range compilation.Links {
 		if link.Delete || link.Preserve {
 			continue
 		}
-		if err := installManagedLink(link, a.ownerUID); err != nil {
+		changed, err := installManagedLink(link, a.ownerUID)
+		if err != nil {
 			return ActionResult{Mutated: mutated}, err
 		}
-		mutated = true
+		mutated = mutated || changed
 	}
 	if !mutated {
 		artifacts, err := a.attestManagedArtifacts(compilation)
@@ -880,20 +882,24 @@ func inspectManagedPath(path, class, expectedLinkTarget string, ownerUID uint32)
 	return item, nil
 }
 
-func installManagedFile(file managedCompiledFile, ownerUID uint32) error {
+func installManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error) {
 	if err := validateManagedCompilationTargets(managedCompilation{Files: []managedCompiledFile{file}, Links: []managedCompiledLink{}}); err != nil {
-		return err
+		return false, err
 	}
-	if _, err := inspectManagedPath(file.Path, file.Class, "", ownerUID); err != nil {
-		return err
+	current, err := inspectManagedPath(file.Path, file.Class, "", ownerUID)
+	if err != nil {
+		return false, err
 	}
 	dir := filepath.Dir(file.Path)
 	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
-		return err
+		return false, err
+	}
+	if current.Exists && current.Mode == file.Mode && bytes.Equal(current.Content, file.Content) {
+		return false, nil
 	}
 	tmp, err := os.CreateTemp(dir, ".nurproxy-helper-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmpPath := tmp.Name()
 	defer func() {
@@ -902,48 +908,56 @@ func installManagedFile(file managedCompiledFile, ownerUID uint32) error {
 	}()
 	tmpInfo, err := tmp.Stat()
 	if err != nil || fileOwnerUID(tmpInfo) != ownerUID {
-		return fmt.Errorf("managed temporary file owner is not the privileged identity")
+		return false, fmt.Errorf("managed temporary file owner is not the privileged identity")
 	}
 	if err := tmp.Chmod(os.FileMode(file.Mode)); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tmp.Write(file.Content); err != nil {
-		return err
+		return false, err
 	}
 	if err := tmp.Sync(); err != nil {
-		return err
+		return false, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return false, err
 	}
 	if err := os.Rename(tmpPath, file.Path); err != nil {
-		return err
+		return false, err
 	}
-	return syncDirectory(dir)
+	if err := syncDirectory(dir); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
-func installManagedLink(link managedCompiledLink, ownerUID uint32) error {
+func installManagedLink(link managedCompiledLink, ownerUID uint32) (bool, error) {
 	if validatePrivatePath(link.Path) != nil || validatePrivatePath(link.Target) != nil {
-		return fmt.Errorf("invalid managed activation link")
+		return false, fmt.Errorf("invalid managed activation link")
 	}
-	if _, err := inspectManagedPath(link.Path, "link", link.Target, ownerUID); err != nil && !errors.Is(err, os.ErrNotExist) {
-		if _, statErr := os.Lstat(link.Path); !errors.Is(statErr, os.ErrNotExist) {
-			return err
-		}
+	current, err := inspectManagedPath(link.Path, "link", link.Target, ownerUID)
+	if err != nil {
+		return false, err
 	}
 	dir := filepath.Dir(link.Path)
 	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
-		return err
+		return false, err
+	}
+	if current.Exists {
+		return false, nil
 	}
 	tmp := filepath.Join(dir, fmt.Sprintf(".nurproxy-helper-link-%d", os.Getpid()))
 	if err := os.Symlink(link.Target, tmp); err != nil {
-		return err
+		return false, err
 	}
 	defer os.Remove(tmp)
 	if err := os.Rename(tmp, link.Path); err != nil {
-		return err
+		return false, err
 	}
-	return syncDirectory(dir)
+	if err := syncDirectory(dir); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func restoreManagedSnapshot(snapshot managedFileSnapshot, ownerUID uint32) error {

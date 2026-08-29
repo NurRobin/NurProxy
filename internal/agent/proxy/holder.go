@@ -348,6 +348,10 @@ type ReconfigureDeps struct {
 	// hot-switch remediation just like the heartbeat probe does. Its zero value
 	// yields the conservative non-root group + sudoers path.
 	Env runtimeenv.Env
+	// HelperManagedApply selects the root-helper transaction as the only writer
+	// and reloader for an existing proxy. In this mode the main agent must not
+	// probe for or recommend direct access to shared backend directories.
+	HelperManagedApply bool
 	// CaddyFactory rebuilds the bundled caddy backend for a switch back to built-in.
 	// Optional: nil means built-in→built-in / switch-back cannot rebuild the backend
 	// (the Holder keeps the current one and explains via health).
@@ -523,10 +527,14 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 		return ReconfigureResult{OK: false, Message: msg}
 	}
 
-	// Run the §12 permission probe + remediation BEFORE swapping the live backend.
-	// The probe never mutates real config and never panics; a denial is reported,
-	// never fatal.
-	probe, rem := h.probeExisting(ctx, req.Type, deps.Env, be)
+	probe := permcheck.Result{CanWrite: true, CanReload: true}
+	var rem *permcheck.Remediation
+	if !deps.HelperManagedApply {
+		// Legacy direct-apply installations still need their local permission
+		// diagnosis. Helper-managed installations deliberately keep the shared
+		// backend namespace read-only to the network-facing process.
+		probe, rem = h.probeExisting(ctx, req.Type, deps.Env, be)
+	}
 
 	// Leaving built-in: stop the bundled Caddy so the host proxy can bind :80/:443.
 	// A stop error is reported but never aborts the switch.
@@ -546,6 +554,14 @@ func (h *Holder) reconfigureExisting(ctx context.Context, req ReconfigureRequest
 	// built-in sense. Health is now governed by the file backend's probe.
 	if deps.Health != nil {
 		deps.Health.SetCaddyRunning(false)
+	}
+	if deps.HelperManagedApply {
+		msg := fmt.Sprintf("switched to existing %s — exact managed mutations use the verified privileged helper; shared backend directories remain read-only", req.Type)
+		log.Printf("reconfigure: %s", msg)
+		if deps.Health != nil {
+			deps.Health.SetError("")
+		}
+		return ReconfigureResult{OK: true, Message: msg}
 	}
 
 	if probe.OK() {

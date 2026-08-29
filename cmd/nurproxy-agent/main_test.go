@@ -9,7 +9,27 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 )
+
+func TestHelperManagedApplyEnabledOnlyForUnprivilegedLinux(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		env  runtimeenv.Env
+		want bool
+	}{
+		{name: "unprivileged linux", env: runtimeenv.Env{OS: "linux", IsRoot: false}, want: true},
+		{name: "root linux", env: runtimeenv.Env{OS: "linux", IsRoot: true}, want: false},
+		{name: "unprivileged non-linux", env: runtimeenv.Env{OS: "darwin", IsRoot: false}, want: false},
+		{name: "unknown", env: runtimeenv.Env{}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := helperManagedApplyEnabled(test.env); got != test.want {
+				t.Fatalf("helperManagedApplyEnabled(%+v) = %v, want %v", test.env, got, test.want)
+			}
+		})
+	}
+}
 
 func TestRecoveryRootsForBackendIncludesDataAndExactBackendRoots(t *testing.T) {
 	info := proxy.Info{

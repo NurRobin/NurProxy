@@ -196,6 +196,96 @@ func TestManagedApplyTransactionSnapshotsCommitsValidatesReloadsAndRestores(t *t
 	}
 }
 
+func TestManagedApplyLeavesExactConvergedArtifactsUntouched(t *testing.T) {
+	action, intent, host := newManagedApplyTest(t)
+	compilation, err := action.compile(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(compilation.Files[0].Path, compilation.Files[0].Content, os.FileMode(compilation.Files[0].Mode)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(compilation.Links[0].Target, compilation.Links[0].Path); err != nil {
+		t.Fatal(err)
+	}
+	beforeFile, err := os.Lstat(compilation.Files[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeLink, err := os.Lstat(compilation.Links[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	material, err := action.Plan(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := helperprotocol.ManagedApplyPlan{
+		OperationID: intent.OperationID, CustomPolicyVersion: material.CustomPolicyVersion,
+		ExecutionPlanHash: material.ExecutionPlanHash, ResourceFingerprint: material.ResourceFingerprint,
+		RollbackCoverage: material.RollbackCoverage,
+	}
+	prepared, err := action.Prepare(context.Background(), intent.OperationID, plan, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared)
+	if err != nil || result.Mutated || !result.Validated {
+		t.Fatalf("exact converged execute = %+v, %v", result, err)
+	}
+	if len(host.mutations) != 0 || host.validations != 1 {
+		t.Fatalf("exact converged state reloaded: mutations=%v validations=%d", host.mutations, host.validations)
+	}
+	if len(result.ManagedArtifacts) != 1 || result.ManagedArtifacts[0].Checksum != compilation.Files[0].SHA256 {
+		t.Fatalf("exact converged artifact was not attested: %+v", result.ManagedArtifacts)
+	}
+	afterFile, err := os.Lstat(compilation.Files[0].Path)
+	if err != nil || !os.SameFile(beforeFile, afterFile) {
+		t.Fatalf("exact converged file identity changed: %v", err)
+	}
+	afterLink, err := os.Lstat(compilation.Links[0].Path)
+	if err != nil || !os.SameFile(beforeLink, afterLink) {
+		t.Fatalf("exact converged link identity changed: %v", err)
+	}
+}
+
+func TestManagedApplyRepairsModeDriftInsteadOfTreatingContentAsConverged(t *testing.T) {
+	action, intent, host := newManagedApplyTest(t)
+	compilation, err := action.compile(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(compilation.Files[0].Path, compilation.Files[0].Content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(compilation.Links[0].Target, compilation.Links[0].Path); err != nil {
+		t.Fatal(err)
+	}
+
+	material, err := action.Plan(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := helperprotocol.ManagedApplyPlan{
+		OperationID: intent.OperationID, CustomPolicyVersion: material.CustomPolicyVersion,
+		ExecutionPlanHash: material.ExecutionPlanHash, ResourceFingerprint: material.ResourceFingerprint,
+		RollbackCoverage: material.RollbackCoverage,
+	}
+	prepared, err := action.Prepare(context.Background(), intent.OperationID, plan, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared)
+	if err != nil || !result.Mutated || !result.Validated || len(host.mutations) != 1 {
+		t.Fatalf("mode repair = %+v, %v; mutations=%v", result, err, host.mutations)
+	}
+	info, err := os.Lstat(compilation.Files[0].Path)
+	if err != nil || uint32(info.Mode()) != compilation.Files[0].Mode {
+		t.Fatalf("managed mode = %v, %v; want %#o", info.Mode(), err, compilation.Files[0].Mode)
+	}
+}
+
 func TestManagedApplyDeletesOnlyExplicitProvenancedRouteAndCanRestoreIt(t *testing.T) {
 	action, intent, _ := newManagedApplyTest(t)
 	compilation, err := action.compile(intent)

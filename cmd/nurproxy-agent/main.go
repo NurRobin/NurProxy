@@ -371,12 +371,13 @@ func main() {
 	// and is reported to the dashboard as context behind the fix.
 	env := runtimeenv.Detect()
 	reconfigureDeps := proxy.ReconfigureDeps{
-		Health:    hs,
-		StopCaddy: caddyProc.Stop,
-		Env:       env,
-		CertDir:   certDir,
-		CertKey:   certKey,
-		Detection: rawDetection,
+		Health:             hs,
+		StopCaddy:          caddyProc.Stop,
+		Env:                env,
+		HelperManagedApply: helperManagedApplyEnabled(env),
+		CertDir:            certDir,
+		CertKey:            certKey,
+		Detection:          rawDetection,
 		CaddyFactory: func() proxy.Proxy {
 			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort))
 			if certStore != nil {
@@ -497,7 +498,11 @@ func main() {
 	// config through the normal apply path, so this is scoped to existing mode.
 	if holder.Mode() == "existing" {
 		if arts, rerr := holder.Current().ReadManaged(ctx); rerr != nil {
-			log.Printf("WARNING: could not read existing config for the central store: %v", rerr)
+			if reconfigureDeps.HelperManagedApply {
+				log.Printf("Direct adopted-config read unavailable at the privilege boundary; verified helper receipts attest managed artifacts: %v", rerr)
+			} else {
+				log.Printf("WARNING: could not read existing config for the central store: %v", rerr)
+			}
 		} else if perr := streamClient.ReportAdopted(ctx, cfg.FQDN, cfg.ProxyType, arts); perr != nil {
 			log.Printf("WARNING: could not report existing config to the central store: %v", perr)
 		} else if len(arts) > 0 {
@@ -525,6 +530,9 @@ func main() {
 	// clears the dashboard warning on its own — no restart. osUser names the grant
 	// commands. Built-in mode reports nothing (checked=false → nil).
 	hb.SetPermissionsFn(func() *models.ProxyPermissions {
+		if reconfigureDeps.HelperManagedApply && holder.Mode() == "existing" {
+			return nil
+		}
 		res, rem, dirs, checked := holder.ProbePermissions(ctx, env)
 		if checked {
 			// Keep health/last_error in sync with the live probe so the stale startup
@@ -576,6 +584,10 @@ func main() {
 	}
 
 	log.Printf("Agent stopped.")
+}
+
+func helperManagedApplyEnabled(env runtimeenv.Env) bool {
+	return env.OS == "linux" && !env.IsRoot
 }
 
 func recoveryRootsForBackend(info proxy.Info, dataDir string) []string {
