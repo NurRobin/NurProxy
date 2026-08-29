@@ -36,6 +36,35 @@ func (d *DB) SetSetting(key, value string) error {
 	return nil
 }
 
+// InitializeAdminPassword atomically claims first-time setup. It writes hash
+// only when the setting is absent or contains the empty legacy value and
+// reports whether this caller won. The conditional upsert is one SQLite
+// statement, so concurrent orchestrator requests or connections cannot both
+// initialize the password.
+func (d *DB) InitializeAdminPassword(hash string) (bool, error) {
+	if hash == "" {
+		return false, fmt.Errorf("initializing admin password: hash is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		INSERT INTO settings (key, value, updated_at)
+		VALUES ('admin_password_hash', ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+			value = excluded.value,
+			updated_at = excluded.updated_at
+		WHERE settings.value = ''`,
+		hash, now,
+	)
+	if err != nil {
+		return false, fmt.Errorf("initializing admin password: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("reading admin password initialization result: %w", err)
+	}
+	return n == 1, nil
+}
+
 // ListSettings returns all stored settings.
 func (d *DB) ListSettings() ([]models.Setting, error) {
 	rows, err := d.read.Query("SELECT key, value, updated_at FROM settings ORDER BY key")
