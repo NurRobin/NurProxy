@@ -13,7 +13,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
-	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverypolicy"
 	"github.com/google/uuid"
 )
 
@@ -57,7 +57,7 @@ func (s *Server) handleSubmitRecoveryExecutionPlan(w http.ResponseWriter, r *htt
 		writeRecoveryError(w, http.StatusNotFound, "diagnostic_not_found", "active diagnostic not found")
 		return
 	}
-	expectedAction, expectedTarget, ok := hardActionForDiagnostic(*diagnostic)
+	expectedAction, expectedTarget, ok := recoverypolicy.HardActionForDiagnostic(diagnostic.Code, diagnostic.RepairScope)
 	if !ok || !diagnostic.HardChange || !diagnostic.RepairEligible || plan.Action != expectedAction ||
 		plan.LogicalTarget != expectedTarget || plan.ResourceFingerprint != diagnostic.ResourceFingerprint {
 		writeRecoveryError(w, http.StatusUnprocessableEntity, "helper_plan_mismatch", "helper plan does not match the current deterministic diagnosis")
@@ -186,24 +186,6 @@ func (s *Server) handleGetRecoveryExecutionGrant(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJSON(w, http.StatusOK, plan.SignedGrant)
-}
-
-func hardActionForDiagnostic(diagnostic recoverymodel.Diagnostic) (helperprotocol.Action, helperprotocol.LogicalTarget, bool) {
-	switch diagnostic.Code {
-	case recoverymodel.CodeSystemdSandboxDenied:
-		return helperprotocol.ActionRepairAgentSandboxPaths, helperprotocol.LogicalTargetAgentUnit, diagnostic.RepairScope == recoverymodel.RepairScopeAgentSandbox
-	case recoverymodel.CodePermissionDenied:
-		exactScope := diagnostic.RepairScope == recoverymodel.RepairScopeExactProvenancedFile || diagnostic.RepairScope == recoverymodel.RepairScopeExclusiveManagedDirectory
-		return helperprotocol.ActionRepairManagedPathAccess, helperprotocol.LogicalTargetManagedPath, exactScope
-	case recoverymodel.CodeProxyReloadFailed:
-		return helperprotocol.ActionValidateReloadProxy, helperprotocol.LogicalTargetDetectedProxy, diagnostic.RepairScope == recoverymodel.RepairScopeDetectedProxyService
-	case recoverymodel.CodeProxyNotRunning:
-		return helperprotocol.ActionStartProxy, helperprotocol.LogicalTargetDetectedProxy, diagnostic.RepairScope == recoverymodel.RepairScopeDetectedProxyService
-	case recoverymodel.CodeProxyBinaryMissing:
-		return helperprotocol.ActionInstallSupportedPackage, helperprotocol.LogicalTargetProxyPackage, diagnostic.RepairScope == recoverymodel.RepairScopeSupportedPackage
-	default:
-		return "", "", false
-	}
 }
 
 func deterministicRecoveryGrantID(agentID, planID, eventID string) string {
