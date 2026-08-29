@@ -305,6 +305,12 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		if err != nil {
 			return managedCompilation{}, err
 		}
+		if !preserve {
+			preserve, err = exactUnmarkedManagedFile(available, []byte(content), a.ownerUID)
+			if err != nil {
+				return managedCompilation{}, err
+			}
+		}
 		compiledContent := []byte(proxy.StampManagedArtifact(content))
 		if preserve {
 			compiledContent = []byte(content)
@@ -363,6 +369,25 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		targets[file.Path] = struct{}{}
 	}
 	return compilation, nil
+}
+
+func exactUnmarkedManagedFile(path string, desired []byte, ownerUID uint32) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Uid != ownerUID || info.Mode().Perm()&0o022 != 0 || info.Size() < 0 || info.Size() > maxConfigFileBytes {
+		return false, nil
+	}
+	content, err := readNoFollowFile(path, info.Size())
+	if err != nil {
+		return false, err
+	}
+	return !proxy.HasManagedArtifactMarker(string(content)) && bytes.Equal(content, desired), nil
 }
 
 type stagedCertificatePair struct{ cert, key []byte }

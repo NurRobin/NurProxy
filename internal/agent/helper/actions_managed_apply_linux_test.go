@@ -360,6 +360,60 @@ server {
 	}
 }
 
+func TestManagedApplyPreservesExactUnmarkedLegacyGeneratedConfiguration(t *testing.T) {
+	action, intent, host := newManagedApplyTest(t)
+	action.agentUID = uint32(os.Getuid()) + 1
+	initial, err := action.compile(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.TrimPrefix(string(initial.Files[0].Content), proxy.ManagedArtifactMarker+"\n")
+	if legacy == string(initial.Files[0].Content) {
+		t.Fatal("generated fixture has no managed marker")
+	}
+	if err := os.WriteFile(initial.Files[0].Path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(initial.Links[0].Target, initial.Links[0].Path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(initial.Files[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := action.Plan(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compilation, err := action.compile(intent)
+	if err != nil || !compilation.Files[0].Preserve || !compilation.Links[0].Preserve {
+		t.Fatalf("legacy generated route was not classified as preserve-only: %+v, %v", compilation, err)
+	}
+	plan := helperprotocol.ManagedApplyPlan{
+		OperationID: intent.OperationID, CustomPolicyVersion: material.CustomPolicyVersion,
+		ExecutionPlanHash: material.ExecutionPlanHash, ResourceFingerprint: material.ResourceFingerprint,
+		RollbackCoverage: material.RollbackCoverage,
+	}
+	prepared, err := action.Prepare(context.Background(), intent.OperationID, plan, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := action.Execute(context.Background(), intent.OperationID, plan, intent, prepared)
+	if err != nil || result.Mutated || !result.Validated || len(host.mutations) != 0 {
+		t.Fatalf("legacy generated preserve execute = %+v, %v; mutations=%v", result, err, host.mutations)
+	}
+	after, err := os.Lstat(initial.Files[0].Path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("legacy generated file identity changed: %v", err)
+	}
+	if err := os.WriteFile(initial.Files[0].Path, []byte(legacy+"\n# operator drift\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := action.Plan(context.Background(), intent); err == nil {
+		t.Fatal("drifted unmarked legacy generated config was admitted")
+	}
+}
+
 func TestManagedApplyRefusesPolicyForeignRawConfigurationWhenLiveBytesDiffer(t *testing.T) {
 	action, intent, _ := newManagedApplyTest(t)
 	action.agentUID = uint32(os.Getuid()) + 1
