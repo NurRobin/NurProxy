@@ -3,9 +3,11 @@ package proxymodel
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/certmodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
@@ -62,6 +64,47 @@ func TestRecoveryWireRoundTrips(t *testing.T) {
 				t.Fatalf("round trip mismatch:\n got: %#v\nwant: %#v", got, tt.in)
 			}
 		})
+	}
+}
+
+func TestCertificateExportWireInventoryAndAcknowledgements(t *testing.T) {
+	set := IntentSet{
+		CertificateExports: &certmodel.ExportInventory{Revision: 1, ChunkIndex: 0, ChunkCount: 1},
+	}
+	raw, err := json.Marshal(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded IntentSet
+	if err := certmodel.DecodeStrict(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.CertificateExports == nil || decoded.CertificateExports.Revision != 1 {
+		t.Fatalf("inventory lost: %#v", decoded)
+	}
+
+	ack := ApplyAck{
+		ExportDeployments: []certmodel.ExportDeployment{{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: strings.Repeat("a", 64), Phase: certmodel.DeploymentSucceeded, Rollback: certmodel.RollbackNotNeeded}},
+		ExportCleanups:    []certmodel.CleanupAcknowledgement{{ExportID: "exp-1", Revision: 2, DesiredFingerprint: strings.Repeat("a", 64), Phase: certmodel.CleanupCompleted, Outcome: certmodel.CleanupRemoved, Rollback: certmodel.RollbackNotNeeded}},
+	}
+	raw, err = json.Marshal(ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(raw)), "key_pem") || strings.Contains(strings.ToLower(string(raw)), "password") {
+		t.Fatalf("secret field in ack: %s", raw)
+	}
+}
+
+func TestCertificateExportWireStrictlyRejectsUnknownAndInvalidInventory(t *testing.T) {
+	for _, raw := range []string{
+		`{"intents":[],"certificate_exports":{"revision":1,"chunk_index":0,"chunk_count":1,"unknown":true}}`,
+		`{"intents":[],"certificate_exports":{"revision":0,"chunk_index":0,"chunk_count":1}}`,
+	} {
+		var set IntentSet
+		if err := certmodel.DecodeStrict([]byte(raw), &set); err == nil {
+			t.Fatalf("accepted %s", raw)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package proxymodel
 import (
 	"fmt"
 
+	"github.com/NurRobin/NurProxy/internal/shared/certmodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
@@ -116,7 +117,34 @@ type IntentSet struct {
 	// CertKeep is the set of hosts whose certs the agent should retain when
 	// PruneCerts is set (every NurProxy cert host for this agent). Empty + PruneCerts
 	// means "remove all NurProxy certs".
-	CertKeep []string `json:"cert_keep,omitempty"`
+	CertKeep           []string                   `json:"cert_keep,omitempty"`
+	CertificateExports *certmodel.ExportInventory `json:"certificate_exports,omitempty"`
+}
+
+func (s IntentSet) Validate() error {
+	if len(s.Certs) > certmodel.MaxCertificateBundles {
+		return fmt.Errorf("too many certificate bundles")
+	}
+	if err := certmodel.ValidateCertificateMaterials(s.Certs); err != nil {
+		return err
+	}
+	if s.CertificateExports != nil {
+		if err := s.CertificateExports.Validate(); err != nil {
+			return fmt.Errorf("certificate export inventory: %w", err)
+		}
+		bundles := make(map[string]struct{}, len(s.Certs))
+		for _, bundle := range s.Certs {
+			bundles[bundle.Host] = struct{}{}
+		}
+		for _, export := range s.CertificateExports.Exports {
+			if export.Enabled {
+				if _, ok := bundles[export.CertificateHost]; !ok {
+					return fmt.Errorf("certificate export %q refers to missing certificate bundle host %q", export.ID, export.CertificateHost)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // CertBundle is one leaf certificate plus its private key destined for an agent's
@@ -125,22 +153,7 @@ type IntentSet struct {
 // the agent-initiated stream, where the agent writes it to disk (encrypting the
 // key at rest) before applying the config that references it. The key is sensitive
 // and only ever travels over the stream's TLS transport.
-type CertBundle struct {
-	// Host is the FQDN the certificate covers, e.g. "app.example.com". The agent
-	// derives the on-disk file names from it.
-	Host string `json:"host"`
-	// CertPEM is the leaf certificate plus issuer chain in PEM form (public).
-	CertPEM string `json:"cert_pem"`
-	// KeyPEM is the private key in PEM form (sensitive; encrypted at rest by the
-	// agent after install).
-	KeyPEM string `json:"key_pem"`
-	// MaterializeKey asks the agent to also write the decrypted private key in
-	// plaintext (.key.plain) so a hand-written config can read it. Set for
-	// cert-only hosts (§7), where NurProxy renders no vhost and would otherwise
-	// only leave the at-rest-encrypted key — useless to the operator. Off for
-	// normal routes, where the key is materialized transiently during render.
-	MaterializeKey bool `json:"materialize_key,omitempty"`
-}
+type CertBundle = certmodel.CertificateMaterial
 
 // ArtifactReport is the agent's atomic apply-ACK for one artifact: the rendered
 // native content + its checksum, plus whether the apply succeeded. The
@@ -181,7 +194,37 @@ type ArtifactReport struct {
 // in a single message (atomic apply-report, §3/B1).
 type ApplyAck struct {
 	// Reports is one entry per attempted artifact (success or per-item error).
-	Reports []ArtifactReport `json:"reports"`
+	Reports           []ArtifactReport                   `json:"reports"`
+	ExportDeployments []certmodel.ExportDeployment       `json:"export_deployments,omitempty"`
+	ExportCleanups    []certmodel.CleanupAcknowledgement `json:"export_cleanups,omitempty"`
+}
+
+func (a ApplyAck) Validate() error {
+	if len(a.ExportDeployments) > certmodel.MaxExportsPerSnapshot || len(a.ExportCleanups) > certmodel.MaxExportsPerSnapshot {
+		return fmt.Errorf("certificate export acknowledgements exceed bounds")
+	}
+	seenDeployments := map[string]struct{}{}
+	for i, deployment := range a.ExportDeployments {
+		if err := deployment.Validate(); err != nil {
+			return fmt.Errorf("export deployment %d: %w", i, err)
+		}
+		key := deployment.ExportID + "\x00" + deployment.DeploymentID + "\x00" + string(deployment.Phase)
+		if _, exists := seenDeployments[key]; exists {
+			return fmt.Errorf("duplicate export deployment acknowledgement")
+		}
+		seenDeployments[key] = struct{}{}
+	}
+	seenCleanups := map[string]uint64{}
+	for i, cleanup := range a.ExportCleanups {
+		if err := cleanup.Validate(); err != nil {
+			return fmt.Errorf("export cleanup %d: %w", i, err)
+		}
+		if revision, exists := seenCleanups[cleanup.ExportID]; exists && revision == cleanup.Revision {
+			return fmt.Errorf("duplicate export cleanup acknowledgement")
+		}
+		seenCleanups[cleanup.ExportID] = cleanup.Revision
+	}
+	return nil
 }
 
 // LogTailRequest starts an on-demand log tail on the agent (§15). The
