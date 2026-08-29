@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/google/uuid"
 )
 
@@ -52,14 +53,38 @@ type ActionHandler interface {
 	Rollback(context.Context, string, helperprotocol.HelperPlan, PreparedAction) error
 }
 
+type ManagedApplyMaterial struct {
+	CustomPolicyVersion string
+	ExecutionPlanHash   string
+	ResourceFingerprint string
+	RollbackCoverage    helperprotocol.RollbackCoverage
+}
+
+type ManagedApplyHandler interface {
+	Plan(context.Context, helperprotocol.ApplyIntent) (ManagedApplyMaterial, error)
+	Rediscover(context.Context, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent) (executionPlanHash string, resourceFingerprint string, err error)
+	Prepare(context.Context, string, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent) (PreparedAction, error)
+	Execute(context.Context, string, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent, PreparedAction) (ActionResult, error)
+	Rollback(context.Context, string, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent, PreparedAction) error
+}
+
 type Engine struct {
 	config         RootConfig
 	buildID        string
 	journal        *Journal
 	attestationKey ed25519.PrivateKey
 	actions        map[helperprotocol.Action]ActionHandler
+	managedApply   ManagedApplyHandler
 	now            func() time.Time
 	executeMu      sync.Mutex
+}
+
+func (e *Engine) SetManagedApplyHandler(handler ManagedApplyHandler) error {
+	if e == nil || handler == nil {
+		return fmt.Errorf("managed apply handler is invalid")
+	}
+	e.managedApply = handler
+	return nil
 }
 
 func NewEngine(config RootConfig, buildID string, journal *Journal, attestationKey ed25519.PrivateKey, actions map[helperprotocol.Action]ActionHandler) (*Engine, error) {
@@ -142,6 +167,58 @@ func (e *Engine) Plan(ctx context.Context, request helperprotocol.PlanActionRequ
 		return helperprotocol.Signed[helperprotocol.HelperPlan]{}, err
 	}
 	return helperprotocol.Sign(e.config.AttestationKeyID, e.attestationKey, helperprotocol.NewEnvelope(helperprotocol.MessageHelperPlan, plan))
+}
+
+func (e *Engine) PlanManagedApply(ctx context.Context, request helperprotocol.PlanManagedApplyRequest) (helperprotocol.Signed[helperprotocol.ManagedApplyPlan], error) {
+	if err := request.Validate(); err != nil || e.managedApply == nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "managed apply planning request is invalid", false)
+	}
+	signedIntent := request.Intent
+	if signedIntent.KeyID != e.config.OrchestratorKeyID || helperprotocol.Verify(e.config.OrchestratorPublicKey(), signedIntent, helperprotocol.MessageApplyIntent) != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "orchestrator apply intent signature is invalid", false)
+	}
+	intent := signedIntent.Envelope.Payload
+	if intent.AgentID != e.config.AgentID {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "apply intent targets another agent", false)
+	}
+	if intent.HelperInstanceID != e.config.HelperInstanceID {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorHelperInstanceMismatch, "apply intent targets another helper instance", false)
+	}
+	if err := e.validateGrantTime(intent.IssuedAt, intent.ExpiresAt); err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	material, err := e.managedApply.Plan(ctx, intent)
+	if err != nil || validateManagedApplyMaterial(material) != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "local managed apply planning refused the desired state", false)
+	}
+	logicalDigest, artifactDigest, deletionDigest, certificateDigest, err := managedApplyDigests(intent)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	now := e.now().UTC()
+	expires := now.Add(planLifetime)
+	intentExpires, parseErr := time.Parse(time.RFC3339Nano, intent.ExpiresAt)
+	if parseErr != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorExecutionGrantExpired, "apply intent lifetime is invalid", false)
+	}
+	if intentExpires.Before(expires) {
+		expires = intentExpires
+	}
+	plan := helperprotocol.ManagedApplyPlan{
+		HelperPlanID: uuid.NewString(), HelperInstanceID: e.config.HelperInstanceID,
+		OperationID: intent.OperationID, DesiredStateRevision: intent.DesiredStateRevision,
+		LogicalManifestDigest: logicalDigest, ArtifactManifestDigest: artifactDigest, DeletionSetDigest: deletionDigest,
+		CertificateIdentityDigest: certificateDigest, CustomPolicyVersion: material.CustomPolicyVersion,
+		ExecutionPlanHash: material.ExecutionPlanHash, ResourceFingerprint: material.ResourceFingerprint,
+		RollbackCoverage: material.RollbackCoverage, ExpiresAt: expires.Format(time.RFC3339Nano),
+	}
+	if err := plan.Validate(); err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	if err := e.journal.StoreManagedPlan(plan, signedIntent); err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	return helperprotocol.Sign(e.config.AttestationKeyID, e.attestationKey, helperprotocol.NewEnvelope(helperprotocol.MessageManagedApplyPlan, plan))
 }
 
 func (e *Engine) Execute(ctx context.Context, request helperprotocol.Envelope[helperprotocol.ExecuteActionRequest]) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
@@ -260,6 +337,154 @@ func (e *Engine) Execute(ctx context.Context, request helperprotocol.Envelope[he
 	return e.signReceipt(succeeded)
 }
 
+func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol.Envelope[helperprotocol.ExecuteManagedApplyRequest]) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	e.executeMu.Lock()
+	defer e.executeMu.Unlock()
+	if request.MessageType != helperprotocol.MessageExecuteManagedApplyRequest || request.Domain != helperprotocol.ProtocolDomain || request.ProtocolVersion != helperprotocol.ProtocolVersion || e.managedApply == nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "invalid managed apply execute request envelope", false)
+	}
+	if err := request.Payload.Validate(); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "invalid managed apply execute request", false)
+	}
+	grantSigned := request.Payload.Grant
+	if grantSigned.KeyID != e.config.OrchestratorKeyID || helperprotocol.Verify(e.config.OrchestratorPublicKey(), grantSigned, helperprotocol.MessageApplyGrant) != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "orchestrator apply grant signature is invalid", false)
+	}
+	grant := grantSigned.Envelope.Payload
+	if grant.AgentID != e.config.AgentID {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "apply grant targets another agent", false)
+	}
+	if grant.HelperInstanceID != e.config.HelperInstanceID {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorHelperInstanceMismatch, "apply grant targets another helper instance", false)
+	}
+	requestDigest, err := helperprotocol.Digest(request)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	if existing, receiptErr := e.journal.GetReceipt(grant.OperationID, requestDigest); receiptErr == nil {
+		return e.signReceipt(existing)
+	} else if errors.Is(receiptErr, ErrRequestConflict) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "operation id is already bound to another request", false)
+	} else if receiptErr != nil && !errors.Is(receiptErr, fs.ErrNotExist) && !errors.Is(receiptErr, ErrReceiptNotFound) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, receiptErr
+	}
+	if err := e.validateGrantTime(grant.IssuedAt, grant.ExpiresAt); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	plan, intentSigned, err := e.journal.LoadManagedPlan(grant.HelperPlanID)
+	if err != nil {
+		if errors.Is(err, ErrPlanNotFound) {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorHelperPlanNotFound, "helper-local managed plan was not found", false)
+		}
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	if intentSigned.KeyID != e.config.OrchestratorKeyID || helperprotocol.Verify(e.config.OrchestratorPublicKey(), intentSigned, helperprotocol.MessageApplyIntent) != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorHelperJournalCorrupt, "stored managed apply intent attestation is invalid", false)
+	}
+	intent := intentSigned.Envelope.Payload
+	if !timeAfter(e.now().UTC(), plan.ExpiresAt) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorStalePlan, "helper-local managed plan has expired", false)
+	}
+	if !applyGrantMatchesPlan(grant, plan, intent) {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorDisplayPlanMismatch, "apply grant does not match the helper-local managed plan", false)
+	}
+	executionHash, fingerprint, err := e.managedApply.Rediscover(ctx, plan, intent)
+	if err != nil || executionHash != plan.ExecutionPlanHash || fingerprint != plan.ResourceFingerprint {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorStalePlan, "local managed proxy facts changed after planning", false)
+	}
+	if e.journal.BreakerOpen() {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorOutcomeIndeterminate, "persistent helper breaker is open", false)
+	}
+	record, existing, err := e.journal.BeginOperation(grant.OperationID, grant.GrantID, requestDigest, helperprotocol.ActionApplyManagedProxyState)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrGrantReplay):
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "apply grant was already consumed by another operation", false)
+		case errors.Is(err, ErrRequestConflict):
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "managed operation conflicts with an existing request", false)
+		default:
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		}
+	}
+	if existing && record.State != helperprotocol.JournalAuthorized {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorOutcomeIndeterminate, "existing managed operation cannot be safely resumed", false)
+	}
+	prepared, prepareErr := e.managedApply.Prepare(ctx, grant.OperationID, plan, intent)
+	if prepareErr != nil || !prepared.ValidFor(plan.RollbackCoverage) {
+		prepared = PreparedAction{RollbackCoverage: plan.RollbackCoverage}
+		receipt := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalFailedBeforeMutation, prepared, "privileged managed pre-state snapshot failed")
+		if _, transitionErr := e.journal.Transition(grant.OperationID, helperprotocol.JournalFailedBeforeMutation, receipt); transitionErr != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, transitionErr
+		}
+		return e.signReceipt(receipt)
+	}
+	running := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalRunning, prepared, "privileged managed execution started")
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalRunning, running); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	result, executeErr := e.managedApply.Execute(ctx, grant.OperationID, plan, intent, prepared)
+	if !result.Mutated && executeErr == nil && result.Validated {
+		message := truncateUTF8(result.SanitizedResult, 4096)
+		if strings.TrimSpace(message) == "" {
+			message = "managed proxy state already converged"
+		}
+		succeeded := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalSucceeded, prepared, message)
+		if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalSucceeded, succeeded); err != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		}
+		return e.signReceipt(succeeded)
+	}
+	if !result.Mutated {
+		failed := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalFailedBeforeMutation, prepared, "managed apply failed before mutation")
+		if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalFailedBeforeMutation, failed); err != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		}
+		return e.signReceipt(failed)
+	}
+	mutated := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalMutated, prepared, "managed proxy mutation completed")
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalMutated, mutated); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	if executeErr != nil || !result.Validated {
+		return e.rollbackManagedApply(ctx, grant.OperationID, requestDigest, plan, intent, prepared)
+	}
+	validated := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalValidated, prepared, "managed proxy post-validation succeeded")
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalValidated, validated); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	message := truncateUTF8(result.SanitizedResult, 4096)
+	if strings.TrimSpace(message) == "" {
+		message = "managed proxy state applied"
+	}
+	succeeded := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalSucceeded, prepared, message)
+	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalSucceeded, succeeded); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	return e.signReceipt(succeeded)
+}
+
+func (e *Engine) rollbackManagedApply(ctx context.Context, operationID, requestDigest string, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent, prepared PreparedAction) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+	running := e.newManagedReceipt(operationID, requestDigest, plan, helperprotocol.JournalRollbackRunning, prepared, "managed proxy rollback started")
+	if _, err := e.journal.Transition(operationID, helperprotocol.JournalRollbackRunning, running); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	rollbackErr := e.managedApply.Rollback(ctx, operationID, plan, intent, prepared)
+	state := helperprotocol.JournalRolledBack
+	message := "managed apply failed and privileged pre-state was fully restored"
+	if rollbackErr != nil || prepared.RollbackCoverage != helperprotocol.RollbackCoverageFull {
+		state = helperprotocol.JournalRollbackFailed
+		message = "managed apply failed and full restoration could not be proven"
+		if err := e.journal.OpenBreaker(message); err != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		}
+	}
+	receipt := e.newManagedReceipt(operationID, requestDigest, plan, state, prepared, message)
+	if _, err := e.journal.Transition(operationID, state, receipt); err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+	}
+	return e.signReceipt(receipt)
+}
+
 func (e *Engine) rollback(ctx context.Context, operationID, requestDigest string, plan helperprotocol.HelperPlan, prepared PreparedAction) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
 	running := e.newReceipt(operationID, requestDigest, plan, helperprotocol.JournalRollbackRunning, prepared, "local rollback started")
 	if _, err := e.journal.Transition(operationID, helperprotocol.JournalRollbackRunning, running); err != nil {
@@ -310,6 +535,70 @@ func (e *Engine) newReceipt(operationID, requestDigest string, plan helperprotoc
 		SanitizedResult:        truncateUTF8(message, 4096),
 		UpdatedAt:              e.now().UTC().Format(time.RFC3339Nano),
 	}
+}
+
+func (e *Engine) newManagedReceipt(operationID, requestDigest string, plan helperprotocol.ManagedApplyPlan, state helperprotocol.JournalState, prepared PreparedAction, message string) helperprotocol.HelperReceipt {
+	return helperprotocol.HelperReceipt{
+		OperationID: operationID, CanonicalRequestDigest: requestDigest,
+		HelperInstanceID: e.config.HelperInstanceID, Action: helperprotocol.ActionApplyManagedProxyState, State: state,
+		RollbackCoverage: prepared.RollbackCoverage, SnapshotDigest: prepared.SnapshotDigest,
+		SanitizedResult: truncateUTF8(message, 4096), UpdatedAt: e.now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func validateManagedApplyMaterial(material ManagedApplyMaterial) error {
+	if !validConfigID(material.CustomPolicyVersion) || !validDigest(material.ExecutionPlanHash) ||
+		!validDigest(material.ResourceFingerprint) || !material.RollbackCoverage.Valid() {
+		return fmt.Errorf("invalid managed apply material")
+	}
+	return nil
+}
+
+func managedApplyDigests(intent helperprotocol.ApplyIntent) (logical, artifacts, deletions, certificates string, err error) {
+	logical, err = helperprotocol.Digest(struct {
+		Resources         []string                 `json:"resource_ids"`
+		Routes            []proxymodel.RouteIntent `json:"routes"`
+		PruneCertificates bool                     `json:"prune_certificates"`
+		CertificateKeep   []string                 `json:"certificate_keep"`
+	}{
+		Resources: intent.Resources, Routes: intent.Routes,
+		PruneCertificates: intent.PruneCertificates, CertificateKeep: intent.CertificateKeep,
+	})
+	if err != nil {
+		return "", "", "", "", err
+	}
+	artifacts, err = helperprotocol.Digest(intent.Artifacts)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	deletions, err = helperprotocol.Digest(intent.DeletionSet)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	certificateArtifacts := make([]helperprotocol.LogicalArtifact, 0, len(intent.Artifacts))
+	for _, artifact := range intent.Artifacts {
+		switch artifact.Kind {
+		case "certificate", "source_key", "runtime_key":
+			certificateArtifacts = append(certificateArtifacts, artifact)
+		}
+	}
+	certificates, err = helperprotocol.Digest(struct {
+		Artifacts []helperprotocol.LogicalArtifact `json:"certificate_artifacts"`
+		Keep      []string                         `json:"certificate_keep"`
+		Prune     bool                             `json:"prune_certificates"`
+	}{Artifacts: certificateArtifacts, Keep: intent.CertificateKeep, Prune: intent.PruneCertificates})
+	return logical, artifacts, deletions, certificates, err
+}
+
+func applyGrantMatchesPlan(grant helperprotocol.ApplyGrant, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent) bool {
+	return grant.AgentID == intent.AgentID && grant.HelperInstanceID == plan.HelperInstanceID &&
+		grant.OperationID == plan.OperationID && grant.HelperPlanID == plan.HelperPlanID &&
+		grant.AuthorizationKind == intent.AuthorizationKind && grant.AuthorizationEventID == intent.AuthorizationEventID &&
+		grant.DesiredStateRevision == plan.DesiredStateRevision && grant.LogicalManifestDigest == plan.LogicalManifestDigest &&
+		grant.ArtifactManifestDigest == plan.ArtifactManifestDigest && grant.DeletionSetDigest == plan.DeletionSetDigest &&
+		grant.CertificateIdentityDigest == plan.CertificateIdentityDigest && grant.CustomPolicyVersion == plan.CustomPolicyVersion &&
+		grant.ExecutionPlanHash == plan.ExecutionPlanHash && grant.ResourceFingerprint == plan.ResourceFingerprint &&
+		grant.RollbackCoverage == plan.RollbackCoverage
 }
 
 func (e *Engine) validateGrantTime(issuedText, expiresText string) error {

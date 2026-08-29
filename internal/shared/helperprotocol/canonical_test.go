@@ -74,3 +74,35 @@ func TestCanonicalBytesSortsKeysAndDigestIsRepresentationStable(t *testing.T) {
 		t.Fatalf("equivalent values have different digests: %s != %s", leftDigest, rightDigest)
 	}
 }
+
+func TestDecodeAllowsOnlySchemaOptionalPointersToBeNull(t *testing.T) {
+	type optional struct {
+		Child *struct {
+			Name string `json:"name"`
+		} `json:"child"`
+		Items []string `json:"items"`
+	}
+	if _, err := Decode[optional]([]byte(`{"child":null,"items":[]}`)); err != nil {
+		t.Fatalf("optional pointer null rejected: %v", err)
+	}
+	if _, err := Decode[optional]([]byte(`{"child":null,"items":null}`)); err == nil {
+		t.Fatal("non-optional slice null accepted")
+	}
+}
+
+func TestDecodeAcceptsCanonicalBase64ForByteSlices(t *testing.T) {
+	decoded, err := Decode[struct {
+		Data []byte `json:"data"`
+	}]([]byte(`{"data":"AQID"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded.Data, []byte{1, 2, 3}) {
+		t.Fatalf("decoded bytes = %v", decoded.Data)
+	}
+	if _, err := Decode[struct {
+		Data []byte `json:"data"`
+	}]([]byte(`{"data":[1,2,3]}`)); err == nil {
+		t.Fatal("array representation accepted for protocol byte sequence")
+	}
+}

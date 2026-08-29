@@ -37,7 +37,7 @@ func TestPublishManagedIntentSetKeepsSignedDesiredStateAtomic(t *testing.T) {
 	h := New()
 	ch, unsub := h.Subscribe("a1")
 	defer unsub()
-	set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}}}
+	set := helperprotocol.NormalizeManagedIntentSet(proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}}})
 	now := time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC)
 	revision, err := helperprotocol.Digest(set)
 	if err != nil {

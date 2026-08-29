@@ -131,6 +131,7 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 	if !managed || r.applyAuthority == nil {
 		return r.hub.PublishIntentSet(agentID, set)
 	}
+	set = helperprotocol.NormalizeManagedIntentSet(set)
 	helper, err := r.db.GetRecoveryHelper(agentID)
 	if err != nil {
 		return r.hub.PublishIntentSet(agentID, set)
@@ -149,6 +150,7 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 }
 
 func buildApplyIntent(agentID, helperInstanceID string, set proxymodel.IntentSet, issued time.Time) (helperprotocol.ApplyIntent, error) {
+	set = helperprotocol.NormalizeManagedIntentSet(set)
 	if err := set.Validate(); err != nil {
 		return helperprotocol.ApplyIntent{}, err
 	}

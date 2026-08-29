@@ -235,7 +235,7 @@ func CanTransition(from, to JournalState) bool {
 	case JournalAuthorized:
 		return to == JournalRunning || to == JournalFailedBeforeMutation
 	case JournalRunning:
-		return to == JournalMutated || to == JournalFailedBeforeMutation || to == JournalOutcomeIndeterminate
+		return to == JournalMutated || to == JournalSucceeded || to == JournalFailedBeforeMutation || to == JournalOutcomeIndeterminate
 	case JournalMutated:
 		return to == JournalValidated || to == JournalRollbackRunning || to == JournalOutcomeIndeterminate
 	case JournalValidated:
@@ -334,6 +334,25 @@ type PlanManagedApplyRequest struct {
 type ManagedIntentSetEnvelope struct {
 	IntentSet proxymodel.IntentSet `json:"intent_set"`
 	Intent    Signed[ApplyIntent]  `json:"signed_apply_intent"`
+}
+
+func NormalizeManagedIntentSet(set proxymodel.IntentSet) proxymodel.IntentSet {
+	set.Intents = append([]proxymodel.RouteIntent{}, set.Intents...)
+	set.Certs = append([]proxymodel.CertBundle{}, set.Certs...)
+	set.Keep = append([]string{}, set.Keep...)
+	set.CertKeep = append([]string{}, set.CertKeep...)
+	for index := range set.Intents {
+		route := &set.Intents[index].Route
+		if route.RequestHeaders == nil {
+			route.RequestHeaders = map[string]string{}
+		}
+		if route.ResponseHeaders == nil {
+			route.ResponseHeaders = map[string]string{}
+		}
+		route.IPAllowlist = append([]string{}, route.IPAllowlist...)
+		route.IPBlocklist = append([]string{}, route.IPBlocklist...)
+	}
+	return set
 }
 
 func (e ManagedIntentSetEnvelope) Validate() error {
@@ -482,6 +501,13 @@ func CertificateResourceID(host string) string {
 	return "cert-" + hex.EncodeToString(digest[:16])
 }
 
+func StagedArtifactFileName(artifact LogicalArtifact) (string, error) {
+	if err := artifact.Validate(); err != nil {
+		return "", err
+	}
+	return artifact.ResourceID + "." + artifact.Kind, nil
+}
+
 func (a LogicalArtifact) Validate() error {
 	if !validID(a.ResourceID) || !validDigest(a.SHA256) || a.Size < 0 || a.Size > MaxArtifactBytes {
 		return fmt.Errorf("invalid logical artifact")
@@ -523,6 +549,7 @@ type ApplyIntent struct {
 
 func (i ApplyIntent) Validate() error {
 	if !validID(i.AgentID) || !validID(i.HelperInstanceID) || !validID(i.OperationID) ||
+		i.Resources == nil || i.Artifacts == nil || i.DeletionSet == nil || i.Routes == nil || i.CertificateKeep == nil ||
 		!validID(i.DesiredStateRevision) || len(i.Resources) > MaxManifestEntries || len(i.Artifacts) > MaxManifestEntries ||
 		len(i.DeletionSet) > MaxManifestEntries || len(i.Routes) > MaxManifestEntries || len(i.CertificateKeep) > MaxManifestEntries ||
 		!i.AuthorizationKind.Valid() || !validID(i.AuthorizationEventID) ||
@@ -563,6 +590,11 @@ func (i ApplyIntent) Validate() error {
 		if _, exists := artifacts[key]; exists {
 			return fmt.Errorf("duplicate apply artifact")
 		}
+		if artifact.Kind == "certificate" || artifact.Kind == "source_key" || artifact.Kind == "runtime_key" {
+			if _, retained := certificateKeep[artifact.Name]; !retained {
+				return fmt.Errorf("certificate artifact is absent from retention set")
+			}
+		}
 		artifacts[key] = struct{}{}
 	}
 	deletions := make(map[string]struct{}, len(i.DeletionSet))
@@ -579,6 +611,9 @@ func (i ApplyIntent) Validate() error {
 	for _, route := range i.Routes {
 		if !validID(route.ArtifactID) || (route.Backend != "nginx" && route.Backend != "apache" && route.Backend != "caddy") || route.Route.Validate() != nil {
 			return fmt.Errorf("invalid apply intent route")
+		}
+		if route.Route.RequestHeaders == nil || route.Route.ResponseHeaders == nil || route.Route.IPAllowlist == nil || route.Route.IPBlocklist == nil {
+			return fmt.Errorf("apply route containers must be canonical arrays and objects")
 		}
 		if route.Route.IsRaw() && route.Route.Raw.Backend != route.Backend {
 			return fmt.Errorf("raw apply route backend mismatch")
@@ -612,6 +647,7 @@ type ApplyGrant struct {
 	CustomPolicyVersion       string            `json:"custom_policy_version"`
 	ExecutionPlanHash         string            `json:"execution_plan_hash"`
 	ResourceFingerprint       string            `json:"resource_fingerprint"`
+	RollbackCoverage          RollbackCoverage  `json:"rollback_coverage"`
 	IssuedAt                  string            `json:"issued_at"`
 	ExpiresAt                 string            `json:"expires_at"`
 }
@@ -623,7 +659,7 @@ func (g ApplyGrant) Validate() error {
 		!validDigest(g.LogicalManifestDigest) || !validDigest(g.ArtifactManifestDigest) ||
 		!validDigest(g.DeletionSetDigest) || !validDigest(g.CertificateIdentityDigest) ||
 		!validID(g.CustomPolicyVersion) || !validDigest(g.ExecutionPlanHash) ||
-		!validDigest(g.ResourceFingerprint) {
+		!validDigest(g.ResourceFingerprint) || !g.RollbackCoverage.Valid() {
 		return fmt.Errorf("invalid apply grant binding")
 	}
 	return validateGrantTimes(g.IssuedAt, g.ExpiresAt)

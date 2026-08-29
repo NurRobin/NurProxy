@@ -23,7 +23,15 @@ func (c *Client) Plan(context.Context, helperprotocol.Action, helperprotocol.Log
 	return helperprotocol.Signed[helperprotocol.HelperPlan]{}, fmt.Errorf("root helper client is supported only on Linux")
 }
 
+func (c *Client) PlanManagedApply(context.Context, helperprotocol.Signed[helperprotocol.ApplyIntent]) (helperprotocol.Signed[helperprotocol.ManagedApplyPlan], error) {
+	return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, fmt.Errorf("root helper client is supported only on Linux")
+}
+
 func (c *Client) Execute(context.Context, helperprotocol.Signed[helperprotocol.ExecutionGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error) {
+	return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", fmt.Errorf("root helper client is supported only on Linux")
+}
+
+func (c *Client) ExecuteManagedApply(context.Context, helperprotocol.Signed[helperprotocol.ApplyGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error) {
 	return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", fmt.Errorf("root helper client is supported only on Linux")
 }
 

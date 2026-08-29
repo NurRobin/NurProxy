@@ -55,6 +55,27 @@ type planRecord struct {
 	Digest string                    `json:"digest"`
 }
 
+type managedPlanRecord struct {
+	Plan         helperprotocol.ManagedApplyPlan                   `json:"plan"`
+	Intent       helperprotocol.Signed[helperprotocol.ApplyIntent] `json:"signed_apply_intent"`
+	PlanDigest   string                                            `json:"plan_digest"`
+	IntentDigest string                                            `json:"intent_digest"`
+}
+
+func (r managedPlanRecord) Validate() error {
+	if r.Plan.Validate() != nil || r.Intent.Validate() != nil || r.Intent.Envelope.MessageType != helperprotocol.MessageApplyIntent ||
+		!validDigest(r.PlanDigest) || !validDigest(r.IntentDigest) {
+		return fmt.Errorf("invalid managed helper plan record")
+	}
+	planDigest, planErr := helperprotocol.Digest(r.Plan)
+	intentDigest, intentErr := helperprotocol.Digest(r.Intent)
+	if planErr != nil || intentErr != nil || planDigest != r.PlanDigest || intentDigest != r.IntentDigest ||
+		r.Plan.OperationID != r.Intent.Envelope.Payload.OperationID || r.Plan.DesiredStateRevision != r.Intent.Envelope.Payload.DesiredStateRevision {
+		return fmt.Errorf("managed helper plan digest mismatch")
+	}
+	return nil
+}
+
 func (r planRecord) Validate() error {
 	if err := r.Plan.Validate(); err != nil || !validDigest(r.Digest) {
 		return fmt.Errorf("invalid helper plan record")
@@ -93,15 +114,16 @@ func (r breakerRecord) Validate() error {
 }
 
 type Journal struct {
-	mu            sync.Mutex
-	root          string
-	ownerUID      uint32
-	plansDir      string
-	operationsDir string
-	grantsDir     string
-	snapshotsDir  string
-	breakerPath   string
-	breakerIsOpen bool
+	mu              sync.Mutex
+	root            string
+	ownerUID        uint32
+	plansDir        string
+	managedPlansDir string
+	operationsDir   string
+	grantsDir       string
+	snapshotsDir    string
+	breakerPath     string
+	breakerIsOpen   bool
 }
 
 func NewJournal(root string, ownerUID uint32) (*Journal, error) {
@@ -109,15 +131,16 @@ func NewJournal(root string, ownerUID uint32) (*Journal, error) {
 		return nil, fmt.Errorf("create helper journal root: %w", err)
 	}
 	j := &Journal{
-		root:          root,
-		ownerUID:      ownerUID,
-		plansDir:      filepath.Join(root, "plans"),
-		operationsDir: filepath.Join(root, "operations"),
-		grantsDir:     filepath.Join(root, "grants"),
-		snapshotsDir:  filepath.Join(root, "snapshots"),
-		breakerPath:   filepath.Join(root, "breaker.json"),
+		root:            root,
+		ownerUID:        ownerUID,
+		plansDir:        filepath.Join(root, "plans"),
+		managedPlansDir: filepath.Join(root, "managed-plans"),
+		operationsDir:   filepath.Join(root, "operations"),
+		grantsDir:       filepath.Join(root, "grants"),
+		snapshotsDir:    filepath.Join(root, "snapshots"),
+		breakerPath:     filepath.Join(root, "breaker.json"),
 	}
-	for _, dir := range []string{j.plansDir, j.operationsDir, j.grantsDir, j.snapshotsDir} {
+	for _, dir := range []string{j.plansDir, j.managedPlansDir, j.operationsDir, j.grantsDir, j.snapshotsDir} {
 		if err := ensurePrivateDirectory(dir, ownerUID); err != nil {
 			return nil, fmt.Errorf("create helper journal directory: %w", err)
 		}
@@ -215,6 +238,79 @@ func (j *Journal) StorePlan(plan helperprotocol.HelperPlan) error {
 	return nil
 }
 
+func (j *Journal) StoreManagedPlan(plan helperprotocol.ManagedApplyPlan, intent helperprotocol.Signed[helperprotocol.ApplyIntent]) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if plan.Validate() != nil || intent.Validate() != nil || intent.Envelope.MessageType != helperprotocol.MessageApplyIntent {
+		return fmt.Errorf("invalid managed helper plan")
+	}
+	planDigest, err := helperprotocol.Digest(plan)
+	if err != nil {
+		return err
+	}
+	intentDigest, err := helperprotocol.Digest(intent)
+	if err != nil {
+		return err
+	}
+	record := managedPlanRecord{Plan: plan, Intent: intent, PlanDigest: planDigest, IntentDigest: intentDigest}
+	path := filepath.Join(j.managedPlansDir, plan.HelperPlanID+".json")
+	if _, err := os.Lstat(path); err == nil {
+		existingPlan, existingIntent, loadErr := j.loadManagedPlanLocked(plan.HelperPlanID)
+		if loadErr != nil {
+			return loadErr
+		}
+		existingPlanDigest, planErr := helperprotocol.Digest(existingPlan)
+		existingIntentDigest, intentErr := helperprotocol.Digest(existingIntent)
+		if planErr != nil || intentErr != nil || existingPlanDigest != planDigest || existingIntentDigest != intentDigest {
+			return ErrRequestConflict
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := j.ensureManagedPlanCapacityLocked(time.Now().UTC()); err != nil {
+		return err
+	}
+	return j.writeRecord(path, record, true)
+}
+
+func (j *Journal) ensureManagedPlanCapacityLocked(now time.Time) error {
+	entries, err := os.ReadDir(j.managedPlansDir)
+	if err != nil {
+		return err
+	}
+	remaining := 0
+	removed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".json") {
+			return fmt.Errorf("%w: unexpected managed plan journal entry", ErrJournalCorrupt)
+		}
+		planID := strings.TrimSuffix(name, ".json")
+		plan, _, err := j.loadManagedPlanLocked(planID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrJournalCorrupt, err)
+		}
+		if !timeAfter(now, plan.ExpiresAt) {
+			if err := os.Remove(filepath.Join(j.managedPlansDir, name)); err != nil {
+				return err
+			}
+			removed = true
+			continue
+		}
+		remaining++
+	}
+	if removed {
+		if err := syncDirectory(j.managedPlansDir); err != nil {
+			return err
+		}
+	}
+	if remaining >= maxStoredPlans {
+		return ErrPlanQuota
+	}
+	return nil
+}
+
 func (j *Journal) ensurePlanCapacityLocked(now time.Time) error {
 	entries, err := os.ReadDir(j.plansDir)
 	if err != nil {
@@ -256,6 +352,30 @@ func (j *Journal) LoadPlan(planID string) (helperprotocol.HelperPlan, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.loadPlanLocked(planID)
+}
+
+func (j *Journal) LoadManagedPlan(planID string) (helperprotocol.ManagedApplyPlan, helperprotocol.Signed[helperprotocol.ApplyIntent], error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.loadManagedPlanLocked(planID)
+}
+
+func (j *Journal) loadManagedPlanLocked(planID string) (helperprotocol.ManagedApplyPlan, helperprotocol.Signed[helperprotocol.ApplyIntent], error) {
+	if !validConfigID(planID) {
+		return helperprotocol.ManagedApplyPlan{}, helperprotocol.Signed[helperprotocol.ApplyIntent]{}, ErrPlanNotFound
+	}
+	payload, err := readTrustedFile(filepath.Join(j.managedPlansDir, planID+".json"), j.ownerUID, helperprotocol.MaxFrameBytes, true)
+	if os.IsNotExist(rootCause(err)) {
+		return helperprotocol.ManagedApplyPlan{}, helperprotocol.Signed[helperprotocol.ApplyIntent]{}, ErrPlanNotFound
+	}
+	if err != nil {
+		return helperprotocol.ManagedApplyPlan{}, helperprotocol.Signed[helperprotocol.ApplyIntent]{}, err
+	}
+	record, err := helperprotocol.Decode[managedPlanRecord](payload)
+	if err != nil {
+		return helperprotocol.ManagedApplyPlan{}, helperprotocol.Signed[helperprotocol.ApplyIntent]{}, fmt.Errorf("%w: %v", ErrJournalCorrupt, err)
+	}
+	return record.Plan, record.Intent, nil
 }
 
 func (j *Journal) loadPlanLocked(planID string) (helperprotocol.HelperPlan, error) {

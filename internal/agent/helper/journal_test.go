@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 func testJournal(t *testing.T) *Journal {
@@ -62,6 +63,48 @@ func TestJournalPersistsPlansAndRejectsPlanIdentityConflict(t *testing.T) {
 	plan.ExecutionPlanHash = strings.Repeat("d", 64)
 	if err := journal.StorePlan(plan); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("conflicting plan error = %v, want request conflict", err)
+	}
+}
+
+func testManagedPlan() (helperprotocol.ManagedApplyPlan, helperprotocol.Signed[helperprotocol.ApplyIntent]) {
+	intent := helperprotocol.ApplyIntent{
+		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: "apply-operation-1", DesiredStateRevision: strings.Repeat("1", 64),
+		Resources: []string{}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: []proxymodel.RouteIntent{}, CertificateKeep: []string{},
+		AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "desired-event-1",
+		IssuedAt:  time.Date(2026, 8, 29, 11, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		ExpiresAt: time.Date(2026, 8, 29, 11, 5, 0, 0, time.UTC).Format(time.RFC3339Nano),
+	}
+	signed := helperprotocol.Signed[helperprotocol.ApplyIntent]{
+		KeyID: "orchestrator-1", Envelope: helperprotocol.NewEnvelope(helperprotocol.MessageApplyIntent, intent), Signature: strings.Repeat("A", 86),
+	}
+	plan := helperprotocol.ManagedApplyPlan{
+		HelperPlanID: "managed-plan-1", HelperInstanceID: "helper-1", OperationID: intent.OperationID, DesiredStateRevision: intent.DesiredStateRevision,
+		LogicalManifestDigest: strings.Repeat("a", 64), ArtifactManifestDigest: strings.Repeat("b", 64), DeletionSetDigest: strings.Repeat("c", 64),
+		CertificateIdentityDigest: strings.Repeat("d", 64), CustomPolicyVersion: "proxy-policy-v1", ExecutionPlanHash: strings.Repeat("e", 64),
+		ResourceFingerprint: strings.Repeat("f", 64), RollbackCoverage: helperprotocol.RollbackCoverageFull, ExpiresAt: intent.ExpiresAt,
+	}
+	return plan, signed
+}
+
+func TestJournalPersistsManagedPlanWithImmutableSignedIntent(t *testing.T) {
+	journal := testJournal(t)
+	plan, intent := testManagedPlan()
+	if err := journal.StoreManagedPlan(plan, intent); err != nil {
+		t.Fatal(err)
+	}
+	loadedPlan, loadedIntent, err := journal.LoadManagedPlan(plan.HelperPlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedPlan.ExecutionPlanHash != plan.ExecutionPlanHash || loadedIntent.Signature != intent.Signature {
+		t.Fatalf("managed plan changed on load: %+v %+v", loadedPlan, loadedIntent)
+	}
+	if err := journal.StoreManagedPlan(plan, intent); err != nil {
+		t.Fatalf("managed plan retry failed: %v", err)
+	}
+	plan.ResourceFingerprint = strings.Repeat("0", 64)
+	if err := journal.StoreManagedPlan(plan, intent); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("managed plan identity conflict error = %v", err)
 	}
 }
 

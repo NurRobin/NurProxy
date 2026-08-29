@@ -43,6 +43,15 @@ func RunRootHelper(ctx context.Context, buildID string) error {
 	if err != nil {
 		return fmt.Errorf("initialize helper engine: %w", err)
 	}
+	if config.ManagedApply != nil {
+		managedApply, err := newManagedApplyAction(config.AgentUID, config.ProxyTarget, *config.ManagedApply, journal, systemProxyServiceHost{})
+		if err != nil {
+			return fmt.Errorf("compile managed apply action: %w", err)
+		}
+		if err := engine.SetManagedApplyHandler(managedApply); err != nil {
+			return fmt.Errorf("enable managed apply action: %w", err)
+		}
+	}
 	listener, err := SystemdListener()
 	if err != nil {
 		return err

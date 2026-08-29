@@ -297,6 +297,9 @@ func parseUTF16Unit(data []byte, start int) (uint16, int, error) {
 
 func validateExactShape(value any, target reflect.Type) error {
 	for target != nil && target.Kind() == reflect.Pointer {
+		if value == nil {
+			return nil
+		}
 		target = target.Elem()
 	}
 	if target == nil || target.Kind() == reflect.Interface {
@@ -333,6 +336,12 @@ func validateExactShape(value any, target reflect.Type) error {
 			}
 		}
 	case reflect.Slice, reflect.Array:
+		if target.Elem().Kind() == reflect.Uint8 {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("protocol byte sequence does not match base64 string schema")
+			}
+			return nil
+		}
 		array, ok := value.([]any)
 		if !ok {
 			return fmt.Errorf("protocol value does not match array schema")

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 type fakeActionHandler struct {
@@ -22,6 +23,42 @@ type fakeActionHandler struct {
 	rollbackCount int
 	revalidate    string
 	executeErr    error
+}
+
+type fakeManagedApplyHandler struct {
+	material      ManagedApplyMaterial
+	prepareCount  int
+	executeCount  int
+	rollbackCount int
+	revalidate    string
+	executeErr    error
+}
+
+func (h *fakeManagedApplyHandler) Plan(context.Context, helperprotocol.ApplyIntent) (ManagedApplyMaterial, error) {
+	return h.material, nil
+}
+
+func (h *fakeManagedApplyHandler) Rediscover(context.Context, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent) (string, string, error) {
+	fingerprint := h.material.ResourceFingerprint
+	if h.revalidate != "" {
+		fingerprint = h.revalidate
+	}
+	return h.material.ExecutionPlanHash, fingerprint, nil
+}
+
+func (h *fakeManagedApplyHandler) Prepare(context.Context, string, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent) (PreparedAction, error) {
+	h.prepareCount++
+	return PreparedAction{SnapshotDigest: strings.Repeat("f", 64), RollbackCoverage: h.material.RollbackCoverage}, nil
+}
+
+func (h *fakeManagedApplyHandler) Execute(context.Context, string, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent, PreparedAction) (ActionResult, error) {
+	h.executeCount++
+	return ActionResult{Mutated: true, Validated: h.executeErr == nil, SanitizedResult: "managed proxy state applied"}, h.executeErr
+}
+
+func (h *fakeManagedApplyHandler) Rollback(context.Context, string, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent, PreparedAction) error {
+	h.rollbackCount++
+	return nil
 }
 
 func (h *fakeActionHandler) Plan(context.Context, helperprotocol.PlanActionRequest) (PlanMaterial, error) {
@@ -55,6 +92,7 @@ type engineFixture struct {
 	engine          *Engine
 	journal         *Journal
 	handler         *fakeActionHandler
+	managed         *fakeManagedApplyHandler
 	config          RootConfig
 	orchestratorKey ed25519.PrivateKey
 	attestationPub  ed25519.PublicKey
@@ -99,6 +137,12 @@ func newEngineFixture(t *testing.T) engineFixture {
 		ResourceFingerprint: strings.Repeat("b", 64),
 		RollbackCoverage:    helperprotocol.RollbackCoverageFull,
 	}}
+	managed := &fakeManagedApplyHandler{material: ManagedApplyMaterial{
+		CustomPolicyVersion: "proxy-policy-v1",
+		ExecutionPlanHash:   strings.Repeat("c", 64),
+		ResourceFingerprint: strings.Repeat("e", 64),
+		RollbackCoverage:    helperprotocol.RollbackCoverageFull,
+	}}
 	now := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
 	engine, err := NewEngine(cfg, "dev-010e5a7", journal, attestationKey, map[helperprotocol.Action]ActionHandler{
 		helperprotocol.ActionValidateReloadProxy: handler,
@@ -106,8 +150,11 @@ func newEngineFixture(t *testing.T) engineFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := engine.SetManagedApplyHandler(managed); err != nil {
+		t.Fatal(err)
+	}
 	engine.now = func() time.Time { return now }
-	return engineFixture{engine: engine, journal: journal, handler: handler, config: cfg, orchestratorKey: orchestratorKey, attestationPub: attestationPub, now: now}
+	return engineFixture{engine: engine, journal: journal, handler: handler, managed: managed, config: cfg, orchestratorKey: orchestratorKey, attestationPub: attestationPub, now: now}
 }
 
 func (f engineFixture) plan(t *testing.T) helperprotocol.HelperPlan {
@@ -255,5 +302,94 @@ func TestEngineFailsClosedWhenPersistentBreakerIsOpen(t *testing.T) {
 	}
 	if fixture.handler.executeCount != 0 {
 		t.Fatal("open breaker allowed mutation")
+	}
+}
+
+func (f engineFixture) managedIntent(t *testing.T) helperprotocol.Signed[helperprotocol.ApplyIntent] {
+	t.Helper()
+	routes := []proxymodel.RouteIntent{{
+		ArtifactID: "domain-1", Backend: "nginx",
+		Route: proxymodel.Route{Host: "app.example.com", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}, RequestHeaders: map[string]string{}, ResponseHeaders: map[string]string{}, IPAllowlist: []string{}, IPBlocklist: []string{}},
+	}}
+	intent := helperprotocol.ApplyIntent{
+		AgentID: f.config.AgentID, HelperInstanceID: f.config.HelperInstanceID,
+		OperationID: "apply-operation-1", DesiredStateRevision: strings.Repeat("1", 64),
+		Resources: []string{"domain-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: routes,
+		CertificateKeep: []string{}, AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "desired-event-1",
+		IssuedAt: f.now.Format(time.RFC3339Nano), ExpiresAt: f.now.Add(4 * time.Minute).Format(time.RFC3339Nano),
+	}
+	signed, err := helperprotocol.Sign(f.config.OrchestratorKeyID, f.orchestratorKey, helperprotocol.NewEnvelope(helperprotocol.MessageApplyIntent, intent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+
+func (f engineFixture) managedExecuteRequest(t *testing.T, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent, mutate func(*helperprotocol.ApplyGrant)) helperprotocol.Envelope[helperprotocol.ExecuteManagedApplyRequest] {
+	t.Helper()
+	grant := helperprotocol.ApplyGrant{
+		GrantID: "apply-grant-1", AuthorizationKind: intent.AuthorizationKind, AuthorizationEventID: intent.AuthorizationEventID,
+		AgentID: f.config.AgentID, HelperInstanceID: f.config.HelperInstanceID, OperationID: intent.OperationID,
+		HelperPlanID: plan.HelperPlanID, DesiredStateRevision: plan.DesiredStateRevision,
+		LogicalManifestDigest: plan.LogicalManifestDigest, ArtifactManifestDigest: plan.ArtifactManifestDigest,
+		DeletionSetDigest: plan.DeletionSetDigest, CertificateIdentityDigest: plan.CertificateIdentityDigest,
+		CustomPolicyVersion: plan.CustomPolicyVersion, ExecutionPlanHash: plan.ExecutionPlanHash,
+		ResourceFingerprint: plan.ResourceFingerprint, RollbackCoverage: plan.RollbackCoverage,
+		IssuedAt: f.now.Format(time.RFC3339Nano), ExpiresAt: f.now.Add(2 * time.Minute).Format(time.RFC3339Nano),
+	}
+	if mutate != nil {
+		mutate(&grant)
+	}
+	signed, err := helperprotocol.Sign(f.config.OrchestratorKeyID, f.orchestratorKey, helperprotocol.NewEnvelope(helperprotocol.MessageApplyGrant, grant))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return helperprotocol.NewEnvelope(helperprotocol.MessageExecuteManagedApplyRequest, helperprotocol.ExecuteManagedApplyRequest{
+		OperationID: grant.OperationID, HelperPlanID: grant.HelperPlanID, Grant: signed,
+	})
+}
+
+func TestEngineManagedApplyRequiresSignedIntentAndGrantAndExecutesOnce(t *testing.T) {
+	fixture := newEngineFixture(t)
+	intent := fixture.managedIntent(t)
+	planSigned, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-1", Intent: intent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := helperprotocol.Verify(fixture.attestationPub, planSigned, helperprotocol.MessageManagedApplyPlan); err != nil {
+		t.Fatalf("managed plan attestation failed: %v", err)
+	}
+	request := fixture.managedExecuteRequest(t, planSigned.Envelope.Payload, intent.Envelope.Payload, nil)
+	receipt, err := fixture.engine.ExecuteManagedApply(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded || receipt.Envelope.Payload.Action != helperprotocol.ActionApplyManagedProxyState {
+		t.Fatalf("unexpected managed receipt: %+v", receipt.Envelope.Payload)
+	}
+	retry, err := fixture.engine.ExecuteManagedApply(context.Background(), request)
+	if err != nil || retry.Signature != receipt.Signature || fixture.managed.executeCount != 1 || fixture.managed.prepareCount != 1 {
+		t.Fatalf("managed retry repeated mutation: receipt=%+v err=%v execute=%d prepare=%d", retry, err, fixture.managed.executeCount, fixture.managed.prepareCount)
+	}
+}
+
+func TestEngineManagedApplyRejectsTamperedGrantBeforeMutation(t *testing.T) {
+	fixture := newEngineFixture(t)
+	intent := fixture.managedIntent(t)
+	planSigned, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-1", Intent: intent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fixture.managedExecuteRequest(t, planSigned.Envelope.Payload, intent.Envelope.Payload, func(grant *helperprotocol.ApplyGrant) {
+		grant.CustomPolicyVersion = "proxy-policy-v2"
+	})
+	if _, err := fixture.engine.ExecuteManagedApply(context.Background(), request); err == nil || fixture.managed.executeCount != 0 {
+		t.Fatalf("tampered managed grant executed: err=%v count=%d", err, fixture.managed.executeCount)
+	}
+
+	forged := fixture.managedIntent(t)
+	forged.Signature = strings.Repeat("A", 86)
+	if _, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-2", Intent: forged}); err == nil {
+		t.Fatal("forged managed intent was planned")
 	}
 }

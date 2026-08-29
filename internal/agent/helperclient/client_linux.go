@@ -104,6 +104,38 @@ func (c *Client) Plan(ctx context.Context, action helperprotocol.Action, target 
 	return signed, nil
 }
 
+func (c *Client) PlanManagedApply(ctx context.Context, intent helperprotocol.Signed[helperprotocol.ApplyIntent]) (helperprotocol.Signed[helperprotocol.ManagedApplyPlan], error) {
+	payload := intent.Envelope.Payload
+	if intent.Validate() != nil || intent.Envelope.MessageType != helperprotocol.MessageApplyIntent ||
+		payload.AgentID != c.agentID || payload.HelperInstanceID != c.pin.HelperInstanceID {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, fmt.Errorf("managed apply intent does not match the enrolled agent helper")
+	}
+	request := helperprotocol.PlanManagedApplyRequest{RequestID: uuid.NewString(), Intent: intent}
+	encoded, err := helperprotocol.CanonicalBytes(helperprotocol.NewEnvelope(helperprotocol.MessagePlanManagedApplyRequest, request))
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	response, err := c.exchange(ctx, encoded)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	signed, err := helperprotocol.Decode[helperprotocol.Signed[helperprotocol.ManagedApplyPlan]](response)
+	if err != nil {
+		if remoteErr := decodeRemoteError(response, request.RequestID); remoteErr != nil {
+			return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, remoteErr
+		}
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, fmt.Errorf("managed helper plan is not a valid protocol response")
+	}
+	if signed.KeyID != c.pin.AttestationKeyID || helperprotocol.Verify(c.pin.publicKey(), signed, helperprotocol.MessageManagedApplyPlan) != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, fmt.Errorf("managed helper plan attestation is invalid")
+	}
+	plan := signed.Envelope.Payload
+	if plan.HelperInstanceID != c.pin.HelperInstanceID || plan.OperationID != payload.OperationID || plan.DesiredStateRevision != payload.DesiredStateRevision {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, fmt.Errorf("managed helper plan does not match the signed desired state")
+	}
+	return signed, nil
+}
+
 func (c *Client) Execute(ctx context.Context, grant helperprotocol.Signed[helperprotocol.ExecutionGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error) {
 	payload := grant.Envelope.Payload
 	if grant.Validate() != nil || grant.Envelope.MessageType != helperprotocol.MessageExecutionGrant ||
@@ -126,6 +158,31 @@ func (c *Client) Execute(ctx context.Context, grant helperprotocol.Signed[helper
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, requestDigest, err
 	}
 	receipt, err := c.decodeReceipt(response, payload.OperationID, requestDigest, payload.Action)
+	return receipt, requestDigest, err
+}
+
+func (c *Client) ExecuteManagedApply(ctx context.Context, grant helperprotocol.Signed[helperprotocol.ApplyGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error) {
+	payload := grant.Envelope.Payload
+	if grant.Validate() != nil || grant.Envelope.MessageType != helperprotocol.MessageApplyGrant ||
+		payload.AgentID != c.agentID || payload.HelperInstanceID != c.pin.HelperInstanceID {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", fmt.Errorf("managed apply grant does not match the enrolled agent helper")
+	}
+	request := helperprotocol.NewEnvelope(helperprotocol.MessageExecuteManagedApplyRequest, helperprotocol.ExecuteManagedApplyRequest{
+		OperationID: payload.OperationID, HelperPlanID: payload.HelperPlanID, Grant: grant,
+	})
+	requestDigest, err := helperprotocol.Digest(request)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", err
+	}
+	encoded, err := helperprotocol.CanonicalBytes(request)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, "", err
+	}
+	response, err := c.exchange(ctx, encoded)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, requestDigest, err
+	}
+	receipt, err := c.decodeReceipt(response, payload.OperationID, requestDigest, helperprotocol.ActionApplyManagedProxyState)
 	return receipt, requestDigest, err
 }
 

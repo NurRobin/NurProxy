@@ -17,18 +17,28 @@ import (
 const MaxRootConfigBytes = 64 << 10
 
 type RootConfig struct {
-	AgentID                   string              `json:"agent_id"`
-	HelperInstanceID          string              `json:"helper_instance_id"`
-	ExpectedBuildID           string              `json:"expected_build_id"`
-	AgentUser                 string              `json:"agent_user"`
-	AgentUID                  uint32              `json:"agent_uid"`
-	OrchestratorKeyID         string              `json:"orchestrator_key_id"`
-	OrchestratorPublicKeyText string              `json:"orchestrator_public_key"`
-	AttestationKeyID          string              `json:"attestation_key_id"`
-	AttestationPrivateKeyFile string              `json:"attestation_private_key_file"`
-	StoreDir                  string              `json:"store_dir"`
-	ProxyTarget               ProxyTargetConfig   `json:"proxy_target"`
-	PackageTarget             PackageTargetConfig `json:"package_target"`
+	AgentID                   string                    `json:"agent_id"`
+	HelperInstanceID          string                    `json:"helper_instance_id"`
+	ExpectedBuildID           string                    `json:"expected_build_id"`
+	AgentUser                 string                    `json:"agent_user"`
+	AgentUID                  uint32                    `json:"agent_uid"`
+	OrchestratorKeyID         string                    `json:"orchestrator_key_id"`
+	OrchestratorPublicKeyText string                    `json:"orchestrator_public_key"`
+	AttestationKeyID          string                    `json:"attestation_key_id"`
+	AttestationPrivateKeyFile string                    `json:"attestation_private_key_file"`
+	StoreDir                  string                    `json:"store_dir"`
+	ProxyTarget               ProxyTargetConfig         `json:"proxy_target"`
+	PackageTarget             PackageTargetConfig       `json:"package_target"`
+	ManagedApply              *ManagedApplyTargetConfig `json:"managed_apply"`
+}
+
+type ManagedApplyTargetConfig struct {
+	StagingDir          string `json:"staging_dir"`
+	AvailableDir        string `json:"available_dir"`
+	EnabledDir          string `json:"enabled_dir"`
+	CertificateDir      string `json:"certificate_dir"`
+	CustomPolicyVersion string `json:"custom_policy_version"`
+	ProxyVersion        string `json:"proxy_version"`
 }
 
 type PackageTargetConfig struct {
@@ -65,6 +75,38 @@ func (c RootConfig) Validate() error {
 	}
 	if err := c.PackageTarget.Validate(c.ProxyTarget.Kind); err != nil {
 		return fmt.Errorf("invalid package target: %w", err)
+	}
+	if c.ManagedApply != nil {
+		if err := c.ManagedApply.Validate(c.ProxyTarget.Kind); err != nil {
+			return fmt.Errorf("invalid managed apply target: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c ManagedApplyTargetConfig) Validate(proxyKind string) error {
+	if !validConfigID(c.CustomPolicyVersion) || validatePrivatePath(c.StagingDir) != nil || validatePrivatePath(c.CertificateDir) != nil ||
+		c.StagingDir != "/var/lib/nurproxy-agent/helper-staging" || c.CertificateDir != "/var/lib/nurproxy-agent/certs" {
+		return fmt.Errorf("managed staging, certificate, or policy mapping is invalid")
+	}
+	switch proxyKind {
+	case "nginx":
+		if !validConfigID(c.ProxyVersion) {
+			return fmt.Errorf("nginx version mapping is invalid")
+		}
+		validPair := (c.AvailableDir == "/etc/nginx/sites-available" && c.EnabledDir == "/etc/nginx/sites-enabled") ||
+			(c.AvailableDir == "/etc/nginx/conf.d" && c.EnabledDir == "")
+		if !validPair {
+			return fmt.Errorf("nginx managed directories are not a compiled layout")
+		}
+	case "apache":
+		validPair := (c.AvailableDir == "/etc/apache2/sites-available" && c.EnabledDir == "/etc/apache2/sites-enabled") ||
+			(c.AvailableDir == "/etc/httpd/conf.d" && c.EnabledDir == "")
+		if !validPair || (c.ProxyVersion != "" && !validConfigID(c.ProxyVersion)) {
+			return fmt.Errorf("apache managed directories are not a compiled layout")
+		}
+	default:
+		return fmt.Errorf("ordinary privileged apply is unsupported for this proxy kind")
 	}
 	return nil
 }

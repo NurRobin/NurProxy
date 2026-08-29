@@ -142,6 +142,20 @@ func (s *Server) dispatch(ctx context.Context, payload []byte) (any, string, err
 		}
 		response, err := s.engine.Execute(ctx, envelope)
 		return response, envelope.Payload.OperationID, err
+	case helperprotocol.MessagePlanManagedApplyRequest:
+		envelope, err := helperprotocol.DecodeEnvelope[helperprotocol.PlanManagedApplyRequest](payload, helperprotocol.MessagePlanManagedApplyRequest)
+		if err != nil {
+			return nil, "unknown", err
+		}
+		response, err := s.engine.PlanManagedApply(ctx, envelope.Payload)
+		return response, envelope.Payload.RequestID, err
+	case helperprotocol.MessageExecuteManagedApplyRequest:
+		envelope, err := helperprotocol.DecodeEnvelope[helperprotocol.ExecuteManagedApplyRequest](payload, helperprotocol.MessageExecuteManagedApplyRequest)
+		if err != nil {
+			return nil, "unknown", err
+		}
+		response, err := s.engine.ExecuteManagedApply(ctx, envelope)
+		return response, envelope.Payload.OperationID, err
 	case helperprotocol.MessageGetReceiptRequest:
 		envelope, err := helperprotocol.DecodeEnvelope[helperprotocol.GetReceiptRequest](payload, helperprotocol.MessageGetReceiptRequest)
 		if err != nil {

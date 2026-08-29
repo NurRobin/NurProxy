@@ -33,7 +33,8 @@ func TestApplyIntentBindsValidatedRoutesToLogicalResources(t *testing.T) {
 	intent := ApplyIntent{
 		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: "apply-1", DesiredStateRevision: "revision-1",
 		Resources: []string{"dom-1"}, Artifacts: []LogicalArtifact{}, DeletionSet: []string{},
-		Routes:            []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}},
+		Routes:            NormalizeManagedIntentSet(proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}}}).Intents,
+		CertificateKeep:   []string{},
 		AuthorizationKind: AuthorizationAuthenticatedDesiredState, AuthorizationEventID: "event-1",
 		IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
 	}
@@ -161,6 +162,7 @@ func TestJournalTransitionsAreClosedAndFailClosed(t *testing.T) {
 		{JournalPlanned, JournalAuthorized},
 		{JournalAuthorized, JournalRunning},
 		{JournalRunning, JournalMutated},
+		{JournalRunning, JournalSucceeded},
 		{JournalRunning, JournalFailedBeforeMutation},
 		{JournalMutated, JournalValidated},
 		{JournalMutated, JournalRollbackRunning},
@@ -220,6 +222,10 @@ func TestApplyIntentBindsHostOperationAndCanonicalLifetime(t *testing.T) {
 		OperationID:          "op-1",
 		DesiredStateRevision: "revision-1",
 		Resources:            []string{"resource-1"},
+		Artifacts:            []LogicalArtifact{},
+		DeletionSet:          []string{},
+		Routes:               []proxymodel.RouteIntent{},
+		CertificateKeep:      []string{},
 		AuthorizationKind:    AuthorizationAuthenticatedDesiredState,
 		AuthorizationEventID: "event-1",
 		IssuedAt:             issued.Format(time.RFC3339Nano),
