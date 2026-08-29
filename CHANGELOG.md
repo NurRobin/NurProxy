@@ -5,6 +5,122 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0-rc.1] - 2026-08-29
+
+This release candidate introduces NurProxy's privilege-separated agent and its
+safe recovery system. It also collects the DNS, TLS, observability, lifecycle,
+and operator-safety work completed since 0.4.0. It is intended for release-branch
+testing before the final 0.5.0 release.
+
+### Highlights
+
+- **Unprivileged agent with a typed root helper.** The network-facing agent now
+  runs as the dedicated `nurproxy` user. A socket-activated, root-owned helper
+  performs only fixed protocol actions; it has no shell or arbitrary argv/path
+  endpoint. Execution grants, local plan re-discovery, durable journals,
+  privileged snapshots, signed receipts, replay protection, and a persistent
+  breaker bind every privileged change to the approved host state.
+- **Ordinary proxy reconciliation uses the same constrained transaction path.**
+  Create, edit, delete, certificate materialization, validation, and reload can
+  be committed atomically without granting the agent write access to shared
+  nginx or Apache directories. Exact provenance and policy checks protect
+  operator-owned configuration and preserve legacy managed artifacts during the
+  migration.
+- **Structured diagnosis and recovery.** The agent classifies bounded proxy and
+  host failures, automatically repairs only proven low-risk managed state, and
+  exposes explicit plans and confirmations for supported hard recovery actions.
+  The dashboard shows diagnostics, refusal reasons, rollback coverage, breaker
+  state, and operation history instead of collapsing every disappearance into a
+  claimed successful repair.
+- **Safer DNS and route lifecycle.** Apex domains use the `@` sentinel, existing
+  DNS records can be explicitly taken over, and opt-in parent cascade deletion
+  tears domains down through the reconciler before removing a server, agent, or
+  zone. Route tombstones ensure an offline agent must attest deletion before
+  central certificate state is pruned.
+- **Operations and observability.** Authenticated Prometheus metrics, webhook
+  audit-event notifications, `nurproxy db version`, richer agent health, ACME
+  rate-limit backoff, and distinct ACME-CA reachability errors make fleet state
+  easier to inspect without exposing it publicly.
+
+### Added
+
+- Socket-activated `nurproxy-agent-helper.service` and `.socket` units, strict
+  helper configuration, helper-instance enrollment, and build-ID handshakes.
+- Typed helper actions for exact managed-file access, proxy validation/reload or
+  start/restart, supported package installation, and bounded local firewall
+  changes. Ambiguous targets and unsupported environments remain diagnosis-only.
+- Durable recovery diagnostics, operation receipts, rollback snapshots,
+  confirmation-bound execution grants, metrics, API endpoints, and dashboard
+  controls.
+- Safe automatic recovery for exact-provenance temporary files, orphaned managed
+  artifacts, certificate bundles, runtime keys, and last-known-live generated
+  configuration.
+- Authenticated `/metrics` output for agent/domain state, certificate expiry,
+  ACME backoff, recovery health, and scrape errors.
+- Configurable webhook delivery for curated audit events.
+- CLI/API/dashboard support for opt-in cascade deletion of servers, agents, and
+  zones through the normal audited teardown path.
+- Apex/root domains, DNS-record takeover, schema-version inspection, and a
+  versioned certificate-export wire contract for forward-compatible agents.
+
+### Changed
+
+- Packaged agents run as `nurproxy:nurproxy`; mutable state moves beneath
+  `/var/lib/nurproxy-agent/state`, helper staging is isolated, and privileged
+  state stays root-owned beneath `/var/lib/nurproxy-agent/helper`.
+- Agent packages install and enable the helper socket, migrate legacy state, and
+  quarantine only unmodified NurProxy legacy privilege drop-ins. Modified or
+  ambiguous operator files cause a fail-closed upgrade instead of being replaced.
+- Orchestrator package upgrades run the no-follow `nurproxy permissions`
+  migration before restart, enforce private data modes, and install an exact
+  systemd data-directory sandbox drop-in.
+- Live backups now use SQLite's online backup API instead of manipulating a live
+  WAL database externally; restores remove stale WAL/SHM sidecars.
+- ACME rate-limit retries use persistent exponential backoff with jitter, while
+  CA reachability failures are reported separately.
+- The release pipeline emits helper-aware agent archives/packages and keeps RCs
+  out of `:latest`, Homebrew, AUR, and the stable APT/YUM repository.
+
+### Fixed
+
+- Cloudflare record updates preserve the existing `proxied` flag.
+- Deleted TLS routes are pruned before backend validation, preventing stale
+  vhosts from deadlocking reconciliation after their certificate is removed.
+- Existing-mode agents resolve default proxy configuration paths correctly and
+  normalize upstream addresses that already contain a port.
+- Raw custom routes re-materialize their plaintext runtime key after certificate
+  renewal, reset, or reconnect.
+- Managed apply retries return the original receipt without repeating mutation;
+  converged state, exact pre-marker routes, auth sidecars, and protected operator
+  files remain untouched.
+- First-time admin setup and session-secret creation converge atomically under
+  concurrent requests, and hashed admin API keys work consistently for MCP and
+  metrics authentication.
+- Reconciler teardown preserves certificate state until route deletion is
+  attested and avoids deleting or overwriting newer desired-state generations.
+
+## Upgrade notes
+
+- **Back up the orchestrator before upgrading.** Run `nurproxy backup` (safe
+  while the service is live in this release line) or stop the service and copy
+  the complete data directory. Database migrations advance automatically through
+  schema 31 and are not intended to be rolled back by an older binary.
+- **Upgrade the orchestrator first, then agents one at a time.** Confirm health
+  and route continuity between hosts. New agents fail closed when helper and
+  orchestrator authorization/build identities do not match.
+- **Prefer the DEB/RPM or install-script upgrade path for agents.** It installs
+  the helper units, moves legacy state into `/var/lib/nurproxy-agent/state`, and
+  refreshes the root-owned helper identity before restarting the unprivileged
+  main agent. A binary-only swap is not a complete 0.5.0 agent upgrade.
+- **Custom orchestrator data directories require the permission migration.** For
+  a manual binary upgrade, stop the service, replace the binary, run
+  `nurproxy permissions --data-dir <dir>`, then start it. Do not work around a
+  refusal with recursive `chmod`/`chown`; inspect the exact conflicting path.
+- **Review custom proxy configuration before enabling hard recovery.** Native
+  syntax validity alone does not establish ownership. Unsupported directives,
+  ambiguous services, shared-directory access requests, MAC-policy denials,
+  read-only filesystems, and immutable targets are deliberately refused.
+
 ## [0.3.0] - 2026-06-07
 
 A hardening and developer-experience release: the control plane can now be
@@ -128,4 +244,5 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.5.0-rc.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.1
 [0.3.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.3.0
