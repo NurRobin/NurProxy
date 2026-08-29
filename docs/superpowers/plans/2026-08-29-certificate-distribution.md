@@ -147,6 +147,10 @@ Add a dedicated Certificates workflow that can stream the current central certif
 
 - Create: `web/src/pages/Certificates.tsx`
 - Create: `web/src/pages/Certificates.test.tsx`
+- Create: `web/src/test/setup.ts`
+- Create: `web/vitest.config.ts`
+- Modify: `web/package.json`
+- Modify: `web/package-lock.json`
 - Modify: `web/src/App.tsx`
 - Modify: `web/src/shells/nav.tsx`
 - Modify: `web/src/lib/api.ts`
@@ -159,6 +163,7 @@ Add a dedicated Certificates workflow that can stream the current central certif
 - [ ] Download PEM ZIP directly. For PFX generate a cryptographically random password with Web Crypto or accept a custom password; show generated passwords once and clear them after download/dialog close.
 - [ ] Build deployment wizard defaults for symlink mode, directory preset, safe permissions, no action, plus progressive disclosure for copy, custom paths/ownership, systemd, and argv. Review every resolved path/action before submit and use the existing second-confirmation flow for hard changes.
 - [ ] Add accessible pending/error/success states and German/English copy that explains rollback and compatibility tradeoffs.
+- [ ] Before the first component test, add the repository's missing lightweight Vitest + jsdom + Testing Library harness and a `test` script. Keep production dependencies unchanged.
 - [ ] Test random-password lifecycle, custom password request handling, blob download cleanup, default-safe wizard, confirmation gates, path preview, no key/password persistence, and status/history rendering.
 - [ ] Verify: `cd web && npm test -- --run && npm run build && npm run lint`.
 
@@ -167,14 +172,14 @@ Add a dedicated Certificates workflow that can stream the current central certif
 **Files:**
 
 - Create: `test/integration/certificate_exports_test.go`
-- Create: `test/e2e/certificates.spec.ts`
+- Create: `test/e2e/certificate_exports_test.go`
 - Modify: `docs/qa/25-fixtures-and-gotchas.md`
 - Modify: `docs/qa/30-manual-integration-checklist.md`
 
 - [ ] Exercise real RSA/ECDSA material, disposable filesystem roots, renewal-equivalent generation changes, symlink and copy installs, hook success/failure, rollback, retention, and unrelated-file preservation.
-- [ ] Browser-test certificate creation, PEM/PFX downloads, one-time password display, deployment review, both confirmations, status, and history.
+- [ ] Add tagged Go full-stack E2E for the API/agent path. Browser-test certificate creation, PEM/PFX downloads, one-time password display, deployment review, both confirmations, status, and history through the shared T3 browser against the isolated stack; retain screenshots/recorded observations in the QA evidence rather than introducing a second browser-runner package.
 - [ ] Add adversarial fixtures for traversal, symlink swaps, hardlinks, FIFOs, oversized command output, wrong key, malformed certificate, and secret-search assertions over logs/audit/API responses.
-- [ ] Verify: `go test -race ./test/integration -run CertificateExport`; run the repository's browser-E2E command against an isolated stack; record exact evidence in the QA docs.
+- [ ] Verify: `go test -race -count=1 -tags=integration ./test/integration -run CertificateExport`; `go test -race -count=1 -tags=e2e ./test/e2e -run CertificateExport`; run the shared-browser flow against the isolated stack and record exact evidence in the QA docs.
 
 ## Task 11: Full release gates and reversible production canary
 
