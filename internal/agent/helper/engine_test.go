@@ -373,6 +373,55 @@ func TestEngineManagedApplyRequiresSignedIntentAndGrantAndExecutesOnce(t *testin
 	}
 }
 
+func TestEngineManagedApplyPlanningIsIdempotentForExactIntentAndFacts(t *testing.T) {
+	fixture := newEngineFixture(t)
+	intent := fixture.managedIntent(t)
+	first, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-1", Intent: intent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-2", Intent: intent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Envelope.Payload.HelperPlanID != first.Envelope.Payload.HelperPlanID || second.Signature != first.Signature {
+		t.Fatalf("exact managed plan retry changed identity: first=%s second=%s", first.Envelope.Payload.HelperPlanID, second.Envelope.Payload.HelperPlanID)
+	}
+	fixture.managed.material.ResourceFingerprint = strings.Repeat("f", 64)
+	changed, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-3", Intent: intent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Envelope.Payload.HelperPlanID == first.Envelope.Payload.HelperPlanID {
+		t.Fatal("changed local facts reused the prior helper plan identity")
+	}
+}
+
+func TestEngineManagedApplyReusesCompatibleStoredLegacyPlan(t *testing.T) {
+	fixture := newEngineFixture(t)
+	intent := fixture.managedIntent(t)
+	first, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-1", Intent: intent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(fixture.journal.managedPlansDir, first.Envelope.Payload.HelperPlanID+".json")); err != nil {
+		t.Fatal(err)
+	}
+	legacy := first.Envelope.Payload
+	legacy.HelperPlanID = "legacy-random-plan-id"
+	if err := fixture.journal.StoreManagedPlan(legacy, intent); err != nil {
+		t.Fatal(err)
+	}
+
+	retry, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-2", Intent: intent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Envelope.Payload.HelperPlanID != legacy.HelperPlanID {
+		t.Fatalf("retry plan id = %q, want stored legacy id %q", retry.Envelope.Payload.HelperPlanID, legacy.HelperPlanID)
+	}
+}
+
 func TestEngineManagedApplyRejectsTamperedGrantBeforeMutation(t *testing.T) {
 	fixture := newEngineFixture(t)
 	intent := fixture.managedIntent(t)

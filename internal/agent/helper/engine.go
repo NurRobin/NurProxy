@@ -200,17 +200,36 @@ func (e *Engine) PlanManagedApply(ctx context.Context, request helperprotocol.Pl
 	if err != nil {
 		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
 	}
-	now := e.now().UTC()
-	expires := now.Add(planLifetime)
+	intentIssued, issuedErr := time.Parse(time.RFC3339Nano, intent.IssuedAt)
 	intentExpires, parseErr := time.Parse(time.RFC3339Nano, intent.ExpiresAt)
-	if parseErr != nil {
+	if issuedErr != nil || parseErr != nil {
 		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorExecutionGrantExpired, "apply intent lifetime is invalid", false)
 	}
+	expires := intentIssued.Add(planLifetime)
 	if intentExpires.Before(expires) {
 		expires = intentExpires
 	}
+	intentDigest, err := helperprotocol.Digest(signedIntent)
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	planIdentity, err := helperprotocol.Digest(struct {
+		IntentDigest        string                          `json:"intent_digest"`
+		ExecutionPlanHash   string                          `json:"execution_plan_hash"`
+		ResourceFingerprint string                          `json:"resource_fingerprint"`
+		CustomPolicyVersion string                          `json:"custom_policy_version"`
+		RollbackCoverage    helperprotocol.RollbackCoverage `json:"rollback_coverage"`
+		ExpiresAt           string                          `json:"expires_at"`
+	}{
+		IntentDigest: intentDigest, ExecutionPlanHash: material.ExecutionPlanHash,
+		ResourceFingerprint: material.ResourceFingerprint, CustomPolicyVersion: material.CustomPolicyVersion,
+		RollbackCoverage: material.RollbackCoverage, ExpiresAt: expires.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
 	plan := helperprotocol.ManagedApplyPlan{
-		HelperPlanID: uuid.NewString(), HelperInstanceID: e.config.HelperInstanceID,
+		HelperPlanID: "managed-plan-" + planIdentity, HelperInstanceID: e.config.HelperInstanceID,
 		OperationID: intent.OperationID, DesiredStateRevision: intent.DesiredStateRevision,
 		LogicalManifestDigest: logicalDigest, ArtifactManifestDigest: artifactDigest, DeletionSetDigest: deletionDigest,
 		CertificateIdentityDigest: certificateDigest, CustomPolicyVersion: material.CustomPolicyVersion,
@@ -219,6 +238,11 @@ func (e *Engine) PlanManagedApply(ctx context.Context, request helperprotocol.Pl
 	}
 	if err := plan.Validate(); err != nil {
 		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	}
+	if existing, found, err := e.journal.FindCompatibleManagedPlan(signedIntent, plan, e.now().UTC()); err != nil {
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err
+	} else if found {
+		return helperprotocol.Sign(e.config.AttestationKeyID, e.attestationKey, helperprotocol.NewEnvelope(helperprotocol.MessageManagedApplyPlan, existing))
 	}
 	if err := e.journal.StoreManagedPlan(plan, signedIntent); err != nil {
 		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, err

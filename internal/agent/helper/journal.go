@@ -360,6 +360,55 @@ func (j *Journal) LoadManagedPlan(planID string) (helperprotocol.ManagedApplyPla
 	return j.loadManagedPlanLocked(planID)
 }
 
+func (j *Journal) FindCompatibleManagedPlan(intent helperprotocol.Signed[helperprotocol.ApplyIntent], candidate helperprotocol.ManagedApplyPlan, now time.Time) (helperprotocol.ManagedApplyPlan, bool, error) {
+	if intent.Validate() != nil || candidate.Validate() != nil || now.IsZero() {
+		return helperprotocol.ManagedApplyPlan{}, false, ErrPlanNotFound
+	}
+	intentDigest, err := helperprotocol.Digest(intent)
+	if err != nil {
+		return helperprotocol.ManagedApplyPlan{}, false, err
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	entries, err := os.ReadDir(j.managedPlansDir)
+	if err != nil {
+		return helperprotocol.ManagedApplyPlan{}, false, err
+	}
+	var selected helperprotocol.ManagedApplyPlan
+	var selectedModTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			return helperprotocol.ManagedApplyPlan{}, false, ErrJournalCorrupt
+		}
+		planID := strings.TrimSuffix(entry.Name(), ".json")
+		plan, storedIntent, loadErr := j.loadManagedPlanLocked(planID)
+		if loadErr != nil {
+			return helperprotocol.ManagedApplyPlan{}, false, loadErr
+		}
+		storedDigest, digestErr := helperprotocol.Digest(storedIntent)
+		if digestErr != nil {
+			return helperprotocol.ManagedApplyPlan{}, false, digestErr
+		}
+		if storedDigest != intentDigest || !timeAfter(now, plan.ExpiresAt) || !compatibleManagedPlan(plan, candidate) {
+			continue
+		}
+		info, statErr := entry.Info()
+		if statErr != nil {
+			return helperprotocol.ManagedApplyPlan{}, false, statErr
+		}
+		if selected.HelperPlanID == "" || info.ModTime().Before(selectedModTime) || (info.ModTime().Equal(selectedModTime) && plan.HelperPlanID < selected.HelperPlanID) {
+			selected, selectedModTime = plan, info.ModTime()
+		}
+	}
+	return selected, selected.HelperPlanID != "", nil
+}
+
+func compatibleManagedPlan(stored, candidate helperprotocol.ManagedApplyPlan) bool {
+	stored.HelperPlanID, stored.ExpiresAt = "", ""
+	candidate.HelperPlanID, candidate.ExpiresAt = "", ""
+	return stored == candidate
+}
+
 func (j *Journal) loadManagedPlanLocked(planID string) (helperprotocol.ManagedApplyPlan, helperprotocol.Signed[helperprotocol.ApplyIntent], error) {
 	if !validConfigID(planID) {
 		return helperprotocol.ManagedApplyPlan{}, helperprotocol.Signed[helperprotocol.ApplyIntent]{}, ErrPlanNotFound
