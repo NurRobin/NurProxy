@@ -1,0 +1,61 @@
+import type { Agent, RecoveryDiagnostic, RecoveryOperation } from './types';
+
+export interface RepairAvailability {
+  enabled: boolean;
+  reason?: string;
+}
+
+export function recoveryHistory(operations: RecoveryOperation[], diagnosticID: string): RecoveryOperation[] {
+  return operations.filter((operation) => operation.diagnostic_id === diagnosticID);
+}
+
+export function diagnosticLocation(diagnostic: RecoveryDiagnostic): string | null {
+  for (const path of diagnostic.affected_paths) {
+    const marker = `${path}:`;
+    const offset = diagnostic.evidence.indexOf(marker);
+    if (offset < 0) continue;
+    const suffix = diagnostic.evidence.slice(offset + marker.length);
+    const line = /^(\d+)(?::\d+)?/.exec(suffix)?.[0];
+    if (line) return `${path}:${line}`;
+  }
+  return null;
+}
+
+export function recoveryOperationTerminal(_operation: RecoveryOperation): boolean {
+  return ['diagnosis_only', 'succeeded', 'rolled_back', 'rollback_failed', 'suppressed'].includes(_operation.state);
+}
+
+export function repairAvailability(
+  _agent: Agent,
+  _diagnostic: RecoveryDiagnostic,
+  _operations: RecoveryOperation[],
+): RepairAvailability {
+  if (_diagnostic.hard_change) return { enabled: false, reason: 'hard_change' };
+  if (_diagnostic.ownership !== 'nurproxy') return { enabled: false, reason: 'ownership_not_nurproxy' };
+  if (!_diagnostic.auto_repair_eligible || !_diagnostic.proposed_action) {
+    return { enabled: false, reason: 'not_safe_repair_eligible' };
+  }
+  if (_operations.some((operation) => operation.diagnostic_id === _diagnostic.id && !recoveryOperationTerminal(operation))) {
+    return { enabled: false, reason: 'operation_active' };
+  }
+  if (_agent.status === 'offline' || _agent.status === 'pending') {
+    return { enabled: false, reason: 'agent_disconnected' };
+  }
+  if (!_agent.recovery_capability || _agent.recovery_capability.stage < 1) {
+    return { enabled: false, reason: 'recovery_capability_unavailable' };
+  }
+  if (!_agent.recovery_capability.actions.includes(_diagnostic.proposed_action)) {
+    return { enabled: false, reason: 'action_unsupported' };
+  }
+  return { enabled: true };
+}
+
+export function recoveryErrorCode(error: unknown): string {
+  if (typeof error === 'object' && error !== null && 'data' in error) {
+    const data = error.data;
+    if (typeof data === 'object' && data !== null && 'code' in data && typeof data.code === 'string') {
+      return data.code;
+    }
+  }
+  return 'unknown';
+}

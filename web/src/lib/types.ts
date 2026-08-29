@@ -169,9 +169,74 @@ export interface Agent {
    * Absent in built-in mode or before the first existing-mode beat.
    */
   proxy_permissions?: ProxyPermissions;
+  safe_auto_repair_override?: boolean | null;
+  safe_auto_repair_effective: boolean;
+  recovery_capability?: RecoveryCapability;
   created_at: string;
   updated_at: string;
   servers?: Server[];
+}
+
+export type RecoveryCode =
+  | 'managed_orphan_config' | 'managed_stale_temp' | 'managed_cert_file_missing'
+  | 'managed_runtime_key_missing' | 'managed_runtime_key_mismatch'
+  | 'generated_config_invalid' | 'operator_config_invalid' | 'permission_denied'
+  | 'systemd_sandbox_denied' | 'proxy_reload_failed' | 'proxy_not_running'
+  | 'port_conflict' | 'proxy_binary_missing' | 'unknown_proxy_error';
+
+export type RecoverySeverity = 'info' | 'warning' | 'error' | 'critical';
+export type RecoveryOwnership = 'nurproxy' | 'operator' | 'system' | 'unknown';
+export type RecoveryAction =
+  | 'prune_managed_orphan' | 'remove_managed_temp' | 'rematerialize_cert_bundle'
+  | 'rematerialize_runtime_key' | 'restore_last_live_artifact';
+export type RecoveryOperationState =
+  | 'detected' | 'diagnosis_only' | 'planned' | 'snapshotted' | 'applying'
+  | 'validating' | 'succeeded' | 'rolling_back' | 'rolled_back'
+  | 'rollback_failed' | 'suppressed';
+
+export interface RecoveryCapability {
+  stage: number;
+  actions: RecoveryAction[];
+}
+
+export interface RecoveryDiagnostic {
+  id: string;
+  code: RecoveryCode;
+  subsystem: string;
+  severity: RecoverySeverity;
+  ownership: RecoveryOwnership;
+  summary: string;
+  evidence: string;
+  affected_paths: string[];
+  resource_fingerprint: string;
+  proposed_action: RecoveryAction | '';
+  auto_repair_eligible: boolean;
+  hard_change: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
+  occurrences: number;
+}
+
+export interface RecoveryStep {
+  name: string;
+  summary: string;
+  state: RecoveryOperationState;
+  at: string;
+}
+
+export interface RecoveryOperation {
+  operation_id: string;
+  diagnostic_id: string;
+  action: RecoveryAction;
+  source: 'automatic' | 'user';
+  state: RecoveryOperationState;
+  steps: RecoveryStep[];
+  snapshot_reference: string;
+  validation_outcome: string;
+  rollback_outcome: string;
+  error: string;
+  started_at: string;
+  finished_at?: string | null;
 }
 
 export interface Server {

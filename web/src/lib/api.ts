@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation } from './types';
 
 const BASE = '/api/v1';
 
@@ -134,6 +134,18 @@ export const api = {
     request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
   rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
   deleteAgent: (id: string, cascade = false) => request<{ message: string }>(`/agents/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
+  listRecoveryDiagnostics: (id: string, includeResolved = true) =>
+    request<RecoveryDiagnostic[]>(`/agents/${id}/diagnostics?include_resolved=${includeResolved}`),
+  listRecoveryOperations: (id: string, limit = 50) =>
+    request<RecoveryOperation[]>(`/agents/${id}/repairs?limit=${limit}`),
+  createRecoveryRepair: (id: string, diagnosticId: string, action: RecoveryAction) =>
+    request<RecoveryOperation>(`/agents/${id}/repairs`, {
+      method: 'POST', body: JSON.stringify({ diagnostic_id: diagnosticId, action }),
+    }),
+  setAgentSafeAutoRepair: (id: string, mode: 'inherit' | 'enabled' | 'disabled') =>
+    request<{ mode: string; safe_auto_repair_effective: boolean }>(`/agents/${id}/safe-auto-repair`, {
+      method: 'PUT', body: JSON.stringify({ mode }),
+    }),
 
   // Servers
   listServers: (agentId: string) => request<Server[]>(`/agents/${agentId}/servers`),
