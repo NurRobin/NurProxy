@@ -19,7 +19,10 @@ var (
 	ErrJournalCorrupt  = errors.New("helper journal corrupt")
 	ErrPlanNotFound    = errors.New("helper plan not found")
 	ErrReceiptNotFound = errors.New("helper receipt not found")
+	ErrPlanQuota       = errors.New("helper plan quota exceeded")
 )
+
+const maxStoredPlans = 128
 
 type OperationRecord struct {
 	OperationID            string                        `json:"operation_id"`
@@ -142,10 +145,7 @@ func (j *Journal) StorePlan(plan helperprotocol.HelperPlan) error {
 	}
 	record := planRecord{Plan: plan, Digest: digest}
 	path := filepath.Join(j.plansDir, plan.HelperPlanID+".json")
-	if err := j.writeRecord(path, record, true); err != nil {
-		if !errors.Is(err, fs.ErrExist) {
-			return err
-		}
+	if _, err := os.Lstat(path); err == nil {
 		existing, loadErr := j.loadPlanLocked(plan.HelperPlanID)
 		if loadErr != nil {
 			return loadErr
@@ -154,6 +154,52 @@ func (j *Journal) StorePlan(plan helperprotocol.HelperPlan) error {
 		if digestErr != nil || existingDigest != digest {
 			return ErrRequestConflict
 		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := j.ensurePlanCapacityLocked(time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := j.writeRecord(path, record, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (j *Journal) ensurePlanCapacityLocked(now time.Time) error {
+	entries, err := os.ReadDir(j.plansDir)
+	if err != nil {
+		return err
+	}
+	remaining := 0
+	removed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".json") {
+			return fmt.Errorf("%w: unexpected plan journal entry", ErrJournalCorrupt)
+		}
+		planID := strings.TrimSuffix(name, ".json")
+		plan, err := j.loadPlanLocked(planID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrJournalCorrupt, err)
+		}
+		if !timeAfter(now, plan.ExpiresAt) {
+			if err := os.Remove(filepath.Join(j.plansDir, name)); err != nil {
+				return err
+			}
+			removed = true
+			continue
+		}
+		remaining++
+	}
+	if removed {
+		if err := syncDirectory(j.plansDir); err != nil {
+			return err
+		}
+	}
+	if remaining >= maxStoredPlans {
+		return ErrPlanQuota
 	}
 	return nil
 }

@@ -173,6 +173,10 @@ func (s *Server) writeError(conn net.Conn, requestID string, err error) {
 	case errors.Is(err, ErrPlanNotFound):
 		code = helperprotocol.ErrorHelperPlanNotFound
 		message = "helper-local plan was not found"
+	case errors.Is(err, ErrPlanQuota):
+		code = helperprotocol.ErrorRequestConflict
+		message = "helper plan capacity is temporarily exhausted"
+		retryable = true
 	case errors.Is(err, ErrRequestConflict), errors.Is(err, fs.ErrExist):
 		code = helperprotocol.ErrorRequestConflict
 		message = "request conflicts with durable helper state"

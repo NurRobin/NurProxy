@@ -2,6 +2,7 @@ package helper
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +62,36 @@ func TestJournalPersistsPlansAndRejectsPlanIdentityConflict(t *testing.T) {
 	plan.ExecutionPlanHash = strings.Repeat("d", 64)
 	if err := journal.StorePlan(plan); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("conflicting plan error = %v, want request conflict", err)
+	}
+}
+
+func TestJournalBoundsUnexpiredPlansAndKeepsIdempotentRetry(t *testing.T) {
+	journal := testJournal(t)
+	for i := 0; i < maxStoredPlans; i++ {
+		plan := testPlan()
+		plan.HelperPlanID = fmt.Sprintf("plan-%03d", i)
+		plan.ExpiresAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+		plan.DisplayPlanHash, _ = helperprotocol.DisplayPlanDigest(plan)
+		if err := journal.StorePlan(plan); err != nil {
+			t.Fatalf("store plan %d: %v", i, err)
+		}
+	}
+	retry := testPlan()
+	retry.HelperPlanID = "plan-000"
+	retry.ExpiresAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	retry, err := journal.LoadPlan(retry.HelperPlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.StorePlan(retry); err != nil {
+		t.Fatalf("idempotent retry at quota: %v", err)
+	}
+	overflow := testPlan()
+	overflow.HelperPlanID = "plan-overflow"
+	overflow.ExpiresAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	overflow.DisplayPlanHash, _ = helperprotocol.DisplayPlanDigest(overflow)
+	if err := journal.StorePlan(overflow); !errors.Is(err, ErrPlanQuota) {
+		t.Fatalf("overflow error = %v, want plan quota", err)
 	}
 }
 
