@@ -662,6 +662,42 @@ var migrations = []string{
 	);
 	CREATE UNIQUE INDEX idx_recovery_helper_attestation_key
 		ON recovery_helper_instances(attestation_key_id);
+	CREATE UNIQUE INDEX idx_recovery_helper_agent_instance
+		ON recovery_helper_instances(agent_id, helper_instance_id);
+	`,
+
+	// Migration 28: helper-attested hard-recovery plans and the two independent
+	// confirmation events that authorize an orchestrator-signed execution grant.
+	`
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_helper_agent_instance
+		ON recovery_helper_instances(agent_id, helper_instance_id);
+	CREATE TABLE recovery_execution_plans (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		helper_plan_id TEXT NOT NULL,
+		operation_id TEXT NOT NULL UNIQUE,
+		helper_instance_id TEXT NOT NULL,
+		diagnostic_id TEXT NOT NULL,
+		action TEXT NOT NULL,
+		logical_target TEXT NOT NULL,
+		display_plan_hash TEXT NOT NULL,
+		execution_plan_hash TEXT NOT NULL,
+		resource_fingerprint TEXT NOT NULL,
+		rollback_coverage TEXT NOT NULL,
+		signed_plan TEXT NOT NULL,
+		plan_digest TEXT NOT NULL,
+		received_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		confirmation_1_id TEXT NOT NULL DEFAULT '',
+		confirmation_1_at INTEGER,
+		confirmation_2_id TEXT NOT NULL DEFAULT '',
+		confirmation_2_at INTEGER,
+		signed_grant TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (agent_id, helper_plan_id),
+		FOREIGN KEY (agent_id, helper_instance_id)
+			REFERENCES recovery_helper_instances(agent_id, helper_instance_id)
+	);
+	CREATE INDEX idx_recovery_execution_plans_agent_received
+		ON recovery_execution_plans(agent_id, received_at DESC, helper_plan_id);
 	`,
 }
 
