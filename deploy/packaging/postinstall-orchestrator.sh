@@ -3,14 +3,7 @@
 # with sane defaults, so enable + start it straight away.
 set -e
 
-data_dir=/var/lib/nurproxy
-if [ -r /etc/nurproxy/nurproxy.env ]; then
-  configured_data_dir=$(sed -n 's/^NP_DATA_DIR=//p' /etc/nurproxy/nurproxy.env | tail -n 1)
-  if [ -n "$configured_data_dir" ]; then
-    data_dir=$configured_data_dir
-  fi
-fi
-/usr/bin/nurproxy permissions --data-dir "$data_dir" --systemd-drop-in /etc/systemd/system/nurproxy.service.d/data-dir.conf
+/usr/bin/nurproxy permissions --data-dir /var/lib/nurproxy --environment-file /etc/nurproxy/nurproxy.env --systemd-drop-in /etc/systemd/system/nurproxy.service.d/data-dir.conf
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload

@@ -27,7 +27,7 @@ func TestOrchestratorPostinstallHardensBeforeStarting(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(got)
-	command := "/usr/bin/nurproxy permissions --data-dir \"$data_dir\" --systemd-drop-in /etc/systemd/system/nurproxy.service.d/data-dir.conf"
+	command := "/usr/bin/nurproxy permissions --data-dir /var/lib/nurproxy --environment-file /etc/nurproxy/nurproxy.env --systemd-drop-in /etc/systemd/system/nurproxy.service.d/data-dir.conf"
 	harden := strings.Index(script, command)
 	start := strings.Index(script, "systemctl enable --now nurproxy.service")
 	if harden < 0 || start < 0 || harden > start {
@@ -40,8 +40,13 @@ func TestOrchestratorPostinstallHardensBeforeStarting(t *testing.T) {
 	if strings.Contains(script[harden:harden+lineEnd], "|| true") {
 		t.Fatal("permission migration failure must propagate")
 	}
-	if !strings.Contains(script, "/etc/nurproxy/nurproxy.env") || !strings.Contains(script, "NP_DATA_DIR=") {
-		t.Fatal("postinstall must resolve the configured NP_DATA_DIR")
+	if !strings.Contains(script, "--environment-file /etc/nurproxy/nurproxy.env") {
+		t.Fatal("postinstall must delegate configured NP_DATA_DIR parsing")
+	}
+	for _, unsafe := range []string{"sed ", "source ", ". /etc/nurproxy", "eval "} {
+		if strings.Contains(script, unsafe) {
+			t.Errorf("postinstall parses EnvironmentFile unsafely with %q", unsafe)
+		}
 	}
 	for _, command := range []string{"systemctl daemon-reload || true", "systemctl enable --now nurproxy.service || true", "systemctl try-restart nurproxy.service || true"} {
 		if strings.Contains(script, command) {

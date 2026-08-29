@@ -10,6 +10,7 @@
 package install
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,113 @@ import (
 	"sort"
 	"strings"
 )
+
+func ParseEnvironmentDataDir(r io.Reader) (string, bool, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	var logical string
+	continuing := false
+	var value string
+	found := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		for _, ch := range line {
+			if ch < 0x20 && ch != '\t' {
+				return "", false, fmt.Errorf("EnvironmentFile contains a control character")
+			}
+		}
+		logical += line
+		if hasUnescapedTrailingBackslash(logical) {
+			logical = logical[:len(logical)-1]
+			continuing = true
+			continue
+		}
+		continuing = false
+		parsed, ok, err := parseEnvironmentDataDirLine(logical)
+		logical = ""
+		if err != nil {
+			return "", false, err
+		}
+		if !ok {
+			continue
+		}
+		if found {
+			return "", false, fmt.Errorf("NP_DATA_DIR is defined more than once")
+		}
+		value, found = parsed, true
+	}
+	if err := scanner.Err(); err != nil {
+		return "", false, err
+	}
+	if continuing {
+		return "", false, fmt.Errorf("NP_DATA_DIR has an unterminated continuation")
+	}
+	return value, found, nil
+}
+
+func hasUnescapedTrailingBackslash(s string) bool {
+	count := 0
+	for i := len(s) - 1; i >= 0 && s[i] == '\\'; i-- {
+		count++
+	}
+	return count%2 == 1
+}
+
+func parseEnvironmentDataDirLine(line string) (string, bool, error) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+		return "", false, nil
+	}
+	eq := strings.IndexByte(trimmed, '=')
+	if eq < 0 {
+		if strings.TrimSpace(trimmed) == "NP_DATA_DIR" {
+			return "", true, fmt.Errorf("NP_DATA_DIR is missing =")
+		}
+		return "", false, nil
+	}
+	if strings.TrimSpace(trimmed[:eq]) != "NP_DATA_DIR" {
+		return "", false, nil
+	}
+	raw := strings.TrimSpace(trimmed[eq+1:])
+	if raw == "" {
+		return "", true, fmt.Errorf("NP_DATA_DIR is empty")
+	}
+	quote := byte(0)
+	if raw[0] == '\'' || raw[0] == '"' {
+		quote = raw[0]
+		raw = raw[1:]
+	}
+	var b strings.Builder
+	closed := quote == 0
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if quote != 0 && ch == quote {
+			if strings.TrimSpace(raw[i+1:]) != "" {
+				return "", true, fmt.Errorf("NP_DATA_DIR has trailing characters after quote")
+			}
+			closed = true
+			break
+		}
+		if ch == '\\' && quote != '\'' {
+			i++
+			if i >= len(raw) {
+				return "", true, fmt.Errorf("NP_DATA_DIR has a trailing escape")
+			}
+			ch = raw[i]
+		}
+		if quote == 0 && (ch == '\'' || ch == '"') {
+			return "", true, fmt.Errorf("NP_DATA_DIR has misplaced quoting")
+		}
+		if ch < 0x20 || ch == 0x7f {
+			return "", true, fmt.Errorf("NP_DATA_DIR contains a control character")
+		}
+		b.WriteByte(ch)
+	}
+	if !closed {
+		return "", true, fmt.Errorf("NP_DATA_DIR has an unterminated quote")
+	}
+	return b.String(), true, nil
+}
 
 // AgentProxyWritePaths are the proxy-backend trees the agent must be able to
 // write/reload through ProtectSystem=strict: config under /etc, plus the log,

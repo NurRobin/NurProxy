@@ -7,6 +7,36 @@ import (
 	"testing"
 )
 
+func TestParseEnvironmentDataDirSupportsSystemdQuotingAndEscapes(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{"NP_DATA_DIR=/srv/nurproxy\n", "/srv/nurproxy"},
+		{"NP_DATA_DIR=\"/srv/nurproxy\"\n", "/srv/nurproxy"},
+		{"NP_DATA_DIR='/srv/nurproxy'\n", "/srv/nurproxy"},
+		{"NP_DATA_DIR=\\/srv\\/nurproxy\n", "/srv/nurproxy"},
+		{"# comment\nNP_PORT=8080\n NP_DATA_DIR = \"/srv/nurproxy\" \n", "/srv/nurproxy"},
+	} {
+		got, found, err := ParseEnvironmentDataDir(strings.NewReader(tt.input))
+		if err != nil || !found || got != tt.want {
+			t.Errorf("parse %q = %q,%v,%v want %q,true,nil", tt.input, got, found, err, tt.want)
+		}
+	}
+}
+
+func TestParseEnvironmentDataDirFailsClosed(t *testing.T) {
+	for _, input := range []string{
+		"NP_DATA_DIR=/srv/one\nNP_DATA_DIR=/srv/two\n",
+		"NP_DATA_DIR=\"/srv/unterminated\n",
+		"NP_DATA_DIR=/srv/trailing\\\n",
+		"NP_DATA_DIR=/srv/control\x00name\n",
+		"NP_DATA_DIR='one' trailing\n",
+		"NP_DATA_DIR\n",
+	} {
+		if _, _, err := ParseEnvironmentDataDir(strings.NewReader(input)); err == nil {
+			t.Errorf("accepted malformed input %q", input)
+		}
+	}
+}
+
 func TestRenderDataDirDropInPinsExactWritablePath(t *testing.T) {
 	got, err := RenderDataDirDropIn("/srv/nurproxy")
 	if err != nil {
