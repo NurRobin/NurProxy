@@ -24,7 +24,7 @@ const (
 	MaxArgBytes               = 1024
 	MaxArgvBytes              = 8 << 10
 	MaxSnapshotChunks         = 64
-	MaxChunkBytes             = 256 << 10
+	MaxChunkBytes             = 3 << 20
 	MaxAssembledSnapshotBytes = 8 << 20
 	MaxActionTimeoutSeconds   = 300
 	MaxPlanLifetime           = 5 * time.Minute
@@ -89,6 +89,7 @@ type RollbackResult string
 
 const (
 	RollbackNotNeeded RollbackResult = "not_needed"
+	RollbackPending   RollbackResult = "pending"
 	RollbackSucceeded RollbackResult = "succeeded"
 	RollbackFailed    RollbackResult = "failed"
 )
@@ -96,9 +97,10 @@ const (
 type CleanupOutcome string
 
 const (
-	CleanupRemoved   CleanupOutcome = "removed"
-	CleanupPreserved CleanupOutcome = "operator_replacement_preserved"
-	CleanupFailed    CleanupOutcome = "failed"
+	CleanupRemoved        CleanupOutcome = "removed"
+	CleanupPreserved      CleanupOutcome = "operator_replacement_preserved"
+	CleanupFailed         CleanupOutcome = "failed"
+	CleanupOutcomePending CleanupOutcome = "pending"
 )
 
 type CleanupPhase string
@@ -163,14 +165,12 @@ type CleanupIntent struct {
 }
 
 type ExportInventory struct {
-	Revision       uint64              `json:"revision"`
-	ChunkIndex     int                 `json:"chunk_index"`
-	ChunkCount     int                 `json:"chunk_count"`
-	ChunkBytes     int                 `json:"chunk_bytes,omitempty"`
-	AssembledBytes int                 `json:"assembled_bytes,omitempty"`
-	Exports        []CertificateExport `json:"exports,omitempty"`
-	Keep           []string            `json:"keep,omitempty"`
-	Cleanup        []CleanupIntent     `json:"cleanup,omitempty"`
+	Revision   uint64              `json:"revision"`
+	ChunkIndex int                 `json:"chunk_index"`
+	ChunkCount int                 `json:"chunk_count"`
+	Exports    []CertificateExport `json:"exports,omitempty"`
+	Keep       []string            `json:"keep,omitempty"`
+	Cleanup    []CleanupIntent     `json:"cleanup,omitempty"`
 }
 
 type CertificateMaterial struct {
@@ -263,7 +263,7 @@ type ExportPlanResult struct {
 }
 
 func (e CertificateExport) Validate() error {
-	if err := boundedText("export ID", e.ID, 1, maxIDBytes); err != nil {
+	if err := exportID("export ID", e.ID); err != nil {
 		return err
 	}
 	if err := boundedText("export name", e.Name, 1, maxNameBytes); err != nil {
@@ -373,15 +373,20 @@ func (i ExportInventory) Validate() error {
 	if i.ChunkCount < 1 || i.ChunkCount > MaxSnapshotChunks || i.ChunkIndex < 0 || i.ChunkIndex >= i.ChunkCount {
 		return fmt.Errorf("invalid chunk coordinates")
 	}
-	if i.ChunkBytes < 0 || i.ChunkBytes > MaxChunkBytes {
-		return fmt.Errorf("inventory chunk exceeds limit")
+	actualBytes, err := InventorySerializedBytes(i)
+	if err != nil {
+		return err
 	}
-	if i.AssembledBytes < 0 || i.AssembledBytes > MaxAssembledSnapshotBytes {
-		return fmt.Errorf("assembled snapshot exceeds limit")
+	if actualBytes > MaxChunkBytes {
+		return fmt.Errorf("inventory chunk exceeds limit")
 	}
 	if len(i.Exports) > MaxExportsPerSnapshot || len(i.Keep) > MaxExportsPerSnapshot || len(i.Cleanup) > MaxExportsPerSnapshot {
 		return fmt.Errorf("export inventory exceeds limit")
 	}
+	return i.validatePayload()
+}
+
+func (i ExportInventory) validatePayload() error {
 	ids, paths := map[string]struct{}{}, map[string]string{}
 	for n, export := range i.Exports {
 		if err := export.Validate(); err != nil {
@@ -400,7 +405,7 @@ func (i ExportInventory) Validate() error {
 	}
 	seenKeep := map[string]struct{}{}
 	for _, id := range i.Keep {
-		if err := boundedText("keep export ID", id, 1, maxIDBytes); err != nil {
+		if err := exportID("keep export ID", id); err != nil {
 			return err
 		}
 		if _, exists := seenKeep[id]; exists {
@@ -419,9 +424,26 @@ func (i ExportInventory) Validate() error {
 		if _, exists := ids[cleanup.ExportID]; exists {
 			return fmt.Errorf("export %q is both desired and cleanup", cleanup.ExportID)
 		}
+		if _, exists := seenKeep[cleanup.ExportID]; exists {
+			return fmt.Errorf("export %q is both kept and cleanup", cleanup.ExportID)
+		}
+		for _, destination := range cleanup.Destinations {
+			if previous, exists := paths[destination.Path]; exists {
+				return fmt.Errorf("cleanup destination path %q conflicts with export %q", destination.Path, previous)
+			}
+			paths[destination.Path] = cleanup.ExportID
+		}
 		seenCleanup[cleanup.ExportID] = struct{}{}
 	}
 	return nil
+}
+
+func InventorySerializedBytes(inventory ExportInventory) (int, error) {
+	raw, err := json.Marshal(inventory)
+	if err != nil {
+		return 0, fmt.Errorf("encode inventory payload: %w", err)
+	}
+	return len(raw), nil
 }
 
 func ValidateInventoryChunks(chunks []ExportInventory) error {
@@ -441,10 +463,14 @@ func ValidateInventoryChunks(chunks []ExportInventory) error {
 		if chunk.ChunkIndex != index {
 			return fmt.Errorf("inventory chunks are missing or reordered")
 		}
-		if chunk.Revision != first.Revision || chunk.ChunkCount != first.ChunkCount || chunk.AssembledBytes != first.AssembledBytes {
+		if chunk.Revision != first.Revision || chunk.ChunkCount != first.ChunkCount {
 			return fmt.Errorf("inventory chunk metadata mismatch")
 		}
-		totalBytes += chunk.ChunkBytes
+		serializedBytes, err := InventorySerializedBytes(chunk)
+		if err != nil {
+			return err
+		}
+		totalBytes += serializedBytes
 		if totalBytes > MaxAssembledSnapshotBytes {
 			return fmt.Errorf("assembled inventory exceeds limit")
 		}
@@ -452,14 +478,11 @@ func ValidateInventoryChunks(chunks []ExportInventory) error {
 		combined.Keep = append(combined.Keep, chunk.Keep...)
 		combined.Cleanup = append(combined.Cleanup, chunk.Cleanup...)
 	}
-	if first.AssembledBytes != 0 && totalBytes != first.AssembledBytes {
-		return fmt.Errorf("assembled inventory size mismatch")
-	}
-	return combined.Validate()
+	return combined.validatePayload()
 }
 
 func (c CleanupIntent) Validate() error {
-	if err := boundedText("cleanup export ID", c.ExportID, 1, maxIDBytes); err != nil {
+	if err := exportID("cleanup export ID", c.ExportID); err != nil {
 		return err
 	}
 	if err := canonicalHost(c.CertificateHost); err != nil {
@@ -468,18 +491,23 @@ func (c CleanupIntent) Validate() error {
 	if err := requiredFingerprint(c.DesiredFingerprint); err != nil {
 		return err
 	}
-	if c.Revision == 0 || !c.Mode.valid() || len(c.Destinations) > MaxDestinationsPerExport {
+	if c.Revision == 0 || !c.Mode.valid() || len(c.Destinations) == 0 || len(c.Destinations) > MaxDestinationsPerExport {
 		return fmt.Errorf("invalid cleanup intent")
 	}
-	seen := map[string]struct{}{}
+	seenPaths := map[string]struct{}{}
+	seenKinds := map[DestinationKind]struct{}{}
 	for _, destination := range c.Destinations {
 		if err := destination.Validate(); err != nil {
 			return err
 		}
-		if _, exists := seen[destination.Path]; exists {
+		if _, exists := seenPaths[destination.Path]; exists {
 			return fmt.Errorf("duplicate cleanup destination")
 		}
-		seen[destination.Path] = struct{}{}
+		if _, exists := seenKinds[destination.Kind]; exists {
+			return fmt.Errorf("duplicate cleanup destination kind")
+		}
+		seenPaths[destination.Path] = struct{}{}
+		seenKinds[destination.Kind] = struct{}{}
 	}
 	return nil
 }
@@ -489,7 +517,16 @@ func ValidateCertificateMaterials(materials []CertificateMaterial) error {
 		return fmt.Errorf("too many certificate bundles")
 	}
 	hosts := map[string]struct{}{}
-	total := 0
+	raw, err := json.Marshal(materials)
+	if err != nil {
+		return fmt.Errorf("encode certificate bundles: %w", err)
+	}
+	if len(raw) > MaxAssembledSnapshotBytes {
+		return fmt.Errorf("aggregate certificate material exceeds bound")
+	}
+	if len(raw) > MaxChunkBytes {
+		return fmt.Errorf("certificate bundles exceed one wire chunk")
+	}
 	for i, material := range materials {
 		if err := canonicalHost(material.Host); err != nil {
 			return fmt.Errorf("certificate bundle %d: %w", i, err)
@@ -501,16 +538,16 @@ func ValidateCertificateMaterials(materials []CertificateMaterial) error {
 		if len(material.CertPEM) == 0 || len(material.KeyPEM) == 0 || len(material.CertPEM) > MaxPEMBytes || len(material.KeyPEM) > MaxPEMBytes {
 			return fmt.Errorf("certificate material exceeds bounds")
 		}
-		total += len(material.CertPEM) + len(material.KeyPEM)
-		if total > MaxAssembledSnapshotBytes {
-			return fmt.Errorf("aggregate certificate material exceeds bound")
+		encoded, err := json.Marshal(material)
+		if err != nil || len(encoded) > MaxChunkBytes {
+			return fmt.Errorf("certificate bundle %d exceeds chunk bound", i)
 		}
 	}
 	return nil
 }
 
 func (s ExportStatus) Validate() error {
-	if err := boundedText("export ID", s.ExportID, 1, maxIDBytes); err != nil {
+	if err := exportID("export ID", s.ExportID); err != nil {
 		return err
 	}
 	if !s.Health.valid() {
@@ -529,7 +566,7 @@ func (d ExportDeployment) Validate() error {
 	if err := boundedText("deployment ID", d.DeploymentID, 1, maxIDBytes); err != nil {
 		return err
 	}
-	if err := boundedText("export ID", d.ExportID, 1, maxIDBytes); err != nil {
+	if err := exportID("export ID", d.ExportID); err != nil {
 		return err
 	}
 	if err := requiredFingerprint(d.DesiredFingerprint); err != nil {
@@ -541,11 +578,36 @@ func (d ExportDeployment) Validate() error {
 	if !d.Phase.valid() || !d.Rollback.valid() {
 		return fmt.Errorf("invalid deployment phase or rollback result")
 	}
-	return optionalCode(d.ErrorCode)
+	if err := optionalCode(d.ErrorCode); err != nil {
+		return err
+	}
+	switch d.Phase {
+	case DeploymentPlanned, DeploymentValidating, DeploymentApplying:
+		if d.AppliedFingerprint != "" || d.Rollback != RollbackNotNeeded || d.ErrorCode != "" {
+			return fmt.Errorf("in-progress deployment contains terminal state")
+		}
+	case DeploymentSucceeded:
+		if d.AppliedFingerprint != d.DesiredFingerprint || d.Rollback != RollbackNotNeeded || d.ErrorCode != "" {
+			return fmt.Errorf("invalid succeeded deployment state")
+		}
+	case DeploymentRollingBack:
+		if d.Rollback != RollbackPending || d.ErrorCode == "" {
+			return fmt.Errorf("invalid rolling-back deployment state")
+		}
+	case DeploymentRolledBack:
+		if d.AppliedFingerprint == "" || d.Rollback != RollbackSucceeded || d.ErrorCode == "" {
+			return fmt.Errorf("invalid rolled-back deployment state")
+		}
+	case DeploymentFailed:
+		if d.ErrorCode == "" || (d.Rollback != RollbackNotNeeded && d.Rollback != RollbackFailed) {
+			return fmt.Errorf("invalid failed deployment state")
+		}
+	}
+	return nil
 }
 
 func (c CleanupAcknowledgement) Validate() error {
-	if err := boundedText("export ID", c.ExportID, 1, maxIDBytes); err != nil {
+	if err := exportID("export ID", c.ExportID); err != nil {
 		return err
 	}
 	if err := requiredFingerprint(c.DesiredFingerprint); err != nil {
@@ -554,7 +616,24 @@ func (c CleanupAcknowledgement) Validate() error {
 	if c.Revision == 0 || !c.Phase.valid() || !c.Outcome.valid() || !c.Rollback.valid() {
 		return fmt.Errorf("invalid cleanup acknowledgement")
 	}
-	return optionalCode(c.ErrorCode)
+	if err := optionalCode(c.ErrorCode); err != nil {
+		return err
+	}
+	switch c.Phase {
+	case CleanupPending, CleanupApplying:
+		if c.Outcome != CleanupOutcomePending || c.Rollback != RollbackNotNeeded || c.ErrorCode != "" {
+			return fmt.Errorf("invalid in-progress cleanup state")
+		}
+	case CleanupCompleted:
+		if (c.Outcome != CleanupRemoved && c.Outcome != CleanupPreserved) || c.Rollback != RollbackNotNeeded || c.ErrorCode != "" {
+			return fmt.Errorf("invalid completed cleanup state")
+		}
+	case CleanupPhaseFailed:
+		if c.Outcome != CleanupFailed || c.ErrorCode == "" || (c.Rollback != RollbackNotNeeded && c.Rollback != RollbackSucceeded && c.Rollback != RollbackFailed) {
+			return fmt.Errorf("invalid failed cleanup state")
+		}
+	}
+	return nil
 }
 
 func (c AgentCapabilities) Validate() error {
@@ -612,7 +691,7 @@ func (r ExportPlanResult) ValidateAt(now time.Time) error {
 	if err := boundedText("request ID", r.RequestID, 1, maxIDBytes); err != nil {
 		return err
 	}
-	if err := boundedText("export ID", r.ExportID, 1, maxIDBytes); err != nil {
+	if err := exportID("export ID", r.ExportID); err != nil {
 		return err
 	}
 	if err := requiredFingerprint(r.SpecHash); err != nil {
@@ -746,10 +825,10 @@ func (v DeploymentPhase) valid() bool {
 	return v == DeploymentPlanned || v == DeploymentValidating || v == DeploymentApplying || v == DeploymentSucceeded || v == DeploymentRollingBack || v == DeploymentRolledBack || v == DeploymentFailed
 }
 func (v RollbackResult) valid() bool {
-	return v == RollbackNotNeeded || v == RollbackSucceeded || v == RollbackFailed
+	return v == RollbackNotNeeded || v == RollbackPending || v == RollbackSucceeded || v == RollbackFailed
 }
 func (v CleanupOutcome) valid() bool {
-	return v == CleanupRemoved || v == CleanupPreserved || v == CleanupFailed
+	return v == CleanupOutcomePending || v == CleanupRemoved || v == CleanupPreserved || v == CleanupFailed
 }
 func (v CleanupPhase) valid() bool {
 	return v == CleanupPending || v == CleanupApplying || v == CleanupCompleted || v == CleanupPhaseFailed
@@ -763,6 +842,7 @@ func (v Capability) valid() bool {
 }
 
 var identityPattern = regexp.MustCompile(`^(?:[A-Za-z_][A-Za-z0-9_.-]*|[0-9]+)$`)
+var exportIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 var servicePattern = regexp.MustCompile(`^[A-Za-z0-9_.@:-]+\.service$`)
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var codePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,95}$`)
@@ -775,6 +855,12 @@ func boundedText(name, value string, min, max int) error {
 		if unicode.IsControl(r) {
 			return fmt.Errorf("%s contains control characters", name)
 		}
+	}
+	return nil
+}
+func exportID(name, value string) error {
+	if !exportIDPattern.MatchString(value) {
+		return fmt.Errorf("%s must use the path-safe export ID format", name)
 	}
 	return nil
 }

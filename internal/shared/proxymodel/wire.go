@@ -1,6 +1,7 @@
 package proxymodel
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/NurRobin/NurProxy/internal/shared/certmodel"
@@ -122,6 +123,9 @@ type IntentSet struct {
 }
 
 func (s IntentSet) Validate() error {
+	if err := validateCertificateExportWireSize(s); err != nil {
+		return err
+	}
 	if len(s.Certs) > certmodel.MaxCertificateBundles {
 		return fmt.Errorf("too many certificate bundles")
 	}
@@ -200,6 +204,9 @@ type ApplyAck struct {
 }
 
 func (a ApplyAck) Validate() error {
+	if err := validateCertificateExportWireSize(a); err != nil {
+		return err
+	}
 	if len(a.ExportDeployments) > certmodel.MaxExportsPerSnapshot || len(a.ExportCleanups) > certmodel.MaxExportsPerSnapshot {
 		return fmt.Errorf("certificate export acknowledgements exceed bounds")
 	}
@@ -214,15 +221,27 @@ func (a ApplyAck) Validate() error {
 		}
 		seenDeployments[key] = struct{}{}
 	}
-	seenCleanups := map[string]uint64{}
+	seenCleanups := map[string]struct{}{}
 	for i, cleanup := range a.ExportCleanups {
 		if err := cleanup.Validate(); err != nil {
 			return fmt.Errorf("export cleanup %d: %w", i, err)
 		}
-		if revision, exists := seenCleanups[cleanup.ExportID]; exists && revision == cleanup.Revision {
+		key := fmt.Sprintf("%s\x00%d", cleanup.ExportID, cleanup.Revision)
+		if _, exists := seenCleanups[key]; exists {
 			return fmt.Errorf("duplicate export cleanup acknowledgement")
 		}
-		seenCleanups[cleanup.ExportID] = cleanup.Revision
+		seenCleanups[key] = struct{}{}
+	}
+	return nil
+}
+
+func validateCertificateExportWireSize(value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("encode certificate export wire event: %w", err)
+	}
+	if len(raw) > certmodel.MaxAssembledSnapshotBytes {
+		return fmt.Errorf("certificate export wire event exceeds limit")
 	}
 	return nil
 }

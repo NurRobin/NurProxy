@@ -2,6 +2,7 @@ package certmodel
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,8 @@ func TestCertificateExportRejectsUnsafeInput(t *testing.T) {
 		{"duplicate destination path", func(e *CertificateExport) { e.Destinations[1].Path = e.Destinations[0].Path }},
 		{"bad public mode", func(e *CertificateExport) { e.Permissions.PublicMode = "07777" }},
 		{"control character", func(e *CertificateExport) { e.Name = "mail\ncert" }},
+		{"traversal export ID", func(e *CertificateExport) { e.ID = "../../mail" }},
+		{"slash export ID", func(e *CertificateExport) { e.ID = "mail/cert" }},
 		{"relative executable", func(e *CertificateExport) {
 			e.Action = PostDeployAction{Kind: ActionCommand, Argv: []string{"bin/reload"}, TimeoutSeconds: 10}
 		}},
@@ -47,6 +50,42 @@ func TestCertificateExportRejectsUnsafeInput(t *testing.T) {
 				t.Fatal("Validate succeeded")
 			}
 		})
+	}
+}
+
+func TestInventorySizesAreDerivedFromSerializedPayload(t *testing.T) {
+	chunk := ExportInventory{Revision: 9, ChunkIndex: 0, ChunkCount: 1, Keep: []string{"exp-1"}}
+	serializedBytes, err := InventorySerializedBytes(chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serializedBytes == 0 {
+		t.Fatal("serialized inventory size is zero")
+	}
+	if err := chunk.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	var decoded ExportInventory
+	if err := DecodeStrict([]byte(`{"revision":9,"chunk_index":0,"chunk_count":1,"chunk_bytes":1}`), &decoded); err == nil {
+		t.Fatal("self-reported chunk size field accepted")
+	}
+}
+
+func TestCertificateMaterialsUseActualSerializedBound(t *testing.T) {
+	material := CertificateMaterial{Host: "mail.example.com", CertPEM: strings.Repeat("c", MaxPEMBytes), KeyPEM: strings.Repeat("k", MaxPEMBytes)}
+	if err := ValidateCertificateMaterials([]CertificateMaterial{material}); err != nil {
+		t.Fatalf("one maximum-sized bundle should fit one wire chunk: %v", err)
+	}
+	two := []CertificateMaterial{material, {Host: "mail2.example.com", CertPEM: material.CertPEM, KeyPEM: material.KeyPEM}}
+	if err := ValidateCertificateMaterials(two); err == nil {
+		t.Fatal("certificate bundles above one serialized wire chunk accepted")
+	}
+	many := make([]CertificateMaterial, 5)
+	for i := range many {
+		many[i] = CertificateMaterial{Host: fmt.Sprintf("mail%d.example.com", i), CertPEM: strings.Repeat("c", MaxPEMBytes), KeyPEM: strings.Repeat("k", MaxPEMBytes)}
+	}
+	if err := ValidateCertificateMaterials(many); err == nil {
+		t.Fatal("serialized certificate material above assembled bound accepted")
 	}
 }
 
@@ -92,10 +131,6 @@ func TestExportAggregateBoundsAndDuplicates(t *testing.T) {
 	if err := inv.Validate(); err == nil {
 		t.Fatal("too many chunks accepted")
 	}
-	inv = ExportInventory{Revision: 1, ChunkIndex: 0, ChunkCount: 1, ChunkBytes: MaxChunkBytes + 1}
-	if err := inv.Validate(); err == nil {
-		t.Fatal("oversized chunk accepted")
-	}
 	tooMany := make([]CertificateExport, MaxExportsPerSnapshot+1)
 	inv = ExportInventory{Revision: 1, ChunkIndex: 0, ChunkCount: 1, Exports: tooMany}
 	if err := inv.Validate(); err == nil {
@@ -105,8 +140,8 @@ func TestExportAggregateBoundsAndDuplicates(t *testing.T) {
 
 func TestInventoryChunkSetRejectsIncompleteReorderedOrMismatchedSnapshots(t *testing.T) {
 	valid := []ExportInventory{
-		{Revision: 7, ChunkIndex: 0, ChunkCount: 2, ChunkBytes: 10, AssembledBytes: 20},
-		{Revision: 7, ChunkIndex: 1, ChunkCount: 2, ChunkBytes: 10, AssembledBytes: 20},
+		{Revision: 7, ChunkIndex: 0, ChunkCount: 2},
+		{Revision: 7, ChunkIndex: 1, ChunkCount: 2},
 	}
 	if err := ValidateInventoryChunks(valid); err != nil {
 		t.Fatalf("valid chunks rejected: %v", err)
@@ -114,8 +149,8 @@ func TestInventoryChunkSetRejectsIncompleteReorderedOrMismatchedSnapshots(t *tes
 	for name, chunks := range map[string][]ExportInventory{
 		"incomplete":  valid[:1],
 		"reordered":   {valid[1], valid[0]},
-		"revision":    {valid[0], {Revision: 8, ChunkIndex: 1, ChunkCount: 2, ChunkBytes: 10, AssembledBytes: 20}},
-		"total bytes": {valid[0], {Revision: 7, ChunkIndex: 1, ChunkCount: 2, ChunkBytes: 10, AssembledBytes: 21}},
+		"revision":    {valid[0], {Revision: 8, ChunkIndex: 1, ChunkCount: 2}},
+		"chunk count": {valid[0], {Revision: 7, ChunkIndex: 1, ChunkCount: 3}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateInventoryChunks(chunks); err == nil {
@@ -188,7 +223,7 @@ func TestCapabilityNegotiationFailsClosedForLegacyPeers(t *testing.T) {
 func TestStatusAndHistoryNeverSerializePrivateMaterial(t *testing.T) {
 	values := []any{
 		ExportStatus{ExportID: "exp-1", Health: HealthHealthy, DesiredFingerprint: strings.Repeat("a", 64), AppliedFingerprint: strings.Repeat("a", 64)},
-		ExportDeployment{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: strings.Repeat("a", 64), Phase: DeploymentSucceeded, Rollback: RollbackNotNeeded},
+		ExportDeployment{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: strings.Repeat("a", 64), AppliedFingerprint: strings.Repeat("a", 64), Phase: DeploymentSucceeded, Rollback: RollbackNotNeeded},
 		CleanupAcknowledgement{ExportID: "exp-1", Revision: 2, DesiredFingerprint: strings.Repeat("a", 64), Phase: CleanupCompleted, Outcome: CleanupRemoved, Rollback: RollbackNotNeeded},
 	}
 	for _, value := range values {
@@ -240,5 +275,81 @@ func TestCleanupIntentRetainsCertificateIdentity(t *testing.T) {
 	intent.CertificateHost = "MAIL.example.com"
 	if err := intent.Validate(); err == nil {
 		t.Fatal("non-canonical cleanup host accepted")
+	}
+}
+
+func TestCleanupInventoryRejectsContradictions(t *testing.T) {
+	active := validExport()
+	cleanup := CleanupIntent{ExportID: "old-1", Revision: 2, CertificateHost: "mail.example.com", DesiredFingerprint: strings.Repeat("a", 64), Mode: ExportModeSymlink, Destinations: []Destination{{Kind: DestinationCert, Path: "/etc/old/cert.pem"}}}
+	cases := map[string]func(*ExportInventory){
+		"empty cleanup": func(i *ExportInventory) { i.Cleanup[0].Destinations = nil },
+		"duplicate kind": func(i *ExportInventory) {
+			i.Cleanup[0].Destinations = append(i.Cleanup[0].Destinations, Destination{Kind: DestinationCert, Path: "/etc/old/other.pem"})
+		},
+		"active path":     func(i *ExportInventory) { i.Cleanup[0].Destinations[0].Path = active.Destinations[0].Path },
+		"keep cleanup ID": func(i *ExportInventory) { i.Keep = append(i.Keep, cleanup.ExportID) },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			inventory := ExportInventory{Revision: 3, ChunkIndex: 0, ChunkCount: 1, Exports: []CertificateExport{active}, Keep: []string{active.ID}, Cleanup: []CleanupIntent{cleanup}}
+			mutate(&inventory)
+			if err := inventory.validatePayload(); err == nil {
+				t.Fatal("contradictory inventory accepted")
+			}
+		})
+	}
+}
+
+func TestDeploymentStateMatrix(t *testing.T) {
+	fp := strings.Repeat("a", 64)
+	valid := []ExportDeployment{
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, Phase: DeploymentApplying, Rollback: RollbackNotNeeded},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, AppliedFingerprint: fp, Phase: DeploymentSucceeded, Rollback: RollbackNotNeeded},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, Phase: DeploymentRollingBack, Rollback: RollbackPending, ErrorCode: "hook_failed"},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, AppliedFingerprint: strings.Repeat("b", 64), Phase: DeploymentRolledBack, Rollback: RollbackSucceeded, ErrorCode: "hook_failed"},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, Phase: DeploymentFailed, Rollback: RollbackFailed, ErrorCode: "rollback_failed"},
+	}
+	for _, deployment := range valid {
+		if err := deployment.Validate(); err != nil {
+			t.Fatalf("valid state rejected: %#v: %v", deployment, err)
+		}
+	}
+	invalid := []ExportDeployment{
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, Phase: DeploymentSucceeded, Rollback: RollbackNotNeeded},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, AppliedFingerprint: fp, Phase: DeploymentSucceeded, Rollback: RollbackNotNeeded, ErrorCode: "unexpected"},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, Phase: DeploymentApplying, Rollback: RollbackFailed},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, Phase: DeploymentFailed, Rollback: RollbackFailed},
+		{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: fp, Phase: DeploymentRolledBack, Rollback: RollbackSucceeded, ErrorCode: "hook_failed"},
+	}
+	for _, deployment := range invalid {
+		if err := deployment.Validate(); err == nil {
+			t.Fatalf("invalid state accepted: %#v", deployment)
+		}
+	}
+}
+
+func TestCleanupStateMatrix(t *testing.T) {
+	fp := strings.Repeat("a", 64)
+	valid := []CleanupAcknowledgement{
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupPending, Outcome: CleanupOutcomePending, Rollback: RollbackNotNeeded},
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupCompleted, Outcome: CleanupRemoved, Rollback: RollbackNotNeeded},
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupPhaseFailed, Outcome: CleanupFailed, Rollback: RollbackFailed, ErrorCode: "rollback_failed"},
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupPhaseFailed, Outcome: CleanupFailed, Rollback: RollbackSucceeded, ErrorCode: "cleanup_failed"},
+	}
+	for _, ack := range valid {
+		if err := ack.Validate(); err != nil {
+			t.Fatalf("valid state rejected: %#v: %v", ack, err)
+		}
+	}
+	invalid := []CleanupAcknowledgement{
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupPending, Outcome: CleanupRemoved, Rollback: RollbackNotNeeded},
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupCompleted, Outcome: CleanupFailed, Rollback: RollbackNotNeeded},
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupPhaseFailed, Outcome: CleanupFailed, Rollback: RollbackFailed},
+		{ExportID: "exp-1", Revision: 2, DesiredFingerprint: fp, Phase: CleanupCompleted, Outcome: CleanupRemoved, Rollback: RollbackSucceeded},
+	}
+	for _, ack := range invalid {
+		if err := ack.Validate(); err == nil {
+			t.Fatalf("invalid state accepted: %#v", ack)
+		}
 	}
 }

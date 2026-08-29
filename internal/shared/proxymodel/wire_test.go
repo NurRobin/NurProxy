@@ -84,7 +84,7 @@ func TestCertificateExportWireInventoryAndAcknowledgements(t *testing.T) {
 	}
 
 	ack := ApplyAck{
-		ExportDeployments: []certmodel.ExportDeployment{{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: strings.Repeat("a", 64), Phase: certmodel.DeploymentSucceeded, Rollback: certmodel.RollbackNotNeeded}},
+		ExportDeployments: []certmodel.ExportDeployment{{DeploymentID: "dep-1", ExportID: "exp-1", DesiredFingerprint: strings.Repeat("a", 64), AppliedFingerprint: strings.Repeat("a", 64), Phase: certmodel.DeploymentSucceeded, Rollback: certmodel.RollbackNotNeeded}},
 		ExportCleanups:    []certmodel.CleanupAcknowledgement{{ExportID: "exp-1", Revision: 2, DesiredFingerprint: strings.Repeat("a", 64), Phase: certmodel.CleanupCompleted, Outcome: certmodel.CleanupRemoved, Rollback: certmodel.RollbackNotNeeded}},
 	}
 	raw, err = json.Marshal(ack)
@@ -105,6 +105,28 @@ func TestCertificateExportWireStrictlyRejectsUnknownAndInvalidInventory(t *testi
 		if err := certmodel.DecodeStrict([]byte(raw), &set); err == nil {
 			t.Fatalf("accepted %s", raw)
 		}
+	}
+}
+
+func TestApplyAckCleanupDedupeUsesFullCompositeKey(t *testing.T) {
+	fp := strings.Repeat("a", 64)
+	cleanup := func(id string, revision uint64) certmodel.CleanupAcknowledgement {
+		return certmodel.CleanupAcknowledgement{ExportID: id, Revision: revision, DesiredFingerprint: fp, Phase: certmodel.CleanupCompleted, Outcome: certmodel.CleanupRemoved, Rollback: certmodel.RollbackNotNeeded}
+	}
+	ack := ApplyAck{ExportCleanups: []certmodel.CleanupAcknowledgement{cleanup("exp-1", 1), cleanup("exp-1", 2), cleanup("exp-1", 1)}}
+	if err := ack.Validate(); err == nil {
+		t.Fatal("non-adjacent duplicate cleanup composite key accepted")
+	}
+}
+
+func TestCertificateExportWireEnforcesActualTotalEventSize(t *testing.T) {
+	set := IntentSet{Keep: []string{strings.Repeat("x", certmodel.MaxAssembledSnapshotBytes+1)}}
+	if err := set.Validate(); err == nil {
+		t.Fatal("oversized serialized intent event accepted")
+	}
+	ack := ApplyAck{Reports: []ArtifactReport{{Content: strings.Repeat("x", certmodel.MaxAssembledSnapshotBytes+1)}}}
+	if err := ack.Validate(); err == nil {
+		t.Fatal("oversized serialized acknowledgement event accepted")
 	}
 }
 
