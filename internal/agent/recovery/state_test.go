@@ -1,6 +1,9 @@
 package recovery
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +19,37 @@ func TestTransitionRejectsSkippedOrStaleState(t *testing.T) {
 	}
 	if ValidTransition(recoverymodel.OperationStateSucceeded, recoverymodel.OperationStateApplying) {
 		t.Fatal("terminal state reopened")
+	}
+}
+
+func TestConcurrentConflictingTransitionsHaveOneWinner(t *testing.T) {
+	for attempt := 0; attempt < 40; attempt++ {
+		store, err := NewSnapshotStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := fmt.Sprintf("op-concurrent-%d", attempt)
+		if err := persistTestManifest(store, id, recoverymodel.OperationStateApplying, testTime()); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var successes atomic.Int32
+		for _, next := range []recoverymodel.OperationState{recoverymodel.OperationStateValidating, recoverymodel.OperationStateRollingBack} {
+			wg.Add(1)
+			go func(next recoverymodel.OperationState) {
+				defer wg.Done()
+				<-start
+				if _, err := store.Transition(id, recoverymodel.OperationStateApplying, next, testTime()); err == nil {
+					successes.Add(1)
+				}
+			}(next)
+		}
+		close(start)
+		wg.Wait()
+		if successes.Load() != 1 {
+			t.Fatalf("attempt %d had %d successful conflicting transitions", attempt, successes.Load())
+		}
 	}
 }
 

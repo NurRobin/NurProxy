@@ -53,6 +53,9 @@ func TestSnapshotAndRollbackPreserveRegularAbsentAndSymlinkState(t *testing.T) {
 	if err := os.Symlink("absent.conf", link); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.Transition("op-1", recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Rollback("op-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +71,57 @@ func TestSnapshotAndRollbackPreserveRegularAbsentAndSymlinkState(t *testing.T) {
 	gotTarget, err := os.Readlink(link)
 	if err != nil || gotTarget != "target.conf" {
 		t.Fatalf("symlink target = %q, %v", gotTarget, err)
+	}
+}
+
+func TestSnapshotSourceReadIsBoundToValidatedFile(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	mustMkdir(t, managed, 0o700)
+	path, external := filepath.Join(managed, "config"), filepath.Join(root, "external")
+	mustWrite(t, path, []byte("managed"), 0o600)
+	mustWrite(t, external, []byte("outside"), 0o600)
+	guard, _ := NewPathGuard(managed)
+	checked := resolveAll(t, guard, path)[0]
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readValidatedSource(checked); err == nil {
+		t.Fatal("validated source read followed replacement symlink")
+	}
+}
+
+func TestSnapshotStoreRemainsBoundWhenOperationsPathIsSwapped(t *testing.T) {
+	root := t.TempDir()
+	data, managed := filepath.Join(root, "data"), filepath.Join(root, "managed")
+	mustMkdir(t, managed, 0o700)
+	path := filepath.Join(managed, "config")
+	mustWrite(t, path, []byte("managed"), 0o600)
+	guard, _ := NewPathGuard(managed)
+	store, err := NewSnapshotStore(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(root, "original-operations")
+	if err := os.Rename(store.operationsDir, original); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(root, "external-operations")
+	mustMkdir(t, external, 0o700)
+	if err := os.Symlink(external, store.operationsDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create("op-bound", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, path), testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(original, "op-bound", manifestFilename)); err != nil {
+		t.Fatalf("bound directory did not receive snapshot: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(external, "op-bound")); !os.IsNotExist(err) {
+		t.Fatalf("swapped path was used: %v", err)
 	}
 }
 
@@ -98,7 +152,7 @@ func TestSnapshotManifestIsTypedSecretFreeAndAtomicallyPersisted(t *testing.T) {
 		t.Fatalf("incomplete metadata: %#v", manifest.Entries[0])
 	}
 	assertMode(t, filepath.Join(store.OperationDir("op-atomic"), manifestFilename), 0o600)
-	matches, err := filepath.Glob(filepath.Join(store.OperationDir("op-atomic"), ".manifest-*.tmp"))
+	matches, err := filepath.Glob(filepath.Join(store.OperationDir("op-atomic"), ".nurproxy-atomic-*"))
 	if err != nil || len(matches) != 0 {
 		t.Fatalf("temporary manifests remain: %v, %v", matches, err)
 	}
@@ -131,6 +185,9 @@ func TestRollbackRejectsSnapshotBlobSymlink(t *testing.T) {
 	}
 	manifest, err := store.Create("op-blob", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, path), testTime())
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition("op-blob", recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack, testTime()); err != nil {
 		t.Fatal(err)
 	}
 	blob := filepath.Join(store.OperationDir("op-blob"), manifest.Entries[0].SnapshotFile)
@@ -166,6 +223,10 @@ func TestRollbackRejectsTamperedSymlinkTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.Transition("op-link", recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack, testTime()); err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = recoverymodel.OperationStateRollingBack
 	manifest.Entries[0].SymlinkTarget = filepath.Join(root, "outside")
 	manifest.Entries[0].SHA256 = digest([]byte(manifest.Entries[0].SymlinkTarget))
 	raw, err := json.Marshal(manifest)
@@ -181,6 +242,105 @@ func TestRollbackRejectsTamperedSymlinkTarget(t *testing.T) {
 	if err := store.Rollback("op-link"); err == nil {
 		t.Fatal("rollback accepted a symlink target outside the captured identity")
 	}
+}
+
+func TestRollbackPrevalidatesEverySnapshotBeforeMutation(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	mustMkdir(t, managed, 0o700)
+	first, second := filepath.Join(managed, "first"), filepath.Join(managed, "second")
+	mustWrite(t, first, []byte("first-before"), 0o600)
+	mustWrite(t, second, []byte("second-before"), 0o600)
+	guard, _ := NewPathGuard(managed)
+	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	manifest, err := store.Create("op-prevalidate", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, first, second), testTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition("op-prevalidate", recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack, testTime()); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, first, []byte("first-after"), 0o600)
+	mustWrite(t, second, []byte("second-after"), 0o600)
+	blob := filepath.Join(store.OperationDir("op-prevalidate"), manifest.Entries[0].SnapshotFile)
+	if err := os.WriteFile(blob, []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Rollback("op-prevalidate"); err == nil {
+		t.Fatal("tampered snapshot accepted")
+	}
+	assertContents(t, first, "first-after")
+	assertContents(t, second, "second-after")
+}
+
+func TestRollbackContinuesIndependentRestoresAfterRuntimeFailure(t *testing.T) {
+	root := t.TempDir()
+	one, two := filepath.Join(root, "one"), filepath.Join(root, "two")
+	mustMkdir(t, one, 0o700)
+	mustMkdir(t, two, 0o700)
+	first, second := filepath.Join(one, "first"), filepath.Join(two, "second")
+	mustWrite(t, first, []byte("first-before"), 0o600)
+	mustWrite(t, second, []byte("second-before"), 0o600)
+	guard, _ := NewPathGuard(one, two)
+	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	if _, err := store.Create("op-partial", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, first, second), testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition("op-partial", recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack, testTime()); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, first, []byte("first-after"), 0o600)
+	if err := os.Remove(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(second, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Rollback("op-partial"); err == nil {
+		t.Fatal("partial restore failure not reported")
+	}
+	assertContents(t, first, "first-before")
+}
+
+func TestRollbackRequiresRollingBackManifestState(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	mustMkdir(t, managed, 0o700)
+	path := filepath.Join(managed, "config")
+	mustWrite(t, path, []byte("before"), 0o600)
+	guard, _ := NewPathGuard(managed)
+	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	if _, err := store.Create("op-state", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, path), testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Rollback("op-state"); err == nil {
+		t.Fatal("rollback accepted non-rolling_back manifest")
+	}
+}
+
+func TestRollbackRejectsReplacedParentDirectory(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	mustMkdir(t, managed, 0o700)
+	path := filepath.Join(managed, "config")
+	mustWrite(t, path, []byte("before"), 0o600)
+	guard, _ := NewPathGuard(managed)
+	store, _ := NewSnapshotStore(filepath.Join(root, "data"))
+	if _, err := store.Create("op-parent", recoverymodel.ActionRemoveManagedTemp, "fp", resolveAll(t, guard, path), testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition("op-parent", recoverymodel.OperationStateSnapshotted, recoverymodel.OperationStateRollingBack, testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(managed, managed+"-original"); err != nil {
+		t.Fatal(err)
+	}
+	mustMkdir(t, managed, 0o700)
+	mustWrite(t, path, []byte("replacement"), 0o600)
+	if err := store.Rollback("op-parent"); err == nil {
+		t.Fatal("rollback accepted a replaced parent directory")
+	}
+	assertContents(t, path, "replacement")
 }
 
 func TestRetentionKeepsNewestTwentyRecentAndActiveWithoutFollowingSymlinks(t *testing.T) {
@@ -235,6 +395,82 @@ func TestRetentionKeepsNewestTwentyRecentAndActiveWithoutFollowingSymlinks(t *te
 	}
 }
 
+func TestRetentionRemovesOnlyOldIncompleteOperationDirectories(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewSnapshotStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDir, freshDir := store.OperationDir("op-incomplete-old"), store.OperationDir("op-incomplete-fresh")
+	mustMkdir(t, oldDir, 0o700)
+	mustMkdir(t, freshDir, 0o700)
+	old := testTime().Add(-retentionAge - time.Hour)
+	if err := os.Chtimes(oldDir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Prune(testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Fatalf("old incomplete operation retained: %v", err)
+	}
+	if _, err := os.Stat(freshDir); err != nil {
+		t.Fatalf("fresh incomplete operation removed: %v", err)
+	}
+}
+
+func TestRetentionPreservesOldOperationWithCorruptManifest(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewSnapshotStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := store.OperationDir("op-corrupt")
+	mustMkdir(t, dir, 0o700)
+	mustWrite(t, filepath.Join(dir, manifestFilename), []byte("not-json"), 0o600)
+	old := testTime().Add(-retentionAge - time.Hour)
+	if err := os.Chtimes(dir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Prune(testTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("corrupt operation was pruned: %v", err)
+	}
+}
+
+func TestRetentionRemovalRequiresSelectedDirectoryIdentity(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewSnapshotStore(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, replacement := store.OperationDir("op-selected"), store.OperationDir("op-replacement")
+	mustMkdir(t, selected, 0o700)
+	mustMkdir(t, replacement, 0o700)
+	info, err := os.Stat(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, inode, ok := fileIdentity(info)
+	if !ok {
+		t.Fatal("selected identity unavailable")
+	}
+	if err := os.Remove(selected); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, selected); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeTreeAtExpected(int(store.operations.Fd()), "op-selected", device, inode); err == nil {
+		t.Fatal("replacement directory was accepted")
+	}
+	if _, err := os.Stat(selected); err != nil {
+		t.Fatalf("replacement directory removed: %v", err)
+	}
+}
+
 func resolveAll(t *testing.T, guard *PathGuard, paths ...string) []GuardedPath {
 	t.Helper()
 	result := make([]GuardedPath, 0, len(paths))
@@ -268,6 +504,13 @@ func assertMode(t *testing.T, path string, want os.FileMode) {
 	}
 	if info.Mode().Perm() != want {
 		t.Fatalf("%s mode = %o, want %o", path, info.Mode().Perm(), want)
+	}
+}
+func assertContents(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != want {
+		t.Fatalf("%s contents = %q, %v; want %q", path, got, err, want)
 	}
 }
 func containsBytes(haystack, needle []byte) bool {

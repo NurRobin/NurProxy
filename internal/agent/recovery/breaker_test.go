@@ -1,6 +1,8 @@
 package recovery
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -56,6 +58,82 @@ func TestRollbackFailedBlocksManualUntilSuccessfulManualValidation(t *testing.T)
 	b.Record(key, recoverymodel.OperationStateSucceeded, now.Add(4*time.Hour), true)
 	if !b.Allow(key, recoverymodel.RequestSourceAutomatic, now.Add(4*time.Hour)).Allowed {
 		t.Fatal("manual validation did not clear latch")
+	}
+}
+
+func TestBreakerPersistsWindowAndRollbackFailedLatchAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	now := testTime()
+	b, err := NewPersistentBreaker(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowKey := BreakerKey{Action: recoverymodel.ActionRemoveManagedTemp, Fingerprint: "window"}
+	for i := 0; i < 3; i++ {
+		if err := b.Record(windowKey, recoverymodel.OperationStateRolledBack, now.Add(time.Duration(i)*time.Minute), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latchKey := BreakerKey{Action: recoverymodel.ActionRematerializeRuntimeKey, Fingerprint: "latch"}
+	if err := b.Record(latchKey, recoverymodel.OperationStateRollbackFailed, now, false); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewPersistentBreaker(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Allow(windowKey, recoverymodel.RequestSourceAutomatic, now.Add(3*time.Minute)).Allowed {
+		t.Fatal("time breaker lost across restart")
+	}
+	if restarted.Allow(latchKey, recoverymodel.RequestSourceUser, now.Add(2*time.Hour)).Allowed {
+		t.Fatal("rollback_failed latch lost across restart")
+	}
+}
+
+func TestBreakerPersistsAfterFailedManualRetry(t *testing.T) {
+	root := t.TempDir()
+	now := testTime()
+	b, err := NewPersistentBreaker(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := BreakerKey{Action: recoverymodel.ActionRemoveManagedTemp, Fingerprint: "manual"}
+	for i := 0; i < 4; i++ {
+		if err := b.Record(key, recoverymodel.OperationStateRolledBack, now.Add(time.Duration(i)*time.Minute), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := NewPersistentBreaker(root); err != nil {
+		t.Fatalf("failed manual retry made durable breaker unreadable: %v", err)
+	}
+}
+
+func TestPersistentBreakerAtomicallyReplacesStateSymlinkWithoutFollowingIt(t *testing.T) {
+	root := t.TempDir()
+	b, err := NewPersistentBreaker(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(root, "external")
+	if err := os.WriteFile(external, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "recovery", breakerFilename)
+	if err := os.Symlink(external, statePath); err != nil {
+		t.Fatal(err)
+	}
+	key := BreakerKey{Action: recoverymodel.ActionRemoveManagedTemp, Fingerprint: "nofollow"}
+	if err := b.Record(key, recoverymodel.OperationStateRolledBack, testTime(), false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(external)
+	if err != nil || string(got) != "sentinel" {
+		t.Fatalf("breaker followed state symlink: %q, %v", got, err)
+	}
+	assertMode(t, statePath, 0o600)
+	matches, err := filepath.Glob(filepath.Join(root, "recovery", ".nurproxy-atomic-*"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("breaker temp files remain: %v, %v", matches, err)
 	}
 }
 
