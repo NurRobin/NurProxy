@@ -14,6 +14,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -29,6 +30,21 @@ type mockAgentClient struct {
 	pushCalls        int
 	deleteRouteCalls int              // inbound DeleteRoute invocations (must stay 0 for stream-connected agents)
 	pushErrors       map[string]error // fqdn -> error
+}
+
+func TestBuildApplyIntentBindsDesiredRoutesToEnrolledHelper(t *testing.T) {
+	set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-7", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.7", Port: 8080}}}}}
+	issued := time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC)
+	intent, err := buildApplyIntent("agent-1", "helper-1", set, issued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.AgentID != "agent-1" || intent.HelperInstanceID != "helper-1" || intent.Resources[0] != "dom-7" || len(intent.Routes) != 1 || intent.AuthorizationKind != helperprotocol.AuthorizationStoredConvergence {
+		t.Fatalf("unexpected apply intent: %+v", intent)
+	}
+	if len(intent.DesiredStateRevision) != 64 || !strings.HasPrefix(intent.OperationID, "apply-") {
+		t.Fatalf("intent has no stable desired-state identity: %+v", intent)
+	}
 }
 
 func newMockAgentClient() *mockAgentClient {

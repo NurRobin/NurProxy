@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -58,7 +60,16 @@ type Reconciler struct {
 	// audit entries to "dryrun" so simulated record changes are unmistakable —
 	// while non-DNS reconciler events (route push, drift, agent status) stay
 	// "system", since those are not simulated by DNS sandbox mode.
-	dnsDryRun bool
+	dnsDryRun      bool
+	applyAuthority interface {
+		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
+	}
+}
+
+func (r *Reconciler) SetApplyAuthority(authority interface {
+	SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
+}) {
+	r.applyAuthority = authority
 }
 
 // New creates a Reconciler.
@@ -109,8 +120,82 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	if err != nil {
 		return err
 	}
-	r.hub.PublishIntentSet(agentID, r.intentSetFor(agent, desired, keepExtra))
+	r.publishIntentSet(agentID, r.intentSetFor(agent, desired, keepExtra))
 	return nil
+}
+
+func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) bool {
+	managedHub, managed := r.hub.(interface {
+		PublishManagedIntentSet(string, helperprotocol.ManagedIntentSetEnvelope) bool
+	})
+	if !managed || r.applyAuthority == nil {
+		return r.hub.PublishIntentSet(agentID, set)
+	}
+	helper, err := r.db.GetRecoveryHelper(agentID)
+	if err != nil {
+		return r.hub.PublishIntentSet(agentID, set)
+	}
+	intent, err := buildApplyIntent(agentID, helper.HelperInstanceID, set, time.Now().UTC())
+	if err != nil {
+		log.Printf("reconciler: cannot build managed apply intent for agent %s: %v", agentID, err)
+		return false
+	}
+	signed, err := r.applyAuthority.SignApplyIntent(intent)
+	if err != nil {
+		log.Printf("reconciler: cannot sign managed apply intent for agent %s: %v", agentID, err)
+		return false
+	}
+	return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed})
+}
+
+func buildApplyIntent(agentID, helperInstanceID string, set proxymodel.IntentSet, issued time.Time) (helperprotocol.ApplyIntent, error) {
+	if err := set.Validate(); err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	revision, err := helperprotocol.Digest(set)
+	if err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	resources := make([]string, 0, len(set.Intents))
+	resourceSet := make(map[string]struct{}, len(set.Intents)+len(set.Certs))
+	routes := append([]proxymodel.RouteIntent(nil), set.Intents...)
+	for _, route := range routes {
+		if _, exists := resourceSet[route.ArtifactID]; !exists {
+			resources = append(resources, route.ArtifactID)
+			resourceSet[route.ArtifactID] = struct{}{}
+		}
+	}
+	for _, certificate := range set.Certs {
+		resourceID := helperprotocol.CertificateResourceID(certificate.Host)
+		if _, exists := resourceSet[resourceID]; !exists {
+			resources = append(resources, resourceID)
+			resourceSet[resourceID] = struct{}{}
+		}
+	}
+	sort.Strings(resources)
+	artifacts, err := helperprotocol.CertificateArtifacts(set.Certs)
+	if err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	if artifacts == nil {
+		artifacts = []helperprotocol.LogicalArtifact{}
+	}
+	if routes == nil {
+		routes = []proxymodel.RouteIntent{}
+	}
+	intent := helperprotocol.ApplyIntent{
+		AgentID: agentID, HelperInstanceID: helperInstanceID,
+		OperationID: "apply-" + revision[:32], DesiredStateRevision: revision,
+		Resources: resources, Artifacts: artifacts, DeletionSet: []string{}, Routes: routes,
+		PruneCertificates: set.PruneCerts, CertificateKeep: append([]string{}, set.CertKeep...),
+		AuthorizationKind:    helperprotocol.AuthorizationStoredConvergence,
+		AuthorizationEventID: "desired-" + revision[:24],
+		IssuedAt:             issued.Format(time.RFC3339Nano), ExpiresAt: issued.Add(5 * time.Minute).Format(time.RFC3339Nano),
+	}
+	if err := intent.Validate(); err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	return intent, nil
 }
 
 // intentSetFor assembles the complete stream push for an agent: the rendered
@@ -622,7 +707,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		// agent that missed the instant push (or lost its cert store) keeps
 		// receiving TLS configs it can never validate — and deleted hosts' certs
 		// would never get scrubbed by the tick.
-		r.hub.PublishIntentSet(agent.ID, r.intentSetFor(agent, desiredByFQDN, keepExtra))
+		r.publishIntentSet(agent.ID, r.intentSetFor(agent, desiredByFQDN, keepExtra))
 		return nil
 	}
 

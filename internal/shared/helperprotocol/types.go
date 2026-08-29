@@ -1,10 +1,15 @@
 package helperprotocol
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 const (
@@ -27,6 +32,7 @@ const (
 	MessageApplyGrant                 MessageType = "apply_grant"
 	MessageCancellationGrant          MessageType = "cancellation_grant"
 	MessageHelperPlan                 MessageType = "helper_plan"
+	MessageManagedApplyPlan           MessageType = "managed_apply_plan"
 	MessageHelperReceipt              MessageType = "helper_receipt"
 	MessageHelperHelloRequest         MessageType = "helper_hello_request"
 	MessageHelperHello                MessageType = "helper_hello"
@@ -39,7 +45,7 @@ func (m MessageType) Valid() bool {
 		MessagePlanManagedApplyRequest, MessageExecuteManagedApplyRequest,
 		MessageGetReceiptRequest, MessageCancelOperationRequest,
 		MessageExecutionGrant, MessageApplyIntent, MessageApplyGrant,
-		MessageCancellationGrant, MessageHelperPlan, MessageHelperReceipt:
+		MessageCancellationGrant, MessageHelperPlan, MessageManagedApplyPlan, MessageHelperReceipt:
 		return true
 	case MessageHelperHelloRequest, MessageHelperHello, MessageErrorResponse:
 		return true
@@ -325,6 +331,46 @@ type PlanManagedApplyRequest struct {
 	Intent    Signed[ApplyIntent] `json:"signed_apply_intent"`
 }
 
+type ManagedIntentSetEnvelope struct {
+	IntentSet proxymodel.IntentSet `json:"intent_set"`
+	Intent    Signed[ApplyIntent]  `json:"signed_apply_intent"`
+}
+
+func (e ManagedIntentSetEnvelope) Validate() error {
+	if e.IntentSet.Validate() != nil || e.Intent.Validate() != nil || e.Intent.Envelope.MessageType != MessageApplyIntent {
+		return fmt.Errorf("invalid managed intent set envelope")
+	}
+	intent := e.Intent.Envelope.Payload
+	revision, revisionErr := Digest(e.IntentSet)
+	if revisionErr != nil || revision != intent.DesiredStateRevision {
+		return fmt.Errorf("managed intent desired-state revision mismatch")
+	}
+	if len(intent.Routes) != len(e.IntentSet.Intents) {
+		return fmt.Errorf("managed intent route count mismatch")
+	}
+	left, leftErr := Digest(intent.Routes)
+	right, rightErr := Digest(e.IntentSet.Intents)
+	if leftErr != nil || rightErr != nil || left != right {
+		return fmt.Errorf("managed intent routes do not match stream intent set")
+	}
+	expectedArtifacts, artifactErr := CertificateArtifacts(e.IntentSet.Certs)
+	left, leftErr = Digest(intent.Artifacts)
+	right, rightErr = Digest(expectedArtifacts)
+	if artifactErr != nil || leftErr != nil || rightErr != nil || left != right {
+		return fmt.Errorf("managed intent certificate manifest does not match stream intent set")
+	}
+	expectedKeep := append([]string(nil), e.IntentSet.CertKeep...)
+	sort.Strings(expectedKeep)
+	actualKeep := append([]string(nil), intent.CertificateKeep...)
+	sort.Strings(actualKeep)
+	left, leftErr = Digest(actualKeep)
+	right, rightErr = Digest(expectedKeep)
+	if leftErr != nil || rightErr != nil || left != right || intent.PruneCertificates != e.IntentSet.PruneCerts {
+		return fmt.Errorf("managed intent certificate retention does not match stream intent set")
+	}
+	return nil
+}
+
 func (r PlanManagedApplyRequest) Validate() error {
 	if !validID(r.RequestID) || r.Intent.Validate() != nil || r.Intent.Envelope.MessageType != MessageApplyIntent {
 		return fmt.Errorf("invalid managed apply plan request")
@@ -409,12 +455,47 @@ type LogicalArtifact struct {
 	Size       int64  `json:"size"`
 }
 
+func CertificateArtifacts(certificates []proxymodel.CertBundle) ([]LogicalArtifact, error) {
+	artifacts := make([]LogicalArtifact, 0, len(certificates)*2)
+	seen := make(map[string]struct{}, len(certificates))
+	for _, certificate := range certificates {
+		if !validCertificateName(certificate.Host) {
+			return nil, fmt.Errorf("invalid certificate artifact host")
+		}
+		if _, exists := seen[certificate.Host]; exists {
+			return nil, fmt.Errorf("duplicate certificate artifact host")
+		}
+		seen[certificate.Host] = struct{}{}
+		certDigest := sha256.Sum256([]byte(certificate.CertPEM))
+		keyDigest := sha256.Sum256([]byte(certificate.KeyPEM))
+		resourceID := CertificateResourceID(certificate.Host)
+		artifacts = append(artifacts,
+			LogicalArtifact{ResourceID: resourceID, Kind: "certificate", Name: certificate.Host, SHA256: hex.EncodeToString(certDigest[:]), Size: int64(len(certificate.CertPEM))},
+			LogicalArtifact{ResourceID: resourceID, Kind: "source_key", Name: certificate.Host, SHA256: hex.EncodeToString(keyDigest[:]), Size: int64(len(certificate.KeyPEM))},
+		)
+	}
+	return artifacts, nil
+}
+
+func CertificateResourceID(host string) string {
+	digest := sha256.Sum256([]byte(strings.ToLower(host)))
+	return "cert-" + hex.EncodeToString(digest[:16])
+}
+
 func (a LogicalArtifact) Validate() error {
-	if !validID(a.ResourceID) || !validLogicalName(a.Name) || !validDigest(a.SHA256) || a.Size < 0 || a.Size > MaxArtifactBytes {
+	if !validID(a.ResourceID) || !validDigest(a.SHA256) || a.Size < 0 || a.Size > MaxArtifactBytes {
 		return fmt.Errorf("invalid logical artifact")
 	}
 	switch a.Kind {
-	case "vhost", "certificate", "source_key", "runtime_key", "auth_sidecar":
+	case "certificate", "source_key", "runtime_key":
+		if !validCertificateName(a.Name) {
+			return fmt.Errorf("invalid certificate artifact name")
+		}
+		return nil
+	case "vhost", "auth_sidecar":
+		if !validLogicalName(a.Name) {
+			return fmt.Errorf("invalid logical artifact name")
+		}
 		return nil
 	default:
 		return fmt.Errorf("invalid logical artifact kind")
@@ -424,23 +505,27 @@ func (a LogicalArtifact) Validate() error {
 const MaxArtifactBytes int64 = 8 << 20
 
 type ApplyIntent struct {
-	AgentID              string            `json:"agent_id"`
-	HelperInstanceID     string            `json:"helper_instance_id"`
-	OperationID          string            `json:"operation_id"`
-	DesiredStateRevision string            `json:"desired_state_revision"`
-	Resources            []string          `json:"resource_ids"`
-	Artifacts            []LogicalArtifact `json:"artifact_manifest"`
-	DeletionSet          []string          `json:"deletion_set"`
-	AuthorizationKind    AuthorizationKind `json:"authorization_kind"`
-	AuthorizationEventID string            `json:"authorization_event_id"`
-	IssuedAt             string            `json:"issued_at"`
-	ExpiresAt            string            `json:"expires_at"`
+	AgentID              string                   `json:"agent_id"`
+	HelperInstanceID     string                   `json:"helper_instance_id"`
+	OperationID          string                   `json:"operation_id"`
+	DesiredStateRevision string                   `json:"desired_state_revision"`
+	Resources            []string                 `json:"resource_ids"`
+	Artifacts            []LogicalArtifact        `json:"artifact_manifest"`
+	DeletionSet          []string                 `json:"deletion_set"`
+	Routes               []proxymodel.RouteIntent `json:"routes"`
+	PruneCertificates    bool                     `json:"prune_certificates"`
+	CertificateKeep      []string                 `json:"certificate_keep"`
+	AuthorizationKind    AuthorizationKind        `json:"authorization_kind"`
+	AuthorizationEventID string                   `json:"authorization_event_id"`
+	IssuedAt             string                   `json:"issued_at"`
+	ExpiresAt            string                   `json:"expires_at"`
 }
 
 func (i ApplyIntent) Validate() error {
 	if !validID(i.AgentID) || !validID(i.HelperInstanceID) || !validID(i.OperationID) ||
 		!validID(i.DesiredStateRevision) || len(i.Resources) > MaxManifestEntries || len(i.Artifacts) > MaxManifestEntries ||
-		len(i.DeletionSet) > MaxManifestEntries || !i.AuthorizationKind.Valid() || !validID(i.AuthorizationEventID) ||
+		len(i.DeletionSet) > MaxManifestEntries || len(i.Routes) > MaxManifestEntries || len(i.CertificateKeep) > MaxManifestEntries ||
+		!i.AuthorizationKind.Valid() || !validID(i.AuthorizationEventID) ||
 		validateGrantTimes(i.IssuedAt, i.ExpiresAt) != nil {
 		return fmt.Errorf("invalid apply intent")
 	}
@@ -449,10 +534,62 @@ func (i ApplyIntent) Validate() error {
 			return fmt.Errorf("invalid apply intent resource")
 		}
 	}
+	certificateKeep := make(map[string]struct{}, len(i.CertificateKeep))
+	for _, host := range i.CertificateKeep {
+		if !validCertificateName(host) {
+			return fmt.Errorf("invalid certificate retention host")
+		}
+		if _, exists := certificateKeep[host]; exists {
+			return fmt.Errorf("duplicate certificate retention host")
+		}
+		certificateKeep[host] = struct{}{}
+	}
+	resources := make(map[string]struct{}, len(i.Resources))
+	for _, id := range i.Resources {
+		if _, exists := resources[id]; exists {
+			return fmt.Errorf("duplicate apply intent resource")
+		}
+		resources[id] = struct{}{}
+	}
+	artifacts := make(map[string]struct{}, len(i.Artifacts))
 	for _, artifact := range i.Artifacts {
 		if err := artifact.Validate(); err != nil {
 			return err
 		}
+		if _, exists := resources[artifact.ResourceID]; !exists {
+			return fmt.Errorf("apply artifact is not in logical resources")
+		}
+		key := artifact.ResourceID + "\x00" + artifact.Kind + "\x00" + artifact.Name
+		if _, exists := artifacts[key]; exists {
+			return fmt.Errorf("duplicate apply artifact")
+		}
+		artifacts[key] = struct{}{}
+	}
+	deletions := make(map[string]struct{}, len(i.DeletionSet))
+	for _, id := range i.DeletionSet {
+		if _, exists := resources[id]; exists {
+			return fmt.Errorf("apply resource cannot be retained and deleted")
+		}
+		if _, exists := deletions[id]; exists {
+			return fmt.Errorf("duplicate apply deletion")
+		}
+		deletions[id] = struct{}{}
+	}
+	routes := make(map[string]struct{}, len(i.Routes))
+	for _, route := range i.Routes {
+		if !validID(route.ArtifactID) || (route.Backend != "nginx" && route.Backend != "apache" && route.Backend != "caddy") || route.Route.Validate() != nil {
+			return fmt.Errorf("invalid apply intent route")
+		}
+		if route.Route.IsRaw() && route.Route.Raw.Backend != route.Backend {
+			return fmt.Errorf("raw apply route backend mismatch")
+		}
+		if _, exists := resources[route.ArtifactID]; !exists {
+			return fmt.Errorf("apply route is not in logical resources")
+		}
+		if _, exists := routes[route.ArtifactID]; exists {
+			return fmt.Errorf("duplicate apply route")
+		}
+		routes[route.ArtifactID] = struct{}{}
 	}
 	return nil
 }
@@ -526,6 +663,32 @@ type HelperPlan struct {
 	RollbackCoverage    RollbackCoverage `json:"rollback_coverage"`
 	Steps               []PlanStep       `json:"steps"`
 	ExpiresAt           string           `json:"expires_at"`
+}
+
+type ManagedApplyPlan struct {
+	HelperPlanID              string           `json:"helper_plan_id"`
+	HelperInstanceID          string           `json:"helper_instance_id"`
+	OperationID               string           `json:"operation_id"`
+	DesiredStateRevision      string           `json:"desired_state_revision"`
+	LogicalManifestDigest     string           `json:"logical_manifest_digest"`
+	ArtifactManifestDigest    string           `json:"staged_artifact_manifest_digest"`
+	DeletionSetDigest         string           `json:"deletion_set_digest"`
+	CertificateIdentityDigest string           `json:"certificate_identity_digest"`
+	CustomPolicyVersion       string           `json:"custom_policy_version"`
+	ExecutionPlanHash         string           `json:"execution_plan_hash"`
+	ResourceFingerprint       string           `json:"resource_fingerprint"`
+	RollbackCoverage          RollbackCoverage `json:"rollback_coverage"`
+	ExpiresAt                 string           `json:"expires_at"`
+}
+
+func (p ManagedApplyPlan) Validate() error {
+	if !validID(p.HelperPlanID) || !validID(p.HelperInstanceID) || !validID(p.OperationID) || !validID(p.DesiredStateRevision) ||
+		!validDigest(p.LogicalManifestDigest) || !validDigest(p.ArtifactManifestDigest) || !validDigest(p.DeletionSetDigest) ||
+		!validDigest(p.CertificateIdentityDigest) || !validID(p.CustomPolicyVersion) || !validDigest(p.ExecutionPlanHash) ||
+		!validDigest(p.ResourceFingerprint) || !p.RollbackCoverage.Valid() || parseCanonicalTime(p.ExpiresAt) == nil {
+		return fmt.Errorf("invalid managed apply plan")
+	}
+	return nil
 }
 
 func (p HelperPlan) Validate() error {
@@ -644,6 +807,26 @@ func validID(value string) bool {
 
 func validLogicalName(value string) bool {
 	return validID(value) && !strings.Contains(value, "..")
+}
+
+func validCertificateName(value string) bool {
+	if strings.HasPrefix(value, "*.") {
+		value = strings.TrimPrefix(value, "*.")
+	}
+	if value == "" || len(value) > 253 || strings.TrimSpace(value) != value || strings.Contains(value, "..") {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validDigest(value string) bool {

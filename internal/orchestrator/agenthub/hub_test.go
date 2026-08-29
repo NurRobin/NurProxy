@@ -1,10 +1,13 @@
 package agenthub
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
@@ -27,6 +30,38 @@ func TestPublishRecoveryPolicyTyped(t *testing.T) {
 	}
 	if !got.Policy.SafeAutoRepair {
 		t.Fatal("safe auto repair policy was not preserved")
+	}
+}
+
+func TestPublishManagedIntentSetKeepsSignedDesiredStateAtomic(t *testing.T) {
+	h := New()
+	ch, unsub := h.Subscribe("a1")
+	defer unsub()
+	set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}}}
+	now := time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC)
+	revision, err := helperprotocol.Digest(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := helperprotocol.ApplyIntent{AgentID: "a1", HelperInstanceID: "helper-1", OperationID: "apply-1", DesiredStateRevision: revision, Resources: []string{"dom-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []string{}, Routes: set.Intents, CertificateKeep: []string{}, AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "event-1", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)}
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := helperprotocol.Sign("key-1", private, helperprotocol.NewEnvelope(helperprotocol.MessageApplyIntent, intent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.PublishManagedIntentSet("a1", helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed}) {
+		t.Fatal("managed intent set was not delivered")
+	}
+	event := <-ch
+	if event.Type != EventManagedRoutes {
+		t.Fatalf("event type = %q", event.Type)
+	}
+	var decoded helperprotocol.ManagedIntentSetEnvelope
+	if err := json.Unmarshal(event.Data, &decoded); err != nil || decoded.Validate() != nil {
+		t.Fatalf("invalid managed envelope: %v", err)
 	}
 }
 

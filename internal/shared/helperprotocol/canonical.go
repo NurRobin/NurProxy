@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	MaxFrameBytes    = 256 << 10
-	MaxStringBytes   = 64 << 10
+	MaxFrameBytes    = 4 << 20
+	MaxStringBytes   = 4 << 20
 	MaxArrayElements = 4096
 	MaxObjectFields  = 256
 	MaxNestingDepth  = 32

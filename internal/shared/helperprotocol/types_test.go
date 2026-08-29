@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 func validExecutionGrant() ExecutionGrant {
@@ -23,6 +25,39 @@ func validExecutionGrant() ExecutionGrant {
 		ConfirmationEventIDs: []string{"confirmation-1", "confirmation-2"},
 		IssuedAt:             issued.Format(time.RFC3339Nano),
 		ExpiresAt:            issued.Add(2 * time.Minute).Format(time.RFC3339Nano),
+	}
+}
+
+func TestApplyIntentBindsValidatedRoutesToLogicalResources(t *testing.T) {
+	now := time.Date(2026, 8, 29, 16, 0, 0, 0, time.UTC)
+	intent := ApplyIntent{
+		AgentID: "agent-1", HelperInstanceID: "helper-1", OperationID: "apply-1", DesiredStateRevision: "revision-1",
+		Resources: []string{"dom-1"}, Artifacts: []LogicalArtifact{}, DeletionSet: []string{},
+		Routes:            []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}},
+		AuthorizationKind: AuthorizationAuthenticatedDesiredState, AuthorizationEventID: "event-1",
+		IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+	}
+	if err := intent.Validate(); err != nil {
+		t.Fatalf("valid intent rejected: %v", err)
+	}
+	intent.Routes[0].ArtifactID = "dom-2"
+	if err := intent.Validate(); err == nil {
+		t.Fatal("route outside logical resources accepted")
+	}
+}
+
+func TestCertificateArtifactsSupportWildcardWithoutUsingHostAsResourceID(t *testing.T) {
+	artifacts, err := CertificateArtifacts([]proxymodel.CertBundle{{Host: "*.example.com", CertPEM: "cert", KeyPEM: "key"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 2 || artifacts[0].ResourceID != CertificateResourceID("*.example.com") || artifacts[0].Name != "*.example.com" {
+		t.Fatalf("unexpected wildcard certificate artifacts: %+v", artifacts)
+	}
+	for _, artifact := range artifacts {
+		if err := artifact.Validate(); err != nil {
+			t.Fatalf("wildcard artifact rejected: %v", err)
+		}
 	}
 }
 

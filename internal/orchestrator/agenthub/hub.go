@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"sync"
 
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
@@ -41,6 +42,7 @@ const (
 	EventLogTailStop    = "log_tail_stop"
 	EventRecoveryPolicy = "recovery_policy"
 	EventRepairRequest  = "repair_request"
+	EventManagedRoutes  = "managed_routes"
 )
 
 // maxStreamsPerAgent caps how many concurrent SSE streams a single agent may
@@ -56,6 +58,17 @@ const maxStreamsPerAgent = 2
 type subscriber struct {
 	ch  chan Event
 	seq uint64 // monotonic registration order; lower == older
+}
+
+func (h *Hub) PublishManagedIntentSet(agentID string, envelope helperprotocol.ManagedIntentSetEnvelope) bool {
+	if envelope.Validate() != nil {
+		return false
+	}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return false
+	}
+	return h.Publish(agentID, Event{Type: EventManagedRoutes, Data: data})
 }
 
 // Hub tracks live agent connections and fans events out to them. It is safe for
