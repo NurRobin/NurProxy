@@ -1,13 +1,14 @@
 [Unit]
 Description=NurProxy agent
-After=network-online.target
-Wants=network-online.target
+After=network-online.target nurproxy-agent-helper.socket
+Wants=network-online.target nurproxy-agent-helper.socket
 
 [Service]
 Type=simple
-User=root
+User=nurproxy
+Group=nurproxy
 EnvironmentFile=/etc/nurproxy-agent/agent.env
-ExecStart=/usr/bin/nurproxy-agent --data-dir /var/lib/nurproxy-agent
+ExecStart=/usr/bin/nurproxy-agent --data-dir /var/lib/nurproxy-agent/state
 Restart=on-failure
 RestartSec=5
 UMask=0077
@@ -17,10 +18,9 @@ ProtectHome=true
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
-ReadWritePaths=/var/lib/nurproxy-agent
-ReadWritePaths=-/etc/nginx -/var/log/nginx -/var/lib/nginx -/var/cache/nginx -/etc/apache2 -/etc/httpd -/var/log/apache2 -/var/log/httpd -/etc/caddy -/var/lib/caddy -/var/log/caddy -/run
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN
+ReadWritePaths=/var/lib/nurproxy-agent/state
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

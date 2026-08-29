@@ -178,3 +178,43 @@ func TestLoadOrCreateAttestationKeyPersistsSecureEd25519Key(t *testing.T) {
 		t.Fatal("unexpected Ed25519 key sizes")
 	}
 }
+
+func TestWriteAndRefreshRootConfigAreAtomicAndStrict(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid64, _ := strconv.ParseUint(current.Uid, 10, 32)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := RootConfig{
+		AgentID: "agent-1", HelperInstanceID: "helper-1", ExpectedBuildID: "dev-old",
+		AgentUser: current.Username, AgentUID: uint32(uid64), OrchestratorKeyID: "orchestrator-1",
+		OrchestratorPublicKeyText: base64.RawURLEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)),
+		AttestationKeyID:          "attestation-1", AttestationPrivateKeyFile: filepath.Join(dir, "attestation.key"), StoreDir: filepath.Join(dir, "store"),
+		ProxyTarget:   ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{"/etc/nginx"}},
+		PackageTarget: PackageTargetConfig{Manager: "/usr/bin/apt-get", Package: "nginx"},
+	}
+	path := filepath.Join(dir, "root-helper.json")
+	if err := writeRootConfig(path, cfg, uint32(uid64)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("root config identity = %v, %v", info, err)
+	}
+	changed, err := refreshRootConfigBuildID(path, "dev-new", uint32(uid64), user.Lookup)
+	if err != nil || !changed {
+		t.Fatalf("refresh = %v, %v", changed, err)
+	}
+	loaded, err := loadRootConfig(path, uint32(uid64), user.Lookup)
+	if err != nil || loaded.ExpectedBuildID != "dev-new" || loaded.HelperInstanceID != cfg.HelperInstanceID {
+		t.Fatalf("refreshed config = %+v, %v", loaded, err)
+	}
+	changed, err = refreshRootConfigBuildID(filepath.Join(dir, "missing.json"), "dev-new", uint32(uid64), user.Lookup)
+	if err != nil || changed {
+		t.Fatalf("missing refresh = %v, %v", changed, err)
+	}
+}

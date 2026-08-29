@@ -41,34 +41,39 @@ func newClient(socketPath, agentID, buildID string, pin Pin) (*Client, error) {
 }
 
 func (c *Client) Hello(ctx context.Context) (helperprotocol.HelperHello, error) {
+	signed, err := c.SignedHello(ctx)
+	return signed.Envelope.Payload, err
+}
+
+func (c *Client) SignedHello(ctx context.Context) (helperprotocol.Signed[helperprotocol.HelperHello], error) {
 	request := helperprotocol.HelperHelloRequest{
 		RequestID: uuid.NewString(), AgentID: c.agentID, AgentBuildID: c.buildID,
 	}
 	payload, err := helperprotocol.CanonicalBytes(helperprotocol.NewEnvelope(helperprotocol.MessageHelperHelloRequest, request))
 	if err != nil {
-		return helperprotocol.HelperHello{}, err
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, err
 	}
 	response, err := c.exchange(ctx, payload)
 	if err != nil {
-		return helperprotocol.HelperHello{}, err
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, err
 	}
 	signed, err := helperprotocol.Decode[helperprotocol.Signed[helperprotocol.HelperHello]](response)
 	if err != nil {
 		if remoteErr := decodeRemoteError(response, request.RequestID); remoteErr != nil {
-			return helperprotocol.HelperHello{}, remoteErr
+			return helperprotocol.Signed[helperprotocol.HelperHello]{}, remoteErr
 		}
-		return helperprotocol.HelperHello{}, fmt.Errorf("helper hello is not a valid protocol response")
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, fmt.Errorf("helper hello is not a valid protocol response")
 	}
 	if signed.KeyID != c.pin.AttestationKeyID || helperprotocol.Verify(c.pin.publicKey(), signed, helperprotocol.MessageHelperHello) != nil {
-		return helperprotocol.HelperHello{}, fmt.Errorf("helper hello attestation is invalid")
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, fmt.Errorf("helper hello attestation is invalid")
 	}
 	hello := signed.Envelope.Payload
 	if hello.RequestID != request.RequestID || hello.HelperInstanceID != c.pin.HelperInstanceID ||
 		hello.HelperBuildID != c.buildID || hello.AttestationKeyID != c.pin.AttestationKeyID ||
 		hello.AttestationPublicKey != c.pin.AttestationPublicKey {
-		return helperprotocol.HelperHello{}, fmt.Errorf("helper hello does not match the enrolled identity")
+		return helperprotocol.Signed[helperprotocol.HelperHello]{}, fmt.Errorf("helper hello does not match the enrolled identity")
 	}
-	return hello, nil
+	return signed, nil
 }
 
 func (c *Client) Plan(ctx context.Context, action helperprotocol.Action, target helperprotocol.LogicalTarget, diagnosticID string) (helperprotocol.Signed[helperprotocol.HelperPlan], error) {

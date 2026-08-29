@@ -127,41 +127,11 @@ func parseEnvironmentDataDirLine(line string) (string, bool, error) {
 	return b.String(), true, nil
 }
 
-// AgentProxyWritePaths are the proxy-backend trees the agent must be able to
-// write/reload through ProtectSystem=strict: config under /etc, plus the log,
-// cache and runtime dirs that nginx -t / -s reload (and apache/caddy) touch.
-// Each is prefixed with "-" so systemd ignores a path absent on this host
-// instead of refusing to start the unit — only the installed backend's dirs
-// exist on any given box. This is what makes the dashboard's "config writable"
-// and "reloadable" checks pass for a file-based backend; without it the mount
-// stays read-only regardless of group/ownership, surfacing as EROFS.
-var AgentProxyWritePaths = []string{
-	"-/etc/nginx", "-/var/log/nginx", "-/var/lib/nginx", "-/var/cache/nginx",
-	"-/etc/apache2", "-/etc/httpd", "-/var/log/apache2", "-/var/log/httpd",
-	"-/etc/caddy", "-/var/lib/caddy", "-/var/log/caddy",
-	"-/run",
-}
-
-// AgentCapabilities are the Linux capabilities the agent unit keeps. The agent
-// runs as root but with a restricted bounding set, so it only holds what it
-// needs:
-//   - CAP_NET_BIND_SERVICE: the bundled Caddy binds :80/:443 without full root.
-//   - CAP_DAC_OVERRIDE: in existing mode the agent drives a host nginx/Apache,
-//     and `nginx -t` must read the proxy's TLS private keys (mode 0600, often
-//     not owned by the agent) and write its log files (often owned by www-data).
-//     Without it a root agent obeys the file-permission bits and the reload
-//     self-test fails with "permission denied" on the key or log — even though
-//     ReadWritePaths already made the mount writable (DAC and the read-only
-//     mount are independent). The bundled-Caddy path does not need it, but the
-//     unit is static and cannot know the mode at install time.
-//   - CAP_CHOWN: `nginx -t` (started as root by the agent) runs ngx_create_paths,
-//     which chown()s the temp dirs (client_body_temp_path etc.) to the worker
-//     user. Changing a file's owner requires CAP_CHOWN; with it dropped, the
-//     process falls under the normal chown() permission check and gets EPERM —
-//     nginx attempts the chown unconditionally, even when the dir already has
-//     the right owner — so every config test fails ("chown(...) failed (1:
-//     Operation not permitted)") and no config can ever be applied.
-var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE", "CAP_DAC_OVERRIDE", "CAP_CHOWN"}
+// AgentCapabilities contains the only privilege retained by the unprivileged
+// network-facing agent. It is needed solely when the bundled Caddy child binds
+// ports 80/443. Existing nginx/apache mutation, validation and reload are typed
+// root-helper transactions; the main agent never receives DAC/CHOWN bypasses.
+var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE"}
 
 // Service describes a NurProxy service to install. The same descriptor is
 // consumed by every Manager; fields without meaning on a given OS are ignored.
@@ -171,8 +141,11 @@ type Service struct {
 	BinaryPath   string            // absolute path to the executable
 	Args         []string          // extra ExecStart arguments
 	User         string            // service user (e.g. "root")
+	Group        string            // optional primary service group (systemd)
 	DataDir      string            // data directory (made ReadWritePaths)
 	WritePaths   []string          // extra ReadWritePaths to punch through ProtectSystem=strict (e.g. proxy config/log/cache trees); prefix an entry with "-" to ignore it when absent
+	AfterUnits   []string          // additional systemd ordering dependencies
+	WantsUnits   []string          // additional weak systemd dependencies
 	EnvFile      string            // optional EnvironmentFile path (systemd)
 	Env          map[string]string // environment variables for the service
 	ConfigFile   string            // optional extra config file to write (e.g. agent.yaml)
@@ -209,13 +182,24 @@ func RenderUnit(s Service) string {
 
 	w("[Unit]\n")
 	w("Description=%s\n", s.Description)
-	w("After=network-online.target\n")
-	w("Wants=network-online.target\n\n")
+	w("After=network-online.target")
+	for _, unit := range s.AfterUnits {
+		w(" %s", unit)
+	}
+	w("\n")
+	w("Wants=network-online.target")
+	for _, unit := range s.WantsUnits {
+		w(" %s", unit)
+	}
+	w("\n\n")
 
 	w("[Service]\n")
 	w("Type=simple\n")
 	if s.User != "" {
 		w("User=%s\n", s.User)
+	}
+	if s.Group != "" {
+		w("Group=%s\n", s.Group)
 	}
 	if s.EnvFile != "" {
 		w("EnvironmentFile=%s\n", s.EnvFile)

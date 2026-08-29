@@ -74,6 +74,10 @@ archives:
       - LICENSE
       - src: deploy/packaging/nurproxy-agent.service
         strip_parent: true
+      - src: deploy/packaging/nurproxy-agent-helper.service
+        strip_parent: true
+      - src: deploy/packaging/nurproxy-agent-helper.socket
+        strip_parent: true
       - src: deploy/packaging/nurproxy-agent.env.example
         strip_parent: true
 
@@ -115,12 +119,19 @@ nfpms:
     contents:
       - src: deploy/packaging/nurproxy-agent.service
         dst: /usr/lib/systemd/system/nurproxy-agent.service
+      - src: deploy/packaging/nurproxy-agent-helper.service
+        dst: /usr/lib/systemd/system/nurproxy-agent-helper.service
+      - src: deploy/packaging/nurproxy-agent-helper.socket
+        dst: /usr/lib/systemd/system/nurproxy-agent-helper.socket
       - src: deploy/packaging/nurproxy-agent.env.example
         dst: /etc/nurproxy-agent/agent.env
         type: "config|noreplace"
       - dst: /var/lib/nurproxy-agent
         type: dir
-        file_info: { mode: 0750 }
+        file_info: { mode: 0755 }
+      - dst: /var/lib/nurproxy-agent/state
+        type: dir
+        file_info: { mode: 0700 }
     scripts:
       postinstall: deploy/packaging/postinstall-agent.sh
       preremove: deploy/packaging/preremove-agent.sh
@@ -200,6 +211,8 @@ aurs:
     package: |-
       install -Dm755 "./nurproxy-agent" "${pkgdir}/usr/bin/nurproxy-agent"
       install -Dm644 "./nurproxy-agent.service" "${pkgdir}/usr/lib/systemd/system/nurproxy-agent.service"
+      install -Dm644 "./nurproxy-agent-helper.service" "${pkgdir}/usr/lib/systemd/system/nurproxy-agent-helper.service"
+      install -Dm644 "./nurproxy-agent-helper.socket" "${pkgdir}/usr/lib/systemd/system/nurproxy-agent-helper.socket"
       install -Dm644 "./nurproxy-agent.env.example" "${pkgdir}/etc/nurproxy-agent/agent.env"
       install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/nurproxy-agent-bin/LICENSE"
 

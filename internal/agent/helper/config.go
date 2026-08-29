@@ -200,6 +200,77 @@ func LoadRootConfig(path string) (RootConfig, error) {
 	return loadRootConfig(path, 0, user.Lookup)
 }
 
+func WriteRootConfig(path string, config RootConfig) error {
+	return writeRootConfig(path, config, 0)
+}
+
+func writeRootConfig(path string, config RootConfig, expectedOwnerUID uint32) error {
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	if err := validatePrivatePath(path); err != nil {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if err := validateTrustedDirectory(parent, expectedOwnerUID); err != nil {
+		return fmt.Errorf("root configuration parent is not trusted: %w", err)
+	}
+	payload, err := helperprotocol.CanonicalBytes(config)
+	if err != nil || len(payload) > MaxRootConfigBytes {
+		return fmt.Errorf("encode bounded root configuration")
+	}
+	temporary, err := os.CreateTemp(parent, ".root-helper-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return syncDirectory(parent)
+}
+
+func RefreshRootConfigBuildID(path, buildID string) (bool, error) {
+	return refreshRootConfigBuildID(path, buildID, 0, user.Lookup)
+}
+
+func refreshRootConfigBuildID(path, buildID string, expectedOwnerUID uint32, lookup func(string) (*user.User, error)) (bool, error) {
+	if !validConfigID(buildID) {
+		return false, fmt.Errorf("invalid helper build identity")
+	}
+	config, err := loadRootConfig(path, expectedOwnerUID, lookup)
+	if err != nil {
+		if os.IsNotExist(rootCause(err)) {
+			return false, nil
+		}
+		return false, err
+	}
+	if config.ExpectedBuildID == buildID {
+		return false, nil
+	}
+	config.ExpectedBuildID = buildID
+	if err := writeRootConfig(path, config, expectedOwnerUID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func loadRootConfig(path string, expectedOwnerUID uint32, lookup func(string) (*user.User, error)) (RootConfig, error) {
 	var zero RootConfig
 	payload, err := readTrustedFile(path, expectedOwnerUID, MaxRootConfigBytes, false)

@@ -21,6 +21,8 @@ func TestHTTPOrchestratorUsesAgentScopedAuthenticatedRecoveryRoutes(t *testing.T
 		key := r.Method + " " + r.URL.Path
 		requests[key]++
 		switch key {
+		case "GET /api/v1/agents/agent-1/recovery/authority":
+			_ = json.NewEncoder(w).Encode(map[string]any{"key_id": "orchestrator-1", "algorithm": "Ed25519", "public_key": strings.Repeat("A", 43)})
 		case "GET /api/v1/agents/agent-1/recovery/helper":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"agent_id": "agent-1", "helper_instance_id": "helper-1", "helper_build_id": "dev-1",
@@ -47,6 +49,10 @@ func TestHTTPOrchestratorUsesAgentScopedAuthenticatedRecoveryRoutes(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	authority, err := remote.Authority(context.Background())
+	if err != nil || authority.KeyID != "orchestrator-1" || len(authority.PublicKey) != 32 {
+		t.Fatalf("authority = %#v, err=%v", authority, err)
+	}
 	pin, err := remote.HelperPin(context.Background())
 	if err != nil || pin.HelperInstanceID != "helper-1" || pin.AttestationKeyID != "attestation-1" {
 		t.Fatalf("pin = %#v, err=%v", pin, err)
@@ -72,7 +78,7 @@ func TestHTTPOrchestratorUsesAgentScopedAuthenticatedRecoveryRoutes(t *testing.T
 		t.Fatal(err)
 	}
 	for _, key := range []string{
-		"GET /api/v1/agents/agent-1/recovery/helper", "GET /api/v1/agents/agent-1/recovery/plans",
+		"GET /api/v1/agents/agent-1/recovery/authority", "GET /api/v1/agents/agent-1/recovery/helper", "GET /api/v1/agents/agent-1/recovery/plans",
 		"POST /api/v1/agents/agent-1/recovery/plans", "POST /api/v1/agents/agent-1/recovery/plans/plan-1/receipt",
 		"POST /api/v1/agents/agent-1/recovery/applies/apply-1/plan", "POST /api/v1/agents/agent-1/recovery/applies/apply-1/receipt",
 	} {

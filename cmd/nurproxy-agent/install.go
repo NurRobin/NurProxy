@@ -14,9 +14,7 @@ import (
 
 // agentService builds the agent's install.Service. Agent config is written as
 // agent.yaml in the data dir (not env) to sidestep the data-dir flag/env
-// precedence and to use the agent's native config file. install.AgentCapabilities
-// keeps the unit narrow: CAP_NET_BIND_SERVICE for the bundled Caddy's ports and
-// CAP_DAC_OVERRIDE so existing-mode `nginx -t` can read TLS keys and write logs.
+// precedence and to use the agent's native config file.
 func agentService(bin, dataDir string, cfg agentconfig.Config, user string) (install.Service, error) {
 	cfg.DataDir = dataDir
 	data, err := yaml.Marshal(cfg)
@@ -30,7 +28,6 @@ func agentService(bin, dataDir string, cfg agentconfig.Config, user string) (ins
 		Args:         []string{"--data-dir", dataDir},
 		User:         user,
 		DataDir:      dataDir,
-		WritePaths:   install.AgentProxyWritePaths,
 		ConfigFile:   filepath.Join(dataDir, "agent.yaml"),
 		ConfigData:   string(data),
 		Capabilities: install.AgentCapabilities,
@@ -45,7 +42,7 @@ func cmdInstall(args []string) {
 	dataDir := fs.String("data-dir", "/var/lib/nurproxy-agent", "Data directory")
 	apiPort := fs.Int("api-port", 8780, "Agent API port")
 	caddyPort := fs.Int("caddy-admin-port", 2019, "Caddy admin API port (localhost)")
-	user := fs.String("user", "root", "System user to run the service as")
+	user := fs.String("user", "nurproxy", "System user to run the service as")
 	bin := fs.String("bin", selfPath(), "Path to the nurproxy-agent binary the service runs")
 	_ = fs.Parse(args)
 

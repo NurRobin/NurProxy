@@ -1,0 +1,27 @@
+[Unit]
+Description=NurProxy privileged recovery helper
+Requires=nurproxy-agent-helper.socket
+After=nurproxy-agent-helper.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/nurproxy-agent root-helper
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6

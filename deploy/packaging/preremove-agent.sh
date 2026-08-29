@@ -5,5 +5,7 @@ set -e
 if [ "$1" = "remove" ] || [ "$1" = "0" ]; then
   if command -v systemctl >/dev/null 2>&1; then
     systemctl --no-reload disable --now nurproxy-agent.service 2>/dev/null || true
+    systemctl --no-reload disable --now nurproxy-agent-helper.socket 2>/dev/null || true
+    systemctl --no-reload stop nurproxy-agent-helper.service 2>/dev/null || true
   fi
 fi

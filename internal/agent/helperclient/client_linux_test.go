@@ -210,10 +210,11 @@ func TestClientHelloVerifiesPinnedHelperIdentity(t *testing.T) {
 	client := helloClientFixture(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	hello, err := client.Hello(ctx)
+	signed, err := client.SignedHello(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	hello := signed.Envelope.Payload
 	if hello.HelperInstanceID != "helper-1" || hello.HelperBuildID != "dev-build-1" {
 		t.Fatalf("hello = %#v", hello)
 	}

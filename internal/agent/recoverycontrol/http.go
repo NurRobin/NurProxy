@@ -3,6 +3,8 @@ package recoverycontrol
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +30,12 @@ type HTTPError struct {
 	StatusCode int
 }
 
+type AuthorityPin struct {
+	KeyID         string
+	PublicKeyText string
+	PublicKey     ed25519.PublicKey
+}
+
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("recovery control request returned status %d", e.StatusCode)
 }
@@ -46,6 +54,22 @@ func NewHTTP(orchestratorURL, agentID, token string, client *http.Client) (*HTTP
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 	return &HTTP{baseURL: strings.TrimRight(parsed.String(), "/"), agentID: agentID, token: token, client: client}, nil
+}
+
+func (h *HTTP) Authority(ctx context.Context) (AuthorityPin, error) {
+	var response struct {
+		KeyID     string `json:"key_id"`
+		Algorithm string `json:"algorithm"`
+		PublicKey string `json:"public_key"`
+	}
+	if err := h.getJSON(ctx, h.basePath()+"/authority", &response); err != nil {
+		return AuthorityPin{}, err
+	}
+	key, err := base64.RawURLEncoding.Strict().DecodeString(response.PublicKey)
+	if err != nil || len(key) != ed25519.PublicKeySize || strings.TrimSpace(response.KeyID) == "" || response.Algorithm != "Ed25519" {
+		return AuthorityPin{}, fmt.Errorf("orchestrator returned an invalid recovery authority")
+	}
+	return AuthorityPin{KeyID: response.KeyID, PublicKeyText: response.PublicKey, PublicKey: ed25519.PublicKey(append([]byte(nil), key...))}, nil
 }
 
 func (h *HTTP) HelperPin(ctx context.Context) (helperclient.Pin, error) {

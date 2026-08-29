@@ -93,6 +93,12 @@ func main() {
 		case "root-helper":
 			cmdRootHelper(os.Args[2:])
 			return
+		case "helper-refresh-build":
+			cmdHelperRefreshBuild(os.Args[2:])
+			return
+		case "helper-bootstrap":
+			cmdHelperBootstrap(os.Args[2:])
+			return
 		}
 	}
 
@@ -476,7 +482,7 @@ func main() {
 			streamClient.WithRecovery(recoveryCoordinator)
 			go recoveryReporter.Run(ctx)
 			if existingMode && !cfg.DryRun {
-				go runHardRecoveryControl(ctx, cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, recoveryCoordinator, streamClient, filepath.Join(cfg.DataDir, "helper-staging"))
+				go runHardRecoveryControl(ctx, cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, recoveryCoordinator, streamClient, recoverycontrol.DefaultStagingRoot)
 			}
 		}
 	}

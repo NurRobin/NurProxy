@@ -58,12 +58,59 @@ func TestOrchestratorPostinstallHardensBeforeStarting(t *testing.T) {
 func TestPackagedAgentUnitMatchesRenderUnit(t *testing.T) {
 	svc := Service{
 		Name: "nurproxy-agent", Description: "NurProxy agent",
-		BinaryPath: "/usr/bin/nurproxy-agent", Args: []string{"--data-dir", "/var/lib/nurproxy-agent"},
-		User: "root", DataDir: "/var/lib/nurproxy-agent", EnvFile: "/etc/nurproxy-agent/agent.env",
-		WritePaths:   AgentProxyWritePaths,
+		BinaryPath: "/usr/bin/nurproxy-agent", Args: []string{"--data-dir", "/var/lib/nurproxy-agent/state"},
+		User: "nurproxy", Group: "nurproxy", DataDir: "/var/lib/nurproxy-agent/state", EnvFile: "/etc/nurproxy-agent/agent.env",
+		AfterUnits:   []string{"nurproxy-agent-helper.socket"},
+		WantsUnits:   []string{"nurproxy-agent-helper.socket"},
 		Capabilities: AgentCapabilities,
 	}
 	assertPackagedUnit(t, "nurproxy-agent.service", svc)
+}
+
+func TestPackagedRootHelperUnitsMatchTrustedRenderers(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "deploy", "packaging")
+	checks := map[string]string{
+		"nurproxy-agent-helper.service": RenderRootHelperUnit("/usr/bin/nurproxy-agent"),
+		"nurproxy-agent-helper.socket":  RenderRootHelperSocket(),
+	}
+	for name, want := range checks {
+		got, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatalf("reading packaged %s: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("packaged %s drifted from its renderer\n--- packaged ---\n%s\n--- rendered ---\n%s", name, got, want)
+		}
+	}
+}
+
+func TestAgentPostinstallCreatesUnprivilegedBoundaryBeforeRestart(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "packaging", "postinstall-agent.sh")
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(payload)
+	ordered := []string{
+		"useradd --system",
+		"install -d -o root -g nurproxy -m 0770 /var/lib/nurproxy-agent/helper-staging",
+		"install -d -o root -g root -m 0700 /var/lib/nurproxy-agent/helper",
+		"systemctl enable --now nurproxy-agent-helper.socket",
+		"systemctl start nurproxy-agent.service",
+	}
+	last := -1
+	for _, needle := range ordered {
+		index := strings.Index(script, needle)
+		if index < 0 || index <= last {
+			t.Fatalf("postinstall missing ordered boundary step %q:\n%s", needle, script)
+		}
+		last = index
+	}
+	for _, forbidden := range []string{"chown -R", "chmod -R", "systemctl enable --now nurproxy-agent-helper.socket || true"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("postinstall contains unsafe or swallowed boundary step %q", forbidden)
+		}
+	}
 }
 
 func assertPackagedUnit(t *testing.T, file string, svc Service) {

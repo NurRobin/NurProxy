@@ -14,6 +14,8 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 )
 
+const DefaultStagingRoot = "/var/lib/nurproxy-agent/helper-staging"
+
 type ManagedHelper interface {
 	PlanManagedApply(context.Context, helperprotocol.Signed[helperprotocol.ApplyIntent]) (helperprotocol.Signed[helperprotocol.ManagedApplyPlan], error)
 	ExecuteManagedApply(context.Context, helperprotocol.Signed[helperprotocol.ApplyGrant]) (helperprotocol.Signed[helperprotocol.HelperReceipt], string, error)
