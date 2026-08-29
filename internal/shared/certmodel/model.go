@@ -387,6 +387,9 @@ func (i ExportInventory) Validate() error {
 }
 
 func (i ExportInventory) validatePayload() error {
+	if len(i.Exports) > MaxExportsPerSnapshot || len(i.Keep) > MaxExportsPerSnapshot || len(i.Cleanup) > MaxExportsPerSnapshot || len(i.Exports)+len(i.Cleanup) > MaxExportsPerSnapshot {
+		return fmt.Errorf("assembled export inventory exceeds collection limits")
+	}
 	ids, paths := map[string]struct{}{}, map[string]string{}
 	for n, export := range i.Exports {
 		if err := export.Validate(); err != nil {
@@ -559,7 +562,32 @@ func (s ExportStatus) Validate() error {
 	if err := optionalFingerprint(s.AppliedFingerprint); err != nil {
 		return err
 	}
-	return optionalCode(s.LastErrorCode)
+	if err := optionalCode(s.LastErrorCode); err != nil {
+		return err
+	}
+	switch s.Health {
+	case HealthPending:
+		if s.LastErrorCode != "" {
+			return fmt.Errorf("pending export status cannot contain an error")
+		}
+	case HealthHealthy:
+		if s.DesiredFingerprint == "" || s.AppliedFingerprint != s.DesiredFingerprint || s.LastErrorCode != "" {
+			return fmt.Errorf("invalid healthy export status")
+		}
+	case HealthDegraded:
+		if s.DesiredFingerprint == "" || s.AppliedFingerprint == "" || s.LastErrorCode == "" {
+			return fmt.Errorf("invalid degraded export status")
+		}
+	case HealthFailed:
+		if s.LastErrorCode == "" {
+			return fmt.Errorf("failed export status requires an error code")
+		}
+	case HealthDisabled:
+		if s.LastErrorCode != "" {
+			return fmt.Errorf("disabled export status cannot contain an error")
+		}
+	}
+	return nil
 }
 
 func (d ExportDeployment) Validate() error {
@@ -706,18 +734,23 @@ func (r ExportPlanResult) ValidateAt(now time.Time) error {
 	if r.ExpiresAt.IsZero() || !r.ExpiresAt.After(now) || r.ExpiresAt.After(now.Add(MaxPlanLifetime)) {
 		return fmt.Errorf("plan token is stale or has excessive lifetime")
 	}
-	if len(r.ResolvedDestinations) > MaxDestinationsPerExport || len(r.Risks) > maxRisks {
+	if len(r.ResolvedDestinations) == 0 || len(r.ResolvedDestinations) > MaxDestinationsPerExport || len(r.Risks) > maxRisks {
 		return fmt.Errorf("plan aggregate exceeds bounds")
 	}
-	seen := map[string]struct{}{}
+	seenPaths := map[string]struct{}{}
+	seenKinds := map[DestinationKind]struct{}{}
 	for _, destination := range r.ResolvedDestinations {
 		if err := destination.Validate(); err != nil {
 			return err
 		}
-		if _, exists := seen[destination.Path]; exists {
+		if _, exists := seenPaths[destination.Path]; exists {
 			return fmt.Errorf("duplicate resolved destination")
 		}
-		seen[destination.Path] = struct{}{}
+		if _, exists := seenKinds[destination.Kind]; exists {
+			return fmt.Errorf("duplicate resolved destination kind")
+		}
+		seenPaths[destination.Path] = struct{}{}
+		seenKinds[destination.Kind] = struct{}{}
 	}
 	if err := r.ResolvedAction.Validate(); err != nil {
 		return err

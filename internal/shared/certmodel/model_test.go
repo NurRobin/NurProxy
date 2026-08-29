@@ -160,6 +160,59 @@ func TestInventoryChunkSetRejectsIncompleteReorderedOrMismatchedSnapshots(t *tes
 	}
 }
 
+func TestInventoryChunkSetEnforcesAggregateCollectionLimits(t *testing.T) {
+	makeExport := func(index int) CertificateExport {
+		export := validExport()
+		export.ID = fmt.Sprintf("exp-%03d", index)
+		export.Name = fmt.Sprintf("export %d", index)
+		export.CertificateHost = fmt.Sprintf("mail-%d.example.com", index)
+		for destinationIndex := range export.Destinations {
+			export.Destinations[destinationIndex].Path = fmt.Sprintf("/etc/mail/%d/%s.pem", index, export.Destinations[destinationIndex].Kind)
+		}
+		return export
+	}
+	exports := make([]CertificateExport, MaxExportsPerSnapshot+1)
+	for index := range exports {
+		exports[index] = makeExport(index)
+	}
+	chunks := []ExportInventory{
+		{Revision: 8, ChunkIndex: 0, ChunkCount: 2, Exports: exports[:64]},
+		{Revision: 8, ChunkIndex: 1, ChunkCount: 2, Exports: exports[64:]},
+	}
+	if err := ValidateInventoryChunks(chunks); err == nil {
+		t.Fatal("aggregate export count above snapshot limit accepted")
+	}
+	keep := make([]string, MaxExportsPerSnapshot+1)
+	for index := range keep {
+		keep[index] = fmt.Sprintf("exp-%03d", index)
+	}
+	chunks = []ExportInventory{
+		{Revision: 8, ChunkIndex: 0, ChunkCount: 2, Keep: keep[:64]},
+		{Revision: 8, ChunkIndex: 1, ChunkCount: 2, Keep: keep[64:]},
+	}
+	if err := ValidateInventoryChunks(chunks); err == nil {
+		t.Fatal("aggregate keep count above snapshot limit accepted")
+	}
+	cleanups := make([]CleanupIntent, MaxExportsPerSnapshot+1)
+	for index := range cleanups {
+		cleanups[index] = CleanupIntent{ExportID: fmt.Sprintf("old-%03d", index), Revision: 8, CertificateHost: fmt.Sprintf("old-%d.example.com", index), DesiredFingerprint: strings.Repeat("a", 64), Mode: ExportModeSymlink, Destinations: []Destination{{Kind: DestinationCert, Path: fmt.Sprintf("/etc/old/%d/cert.pem", index)}}}
+	}
+	chunks = []ExportInventory{
+		{Revision: 8, ChunkIndex: 0, ChunkCount: 2, Cleanup: cleanups[:64]},
+		{Revision: 8, ChunkIndex: 1, ChunkCount: 2, Cleanup: cleanups[64:]},
+	}
+	if err := ValidateInventoryChunks(chunks); err == nil {
+		t.Fatal("aggregate cleanup count above snapshot limit accepted")
+	}
+	chunks = []ExportInventory{
+		{Revision: 8, ChunkIndex: 0, ChunkCount: 2, Exports: exports[:65]},
+		{Revision: 8, ChunkIndex: 1, ChunkCount: 2, Cleanup: cleanups[:64]},
+	}
+	if err := ValidateInventoryChunks(chunks); err == nil {
+		t.Fatal("aggregate desired plus cleanup count above snapshot limit accepted")
+	}
+}
+
 func TestPlanEnvelopesValidateNestedPayload(t *testing.T) {
 	now := time.Now().UTC()
 	request := ExportPlanRequestEnvelope{Request: ExportPlanRequest{RequestID: "plan-1", Export: validExport(), RequestedAt: now}}
@@ -203,6 +256,21 @@ func TestPlanResultRejectsStaleOrUnboundTokens(t *testing.T) {
 	}
 }
 
+func TestPlanResultRequiresUniqueDestinationKindsAndPaths(t *testing.T) {
+	now := time.Date(2026, 8, 29, 5, 0, 0, 0, time.UTC)
+	base := ExportPlanResult{RequestID: "plan-1", ExportID: "exp-1", SpecHash: strings.Repeat("a", 64), CapabilityRevision: "cap-1", FreshnessToken: "opaque-token-123456", ExpiresAt: now.Add(time.Minute), ResolvedAction: ResolvedAction{Kind: ActionNone}}
+	if err := base.ValidateAt(now); err == nil {
+		t.Fatal("plan without destinations accepted")
+	}
+	base.ResolvedDestinations = []ResolvedDestination{
+		{Kind: DestinationCert, Path: "/etc/mail/cert.pem", UID: 0, GID: 0, Mode: "0644"},
+		{Kind: DestinationCert, Path: "/etc/mail/other.pem", UID: 0, GID: 0, Mode: "0644"},
+	}
+	if err := base.ValidateAt(now); err == nil {
+		t.Fatal("plan with duplicate destination kind accepted")
+	}
+}
+
 func TestCapabilityNegotiationFailsClosedForLegacyPeers(t *testing.T) {
 	if SupportsExports(nil) {
 		t.Fatal("legacy peer unexpectedly supports exports")
@@ -236,6 +304,37 @@ func TestStatusAndHistoryNeverSerializePrivateMaterial(t *testing.T) {
 			if strings.Contains(lower, forbidden) {
 				t.Fatalf("%T serialized %q: %s", value, forbidden, raw)
 			}
+		}
+	}
+}
+
+func TestExportStatusHealthMatrix(t *testing.T) {
+	desired := strings.Repeat("a", 64)
+	applied := strings.Repeat("b", 64)
+	valid := []ExportStatus{
+		{ExportID: "exp-1", Health: HealthPending, DesiredFingerprint: desired},
+		{ExportID: "exp-1", Health: HealthHealthy, DesiredFingerprint: desired, AppliedFingerprint: desired},
+		{ExportID: "exp-1", Health: HealthDegraded, DesiredFingerprint: desired, AppliedFingerprint: applied, LastErrorCode: "hook_failed"},
+		{ExportID: "exp-1", Health: HealthFailed, DesiredFingerprint: desired, AppliedFingerprint: applied, LastErrorCode: "rollback_failed"},
+		{ExportID: "exp-1", Health: HealthDisabled, AppliedFingerprint: applied},
+	}
+	for _, status := range valid {
+		if err := status.Validate(); err != nil {
+			t.Fatalf("valid status rejected: %#v: %v", status, err)
+		}
+	}
+	invalid := []ExportStatus{
+		{ExportID: "exp-1", Health: HealthPending, LastErrorCode: "unexpected"},
+		{ExportID: "exp-1", Health: HealthHealthy},
+		{ExportID: "exp-1", Health: HealthHealthy, DesiredFingerprint: desired, AppliedFingerprint: applied},
+		{ExportID: "exp-1", Health: HealthHealthy, DesiredFingerprint: desired, AppliedFingerprint: desired, LastErrorCode: "unexpected"},
+		{ExportID: "exp-1", Health: HealthDegraded, DesiredFingerprint: desired, AppliedFingerprint: applied},
+		{ExportID: "exp-1", Health: HealthFailed, DesiredFingerprint: desired},
+		{ExportID: "exp-1", Health: HealthDisabled, LastErrorCode: "unexpected"},
+	}
+	for _, status := range invalid {
+		if err := status.Validate(); err == nil {
+			t.Fatalf("invalid status accepted: %#v", status)
 		}
 	}
 }
