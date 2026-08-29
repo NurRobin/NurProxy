@@ -66,6 +66,19 @@ func (s *Server) handleSubmitManagedApplyPlan(w http.ResponseWriter, r *http.Req
 		writeRecoveryError(w, http.StatusConflict, "managed_apply_intent_invalid", "stored managed apply intent failed verification")
 		return
 	}
+	if existing.SignedReceipt != nil {
+		intent := existing.SignedIntent.Envelope.Payload
+		plan := signed.Envelope.Payload
+		logical, artifacts, deletions, certificates, digestErr := helperprotocol.ManagedApplyDigests(intent)
+		if digestErr != nil || plan.DesiredStateRevision != intent.DesiredStateRevision ||
+			plan.LogicalManifestDigest != logical || plan.ArtifactManifestDigest != artifacts ||
+			plan.DeletionSetDigest != deletions || plan.CertificateIdentityDigest != certificates {
+			writeRecoveryError(w, http.StatusConflict, "managed_apply_mismatch", "managed apply retry does not match completed desired state")
+			return
+		}
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
 	created := existing.SignedPlan == nil
 	if err := s.db.StoreManagedApplyPlan(agentID, signed, time.Now().UTC()); err != nil {
 		switch {

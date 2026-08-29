@@ -126,6 +126,24 @@ func TestManagedApplyPlanGetsImmediateBoundGrantAndAttestedReceipt(t *testing.T)
 	if w.Code != http.StatusOK {
 		t.Fatalf("managed execution fetch = %d: %s", w.Code, w.Body.String())
 	}
+
+	retryPlan := signedPlan.Envelope.Payload
+	retryPlan.HelperPlanID = "managed-plan-retry"
+	signedRetryPlan, err := helperprotocol.Sign("attestation-1", helperPrivate, helperprotocol.NewEnvelope(helperprotocol.MessageManagedApplyPlan, retryPlan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = doRequestWithAuth(t, handler, http.MethodPost, basePath+"/plan", signedRetryPlan, recoveryAgentToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("completed managed retry = %d: %s", w.Code, w.Body.String())
+	}
+	var retried db.ManagedApplyExecution
+	if err := json.Unmarshal(w.Body.Bytes(), &retried); err != nil {
+		t.Fatal(err)
+	}
+	if retried.SignedReceipt == nil || retried.HelperPlanID != "managed-plan-1" {
+		t.Fatalf("completed retry did not return the original receipt and plan: %+v", retried)
+	}
 }
 
 func TestManagedApplyPlanRejectsWrongAgentTamperingAndSupersededIntent(t *testing.T) {
