@@ -14,6 +14,8 @@ package proxymodel
 
 import (
 	"fmt"
+	"net"
+	"regexp"
 	"strings"
 )
 
@@ -236,5 +238,108 @@ func (r Route) Validate() error {
 			return fmt.Errorf("basic auth: password hash is required")
 		}
 	}
+	if !validHost(r.Host) {
+		return fmt.Errorf("host %q is not a valid DNS name", r.Host)
+	}
+	if !validUpstreamAddr(r.Upstream.Addr) {
+		return fmt.Errorf("upstream address %q is not a host name or IP address", r.Upstream.Addr)
+	}
+	return r.ValidateOptions()
+}
+
+var (
+	hostLabelRe   = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$`)
+	headerNameRe  = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	bodySizeRe    = regexp.MustCompile(`^\s*(?i:unlimited|[0-9]+(\.[0-9]+)?\s*[kmg]?b?)\s*$`)
+	pathUnsafeSet = " \t\"'\\{};#"
+)
+
+// ValidateOptions checks the option values that renderers interpolate into
+// native proxy configs: header names and values, body size, path rules, IP
+// lists and basic-auth credentials. It does not require a host or upstream,
+// so the orchestrator can check a domain's proxy settings on their own.
+func (r Route) ValidateOptions() error {
+	for kind, headers := range map[string]map[string]string{"request": r.RequestHeaders, "response": r.ResponseHeaders} {
+		for name, value := range headers {
+			if !headerNameRe.MatchString(name) {
+				return fmt.Errorf("%s header name %q may only contain letters, digits, '-' and '_'", kind, name)
+			}
+			if !validHeaderValue(value) {
+				return fmt.Errorf("%s header %s has a value with control characters or a backslash", kind, name)
+			}
+		}
+	}
+	if r.MaxBodySize != "" && !bodySizeRe.MatchString(r.MaxBodySize) {
+		return fmt.Errorf("max body size %q is not a size like 10m, 1GB or unlimited", r.MaxBodySize)
+	}
+	for _, p := range []struct{ name, value string }{{"path strip prefix", r.Path.StripPrefix}, {"path rewrite", r.Path.Rewrite}} {
+		if p.value != "" && (hasControl(p.value) || strings.ContainsAny(p.value, pathUnsafeSet)) {
+			return fmt.Errorf("%s %q contains whitespace, quotes, braces, '#', ';' or a backslash", p.name, p.value)
+		}
+	}
+	for _, list := range [][]string{r.IPAllowlist, r.IPBlocklist} {
+		for _, entry := range list {
+			if !validIPOrCIDR(entry) {
+				return fmt.Errorf("IP list entry %q is not an IP address or CIDR range", entry)
+			}
+		}
+	}
+	if r.BasicAuth != nil {
+		if hasControl(r.BasicAuth.Username) || strings.Contains(r.BasicAuth.Username, ":") {
+			return fmt.Errorf("basic auth: username must not contain ':' or control characters")
+		}
+		if hasControl(r.BasicAuth.PasswordHash) {
+			return fmt.Errorf("basic auth: password hash must not contain control characters")
+		}
+	}
 	return nil
+}
+
+// validHost accepts a DNS name with an optional leading "*." wildcard label.
+func validHost(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for i, label := range strings.Split(host, ".") {
+		if i == 0 && label == "*" {
+			continue
+		}
+		if !hostLabelRe.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// validUpstreamAddr accepts a DNS name or an IP address (IPv6 with or without
+// brackets).
+func validUpstreamAddr(addr string) bool {
+	if net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]")) != nil {
+		return true
+	}
+	return !strings.HasPrefix(addr, "*") && validHost(addr)
+}
+
+func validIPOrCIDR(entry string) bool {
+	if net.ParseIP(entry) != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(entry)
+	return err == nil
+}
+
+// validHeaderValue refuses control characters (CR, LF, NUL, ...) and
+// backslashes. Backslash escaping differs between nginx and Apache, so a
+// value that needs one cannot be rendered the same way everywhere.
+func validHeaderValue(v string) bool {
+	return !hasControl(v) && !strings.Contains(v, `\`)
+}
+
+func hasControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }

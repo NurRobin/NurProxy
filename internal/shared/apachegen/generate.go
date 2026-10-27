@@ -110,6 +110,12 @@ func Render(in Input) (Result, error) {
 	if route.Upstream.Port <= 0 || route.Upstream.Port > 65535 {
 		return Result{}, fmt.Errorf("upstream port %d out of range (1-65535)", route.Upstream.Port)
 	}
+	// Apache reads one directive per line and has no policy check on the
+	// rendered vhost, so every interpolated value must pass the model's value
+	// checks (plain names, no control characters or backslashes).
+	if err := route.Validate(); err != nil {
+		return Result{}, err
+	}
 
 	var warnings []Warning
 	warn := func(option, reason string) {

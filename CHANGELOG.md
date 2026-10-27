@@ -36,11 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for that block, and directive names must be plain words. A raw config that
   uses quoted directive names, single-quoted values, backslashes outside a
   `rewrite` pattern, `#` or braces inside a word, comments in the middle of a
-  directive, or anything besides `listen`, `server_name` and `return 301
-  https://...` in the redirect server is refused. As before, it is kept only
-  if the exact bytes are already installed. Configs rendered from the
-  dashboard form still pass. Header values that contain `'`, `#` or braces
-  are now rendered in double quotes, so nginx reads them as one value.
+  directive, lines over 2048 bytes, or a redirect server with anything other
+  than `listen 80`, one `server_name` for the domain and one `return 301
+  https://$host$request_uri` is refused. Listeners must match what NurProxy
+  renders: no options on port 80, and `ssl` (plus `http2` on older nginx) on
+  port 443, because nginx applies listen options to every vhost on that
+  port. As before, a refused config is kept only if the exact bytes are
+  already installed. Configs rendered from the dashboard form still pass.
+- **Rendered vhosts get the same check.** The helper now runs every nginx
+  vhost it renders from a domain's settings through the same check (with
+  basic auth and rate limits allowed in the form NurProxy renders them) and
+  refuses to write one that fails.
+- **Proxy settings are validated before they reach a config.** Header names
+  may only contain letters, digits, `-` and `_`. Header values may not contain
+  control characters or backslashes. Hosts and upstream addresses must be DNS
+  names or IP addresses, IP lists must hold IPs or CIDR ranges, body sizes
+  must look like `10m`, `1GB` or `unlimited`, path rules may not contain
+  whitespace, quotes, braces, `#`, `;` or backslashes, and basic-auth user
+  names may not contain `:`. The API rejects such values when a domain is
+  saved, and the nginx and Apache renderers and the helper refuse them. Header
+  values that contain `'`, `#` or braces are now rendered in double quotes,
+  so nginx reads them as one value; the nginx renderer also escapes
+  backslashes inside quotes as a second safeguard. A domain that already has
+  such a value stored must be corrected before its agent applies again.
 
 ## [0.5.0] - 2026-10-27
 

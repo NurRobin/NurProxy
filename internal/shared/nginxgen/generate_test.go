@@ -451,6 +451,9 @@ func TestQuoteHeaderValue(t *testing.T) {
 		{"#a", `"#a"`},
 		{"a#b", `"a#b"`},
 		{"{x}", `"{x}"`},
+		{`a\b`, `"a\\b"`},
+		{`\";include /etc/x;#`, `"\\\";include /etc/x;#"`},
+		{`x\`, `"x\\"`},
 	}
 	for _, tt := range tests {
 		if got := quoteHeaderValue(tt.in); got != tt.want {

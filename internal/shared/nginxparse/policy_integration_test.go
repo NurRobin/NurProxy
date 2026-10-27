@@ -46,17 +46,31 @@ func TestValidateManagedAgreesWithRealNginx(t *testing.T) {
 		name     string
 		content  string
 		admitted bool
+		validate func(string, ManagedPolicy) error
 	}
 	var cases []nginxCase
 	for name, content := range policyTestAccepted {
-		cases = append(cases, nginxCase{name: "accepted/" + name, content: content, admitted: true})
+		cases = append(cases, nginxCase{name: "accepted/" + name, content: content, admitted: true, validate: ValidateManaged})
 	}
-	for name, content := range policyTestGeneratedConfigs(t) {
+	for name, generated := range policyTestGeneratedConfigs(t) {
 		// nginx -t resolves upstream host names; keep the check offline.
-		cases = append(cases, nginxCase{name: "generated/" + name, content: strings.ReplaceAll(content, "backend.internal", "127.0.0.1"), admitted: true})
+		content := strings.ReplaceAll(generated.full, "backend.internal", "127.0.0.1")
+		cases = append(cases, nginxCase{name: "generated/" + name, content: content, admitted: true, validate: ValidateRendered})
 	}
 	for _, tt := range policyTestRefused {
-		cases = append(cases, nginxCase{name: "refused/" + tt.name, content: tt.content})
+		cases = append(cases, nginxCase{name: "refused/" + tt.name, content: tt.content, validate: ValidateManaged})
+	}
+	// Escaped header values that nginx must read as one value: if it ended
+	// the string early, the error_log after it would open a marker.
+	hostileValues := strings.Replace(policyTestRendered, "    location / {",
+		`    add_header X-B "\\\";error_log /tmp/x.log info;#" always;`+"\n"+
+			`    add_header X-C "\\\\\";error_log /tmp/x.log info;#\\" always;`+"\n"+
+			`    add_header X-D "a\\" always;`+"\n    location / {", 1)
+	cases = append(cases, nginxCase{name: "rendered/escaped header values", content: hostileValues, admitted: true, validate: ValidateRendered})
+	cases = append(cases, nginxCase{name: "rendered/sample", content: policyTestRendered, admitted: true, validate: ValidateRendered})
+	cases = append(cases, nginxCase{name: "rendered/unescaped quote", content: strings.Replace(policyTestRendered, `"\\\";include /etc/x;#"`, `"\\";error_log /tmp/x.log info;#"`, 1), validate: ValidateRendered})
+	for name, content := range policyTestRenderedRefused {
+		cases = append(cases, nginxCase{name: "rendered refused/" + name, content: content, validate: ValidateRendered})
 	}
 	sort.Slice(cases, func(i, j int) bool { return cases[i].name < cases[j].name })
 
@@ -74,10 +88,10 @@ func TestValidateManagedAgreesWithRealNginx(t *testing.T) {
 		markers[i] = fmt.Sprintf("/markers/case-%03d.log", i)
 		content := strings.ReplaceAll(c.content, "/tmp/x.log", markers[i])
 		cases[i].content = content
-		if c.admitted && ValidateManaged(content, policyTestPolicy) != nil {
-			t.Fatalf("%s: admitted case no longer passes the policy", c.name)
+		if err := c.validate(content, policyTestPolicyFor(content)); c.admitted && err != nil {
+			t.Fatalf("%s: admitted case no longer passes the policy: %v", c.name, err)
 		}
-		if !c.admitted && ValidateManaged(content, policyTestPolicy) == nil {
+		if !c.admitted && c.validate(content, policyTestPolicyFor(content)) == nil {
 			t.Fatalf("%s: refused case passes the policy", c.name)
 		}
 		file := fmt.Sprintf("case-%03d.conf", i)

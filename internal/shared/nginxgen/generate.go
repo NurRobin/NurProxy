@@ -154,6 +154,11 @@ func Render(in Input) (Result, error) {
 	if route.Upstream.Port <= 0 || route.Upstream.Port > 65535 {
 		return Result{}, fmt.Errorf("upstream port %d out of range (1-65535)", route.Upstream.Port)
 	}
+	// Every value below is interpolated into the native config, so it must
+	// pass the model's value checks (plain names, no control characters).
+	if err := route.Validate(); err != nil {
+		return Result{}, err
+	}
 
 	var warnings []Warning
 	warn := func(option, reason string) {
@@ -396,14 +401,16 @@ func normalizeBodySize(s string) string {
 func basicAuthRealm(host string) string { return "Restricted: " + host }
 
 // quoteHeaderValue wraps a header value in double quotes when it contains
-// whitespace, a semicolon, a quote, "#" or a brace, which nginx would otherwise
-// tokenize differently (or which the raw config check refuses in an unquoted
-// word). Embedded double quotes are backslash-escaped.
+// whitespace, a semicolon, a quote, a backslash, "#" or a brace, which nginx
+// would otherwise tokenize differently (or which the raw config check refuses
+// in an unquoted word). Inside the quotes, backslashes are escaped before
+// double quotes, so nginx reads back exactly v.
 func quoteHeaderValue(v string) string {
 	if v == "" {
 		return `""`
 	}
-	if strings.ContainsAny(v, " \t;\"'#{}") {
+	if strings.ContainsAny(v, " \t;\"'#{}\\") {
+		v = strings.ReplaceAll(v, `\`, `\\`)
 		return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
 	}
 	return v
