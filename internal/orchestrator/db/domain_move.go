@@ -129,10 +129,10 @@ func (d *DB) ClaimDomainRoute(dom *models.Domain) error {
 		}
 		return err
 	}
-	resourceID, host := domainArtifactID(dom.ID), dom.FQDN(zone.Name)
+	resourceID, file := domainArtifactID(dom.ID), helperprotocol.ManagedVhostKey(dom.FQDN(zone.Name))
 	stale := make([]helperprotocol.ManagedDeletion, 0)
 	for _, deletion := range pending {
-		if deletion.ResourceID == resourceID || deletion.Host == host {
+		if deletion.ResourceID == resourceID || helperprotocol.ManagedVhostKey(deletion.Host) == file {
 			stale = append(stale, deletion)
 		}
 	}

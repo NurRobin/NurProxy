@@ -11,7 +11,24 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/recoveryauth"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+func seedLiveDomain(t *testing.T, database *db.DB, subdomain string) {
+	t.Helper()
+	if err := database.CreateProvider(&models.Provider{ID: "prov-live", Type: "cloudflare", Name: "CF", Config: `{"api_token":"test"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateZone(&models.Zone{ID: "zone-live", ProviderID: "prov-live", ExternalID: "ext-live", Name: "example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateServer(&models.Server{ID: "srv-live", AgentID: "agent-1", Name: "Live", Address: "10.0.0.5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateDomain(&models.Domain{Subdomain: subdomain, ZoneID: "zone-live", ServerID: "srv-live", Port: 8080, Status: models.DomainStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // The helper latches its permanent breaker after rollback_failed and after a
 // journal recovery that ends outcome_indeterminate (#148). helper-status must
@@ -21,6 +38,7 @@ func TestHelperStatusReportsManagedApplyBreaker(t *testing.T) {
 		name          string
 		state         helperprotocol.JournalState
 		note          string // appended to the receipt message
+		liveDomain    string // subdomain of example.com kept live on agent-1
 		wantOpen      bool
 		wantLeftovers string
 	}{
@@ -31,6 +49,11 @@ func TestHelperStatusReportsManagedApplyBreaker(t *testing.T) {
 		{name: "succeeded with leftover vhosts", state: helperprotocol.JournalSucceeded,
 			note:          "; " + helperprotocol.ManagedLeftoverVhostsNote + "nurproxy-a.example.com.conf, nurproxy-b.example.com.conf; later note",
 			wantLeftovers: "nurproxy-a.example.com.conf, nurproxy-b.example.com.conf"},
+		{name: "files of live domains are not leftovers", state: helperprotocol.JournalSucceeded, liveDomain: "a",
+			note:          "; " + helperprotocol.ManagedLeftoverVhostsNote + "nurproxy-a.example.com.conf, nurproxy-b.example.com.conf and 3 more",
+			wantLeftovers: "nurproxy-b.example.com.conf and 3 more"},
+		{name: "only live domain files leaves nothing to report", state: helperprotocol.JournalSucceeded, liveDomain: "a",
+			note: "; " + helperprotocol.ManagedLeftoverVhostsNote + "nurproxy-a.example.com.conf"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -40,6 +63,9 @@ func TestHelperStatusReportsManagedApplyBreaker(t *testing.T) {
 				t.Fatal(err)
 			}
 			srv.SetRecoveryAuthority(authority)
+			if tc.liveDomain != "" {
+				seedLiveDomain(t, database, tc.liveDomain)
+			}
 			_, signedPlan, helperPrivate := managedApplyAPIFixture(t, database, authority)
 			basePath := "/api/v1/agents/agent-1/recovery/applies/apply-operation-1"
 			w := doRequestWithAuth(t, handler, http.MethodPost, basePath+"/plan", signedPlan, recoveryAgentToken)

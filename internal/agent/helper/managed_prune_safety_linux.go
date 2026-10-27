@@ -132,8 +132,9 @@ func (a *managedApplyAction) referencedCertificateBases(compilation managedCompi
 
 // certificateBaseReferenced matches "/<base><suffix>" so any absolute or
 // differently spelled path to the store file (double slashes, symlinked
-// store directory) still counts as a reference. A false positive only keeps a
-// certificate one apply longer.
+// store directory) still counts as a reference. A false positive keeps the
+// certificate for as long as the matching config file exists; it never
+// deletes anything.
 func certificateBaseReferenced(base string, contents [][]byte) bool {
 	for _, suffix := range managedCertificateSuffixes {
 		needle := []byte("/" + base + suffix)

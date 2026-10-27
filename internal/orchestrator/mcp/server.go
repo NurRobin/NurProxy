@@ -399,10 +399,11 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "create", dom.Subdomain)
+	var warnings []string
 	if err := d.ClaimDomainRoute(dom); err != nil {
-		return nil, fmt.Errorf("domain created, but colliding route tombstones could not be dropped: %w", err)
+		warnings = append(warnings, "colliding route tombstones could not be dropped: "+err.Error())
 	}
-	return dom, nil
+	return domainWithWarnings(dom, warnings), nil
 }
 
 func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
@@ -462,15 +463,32 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "update", dom.Subdomain)
+	// The update is committed from here on, so cleanup failures are reported
+	// as warnings next to the domain rather than as a tool error.
+	var warnings []string
 	if removed, err := d.CompleteDomainMove(move); err != nil {
-		return nil, fmt.Errorf("domain moved, but its stale artifact could not be removed: %w", err)
+		warnings = append(warnings, "stale config artifact could not be removed: "+err.Error())
 	} else if removed {
 		auditMCP(d, "config_artifact", move.ArtifactID, "remove", "domain moved to another agent")
 	}
 	if err := d.ClaimDomainRoute(dom); err != nil {
-		return nil, fmt.Errorf("domain updated, but colliding route tombstones could not be dropped: %w", err)
+		warnings = append(warnings, "colliding route tombstones could not be dropped: "+err.Error())
 	}
-	return dom, nil
+	return domainWithWarnings(dom, warnings), nil
+}
+
+// domainResult is a domain plus post-commit cleanup warnings; it marshals as
+// the plain domain object when there are none.
+type domainResult struct {
+	*models.Domain
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+func domainWithWarnings(dom *models.Domain, warnings []string) any {
+	if len(warnings) == 0 {
+		return dom
+	}
+	return domainResult{Domain: dom, Warnings: warnings}
 }
 
 func toolDeleteDomain(d *db.DB, args json.RawMessage) (any, error) {

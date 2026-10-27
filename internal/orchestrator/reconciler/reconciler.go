@@ -206,23 +206,27 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 // rendered again (a domain moved away and back, or a new domain reusing a
 // deleted host) and a second tombstone for an already listed host would put
 // the same vhost file into one signed apply twice; the helper rejects that,
-// and every apply on the agent would stay blocked.
+// and every apply on the agent would stay blocked. Hosts are compared by the
+// managed vhost file they map to, which is case-sensitive: App.example.com
+// and app.example.com are two files, and the tombstone for one must not be
+// dropped because the other is rendered.
 func deletionsOutsideDesired(deletions []helperprotocol.ManagedDeletion, intents []proxymodel.RouteIntent) []helperprotocol.ManagedDeletion {
 	resources := make(map[string]struct{}, len(intents))
-	hosts := make(map[string]struct{}, len(intents)+len(deletions))
+	files := make(map[string]struct{}, len(intents)+len(deletions))
 	for _, intent := range intents {
 		resources[intent.ArtifactID] = struct{}{}
-		hosts[strings.ToLower(intent.Route.Host)] = struct{}{}
+		files[helperprotocol.ManagedVhostKey(intent.Route.Host)] = struct{}{}
 	}
 	kept := make([]helperprotocol.ManagedDeletion, 0, len(deletions))
 	for _, deletion := range deletions {
 		if _, rendered := resources[deletion.ResourceID]; rendered {
 			continue
 		}
-		if _, taken := hosts[strings.ToLower(deletion.Host)]; taken {
+		key := helperprotocol.ManagedVhostKey(deletion.Host)
+		if _, taken := files[key]; taken {
 			continue
 		}
-		hosts[strings.ToLower(deletion.Host)] = struct{}{}
+		files[key] = struct{}{}
 		kept = append(kept, deletion)
 	}
 	return kept
