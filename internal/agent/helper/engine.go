@@ -69,6 +69,14 @@ type ManagedApplyHandler interface {
 	Rollback(context.Context, string, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent, PreparedAction) error
 }
 
+// ManagedApplyConvergenceChecker is implemented by managed apply handlers that
+// can prove, without writing anything, that applying the plan would change
+// nothing on disk. The returned result must be exactly what Execute would return
+// for that converged state (Mutated false, Validated true, artifact attestations).
+type ManagedApplyConvergenceChecker interface {
+	Converged(context.Context, helperprotocol.ManagedApplyPlan, helperprotocol.ApplyIntent) (ActionResult, bool, error)
+}
+
 type Engine struct {
 	config         RootConfig
 	buildID        string
@@ -254,6 +262,7 @@ func (e *Engine) PlanManagedApply(ctx context.Context, request helperprotocol.Pl
 func (e *Engine) Execute(ctx context.Context, request helperprotocol.Envelope[helperprotocol.ExecuteActionRequest]) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
 	e.executeMu.Lock()
 	defer e.executeMu.Unlock()
+	defer e.pruneJournal()
 	if request.MessageType != helperprotocol.MessageExecuteActionRequest || request.Domain != helperprotocol.ProtocolDomain || request.ProtocolVersion != helperprotocol.ProtocolVersion {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "invalid execute request envelope", false)
 	}
@@ -370,6 +379,7 @@ func (e *Engine) Execute(ctx context.Context, request helperprotocol.Envelope[he
 func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol.Envelope[helperprotocol.ExecuteManagedApplyRequest]) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
 	e.executeMu.Lock()
 	defer e.executeMu.Unlock()
+	defer e.pruneJournal()
 	if request.MessageType != helperprotocol.MessageExecuteManagedApplyRequest || request.Domain != helperprotocol.ProtocolDomain || request.ProtocolVersion != helperprotocol.ProtocolVersion || e.managedApply == nil {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorExecutionGrantInvalid, "invalid managed apply execute request envelope", false)
 	}
@@ -391,13 +401,16 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 	if err != nil {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 	}
-	if existing, receiptErr := e.journal.GetReceipt(grant.OperationID, requestDigest); receiptErr == nil {
-		return e.signReceipt(existing)
-	} else if errors.Is(receiptErr, ErrRequestConflict) {
+	stored, receiptErr := e.journal.GetReceipt(grant.OperationID, requestDigest)
+	switch {
+	case receiptErr == nil:
+		return e.signReceipt(stored)
+	case errors.Is(receiptErr, ErrRequestConflict):
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorRequestConflict, "operation id is already bound to another request", false)
-	} else if receiptErr != nil && !errors.Is(receiptErr, fs.ErrNotExist) && !errors.Is(receiptErr, ErrReceiptNotFound) {
+	case !errors.Is(receiptErr, fs.ErrNotExist) && !errors.Is(receiptErr, ErrReceiptNotFound):
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, receiptErr
 	}
+	unjournaled := errors.Is(receiptErr, fs.ErrNotExist)
 	if err := e.validateGrantTime(grant.IssuedAt, grant.ExpiresAt); err != nil {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 	}
@@ -424,6 +437,13 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 	}
 	if e.journal.BreakerOpen() {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, protocolFailure(helperprotocol.ErrorOutcomeIndeterminate, "persistent helper breaker is open", false)
+	}
+	if unjournaled {
+		if receipt, converged, err := e.convergedManagedReceipt(ctx, grant.OperationID, requestDigest, plan, intent); err != nil {
+			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
+		} else if converged {
+			return e.signReceipt(receipt)
+		}
 	}
 	record, existing, err := e.journal.BeginOperation(grant.OperationID, grant.GrantID, requestDigest, helperprotocol.ActionApplyManagedProxyState)
 	if err != nil {
@@ -496,6 +516,45 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 	}
 	return e.signReceipt(succeeded)
+}
+
+// convergedManagedReceipt answers an apply whose on-disk state already matches
+// the plan without journaling a grant, operation or snapshot. Nothing was written,
+// so there is nothing to recover or roll back; a retry of the same grant re-runs
+// this check against a fingerprint that still has to match the plan. Any doubt
+// (no checker, an inspection error, a single differing target) falls back to the
+// full journaled transaction, which reports the problem the usual way.
+func (e *Engine) convergedManagedReceipt(ctx context.Context, operationID, requestDigest string, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent) (helperprotocol.HelperReceipt, bool, error) {
+	checker, ok := e.managedApply.(ManagedApplyConvergenceChecker)
+	if !ok {
+		return helperprotocol.HelperReceipt{}, false, nil
+	}
+	result, converged, err := checker.Converged(ctx, plan, intent)
+	if err != nil || !converged || result.Mutated || !result.Validated {
+		return helperprotocol.HelperReceipt{}, false, nil
+	}
+	message := truncateUTF8(result.SanitizedResult, 4096)
+	if strings.TrimSpace(message) == "" {
+		message = "managed proxy state already converged"
+	}
+	receipt := e.newManagedReceipt(operationID, requestDigest, plan, helperprotocol.JournalSucceeded, PreparedAction{RollbackCoverage: plan.RollbackCoverage}, message)
+	receipt.ManagedArtifacts = append([]helperprotocol.ManagedArtifactReceipt(nil), result.ManagedArtifacts...)
+	if err := receipt.Validate(); err != nil {
+		return helperprotocol.HelperReceipt{}, false, err
+	}
+	return receipt, true, nil
+}
+
+// pruneJournal applies journal retention at most once per journalPruneInterval.
+// Retention failures are logged, never returned: they must not fail the request
+// that triggered them.
+func (e *Engine) pruneJournal() {
+	result, ran, err := e.journal.PruneIfDue(e.now().UTC())
+	if err != nil {
+		slog.Warn("helper journal retention failed", "error", err)
+	} else if ran && result.Operations > 0 {
+		slog.Info("helper journal retention pruned finished operations", "operations", result.Operations, "grants", result.Grants, "snapshots", result.Snapshots)
+	}
 }
 
 func (e *Engine) rollbackManagedApply(ctx context.Context, operationID, requestDigest string, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent, prepared PreparedAction) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {

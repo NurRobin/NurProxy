@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,27 @@ var (
 )
 
 const maxStoredPlans = 128
+
+// Retention for finished operations. Every terminal record per action is kept
+// while it is younger than operationRetentionAge, and the newest
+// operationRetentionPerAction are kept regardless of age. maxRetainedOperations
+// is a backstop that may cut into the age window, but never below the per-action
+// floor and never for records younger than operationRetentionMinAge, which is far
+// longer than any grant lifetime, so a pruned grant can no longer be replayed.
+const (
+	operationRetentionPerAction = 50
+	operationRetentionAge       = 14 * 24 * time.Hour
+	operationRetentionMinAge    = time.Hour
+	maxRetainedOperations       = 1000
+	journalPruneInterval        = time.Hour
+)
+
+// PruneResult counts the journal files one prune pass removed.
+type PruneResult struct {
+	Operations int
+	Grants     int
+	Snapshots  int
+}
 
 type OperationRecord struct {
 	OperationID            string                        `json:"operation_id"`
@@ -124,6 +146,7 @@ type Journal struct {
 	snapshotsDir    string
 	breakerPath     string
 	breakerIsOpen   bool
+	lastPrune       time.Time
 }
 
 func NewJournal(root string, ownerUID uint32) (*Journal, error) {
@@ -574,6 +597,144 @@ func (j *Journal) Recover() error {
 		}
 	}
 	return nil
+}
+
+// Prune removes finished operations, with their grant claim and snapshot, that
+// fall outside the retention window. Non-terminal records, records Recover turns
+// into incidents (rollback_failed, outcome_indeterminate) and anything unreadable
+// are never touched. A snapshot or grant that is already gone is not an error.
+func (j *Journal) Prune(now time.Time) (PruneResult, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.lastPrune = now
+	return j.pruneLocked(now)
+}
+
+// PruneIfDue runs Prune at most once per journalPruneInterval.
+func (j *Journal) PruneIfDue(now time.Time) (PruneResult, bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !j.lastPrune.IsZero() && now.Sub(j.lastPrune) < journalPruneInterval {
+		return PruneResult{}, false, nil
+	}
+	j.lastPrune = now
+	result, err := j.pruneLocked(now)
+	return result, true, err
+}
+
+type pruneCandidate struct {
+	record  OperationRecord
+	updated time.Time
+}
+
+func (j *Journal) pruneLocked(now time.Time) (PruneResult, error) {
+	entries, err := os.ReadDir(j.operationsDir)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	byAction := make(map[helperprotocol.Action][]pruneCandidate)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		operationID := strings.TrimSuffix(name, ".json")
+		record, loadErr := j.loadOperationLocked(operationID)
+		if loadErr != nil || record.OperationID != operationID || !prunableJournalState(record.State) {
+			continue
+		}
+		updated, parseErr := time.Parse(time.RFC3339Nano, record.UpdatedAt)
+		if parseErr != nil {
+			continue
+		}
+		byAction[record.Action] = append(byAction[record.Action], pruneCandidate{record: record, updated: updated})
+	}
+	var expired, overflow []pruneCandidate
+	retained := 0
+	for _, candidates := range byAction {
+		sortCandidatesNewestFirst(candidates)
+		for index, candidate := range candidates {
+			switch {
+			case index < operationRetentionPerAction:
+				retained++
+			case now.Sub(candidate.updated) > operationRetentionAge:
+				expired = append(expired, candidate)
+			default:
+				retained++
+				overflow = append(overflow, candidate)
+			}
+		}
+	}
+	if retained > maxRetainedOperations {
+		sortCandidatesNewestFirst(overflow)
+		for index := len(overflow) - 1; index >= 0 && retained > maxRetainedOperations; index-- {
+			if now.Sub(overflow[index].updated) < operationRetentionMinAge {
+				break
+			}
+			expired = append(expired, overflow[index])
+			retained--
+		}
+	}
+	var result PruneResult
+	if len(expired) == 0 {
+		return result, nil
+	}
+	for _, candidate := range expired {
+		if err := j.removeOperationLocked(candidate.record, &result); err != nil {
+			return result, err
+		}
+	}
+	for _, dir := range []string{j.snapshotsDir, j.grantsDir, j.operationsDir} {
+		if err := syncDirectory(dir); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+// removeOperationLocked deletes snapshot and grant before the operation record,
+// so an interrupted prune leaves a terminal record the next pass finishes.
+func (j *Journal) removeOperationLocked(record OperationRecord, result *PruneResult) error {
+	if !validConfigID(record.OperationID) || !validConfigID(record.GrantID) {
+		return nil
+	}
+	if err := os.Remove(filepath.Join(j.snapshotsDir, record.OperationID+".json")); err == nil {
+		result.Snapshots++
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	// A grant claim that is missing, unreadable or bound to another operation is
+	// left alone; only the claim this operation consumed is removed with it.
+	if claim, err := j.loadGrantLocked(record.GrantID); err == nil && claim.OperationID == record.OperationID {
+		if err := os.Remove(filepath.Join(j.grantsDir, record.GrantID+".json")); err == nil {
+			result.Grants++
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(j.operationsDir, record.OperationID+".json")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	result.Operations++
+	return nil
+}
+
+func sortCandidatesNewestFirst(candidates []pruneCandidate) {
+	sort.Slice(candidates, func(a, b int) bool {
+		if !candidates[a].updated.Equal(candidates[b].updated) {
+			return candidates[a].updated.After(candidates[b].updated)
+		}
+		return candidates[a].record.OperationID > candidates[b].record.OperationID
+	})
+}
+
+func prunableJournalState(state helperprotocol.JournalState) bool {
+	switch state {
+	case helperprotocol.JournalSucceeded, helperprotocol.JournalFailedBeforeMutation, helperprotocol.JournalRolledBack:
+		return true
+	default:
+		return false
+	}
 }
 
 func (j *Journal) BreakerOpen() bool {

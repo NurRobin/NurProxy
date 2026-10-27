@@ -894,7 +894,7 @@ func installManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error)
 	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
 		return false, err
 	}
-	if current.Exists && current.Mode == file.Mode && bytes.Equal(current.Content, file.Content) {
+	if managedFileConverged(current, file) {
 		return false, nil
 	}
 	tmp, err := os.CreateTemp(dir, ".nurproxy-helper-*")
