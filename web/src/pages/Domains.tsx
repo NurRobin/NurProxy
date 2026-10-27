@@ -5,6 +5,7 @@ import { usePolling } from '../lib/usePolling';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
+import { proxyConfigChanges } from '../lib/proxy-config';
 import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities } from '../lib/types';
 import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
@@ -206,18 +207,15 @@ export default function Domains() {
     if (!detailDomain) return;
     setEditLoading(true);
     try {
-      const customHeaders: Record<string, string> = {};
-      for (const h of editHeaders) if (h.key.trim()) customHeaders[h.key.trim()] = h.value;
       const proxiedChanged = !detailDomain.cert_only && zoneSupportsProxy(detailDomain.zone_id) &&
         editProxied !== proxiedChoice(detailDomain.proxied);
       await api.updateDomain(detailDomain.id, {
         ...(proxiedChanged ? { proxied: proxiedValue(editProxied) } : {}),
         websocket: editWebsocket, force_https: editForceHttps,
-        proxy_config: {
+        proxy_config: proxyConfigChanges(detailDomain.proxy_config, {
           websocket: editWebsocket, force_https: editForceHttps,
-          max_body_size: editMaxBody || undefined,
-          custom_request_headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
-        },
+          max_body_size: editMaxBody, custom_request_headers: editHeaders,
+        }),
       });
       toast.success(t('domains.updated'));
       setDetailDomain(null);

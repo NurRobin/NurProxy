@@ -110,6 +110,12 @@ func Render(in Input) (Result, error) {
 	if route.Upstream.Port <= 0 || route.Upstream.Port > 65535 {
 		return Result{}, fmt.Errorf("upstream port %d out of range (1-65535)", route.Upstream.Port)
 	}
+	// Apache reads one directive per line and has no policy check on the
+	// rendered vhost, so every interpolated value must pass the model's value
+	// checks (plain names, no control characters or backslashes).
+	if err := route.Validate(); err != nil {
+		return Result{}, err
+	}
 
 	var warnings []Warning
 	warn := func(option, reason string) {
@@ -164,47 +170,27 @@ func Render(in Input) (Result, error) {
 		fmt.Fprintf(&b, "\n    LimitRequestBody %s\n", size)
 	}
 
-	// IP allow/block. Apache 2.4 uses mod_authz_host's Require directives inside a
-	// <RequireAll> so a blocklist (Require not ip) and an allowlist (Require ip)
-	// compose. With only a blocklist, deny those and allow the rest; with an
-	// allowlist, permit only the listed ranges.
-	if len(route.IPBlocklist) > 0 || len(route.IPAllowlist) > 0 {
-		b.WriteString("\n    <RequireAll>\n")
-		if len(route.IPAllowlist) > 0 {
-			fmt.Fprintf(&b, "        Require ip %s\n", strings.Join(route.IPAllowlist, " "))
-		} else {
-			// No allowlist: everyone is allowed except the blocked ranges below.
-			b.WriteString("        Require all granted\n")
-		}
-		for _, cidr := range route.IPBlocklist {
-			fmt.Fprintf(&b, "        Require not ip %s\n", cidr)
-		}
-		b.WriteString("    </RequireAll>\n")
-	}
-
-	// Basic auth references an htpasswd file the agent maintains. Apache scopes
-	// auth to a <Location />; AuthType Basic + AuthUserFile + a Require valid-user
-	// inside its own <RequireAll>-free block. When IP rules are present they live
-	// at vhost scope above; auth here is independent.
+	// Access control (IP allow/block and basic auth). Apache accepts Require and
+	// <RequireAll> only in directory context, never directly in <VirtualHost>,
+	// so the rules go in a <Location /> covering every request the vhost
+	// proxies. With both an IP rule and basic auth a request must pass both,
+	// matching nginx's default `satisfy all`.
+	authFile := ""
 	if route.BasicAuth != nil {
 		if in.AuthFile != "" {
-			b.WriteString("\n    <Location />\n")
-			fmt.Fprintf(&b, "        AuthType Basic\n")
-			fmt.Fprintf(&b, "        AuthName %s\n", quoteValue(basicAuthRealm(route.Host)))
-			fmt.Fprintf(&b, "        AuthUserFile %s\n", in.AuthFile)
-			fmt.Fprintf(&b, "        Require valid-user\n")
-			b.WriteString("    </Location>\n")
+			authFile = in.AuthFile
 		} else {
 			warn("basic_auth", "no htpasswd file path provided; basic auth dropped")
 		}
 	}
+	writeAccessControl(&b, route, authFile)
 
 	// Response headers via mod_headers (always set, even on proxied/error
 	// responses, matching nginx's "always").
 	if len(route.ResponseHeaders) > 0 {
 		b.WriteString("\n")
 		for _, k := range sortedKeys(route.ResponseHeaders) {
-			fmt.Fprintf(&b, "    Header always set %s %s\n", k, quoteValue(route.ResponseHeaders[k]))
+			fmt.Fprintf(&b, "    Header always set %s %s\n", k, headerValue(route.ResponseHeaders[k]))
 		}
 	}
 
@@ -213,7 +199,7 @@ func Render(in Input) (Result, error) {
 	if len(route.RequestHeaders) > 0 {
 		b.WriteString("\n")
 		for _, k := range sortedKeys(route.RequestHeaders) {
-			fmt.Fprintf(&b, "    RequestHeader set %s %s\n", k, quoteValue(route.RequestHeaders[k]))
+			fmt.Fprintf(&b, "    RequestHeader set %s %s\n", k, headerValue(route.RequestHeaders[k]))
 		}
 	}
 
@@ -235,7 +221,7 @@ func Render(in Input) (Result, error) {
 	if route.EffectiveScheme() == proxymodel.SchemeHTTPS {
 		upstreamScheme = "https"
 	}
-	upstreamBase := fmt.Sprintf("%s://%s:%d", upstreamScheme, route.Upstream.Addr, route.Upstream.Port)
+	upstreamBase := upstreamScheme + "://" + proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port)
 
 	// Path handling. Apache expresses prefix strip / rewrite via mod_rewrite;
 	// otherwise a plain ProxyPass at "/" forwards everything.
@@ -264,7 +250,7 @@ func Render(in Input) (Result, error) {
 			}
 			b.WriteString("    RewriteEngine On\n")
 			b.WriteString("    RewriteCond %{HTTP:Upgrade} =websocket [NC]\n")
-			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s:%d/$1 [P,L]\n", wsScheme, route.Upstream.Addr, route.Upstream.Port)
+			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s/$1 [P,L]\n", wsScheme, proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port))
 		}
 		fmt.Fprintf(&b, "    ProxyPass / %s/", upstreamBase)
 		// Upstream timeouts map onto ProxyPass connectiontimeout/timeout key=value
@@ -285,6 +271,47 @@ func Render(in Input) (Result, error) {
 		VHost:    b.String(),
 		Warnings: warnings,
 	}, nil
+}
+
+// writeAccessControl renders the <Location /> block holding the route's
+// authorization rules, or nothing when the route has none. authFile is the
+// htpasswd path; empty means no basic auth.
+//
+// The IP rules and `Require valid-user` share one <RequireAll>, so every rule
+// must pass. Apache refuses a <RequireAll> made only of negations, so a
+// blocklist gets `Require all granted` beside its `Require not ip` lines
+// unless an allowlist or valid-user already supplies the positive rule.
+func writeAccessControl(b *strings.Builder, route proxymodel.Route, authFile string) {
+	hasIP := len(route.IPAllowlist) > 0 || len(route.IPBlocklist) > 0
+	if !hasIP && authFile == "" {
+		return
+	}
+	b.WriteString("\n    <Location />\n")
+	if authFile != "" {
+		b.WriteString("        AuthType Basic\n")
+		fmt.Fprintf(b, "        AuthName %s\n", quoteValue(basicAuthRealm(route.Host)))
+		fmt.Fprintf(b, "        AuthUserFile %s\n", authFile)
+	}
+	if !hasIP {
+		b.WriteString("        Require valid-user\n")
+		b.WriteString("    </Location>\n")
+		return
+	}
+	b.WriteString("        <RequireAll>\n")
+	switch {
+	case len(route.IPAllowlist) > 0:
+		fmt.Fprintf(b, "            Require ip %s\n", strings.Join(route.IPAllowlist, " "))
+	case authFile == "":
+		b.WriteString("            Require all granted\n")
+	}
+	for _, cidr := range route.IPBlocklist {
+		fmt.Fprintf(b, "            Require not ip %s\n", cidr)
+	}
+	if authFile != "" {
+		b.WriteString("            Require valid-user\n")
+	}
+	b.WriteString("        </RequireAll>\n")
+	b.WriteString("    </Location>\n")
 }
 
 // resolveTLS decides whether the VirtualHost gets a TLS listener (:443 +
@@ -367,18 +394,26 @@ func parseSizeToBytes(s string) (int64, bool) {
 // basicAuthRealm builds the AuthName realm string for a host.
 func basicAuthRealm(host string) string { return "Restricted: " + host }
 
-// quoteValue wraps an Apache directive argument in double quotes when it
-// contains whitespace, which Apache would otherwise tokenize into multiple
-// arguments. Embedded double quotes are backslash-escaped. An empty value is
-// rendered as an explicit empty-string token.
+// headerValue renders a Header or RequestHeader value so mod_headers sets it
+// literally. mod_headers reads the value as a format string: "%" starts a
+// format specifier such as %{NAME}e (an environment variable) and "\"
+// starts an escape such as \n, so both are doubled. The result is then
+// written as one quoted word. proxymodel refuses values that start with
+// "expr=" (also behind leading quotes or spaces), which mod_headers would
+// evaluate as an expression.
+func headerValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	return quoteValue(strings.ReplaceAll(v, "%", "%%"))
+}
+
+// quoteValue renders v as one double-quoted Apache directive argument, so
+// the word Apache's config tokenizer (ap_getword_conf) hands to the
+// directive is exactly v. Inside double quotes that tokenizer turns `\\`
+// into `\` and `\"` into `"` and keeps every other character as is, so
+// backslashes are escaped before double quotes.
 func quoteValue(v string) string {
-	if v == "" {
-		return `""`
-	}
-	if strings.ContainsAny(v, " \t\"") {
-		return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
-	}
-	return v
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
 }
 
 // regexpEscape escapes the regex metacharacters that can appear in a URL path
