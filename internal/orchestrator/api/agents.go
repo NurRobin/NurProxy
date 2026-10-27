@@ -574,10 +574,11 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update version if it changed.
+	// Update version if it changed. A narrow write: a full-row UpdateAgent from
+	// this snapshot could revert a rename made concurrently through the API.
 	if req.Version != "" && agent.Version != req.Version {
 		agent.Version = req.Version
-		if uerr := s.db.UpdateAgent(agent); uerr != nil {
+		if uerr := s.db.UpdateAgentVersion(id, req.Version); uerr != nil {
 			log.Printf("failed to update agent version: %v", uerr)
 		}
 	}

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -210,6 +211,18 @@ func (d *DB) ListAgentAnchorCleanups() ([]AgentAnchorCleanup, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// AgentAnchorCleanupCounts returns how many anchor cleanups are queued and how
+// many of those have failed at least once.
+func (d *DB) AgentAnchorCleanupCounts(ctx context.Context) (pending, failing int, err error) {
+	err = d.read.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(CASE WHEN attempts > 0 THEN 1 ELSE 0 END), 0)
+		FROM agent_anchor_cleanups`).Scan(&pending, &failing)
+	if err != nil {
+		return 0, 0, fmt.Errorf("counting anchor cleanups: %w", err)
+	}
+	return pending, failing, nil
 }
 
 // RemoveAgentAnchorCleanup drops a queued cleanup once it is done.

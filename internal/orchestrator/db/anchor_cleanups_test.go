@@ -212,6 +212,28 @@ func TestSetAgentAnchorRecord_ReclaimsQueuedRecord(t *testing.T) {
 	}
 }
 
+// The heartbeat's version write must not carry the rest of a stale row back:
+// a rename that happened after the heartbeat read the agent has to survive.
+func TestUpdateAgentVersion_DoesNotRevertRename(t *testing.T) {
+	d := testDB(t)
+	a := createTestAgent(t, d)
+	renamed, _ := d.GetAgent(a.ID)
+	renamed.FQDN = "agent9.example.com"
+	if err := d.UpdateAgent(renamed); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateAgentVersion(a.ID, "2.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.GetAgent(a.ID)
+	if got.FQDN != "agent9.example.com" || got.Version != "2.1.0" {
+		t.Errorf("got fqdn=%q version=%q, want agent9.example.com / 2.1.0", got.FQDN, got.Version)
+	}
+	if err := d.UpdateAgentVersion("missing", "1"); err == nil {
+		t.Error("expected error for unknown agent")
+	}
+}
+
 // A plain UpdateAgent (no FQDN change) from a stale snapshot must not wipe
 // anchor ids the reconciler stored in the meantime.
 func TestUpdateAgent_KeepsAnchorWithoutRename(t *testing.T) {

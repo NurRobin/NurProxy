@@ -60,7 +60,14 @@ type Reconciler struct {
 	// audit entries to "dryrun" so simulated record changes are unmistakable —
 	// while non-DNS reconciler events (route push, drift, agent status) stay
 	// "system", since those are not simulated by DNS sandbox mode.
-	dnsDryRun      bool
+	dnsDryRun bool
+
+	// anchorRenameGrace is how long an old anchor record released by a rename
+	// is kept before it may be deleted, for CNAMEs NurProxy does not track.
+	anchorRenameGrace time.Duration
+	// anchorWarnAt rate-limits the warning about failing anchor cleanups.
+	anchorWarnAt time.Time
+
 	applyAuthority interface {
 		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
 	}
@@ -75,9 +82,10 @@ func (r *Reconciler) SetApplyAuthority(authority interface {
 // New creates a Reconciler.
 func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reconciler {
 	return &Reconciler{
-		db:          database,
-		agentClient: agentClient,
-		interval:    interval,
+		db:                database,
+		agentClient:       agentClient,
+		interval:          interval,
+		anchorRenameGrace: defaultAnchorRenameGrace,
 	}
 }
 

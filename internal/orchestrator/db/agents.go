@@ -752,6 +752,21 @@ func (d *DB) safeAutoRepairSetting() (string, error) {
 	return value, nil
 }
 
+// UpdateAgentVersion sets only the reported agent version, so the heartbeat
+// never writes back a stale copy of the rest of the row (which could revert a
+// concurrent FQDN change).
+func (d *DB) UpdateAgentVersion(id, version string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`UPDATE agents SET version = ?, updated_at = ? WHERE id = ?`, version, now, id)
+	if err != nil {
+		return fmt.Errorf("updating agent version: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
+}
+
 // SetAgentDNSError records an orchestrator-side DNS/config error about an agent
 // (e.g. its FQDN is outside every assigned zone). Passing an empty string
 // clears it. It touches only dns_error (not last_seen or last_error), so it
