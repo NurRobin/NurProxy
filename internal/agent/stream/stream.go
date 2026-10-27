@@ -417,7 +417,8 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 		return
 	}
 	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
-		log.Printf("Stream: privileged managed apply ended as %s", receipt.Envelope.Payload.State)
+		log.Printf("Stream: privileged managed apply %s ended as %s: %s", receipt.Envelope.Payload.OperationID,
+			receipt.Envelope.Payload.State, receipt.Envelope.Payload.SanitizedResult)
 		if c.health != nil {
 			c.health.SetError("privileged managed proxy reconciliation did not succeed")
 		}

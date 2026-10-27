@@ -297,8 +297,11 @@ func (systemProxyServiceHost) Validate(ctx context.Context, target ProxyTargetCo
 	default:
 		return fmt.Errorf("unsupported proxy validator")
 	}
-	_, err := runBounded(ctx, target.Binary, args...)
-	return err
+	output, err := runBounded(ctx, target.Binary, args...)
+	if err != nil {
+		return newNativeValidationError(err, output)
+	}
+	return nil
 }
 
 func (systemProxyServiceHost) Mutate(ctx context.Context, target ProxyTargetConfig, mutation proxyServiceMutation) error {
@@ -457,7 +460,9 @@ func runBounded(ctx context.Context, binary string, args ...string) (string, err
 		return "", fmt.Errorf("command output exceeded limit")
 	}
 	if err != nil {
-		return "", err
+		// The output is returned with the error so callers can surface the
+		// native tool's own explanation (for example `nginx -t` stderr).
+		return output.String(), err
 	}
 	return output.String(), nil
 }

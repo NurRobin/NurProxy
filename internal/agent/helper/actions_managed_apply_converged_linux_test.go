@@ -50,6 +50,17 @@ func installExactAuthRoute(t *testing.T, action *managedApplyAction, intent *hel
 	runManagedApply(t, action, setup)
 }
 
+// writeLeftoverVhost puts a vhost for gone.example.com, which no route in the
+// intent renders, into the available directory.
+func writeLeftoverVhost(t *testing.T, action *managedApplyAction, marked bool, directive string) {
+	t.Helper()
+	content := "server {\n  server_name gone.example.com;\n  " + directive + "\n}\n"
+	if marked {
+		content = proxy.StampManagedArtifact(content)
+	}
+	writeManagedTarget(t, filepath.Join(action.layout.AvailableDir, "nurproxy-gone.example.com.conf"), []byte(content), 0o644)
+}
+
 func deleteRouteIntent(intent *helperprotocol.ApplyIntent) {
 	intent.DesiredStateRevision = strings.Repeat("2", 64)
 	intent.Resources = []string{}
@@ -157,6 +168,40 @@ func TestManagedApplyConvergedAgreesWithExecute(t *testing.T) {
 				intent.PruneCertificates = true
 				writeManagedTarget(t, filepath.Join(action.layout.CertificateDir, "stale.example.com.crt"), []byte("cert"), 0o600)
 			},
+		},
+		{
+			name: "stale certificate still referenced by a leftover vhost",
+			setup: func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, route managedCompilation) {
+				installExactRoute(t, route)
+				intent.PruneCertificates = true
+				certPath := filepath.Join(action.layout.CertificateDir, "gone.example.com.crt")
+				writeManagedTarget(t, certPath, []byte("cert"), 0o600)
+				writeLeftoverVhost(t, action, true, "ssl_certificate "+certPath+";")
+			},
+			wantConverged: true,
+		},
+		{
+			name: "unmarked tombstoned vhost is left in place",
+			setup: func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, route managedCompilation) {
+				installExactRoute(t, route)
+				writeLeftoverVhost(t, action, false, "")
+				intent.DeletionSet = []helperprotocol.ManagedDeletion{{ResourceID: "dom-59", Host: "gone.example.com", Backend: "nginx"}}
+			},
+			wantConverged: true,
+		},
+		{
+			name: "unrouted auth file still referenced by a leftover vhost",
+			setup: func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, route managedCompilation) {
+				installExactRoute(t, route)
+				intent.PruneCertificates = true
+				authPath := managedAuthFilePath(action.layout.AuthDir(), "gone.example.com")
+				if err := os.MkdirAll(filepath.Dir(authPath), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeManagedTarget(t, authPath, []byte("operator:hash\n"), 0o640)
+				writeLeftoverVhost(t, action, false, "auth_basic_user_file "+authPath+";")
+			},
+			wantConverged: true,
 		},
 		{
 			name: "nothing left to prune",
@@ -284,6 +329,9 @@ func TestManagedApplyConvergedAgreesWithExecute(t *testing.T) {
 				t.Fatalf("Converged=%t disagrees with Execute Mutated=%t", converged, executed.Mutated)
 			}
 			if converged {
+				if checked.SanitizedResult != executed.SanitizedResult {
+					t.Fatalf("converged message %q differs from execute %q", checked.SanitizedResult, executed.SanitizedResult)
+				}
 				left, leftErr := helperprotocol.Digest(checked.ManagedArtifacts)
 				right, rightErr := helperprotocol.Digest(executed.ManagedArtifacts)
 				if leftErr != nil || rightErr != nil || left != right {

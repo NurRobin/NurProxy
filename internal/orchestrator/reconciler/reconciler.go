@@ -163,6 +163,7 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 		log.Printf("reconciler: cannot load managed route tombstones for agent %s: %v", agentID, err)
 		return false
 	}
+	deletions = deletionsOutsideDesired(deletions, set.Intents)
 	now := time.Now().UTC()
 	revision, err := helperprotocol.Digest(set)
 	if err != nil {
@@ -198,6 +199,37 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 		return false
 	}
 	return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed})
+}
+
+// deletionsOutsideDesired drops tombstones that collide with the agent's
+// desired routes or with each other. A tombstone whose resource or host is
+// rendered again (a domain moved away and back, or a new domain reusing a
+// deleted host) and a second tombstone for an already listed host would put
+// the same vhost file into one signed apply twice; the helper rejects that,
+// and every apply on the agent would stay blocked. Hosts are compared by the
+// managed vhost file they map to, which is case-sensitive: App.example.com
+// and app.example.com are two files, and the tombstone for one must not be
+// dropped because the other is rendered.
+func deletionsOutsideDesired(deletions []helperprotocol.ManagedDeletion, intents []proxymodel.RouteIntent) []helperprotocol.ManagedDeletion {
+	resources := make(map[string]struct{}, len(intents))
+	files := make(map[string]struct{}, len(intents)+len(deletions))
+	for _, intent := range intents {
+		resources[intent.ArtifactID] = struct{}{}
+		files[helperprotocol.ManagedVhostKey(intent.Route.Host)] = struct{}{}
+	}
+	kept := make([]helperprotocol.ManagedDeletion, 0, len(deletions))
+	for _, deletion := range deletions {
+		if _, rendered := resources[deletion.ResourceID]; rendered {
+			continue
+		}
+		key := helperprotocol.ManagedVhostKey(deletion.Host)
+		if _, taken := files[key]; taken {
+			continue
+		}
+		files[key] = struct{}{}
+		kept = append(kept, deletion)
+	}
+	return kept
 }
 
 func buildApplyIntent(agentID, helperInstanceID string, set proxymodel.IntentSet, issued time.Time) (helperprotocol.ApplyIntent, error) {

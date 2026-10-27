@@ -870,6 +870,25 @@ type HelperReceipt struct {
 
 const MaxManagedReceiptContentBytes = MaxFrameBytes / 8
 
+// ManagedVhostKey returns the host part of the managed vhost file name the
+// agent's nginx and Apache backends derive for host (nurproxy-<key>.conf).
+// Two hosts collide on disk exactly when their keys are equal; the comparison
+// is case-sensitive like the file system. It must stay in step with
+// sanitizeHostForFile in internal/agent/proxy/{nginx,apache}.
+func ManagedVhostKey(host string) string {
+	key := strings.TrimSpace(host)
+	key = strings.ReplaceAll(key, "*.", "_wildcard.")
+	key = strings.ReplaceAll(key, "/", "_")
+	key = strings.ReplaceAll(key, "\\", "_")
+	return strings.ReplaceAll(key, "..", "_")
+}
+
+// ManagedLeftoverVhostsNote introduces, inside a managed apply receipt's
+// sanitized_result, the list of NurProxy-named vhost files the apply left on
+// disk without a desired route. The orchestrator looks for it to surface the
+// leftovers; the list runs to the next "; " or the end of the message.
+const ManagedLeftoverVhostsNote = "vhost file(s) with no route in this apply, left in place: "
+
 type ManagedArtifactReceipt struct {
 	ArtifactID string   `json:"artifact_id"`
 	Backend    string   `json:"backend"`

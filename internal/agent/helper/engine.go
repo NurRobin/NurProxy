@@ -489,7 +489,7 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 		return e.signReceipt(succeeded)
 	}
 	if !result.Mutated {
-		failed := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalFailedBeforeMutation, prepared, "managed apply failed before mutation")
+		failed := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalFailedBeforeMutation, prepared, withNativeDiagnostic("managed apply failed before mutation", executeErr))
 		if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalFailedBeforeMutation, failed); err != nil {
 			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 		}
@@ -500,7 +500,7 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 	}
 	if executeErr != nil || !result.Validated {
-		return e.rollbackManagedApply(ctx, grant.OperationID, requestDigest, plan, intent, prepared)
+		return e.rollbackManagedApply(ctx, grant.OperationID, requestDigest, plan, intent, prepared, executeErr)
 	}
 	validated := e.newManagedReceipt(grant.OperationID, requestDigest, plan, helperprotocol.JournalValidated, prepared, "managed proxy post-validation succeeded")
 	if _, err := e.journal.Transition(grant.OperationID, helperprotocol.JournalValidated, validated); err != nil {
@@ -559,7 +559,7 @@ func (e *Engine) pruneJournal() {
 	}
 }
 
-func (e *Engine) rollbackManagedApply(ctx context.Context, operationID, requestDigest string, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent, prepared PreparedAction) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
+func (e *Engine) rollbackManagedApply(ctx context.Context, operationID, requestDigest string, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent, prepared PreparedAction, executeErr error) (helperprotocol.Signed[helperprotocol.HelperReceipt], error) {
 	running := e.newManagedReceipt(operationID, requestDigest, plan, helperprotocol.JournalRollbackRunning, prepared, "managed proxy rollback started")
 	if _, err := e.journal.Transition(operationID, helperprotocol.JournalRollbackRunning, running); err != nil {
 		return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
@@ -578,6 +578,10 @@ func (e *Engine) rollbackManagedApply(ctx context.Context, operationID, requestD
 		if err := e.journal.OpenBreaker(message); err != nil {
 			return helperprotocol.Signed[helperprotocol.HelperReceipt]{}, err
 		}
+	}
+	message = withNativeDiagnostic(message, executeErr)
+	if detail := nativeDiagnostic(rollbackErr); detail != "" {
+		message += "; rollback validation: " + detail
 	}
 	receipt := e.newManagedReceipt(operationID, requestDigest, plan, state, prepared, message)
 	if _, err := e.journal.Transition(operationID, state, receipt); err != nil {

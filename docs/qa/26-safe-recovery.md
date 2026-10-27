@@ -59,3 +59,13 @@ independent of older unbounded operation history without changing the scalar
 breaker semantics. Every recovery-history card summary includes operation
 state, action, request source, and relative start time, including while older
 cards remain collapsed.
+
+## Managed apply receipts
+
+When native validation fails during a helper-backed managed apply, the receipt
+message (and the agent log line for that operation) carries the validator's
+output, folded onto one line, stripped of control characters and capped at
+1 KiB. On a syntax error `nginx -t` or `apachectl configtest` may echo the
+offending token from the config file, so a value written into a raw config can
+appear there. The newest receipt also drives the dashboard's helper breaker and
+leftover-vhost notices in Diagnosis & recovery.
