@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -173,5 +174,86 @@ func TestEnvOr(t *testing.T) {
 	}
 	if got := envOr("NP_TEST_UNSET_KEY", "def"); got != "def" {
 		t.Errorf("envOr with unset value = %q, want def", got)
+	}
+}
+
+// newUpdateFlagSet mirrors the shape of `domain update`: a bool and a string
+// flag next to a single positional ID.
+func newUpdateFlagSet() (*flag.FlagSet, *bool, *string) {
+	fs := flag.NewFlagSet("domain update", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	forceHTTPS := fs.Bool("force-https", false, "")
+	sslMode := fs.String("ssl-mode", "", "")
+	return fs, forceHTTPS, sslMode
+}
+
+func TestParseArgsInterspersedFlags(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		positional string
+		wantArg    string
+		wantForce  bool
+		wantSSL    string
+		wantErr    string
+	}{
+		{"bool flag after id", []string{"83", "--force-https"}, "domain id", "83", true, "", ""},
+		{"bool flag before id", []string{"--force-https", "83"}, "domain id", "83", true, "", ""},
+		{"string flag after id", []string{"83", "--ssl-mode", "auto"}, "domain id", "83", false, "auto", ""},
+		{"string flag with = after id", []string{"83", "--ssl-mode=auto"}, "domain id", "83", false, "auto", ""},
+		{"flags on both sides", []string{"--ssl-mode", "auto", "83", "-force-https"}, "domain id", "83", true, "auto", ""},
+		{"explicit bool false after id", []string{"83", "--force-https=false"}, "domain id", "83", false, "", ""},
+		{"terminator before id", []string{"--force-https", "--", "83"}, "domain id", "83", true, "", ""},
+		{"terminator keeps dash arg positional", []string{"--", "-5"}, "domain id", "-5", false, "", ""},
+		{"flag after terminator is positional", []string{"83", "--", "--force-https"}, "domain id", "", false, "", `unexpected argument "--force-https"`},
+		{"extra positional", []string{"83", "84", "--force-https"}, "domain id", "", false, "", `unexpected argument "84"`},
+		{"missing id", []string{"--force-https"}, "domain id", "", false, "", "missing domain id"},
+		{"empty id", []string{""}, "domain id", "", false, "", "missing domain id"},
+		{"no positional expected", []string{"--force-https"}, "", "", true, "", ""},
+		{"stray positional rejected", []string{"oops", "--force-https"}, "", "", false, "", `unexpected argument "oops"`},
+		{"unknown flag after id", []string{"83", "--nope"}, "domain id", "", false, "", "flag provided but not defined"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, force, ssl := newUpdateFlagSet()
+			got, err := parseArgs(fs, tt.args, tt.positional)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseArgs(%q) error = %v, want containing %q", tt.args, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseArgs(%q) unexpected error: %v", tt.args, err)
+			}
+			if got != tt.wantArg {
+				t.Errorf("positional = %q, want %q", got, tt.wantArg)
+			}
+			if *force != tt.wantForce {
+				t.Errorf("force-https = %v, want %v", *force, tt.wantForce)
+			}
+			if *ssl != tt.wantSSL {
+				t.Errorf("ssl-mode = %q, want %q", *ssl, tt.wantSSL)
+			}
+		})
+	}
+}
+
+// TestParseArgsVisitSeesTrailingFlag guards #145: domain update only sends
+// force_https when fs.Visit reports the flag as set, so a flag after the ID
+// must register as visited.
+func TestParseArgsVisitSeesTrailingFlag(t *testing.T) {
+	fs, _, _ := newUpdateFlagSet()
+	if _, err := parseArgs(fs, []string{"83", "--force-https"}, "domain id"); err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	seen := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "force-https" {
+			seen = true
+		}
+	})
+	if !seen {
+		t.Fatal("force-https after the ID was not visited")
 	}
 }

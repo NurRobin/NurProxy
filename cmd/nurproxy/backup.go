@@ -48,7 +48,9 @@ func cmdBackup(args []string) {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory (default: $NP_DATA_DIR or ./data)")
 	out := fs.String("o", "", "Output file (default: nurproxy-backup-<timestamp>.tar.gz)")
-	_ = fs.Parse(args)
+	if _, err := parseArgs(fs, args, ""); err != nil {
+		fatalf("backup: %v", err)
+	}
 
 	dir := resolveDataDir(*dataDir)
 	outPath := *out
@@ -189,10 +191,9 @@ func cmdRestore(args []string) {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory to restore into (default: $NP_DATA_DIR or ./data)")
 	force := fs.Bool("force", false, "Overwrite an existing database in the data dir")
-	_ = fs.Parse(args)
-
-	if fs.NArg() != 1 {
-		fatalf("restore: exactly one archive argument is required, e.g. `nurproxy restore backup.tar.gz`")
+	archive, err := parseArgs(fs, args, "archive argument")
+	if err != nil {
+		fatalf("restore: %v (e.g. `nurproxy restore backup.tar.gz`)", err)
 	}
 	dir := resolveDataDir(*dataDir)
 
@@ -205,7 +206,7 @@ func cmdRestore(args []string) {
 		}
 	}
 
-	restored, err := restoreArchive(fs.Arg(0), dir, *force)
+	restored, err := restoreArchive(archive, dir, *force)
 	if err != nil {
 		fatalf("restore: %v", err)
 	}
@@ -414,7 +415,9 @@ func cmdDB(args []string) {
 	}
 	fs := flag.NewFlagSet("db version", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Data directory (default: $NP_DATA_DIR or ./data)")
-	_ = fs.Parse(args[1:])
+	if _, err := parseArgs(fs, args[1:], ""); err != nil {
+		fatalf("db version: %v", err)
+	}
 
 	path := filepath.Join(resolveDataDir(*dataDir), dbFileName)
 	if _, err := os.Stat(path); err != nil {

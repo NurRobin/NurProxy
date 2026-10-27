@@ -94,7 +94,7 @@
 
 ### Restore: no-clobber guard and `--force`
 - **Must:** `nurproxy restore <archive>` refuses to extract if the target data dir already contains `nurproxy.db`, failing with `<dir> already has a nurproxy.db — refusing to overwrite (pass --force to replace it)` (`backup.go:147-149`). `--force` overrides the guard (`backup.go:126,134`). On success it prints `Restored <n> file(s) into <dir>` and `Start the orchestrator against this data dir to bring it back up.` (`backup.go:138-139`).
-- **Access:** CLI only. `nurproxy restore [--data-dir DIR] [--force] ARCHIVE` (`backup.go:123-127`). Exactly one archive argument is required; otherwise it errors `exactly one archive argument is required` (`backup.go:129-131`).
+- **Access:** CLI only. `nurproxy restore [--data-dir DIR] [--force] ARCHIVE` (`backup.go:123-127`). Exactly one archive argument is required (flags may come before or after it); a missing archive errors `restore: missing archive argument`, an extra one `restore: unexpected argument ...`.
 - **Prerequisites:** a valid backup archive (from the backup test) and an empty target dir.
 - **Steps:**
   ```bash
