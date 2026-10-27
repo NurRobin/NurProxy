@@ -314,7 +314,7 @@
     `ReadWritePaths=` covering the proxy's dirs (prefixed `-` so an absent path is
     ignored), then `daemon-reload` + `restart <unit>`. For a **root** agent it also
     adds `AmbientCapabilities`/`CapabilityBoundingSet` set to
-    `CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE` (the bind cap is retained alongside the
+    `CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN` (the bind cap is retained alongside the
     restored DAC override), and that step is the **complete** fix (group/sudo do not
     apply to root) — the
     builder returns early (`remediation.go:119-145`, `204-241`,

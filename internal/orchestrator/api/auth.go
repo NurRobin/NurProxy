@@ -107,8 +107,13 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.db.SetSetting("admin_password_hash", hash); err != nil {
+	won, err := s.db.InitializeAdminPassword(hash)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save password")
+		return
+	}
+	if !won {
+		writeError(w, http.StatusConflict, "admin password already configured")
 		return
 	}
 

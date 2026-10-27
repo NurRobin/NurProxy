@@ -45,6 +45,11 @@ type Input struct {
 	// renderer only references it via auth_basic_user_file. When BasicAuth is set
 	// but AuthFile is empty, basic auth is dropped with a warning.
 	AuthFile string
+	// NginxVersion is the agent's detected nginx version (e.g. "1.18.0"). It selects
+	// the HTTP/2 syntax: nginx >= 1.25.1 uses the `http2 on;` directive; older nginx
+	// must use the `listen ... http2` parameter, since the directive is unknown
+	// there and fails `nginx -t`. Empty defaults to the modern `http2 on;` form.
+	NginxVersion string
 }
 
 // Warning records a single Route option this renderer could not express in the
@@ -75,6 +80,47 @@ type Result struct {
 	// Warnings lists options dropped because this nginx renderer cannot express
 	// them. Never nil-vs-empty significant; len 0 means a clean render.
 	Warnings []Warning
+}
+
+// http2OnSupported reports whether an nginx version understands the `http2 on;`
+// directive, introduced in nginx 1.25.1. Older nginx must enable HTTP/2 via the
+// `listen ... http2` parameter instead (the directive is unknown there and fails
+// `nginx -t`). An empty or unparseable version defaults to true (modern syntax) —
+// the agent supplies its detected version so a real older nginx is handled.
+func http2OnSupported(version string) bool {
+	maj, min, patch, ok := parseNginxVersion(version)
+	if !ok {
+		return true
+	}
+	switch {
+	case maj != 1:
+		return maj > 1
+	case min != 25:
+		return min > 25
+	default:
+		return patch >= 1
+	}
+}
+
+// parseNginxVersion parses a dotted nginx version like "1.18.0" or "1.25.1" into
+// its numeric components (a missing patch defaults to 0). ok is false when the
+// string lacks a leading "MAJOR.MINOR" numeric form.
+func parseNginxVersion(v string) (maj, min, patch int, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(v), ".", 4)
+	if len(parts) < 2 {
+		return 0, 0, 0, false
+	}
+	var err error
+	if maj, err = strconv.Atoi(parts[0]); err != nil {
+		return 0, 0, 0, false
+	}
+	if min, err = strconv.Atoi(parts[1]); err != nil {
+		return 0, 0, 0, false
+	}
+	if len(parts) >= 3 {
+		patch, _ = strconv.Atoi(parts[2])
+	}
+	return maj, min, patch, true
 }
 
 // Render produces an nginx server block from a proxymodel.Route (§5). It is a
@@ -151,9 +197,16 @@ func Render(in Input) (Result, error) {
 	// Main server block.
 	fmt.Fprintf(&b, "server {\n")
 	if tlsEnabled {
-		fmt.Fprintf(&b, "    listen 443 ssl;\n")
-		fmt.Fprintf(&b, "    listen [::]:443 ssl;\n")
-		fmt.Fprintf(&b, "    http2 on;\n")
+		if http2OnSupported(in.NginxVersion) {
+			fmt.Fprintf(&b, "    listen 443 ssl;\n")
+			fmt.Fprintf(&b, "    listen [::]:443 ssl;\n")
+			fmt.Fprintf(&b, "    http2 on;\n")
+		} else {
+			// nginx < 1.25.1 has no `http2 on;` directive — enable HTTP/2 via the
+			// (deprecated but supported) listen parameter so `nginx -t` passes.
+			fmt.Fprintf(&b, "    listen 443 ssl http2;\n")
+			fmt.Fprintf(&b, "    listen [::]:443 ssl http2;\n")
+		}
 	} else {
 		fmt.Fprintf(&b, "    listen 80;\n")
 		fmt.Fprintf(&b, "    listen [::]:80;\n")

@@ -1,4 +1,5 @@
 import { createContext, useContext } from 'react';
+import { UnauthorizedError } from '../lib/api';
 
 export type ToastVariant = 'error' | 'success' | 'info';
 
@@ -42,6 +43,9 @@ export function useToast(): ToastContextValue {
 
 /** Pulls a readable message out of an API error (strips the "API error 500:" prefix). */
 export function errMessage(err: unknown, fallback = 'Something went wrong'): string {
+  // Session expiry is handled globally (the app returns to the login screen) —
+  // return an empty message so the toast layer drops it instead of toasting.
+  if (err instanceof UnauthorizedError) return '';
   if (err instanceof Error) {
     return err.message.replace(/^API error \d+:\s*/, '').trim() || fallback;
   }

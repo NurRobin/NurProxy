@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/shared/install"
 )
 
@@ -25,8 +26,8 @@ func cmdSetup(args []string) {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
 	orchestrator := fs.String("orchestrator", "", "Orchestrator URL (skips the prompt)")
 	fqdnFlag := fs.String("fqdn", "", "Agent anchor FQDN (skips the prompt)")
-	dataDir := fs.String("data-dir", "/var/lib/nurproxy-agent", "Data directory")
-	user := fs.String("user", "root", "System user to run the service as")
+	dataDir := fs.String("data-dir", "/var/lib/nurproxy-agent/state", "Data directory")
+	user := fs.String("user", "nurproxy", "System user to run the service as")
 	bin := fs.String("bin", selfPath(), "Path to the nurproxy-agent binary the service runs")
 	_ = fs.Parse(args)
 
@@ -69,7 +70,7 @@ func cmdSetup(args []string) {
 			Args:         []string{"--data-dir", *dataDir},
 			User:         *user,
 			DataDir:      *dataDir,
-			WritePaths:   install.AgentProxyWritePaths,
+			WritePaths:   []string{recoverycontrol.DefaultStagingRoot},
 			EnvFile:      agentEnvFile,
 			Env:          env,
 			Capabilities: install.AgentCapabilities,

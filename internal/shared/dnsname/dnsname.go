@@ -8,13 +8,25 @@ import (
 	"strings"
 )
 
+// ValidateSubdomainOrApex accepts everything ValidateSubdomain accepts plus the
+// "@" apex sentinel (the record lives at the zone apex/root). Use it for domain
+// rows, where apex is meaningful; NOT for hostnames like an agent FQDN, where
+// "@" is not a real name and would break DNS and route rendering downstream.
+func ValidateSubdomainOrApex(s string) error {
+	if s == "@" {
+		return nil
+	}
+	return ValidateSubdomain(s)
+}
+
 // ValidateSubdomain checks that s is a valid subdomain label sequence to place
 // under a managed zone (e.g. "jellyfin", "api.internal", or a leading "*" for a
 // wildcard). It enforces the DNS label rules: each dot-separated label is 1–63
 // characters of letters, digits, or hyphens, not starting or ending with a
 // hyphen; the whole name is at most 253 characters. A single leading "*" label
 // is allowed (wildcard); "*" anywhere else is rejected. Validation is
-// case-insensitive.
+// case-insensitive. The "@" apex sentinel is NOT accepted here — domain
+// creation goes through ValidateSubdomainOrApex.
 func ValidateSubdomain(s string) error {
 	if s == "" {
 		return fmt.Errorf("subdomain is required")

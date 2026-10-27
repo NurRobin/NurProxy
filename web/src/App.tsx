@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
-import { api } from './lib/api';
+import { api, onUnauthorized } from './lib/api';
 import { useUIVariant } from './lib/ui-variant-context';
 import { Spinner } from './components/Button';
 import Login from './pages/Login';
@@ -47,6 +47,13 @@ function App() {
   }, [checkSetupWizard]);
 
   useEffect(() => { checkAuth(); }, [checkAuth]);
+
+  // A 401 from any non-auth API call means the session expired — drop back to
+  // the login screen instead of letting every poll error out forever.
+  useEffect(() => {
+    onUnauthorized(() => setAuthState('unauthenticated'));
+    return () => onUnauthorized(null);
+  }, []);
 
   async function handleLogout() {
     try { await api.logout(); } catch { /* ignore */ }

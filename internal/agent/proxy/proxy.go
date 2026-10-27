@@ -2,9 +2,15 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"unicode"
 
+	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // Proxy is the agent-side abstraction over a reverse-proxy backend (§5). It
@@ -65,11 +71,12 @@ type Proxy interface {
 
 	// Prune removes every NurProxy-generated artifact the backend manages that is
 	// NOT in keep, leaving no ghost vhost when a domain is deleted (§3). The agent
-	// calls it after applying the full desired intent set received over its
-	// dial-out stream, so removal never needs an inbound probe (invariant #2). It
-	// only ever touches NurProxy-generated files (the nurproxy- prefix), never an
-	// operator's adopted config. The admin-API Caddy is a no-op: ClearRoutes
-	// already drops routes absent from the set. Returns the number removed.
+	// calls file-backed implementations before validating the full desired set, so
+	// an invalid orphan cannot block its own cleanup. The admin-API Caddy receives
+	// the call after successful route additions and uses it to scrub orphaned
+	// certificate material. Removal rides the dial-out stream (invariant #2) and
+	// only touches NurProxy-generated artifacts, never operator-adopted config.
+	// Returns the number removed.
 	Prune(ctx context.Context, keep []Target) (int, error)
 
 	// Validate checks the live config without applying changes (nginx -t /
@@ -79,6 +86,69 @@ type Proxy interface {
 	// InstallCerts writes cert/key bundles to the backend's expected location
 	// (§7), before Apply of any config that references them (preflight ordering).
 	InstallCerts(ctx context.Context, certs []CertBundle) error
+}
+
+type RecoveryInspector interface {
+	InspectRecovery(context.Context, RecoveryDesired) ([]RecoveryCandidate, error)
+	ExecuteRecovery(context.Context, RecoveryCandidate, map[string]CertBundle) error
+	ReloadRecovery(context.Context) error
+}
+
+type RecoveryDesired struct {
+	KeepTargets          []Target
+	KeepCertHosts        []string
+	ActiveOperationPaths []string
+}
+
+type RecoveryPathIdentity struct {
+	Path          string
+	Exists        bool
+	Mode          uint32
+	Device        uint64
+	Inode         uint64
+	SymlinkTarget string
+	SHA256        string
+
+	parentDevice uint64
+	parentInode  uint64
+}
+
+type RecoveryCandidate struct {
+	Action     recoverymodel.Action
+	Host       string
+	Paths      []string
+	Identities []RecoveryPathIdentity
+}
+
+func (candidate RecoveryCandidate) Validate() error {
+	switch candidate.Action {
+	case recoverymodel.ActionPruneManagedOrphan, recoverymodel.ActionRemoveManagedTemp,
+		recoverymodel.ActionRematerializeCertBundle, recoverymodel.ActionRematerializeRuntimeKey:
+	default:
+		return fmt.Errorf("unsupported recovery action %q", candidate.Action)
+	}
+	if strings.TrimSpace(candidate.Host) != candidate.Host || dnsname.ValidateSubdomain(candidate.Host) != nil || strings.ContainsAny(candidate.Host, `/\\`) {
+		return fmt.Errorf("invalid recovery host")
+	}
+	for _, r := range candidate.Host {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("invalid recovery host")
+		}
+	}
+	if len(candidate.Paths) == 0 {
+		return fmt.Errorf("recovery candidate has no paths")
+	}
+	seen := make(map[string]struct{}, len(candidate.Paths))
+	for _, path := range candidate.Paths {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return fmt.Errorf("recovery path must be absolute and clean")
+		}
+		if _, exists := seen[path]; exists {
+			return fmt.Errorf("duplicate recovery path")
+		}
+		seen[path] = struct{}{}
+	}
+	return nil
 }
 
 // Info is a backend's static identity plus detected host facts (§5). It is the
@@ -94,6 +164,10 @@ type Info struct {
 	BinaryPath string `json:"binary_path,omitempty"`
 	// ConfigDir is the primary config directory this backend manages.
 	ConfigDir string `json:"config_dir,omitempty"`
+	// ManagedRoots contains every exact directory in which this backend may
+	// expose a managed recovery entry. It never contains a broad configuration
+	// parent merely to cover multiple layout directories.
+	ManagedRoots []string `json:"managed_roots,omitempty"`
 	// LogPaths are the error/access log paths surfaced in the dashboard (§15).
 	LogPaths []string `json:"log_paths,omitempty"`
 }

@@ -16,6 +16,10 @@ type Config struct {
 	Type string
 	// Binary overrides the detected proxy binary path (empty = autodetect).
 	Binary string
+	// Version is the detected proxy version (e.g. nginx "1.18.0"). Optional; when
+	// empty the nginx backend probes `<binary> -v` itself. It selects the rendered
+	// HTTP/2 syntax (nginx < 1.25.1 needs `listen ... http2`, not `http2 on;`).
+	Version string
 	// ConfigDir overrides the detected config directory (empty = OS default).
 	ConfigDir string
 	// ReloadCmd overrides the service reload command (empty = backend default).

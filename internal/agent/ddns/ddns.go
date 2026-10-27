@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/netip"
@@ -14,25 +15,28 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // Heartbeat periodically sends heartbeats with the agent's public IP to the
 // orchestrator.
 type Heartbeat struct {
-	orchestratorURL string
-	agentID         string
-	token           string
-	version         string
-	interval        time.Duration
-	healthFn        func() (caddyRunning bool, lastError string)
-	modeFn          func() string
-	detectionFn     func() *models.ProxyDetection
-	capabilitiesFn  func() *models.ProxyCapabilities
-	permissionsFn   func() *models.ProxyPermissions
-	checksumsFn     func() []proxymodel.ArtifactChecksum
-	client          *http.Client
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
+	orchestratorURL      string
+	agentID              string
+	token                string
+	version              string
+	interval             time.Duration
+	healthFn             func() (caddyRunning bool, lastError string)
+	modeFn               func() string
+	detectionFn          func() *models.ProxyDetection
+	capabilitiesFn       func() *models.ProxyCapabilities
+	permissionsFn        func() *models.ProxyPermissions
+	checksumsFn          func() []proxymodel.ArtifactChecksum
+	recoveryCapabilityFn func() *recoverymodel.Capability
+	recoveryPolicyFn     func(bool)
+	client               *http.Client
+	cancel               context.CancelFunc
+	wg                   sync.WaitGroup
 }
 
 // heartbeatPayload is the JSON body sent to the orchestrator.
@@ -66,7 +70,8 @@ type heartbeatPayload struct {
 	// ArtifactChecksums reports each managed artifact's current on-disk/live
 	// checksum (§11) so the orchestrator can detect drift against the accepted
 	// state. Omitted when the agent manages nothing.
-	ArtifactChecksums []proxymodel.ArtifactChecksum `json:"artifact_checksums,omitempty"`
+	ArtifactChecksums  []proxymodel.ArtifactChecksum `json:"artifact_checksums,omitempty"`
+	RecoveryCapability *recoverymodel.Capability     `json:"recovery_capability,omitempty"`
 }
 
 // New creates a new Heartbeat sender. healthFn supplies the agent's current
@@ -123,6 +128,14 @@ func (h *Heartbeat) SetCapabilitiesFn(fn func() *models.ProxyCapabilities) {
 // without restarting the heartbeat.
 func (h *Heartbeat) SetArtifactChecksumsFn(fn func() []proxymodel.ArtifactChecksum) {
 	h.checksumsFn = fn
+}
+
+func (h *Heartbeat) SetRecoveryCapabilityFn(fn func() *recoverymodel.Capability) {
+	h.recoveryCapabilityFn = fn
+}
+
+func (h *Heartbeat) SetRecoveryPolicyFn(fn func(bool)) {
+	h.recoveryPolicyFn = fn
 }
 
 // Start begins the heartbeat loop. It blocks until the context is canceled.
@@ -205,19 +218,27 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 	if h.checksumsFn != nil {
 		checksums = h.checksumsFn()
 	}
+	var recoveryCapability *recoverymodel.Capability
+	if h.recoveryCapabilityFn != nil {
+		recoveryCapability = h.recoveryCapabilityFn()
+		if recoveryCapability != nil && recoveryCapability.Validate() != nil {
+			recoveryCapability = nil
+		}
+	}
 
 	payload := heartbeatPayload{
-		AgentID:           h.agentID,
-		PublicIP:          ip,
-		PublicIP6:         ip6,
-		Version:           h.version,
-		CaddyRunning:      caddyRunning,
-		LastError:         lastError,
-		ProxyMode:         mode,
-		ProxyDetection:    detection,
-		ProxyCapabilities: capabilities,
-		ProxyPermissions:  permissions,
-		ArtifactChecksums: checksums,
+		AgentID:            h.agentID,
+		PublicIP:           ip,
+		PublicIP6:          ip6,
+		Version:            h.version,
+		CaddyRunning:       caddyRunning,
+		LastError:          lastError,
+		ProxyMode:          mode,
+		ProxyDetection:     detection,
+		ProxyCapabilities:  capabilities,
+		ProxyPermissions:   permissions,
+		ArtifactChecksums:  checksums,
+		RecoveryCapability: recoveryCapability,
 	}
 
 	data, err := json.Marshal(payload)
@@ -245,6 +266,15 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 	if resp.StatusCode >= 400 {
 		log.Printf("Heartbeat: orchestrator returned status %d", resp.StatusCode)
 		return
+	}
+	if h.recoveryPolicyFn != nil {
+		var response struct {
+			SafeAutoRepairEffective *bool `json:"safe_auto_repair_effective"`
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if readErr == nil && len(bytes.TrimSpace(body)) > 0 && json.Unmarshal(body, &response) == nil && response.SafeAutoRepairEffective != nil {
+			h.recoveryPolicyFn(*response.SafeAutoRepairEffective)
+		}
 	}
 
 	if ip6 != "" {

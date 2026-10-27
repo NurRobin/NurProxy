@@ -51,6 +51,24 @@ func TestAttributeNginxTestError_table(t *testing.T) {
 			wantLine:    15,
 		},
 		{
+			name:        "same basename in foreign root is not ours",
+			out:         `nginx: [emerg] unknown directive "x" in /tmp/nurproxy-app.example.com.conf:8`,
+			ourFile:     ourFile,
+			wantLocated: true,
+			wantOurs:    false,
+			wantFile:    "/tmp/nurproxy-app.example.com.conf",
+			wantLine:    8,
+		},
+		{
+			name:        "case mismatch is not ours",
+			out:         `nginx: [emerg] unknown directive "x" in /etc/nginx/sites-enabled/NURPROXY-app.example.com.conf:8`,
+			ourFile:     ourFile,
+			wantLocated: true,
+			wantOurs:    false,
+			wantFile:    "/etc/nginx/sites-enabled/NURPROXY-app.example.com.conf",
+			wantLine:    8,
+		},
+		{
 			name: "chained context lines attribute to the innermost (last) frame",
 			out: `nginx: [emerg] invalid parameter in /etc/nginx/nginx.conf:9
 nginx: configuration file test failed in /etc/nginx/sites-enabled/nurproxy-app.example.com.conf:5`,
@@ -124,34 +142,29 @@ nginx: configuration file /etc/nginx/nginx.conf test failed`,
 	}
 }
 
-func TestCommandError_message(t *testing.T) {
-	tests := []struct {
-		name string
-		attr ErrAttribution
-		want string
-	}{
-		{
-			name: "ours names the generated config",
-			attr: ErrAttribution{Located: true, Ours: true, File: "/x/nurproxy-a.conf", Line: 4},
-			want: "nginx -t failed in the generated config at /x/nurproxy-a.conf:4",
-		},
-		{
-			name: "theirs names the existing config with jump location",
-			attr: ErrAttribution{Located: true, Ours: false, File: "/etc/nginx/sites-enabled/legacy", Line: 9},
-			want: "nginx -t failed: error in your existing config at /etc/nginx/sites-enabled/legacy:9",
-		},
-		{
-			name: "unlocated surfaces raw output",
-			attr: ErrAttribution{Located: false, Raw: "nginx: [emerg] permission denied"},
-			want: "nginx -t failed: nginx: [emerg] permission denied",
-		},
+func TestAttributeNginxTestErrorMatchesAnyArtifactInBatch(t *testing.T) {
+	first := "/etc/nginx/sites-available/nurproxy-one.example.com.conf"
+	second := "/etc/nginx/sites-available/nurproxy-two.example.com.conf"
+	out := `nginx: [emerg] unknown directive "bad" in /etc/nginx/sites-enabled/nurproxy-two.example.com.conf:6`
+	got := AttributeNginxTestError(out, first, second)
+	if !got.Ours || !got.Located {
+		t.Fatalf("attribution = %#v, want second batch artifact", got)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := (&commandError{Attribution: tt.attr}).Error()
-			if got != tt.want {
-				t.Errorf("Error() = %q, want %q", got, tt.want)
-			}
-		})
+}
+
+func TestAttributeNginxTestErrorPermissionRequiresCommandLineShape(t *testing.T) {
+	if got := AttributeNginxTestError("documentation mentions permission denied handling"); got.Permission {
+		t.Fatalf("prose gained Permission: %#v", got)
+	}
+	if got := AttributeNginxTestError("sudo: a password is required"); !got.Permission {
+		t.Fatalf("sudo denial lacked Permission: %#v", got)
+	}
+	for _, out := range []string{
+		`nginx: [alert] open() "/run/nginx.pid" failed (1: Operation not permitted)`,
+		`2026/08/29 01:20:31 [alert] 4242#4242: open() "/run/nginx.pid" failed (1: Operation not permitted)`,
+	} {
+		if got := AttributeNginxTestError(out); !got.Permission {
+			t.Fatalf("real alert denial lacked Permission: %#v", got)
+		}
 	}
 }

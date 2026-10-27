@@ -74,6 +74,13 @@ func TestNew_validation(t *testing.T) {
 	}
 }
 
+func TestGenericBackendRemainsDiagnosisOnlyForRecovery(t *testing.T) {
+	b, _ := newBackend(t, "{{.Host}}")
+	if _, ok := any(b).(proxy.RecoveryInspector); ok {
+		t.Fatal("custom backend unexpectedly exposes automatic recovery")
+	}
+}
+
 func TestNew_fileExtDefaultsAndDots(t *testing.T) {
 	dir := t.TempDir()
 	base := proxy.Config{ConfigDir: dir, ReloadCmd: "x", Template: "x"}

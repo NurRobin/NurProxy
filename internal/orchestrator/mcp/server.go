@@ -9,7 +9,6 @@
 package mcp
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
@@ -64,7 +64,12 @@ func (h *Handler) authorized(r *http.Request) bool {
 		return false
 	}
 	token := strings.TrimSpace(authz[len(prefix):])
-	return subtle.ConstantTimeCompare([]byte(token), []byte(key)) == 1
+	// The stored key is the SHA-256 digest since the hashing change (a legacy
+	// plaintext row is accepted too). Comparing the raw token against the
+	// stored value locked MCP out on every hashed install — always use the
+	// shared helper.
+	ok, _ := auth.MatchesStoredAPIKey(key, token)
+	return ok
 }
 
 // mcpClientIP returns the peer IP for rate-limiting. Like the REST side it keys
@@ -358,7 +363,7 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if in.Subdomain == "" || in.ZoneID == "" || in.ServerID == "" {
 		return nil, fmt.Errorf("subdomain, zone_id, and server_id are required")
 	}
-	if err := dnsname.ValidateSubdomain(in.Subdomain); err != nil {
+	if err := dnsname.ValidateSubdomainOrApex(in.Subdomain); err != nil {
 		return nil, err
 	}
 	if in.Port <= 0 || in.Port > 65535 {
@@ -394,7 +399,11 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "create", dom.Subdomain)
-	return dom, nil
+	var warnings []string
+	if err := d.ClaimDomainRoute(dom); err != nil {
+		warnings = append(warnings, "colliding route tombstones could not be dropped: "+err.Error())
+	}
+	return domainWithWarnings(dom, warnings), nil
 }
 
 func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
@@ -416,6 +425,7 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("domain not found")
 	}
+	before := *dom
 	if in.ServerID != nil {
 		if _, err := d.GetServer(*in.ServerID); err != nil {
 			return nil, fmt.Errorf("server not found")
@@ -438,11 +448,47 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		dom.SSLMode = models.SSLMode(*in.SSLMode)
 	}
 	dom.Status = models.DomainStatusPending // re-queue for reconciliation
+	// Same move handling as the REST API: tombstone the old host on the old
+	// agent before the row changes, drop the stale artifact afterwards (#148).
+	// The reconciler's next tick pushes both agents.
+	var move *db.DomainMove
+	if before.ServerID != dom.ServerID {
+		move, err = d.BeginDomainMove(&before, dom.ServerID, time.Now().UTC())
+		if err != nil {
+			return nil, fmt.Errorf("failed to persist managed deletion identity for the old agent: %w", err)
+		}
+	}
 	if err := d.UpdateDomain(dom); err != nil {
+		d.AbortDomainMove(move)
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "update", dom.Subdomain)
-	return dom, nil
+	// The update is committed from here on, so cleanup failures are reported
+	// as warnings next to the domain rather than as a tool error.
+	var warnings []string
+	if removed, err := d.CompleteDomainMove(move); err != nil {
+		warnings = append(warnings, "stale config artifact could not be removed: "+err.Error())
+	} else if removed {
+		auditMCP(d, "config_artifact", move.ArtifactID, "remove", "domain moved to another agent")
+	}
+	if err := d.ClaimDomainRoute(dom); err != nil {
+		warnings = append(warnings, "colliding route tombstones could not be dropped: "+err.Error())
+	}
+	return domainWithWarnings(dom, warnings), nil
+}
+
+// domainResult is a domain plus post-commit cleanup warnings; it marshals as
+// the plain domain object when there are none.
+type domainResult struct {
+	*models.Domain
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+func domainWithWarnings(dom *models.Domain, warnings []string) any {
+	if len(warnings) == 0 {
+		return dom
+	}
+	return domainResult{Domain: dom, Warnings: warnings}
 }
 
 func toolDeleteDomain(d *db.DB, args json.RawMessage) (any, error) {

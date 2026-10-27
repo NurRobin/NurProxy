@@ -2,12 +2,138 @@ package certstore
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 )
+
+func testCertificatePair(t *testing.T, host string) ([]byte, []byte) {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: host}, DNSNames: []string{host}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, privateKey.Public(), privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+}
+
+func testRecoveryWriter(path string, data []byte, mode os.FileMode) error {
+	return os.WriteFile(path, data, mode)
+}
+
+func TestInspectAndRefreshRuntimeKeyCryptographically(t *testing.T) {
+	host := "app.example.com"
+	certPEM, keyPEM := testCertificatePair(t, host)
+	_, wrongKey := testCertificatePair(t, "wrong.example.com")
+	encryptKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := New(t.TempDir(), encryptKey)
+	if _, err := store.Install(Bundle{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+
+	inspection, err := store.InspectRecovery(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyMissing || inspection.RuntimeKeyPath == "" {
+		t.Fatalf("missing runtime inspection = %+v", inspection)
+	}
+	if err := store.RefreshRuntimeKey(host, testRecoveryWriter); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = store.InspectRecovery(host)
+	if err != nil || !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyValid {
+		t.Fatalf("refreshed inspection = %+v, err=%v", inspection, err)
+	}
+
+	if err := os.WriteFile(inspection.RuntimeKeyPath, wrongKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = store.InspectRecovery(host)
+	if err != nil || !inspection.BundleValid || inspection.RuntimeKeyState != RuntimeKeyMismatch {
+		t.Fatalf("mismatched runtime inspection = %+v, err=%v", inspection, err)
+	}
+	if err := store.RefreshRuntimeKey(host, testRecoveryWriter); err != nil {
+		t.Fatal(err)
+	}
+	if inspection, err = store.InspectRecovery(host); err != nil || inspection.RuntimeKeyState != RuntimeKeyValid {
+		t.Fatalf("repaired runtime inspection = %+v, err=%v", inspection, err)
+	}
+}
+
+func TestInspectRecoveryAbsentBundleAndSymlinkFailClosed(t *testing.T) {
+	store := New(t.TempDir(), []byte("01234567890123456789012345678901"))
+	inspection, err := store.InspectRecovery("absent.example.com")
+	if err != nil || inspection.BundlePresent || inspection.BundleValid {
+		t.Fatalf("absent inspection = %+v, err=%v", inspection, err)
+	}
+
+	host := "app.example.com"
+	certPEM, keyPEM := testCertificatePair(t, host)
+	if _, err := store.Install(Bundle{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	runtimePath := filepath.Join(store.Dir(), SanitizeHost(host)+keyMaterializedSuffix)
+	if err := os.Symlink(filepath.Join(store.Dir(), SanitizeHost(host)+keySuffix), runtimePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InspectRecovery(host); err == nil {
+		t.Fatal("runtime-key symlink was accepted")
+	}
+}
+
+func TestInspectRecoveryUndecryptableOwnedSourceIsPresentButInvalid(t *testing.T) {
+	host := "app.example.com"
+	certPEM, keyPEM := testCertificatePair(t, host)
+	store := New(t.TempDir(), []byte("01234567890123456789012345678901"))
+	if _, err := store.Install(Bundle{Host: host, CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	inspection := store.RecoveryPaths(host)
+	if err := os.WriteFile(inspection.SourceKeyPath, []byte("bounded-but-not-valid-ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.InspectRecovery(host)
+	if err != nil {
+		t.Fatalf("invalid owned source should be classifiable: %v", err)
+	}
+	if !inspection.BundlePresent || inspection.BundleValid {
+		t.Fatalf("invalid source inspection = %+v", inspection)
+	}
+}
+
+func TestInstallRecoveryBundleRejectsCryptographicMismatch(t *testing.T) {
+	host := "app.example.com"
+	certPEM, _ := testCertificatePair(t, host)
+	_, wrongKey := testCertificatePair(t, "wrong.example.com")
+	store := New(t.TempDir(), nil)
+	if err := store.InstallRecoveryBundle(Bundle{Host: host, CertPEM: certPEM, KeyPEM: wrongKey}, testRecoveryWriter); err == nil {
+		t.Fatal("mismatched recovery bundle was installed")
+	}
+	if inspection, err := store.InspectRecovery(host); err != nil || inspection.BundlePresent {
+		t.Fatalf("rejected bundle left artifacts: %+v err=%v", inspection, err)
+	}
+}
 
 func TestInstall_encryptsKeyAtRest_andReadsBack(t *testing.T) {
 	dir := t.TempDir()
@@ -366,5 +492,65 @@ func TestPrune_removesOrphanHosts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "drop.example.com.crt")); !os.IsNotExist(err) {
 		t.Error("orphan host cert should be pruned")
+	}
+}
+
+func TestInstall_refreshesExistingMaterializedKey(t *testing.T) {
+	// Regression for the raw-config renewal bug: once <host>.key.plain exists on
+	// disk (materialized by CertPaths or a prior MaterializePlain install), a raw
+	// vhost references it directly and the backend never calls CertPaths for raw
+	// routes. Install must therefore refresh the plaintext key on every push —
+	// even without MaterializePlain — or a re-issued cert pairs with a stale key
+	// and nginx -t fails for the whole agent.
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	s := New(dir, key)
+
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nleaf1\n-----END CERTIFICATE-----\n")
+	keyPEM1 := []byte("-----BEGIN PRIVATE KEY-----\nkey1\n-----END PRIVATE KEY-----\n")
+	if _, err := s.Install(Bundle{Host: "raw.example.com", CertPEM: certPEM, KeyPEM: keyPEM1}); err != nil {
+		t.Fatalf("Install #1: %v", err)
+	}
+	// Materialize the plaintext key like a non-raw render (or first-time raw
+	// setup) would.
+	if _, err := s.CertPaths("raw.example.com"); err != nil {
+		t.Fatalf("CertPaths: %v", err)
+	}
+
+	// Re-issue: new keypair pushed, MaterializePlain NOT set.
+	keyPEM2 := []byte("-----BEGIN PRIVATE KEY-----\nkey2\n-----END PRIVATE KEY-----\n")
+	if _, err := s.Install(Bundle{Host: "raw.example.com", CertPEM: certPEM, KeyPEM: keyPEM2}); err != nil {
+		t.Fatalf("Install #2: %v", err)
+	}
+
+	plain, err := os.ReadFile(filepath.Join(dir, "raw.example.com.key.plain"))
+	if err != nil {
+		t.Fatalf("read key.plain: %v", err)
+	}
+	if !bytes.Equal(plain, keyPEM2) {
+		t.Errorf("key.plain not refreshed on install: got %q, want new key", plain)
+	}
+}
+
+func TestInstall_noMaterializedKey_staysAbsent(t *testing.T) {
+	// Without MaterializePlain and without a pre-existing key.plain, Install must
+	// NOT write a plaintext key — that would silently negate at-rest encryption
+	// for hosts that never reference it.
+	dir := t.TempDir()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	s := New(dir, key)
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n")
+	if _, err := s.Install(Bundle{Host: "plainless.example.com", CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "plainless.example.com.key.plain")); !os.IsNotExist(err) {
+		t.Errorf("key.plain should not exist, stat err = %v", err)
 	}
 }

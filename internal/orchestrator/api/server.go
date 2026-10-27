@@ -11,6 +11,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -22,11 +23,24 @@ import (
 // It is masked from the settings API (see system.go) so it never leaves the box.
 const sessionSecretSetting = "session_secret"
 
+const (
+	sessionSecretPersistAttempts = 3
+	sessionSecretRetryDelay      = 50 * time.Millisecond
+)
+
 // RoutePusher computes an agent's desired routes and delivers them over its live
 // stream. The reconciler implements it; API handlers call it to push config the
 // instant a domain changes.
 type RoutePusher interface {
 	PushAgentRoutes(agentID string) error
+}
+
+// DNSTakeover forcibly aligns a domain's public DNS record with NurProxy's desired
+// CNAME using the zone provider's stored credentials — the explicit admin override
+// of the default "never touch a record we didn't create" stance, used to migrate an
+// existing domain whose DNS predates NurProxy. The reconciler implements it.
+type DNSTakeover interface {
+	TakeoverDomainDNS(ctx context.Context, domID int64) error
 }
 
 // CertIssuer obtains a central TLS certificate for a host on demand (the §7
@@ -46,6 +60,7 @@ type Server struct {
 	sessions *auth.SessionManager
 	hub      *agenthub.Hub
 	pusher   RoutePusher
+	takeover DNSTakeover
 	issuer   CertIssuer
 	logs     *logbroker.Broker
 	// loginLimiter blunts online password guessing: too many failed logins from
@@ -55,11 +70,20 @@ type Server struct {
 	// tokenBackfilled guards the once-per-agent encrypted-token backfill in
 	// requireAgentAuth (see backfillAgentToken).
 	tokenBackfilled sync.Map
+	// recoveryMu serializes report transitions and manual repair admission so
+	// two requests cannot create competing active operations from one diagnosis.
+	recoveryMu sync.Mutex
+	// recoveryAuthority exposes only its public identity and typed grant signer.
+	recoveryAuthority recoveryAuthorityPublic
 
 	// dnsDryRun / acmeDryRun reflect sandbox mode so the health endpoint can tell
 	// the dashboard to show a "dry-run — no external calls" banner (#93).
 	dnsDryRun  bool
 	acmeDryRun bool
+
+	// caStatus reports the latest ACME-CA reachability observation (#91), wired
+	// from the tls.CAProber. Nil (never wired, or ACME dry-run) omits the check.
+	caStatus func() tls.CAStatus
 }
 
 // SetDryRun records whether the orchestrator is running in DNS/ACME sandbox mode
@@ -69,6 +93,13 @@ func (s *Server) SetDryRun(dns, acme bool) {
 	s.acmeDryRun = acme
 }
 
+// SetCAStatus wires the ACME-CA reachability probe into the health endpoint
+// (#91) so a CA-egress problem on the orchestrator host is visible in the
+// dashboard instead of masquerading as per-domain issuance flakiness.
+func (s *Server) SetCAStatus(status func() tls.CAStatus) {
+	s.caStatus = status
+}
+
 // SetAgentHub wires the live agent connection hub and the route pusher into the
 // server, enabling the SSE stream endpoint and instant route delivery. When
 // unset (e.g. in tests), the stream endpoint reports streaming unavailable and
@@ -76,6 +107,14 @@ func (s *Server) SetDryRun(dns, acme bool) {
 func (s *Server) SetAgentHub(hub *agenthub.Hub, pusher RoutePusher) {
 	s.hub = hub
 	s.pusher = pusher
+}
+
+// SetDNSTakeover wires the DNS-takeover capability (the admin override that lets
+// NurProxy overwrite a conflicting foreign DNS record with the desired CNAME using
+// the provider's own credentials). Optional: when unset, the takeover endpoint
+// reports the capability unavailable.
+func (s *Server) SetDNSTakeover(t DNSTakeover) {
+	s.takeover = t
 }
 
 // SetCertIssuer wires the on-demand TLS issuer so domain creation can trigger
@@ -123,10 +162,11 @@ func NewServer(database *db.DB, version string) *Server {
 // an ephemeral random key is used: still unforgeable, but sessions reset on the
 // next restart.
 func loadOrCreateSessionKey(database *db.DB) []byte {
-	if v, err := database.GetSetting(sessionSecretSetting); err == nil && v != "" {
-		if key, derr := base64.StdEncoding.DecodeString(v); derr == nil && len(key) == 32 {
-			return key
-		}
+	stored, getErr := database.GetSetting(sessionSecretSetting)
+	if key, ok := decodeSessionKey(stored); getErr == nil && ok {
+		return key
+	}
+	if getErr == nil && stored != "" {
 		log.Printf("warning: stored session secret is malformed; regenerating (existing sessions will be invalidated)")
 	}
 
@@ -135,10 +175,44 @@ func loadOrCreateSessionKey(database *db.DB) []byte {
 		// crypto/rand is broken — unrecoverable for a security-sensitive key.
 		log.Fatalf("failed to generate session secret: %v", err)
 	}
-	if err := database.SetSetting(sessionSecretSetting, base64.StdEncoding.EncodeToString(key)); err != nil {
-		log.Printf("warning: could not persist session secret, sessions will reset on restart: %v", err)
+	candidate := base64.StdEncoding.EncodeToString(key)
+	var lastPersistErr error
+	for attempt := 0; attempt < sessionSecretPersistAttempts; attempt++ {
+		actual, _, err := database.CompareAndSwapSetting(sessionSecretSetting, stored, candidate)
+		if err != nil {
+			lastPersistErr = err
+			if authoritative, readErr := database.GetSetting(sessionSecretSetting); readErr == nil {
+				if persisted, ok := decodeSessionKey(authoritative); ok {
+					return persisted
+				}
+				stored = authoritative
+			}
+		} else {
+			if persisted, ok := decodeSessionKey(actual); ok {
+				return persisted
+			}
+			stored = actual
+		}
+		if attempt+1 < sessionSecretPersistAttempts {
+			time.Sleep(sessionSecretRetryDelay)
+		}
 	}
+	if authoritative, err := database.GetSetting(sessionSecretSetting); err == nil {
+		if persisted, ok := decodeSessionKey(authoritative); ok {
+			return persisted
+		}
+	}
+	if lastPersistErr != nil {
+		log.Printf("warning: could not persist session secret after retries, sessions will reset on restart: %v", lastPersistErr)
+		return key
+	}
+	log.Printf("warning: stored session secret remained malformed after atomic replacement; sessions will reset on restart")
 	return key
+}
+
+func decodeSessionKey(encoded string) ([]byte, bool) {
+	key, err := base64.StdEncoding.DecodeString(encoded)
+	return key, err == nil && len(key) == 32
 }
 
 // Handler returns the mux wrapped with middleware.
@@ -188,6 +262,26 @@ func (s *Server) registerRoutes() {
 	// rejects any id that is not the caller's own.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/status", s.requireAgentAuth(s.handleAgentStatus))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", s.requireAgentAuth(s.handleAgentHeartbeat))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/diagnostics", s.requireAuth(s.handleListRecoveryDiagnostics))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/repairs", s.requireAuth(s.handleListRepairs))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs", s.requireAuth(s.handleCreateRepair))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/report", s.requireAgentAuth(s.handleRecoveryReport))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/authority", s.requireAgentAuth(s.handleGetRecoveryAuthority))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/recovery/helper", s.requireAuth(s.handleEnrollRecoveryHelper))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/helper", s.requireAgentAuth(s.handleGetRecoveryHelper))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/helper-status", s.requireAuth(s.handleGetRecoveryHelperAdmin))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/plans", s.requireAgentAuth(s.handleSubmitRecoveryExecutionPlan))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/plans", s.requireAgentAuth(s.handleListRecoveryExecutionPlans))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/hard-plans", s.requireAuth(s.handleListRecoveryExecutionPlansAdmin))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/plans/{planId}", s.requireAuth(s.handleGetRecoveryExecutionPlan))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/plans/{planId}/confirm", s.requireAuth(s.handleConfirmRecoveryExecutionPlan))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/plans/{planId}/grant", s.requireAgentAuth(s.handleGetRecoveryExecutionGrant))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/plans/{planId}/receipt", s.requireAgentAuth(s.handleSubmitRecoveryExecutionReceipt))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/applies/{operationId}/plan", s.requireAgentAuth(s.handleSubmitManagedApplyPlan))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/recovery/applies/{operationId}", s.requireAgentAuth(s.handleGetManagedApply))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/applies/{operationId}/receipt", s.requireAgentAuth(s.handleSubmitManagedApplyReceipt))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs/{opId}/ack", s.requireAgentAuth(s.handleRepairAck))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/safe-auto-repair", s.requireAuth(s.handleSetSafeAutoRepair))
 	// Live push channel: the agent dials out and holds this open; the
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))
@@ -226,6 +320,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/domains/{id}/config", s.requireAuth(s.handleGetDomainConfig))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/config", s.requireAuth(s.handleUpdateDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/config/reset", s.requireAuth(s.handleResetDomainConfig))
+	s.mux.HandleFunc("POST /api/v1/domains/{id}/dns/takeover", s.requireAuth(s.handleDomainDNSTakeover))
 
 	// Config artifacts + drift review (auth required, §11 Phase 3)
 	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAuth(s.handleListArtifacts))

@@ -3,12 +3,18 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+// ErrCertNotFound marks a certificate lookup that matched no row, so callers
+// can tell "no cert stored for this host" (usually fine) from a real query or
+// decryption failure via errors.Is.
+var ErrCertNotFound = errors.New("certificate not found")
 
 // UpsertCertificate inserts or replaces the certificate for a host. The private
 // key (KeyPEM) is encrypted with the existing AES-256-GCM key before storage;
@@ -68,7 +74,7 @@ func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
 		FROM certificates WHERE host = ?`, host)
 	c, err := d.scanCertificate(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("certificate not found: %s", host)
+		return nil, fmt.Errorf("%w: %s", ErrCertNotFound, host)
 	}
 	if err != nil {
 		return nil, err

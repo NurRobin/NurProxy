@@ -3,6 +3,8 @@ package models
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // AgentStatus represents the lifecycle state of an agent.
@@ -242,10 +244,20 @@ type Agent struct {
 	// DNSRecordID6 is the provider record ID of the agent's AAAA record, tracked
 	// separately from the A record's DNSRecordID so DDNS can update each address
 	// family independently. Empty until an AAAA record is created/adopted.
-	DNSRecordID6 string      `json:"dns_record_id6,omitempty"`
-	Status       AgentStatus `json:"status"`
-	LastSeen     *time.Time  `json:"last_seen,omitempty"`
-	Version      string      `json:"version,omitempty"`
+	DNSRecordID6 string `json:"dns_record_id6,omitempty"`
+	// DNSRecordOwned / DNSRecordOwned6 report whether NurProxy created the A /
+	// AAAA anchor record (true) or adopted an existing one (false). Only owned
+	// anchors are deleted at the provider when the agent is renamed or deleted.
+	// DNSRecordZoneID / DNSRecordZoneID6 name the zone each record lives in.
+	// These are owned by the DB layer: UpdateAgent never writes them from the
+	// struct (see db.SetAgentAnchorRecord).
+	DNSRecordOwned   bool        `json:"dns_record_owned"`
+	DNSRecordOwned6  bool        `json:"dns_record_owned6"`
+	DNSRecordZoneID  string      `json:"dns_record_zone_id,omitempty"`
+	DNSRecordZoneID6 string      `json:"dns_record_zone_id6,omitempty"`
+	Status           AgentStatus `json:"status"`
+	LastSeen         *time.Time  `json:"last_seen,omitempty"`
+	Version          string      `json:"version,omitempty"`
 	// VersionStatus is a COMPUTED, non-persisted comparison of the agent's version
 	// against the orchestrator's, set by the API when listing/showing an agent so
 	// the dashboard can flag skew: "current" | "outdated" | "ahead" | "unknown"
@@ -295,9 +307,12 @@ type Agent struct {
 	// re-applies generated artifacts over on-disk drift instead of flagging it for
 	// review. Off by default — drift is a review, not a bulldoze. DNS
 	// reconciliation stays automatic regardless of this flag.
-	AutoReconcileConfig bool      `json:"auto_reconcile_config"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	AutoReconcileConfig     bool                      `json:"auto_reconcile_config"`
+	SafeAutoRepairOverride  *bool                     `json:"safe_auto_repair_override"`
+	SafeAutoRepairEffective bool                      `json:"safe_auto_repair_effective"`
+	RecoveryCapability      *recoverymodel.Capability `json:"recovery_capability,omitempty"`
+	CreatedAt               time.Time                 `json:"created_at"`
+	UpdatedAt               time.Time                 `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.
@@ -394,8 +409,16 @@ type Domain struct {
 	UpdatedAt  time.Time    `json:"updated_at"`
 }
 
-// FQDN returns the full domain name (subdomain + zone).
+// IsApex reports whether the domain targets the zone apex (root), represented by
+// the "@" subdomain sentinel.
+func (d Domain) IsApex() bool { return d.Subdomain == "@" }
+
+// FQDN returns the full domain name (subdomain + zone). The "@" sentinel means
+// the zone apex, so the bare zone name is returned.
 func (d Domain) FQDN(zoneName string) string {
+	if d.IsApex() {
+		return zoneName
+	}
 	return d.Subdomain + "." + zoneName
 }
 

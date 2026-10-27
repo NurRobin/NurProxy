@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"sync"
 
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // Event is a single message pushed to an agent over its stream.
@@ -37,7 +39,10 @@ const (
 	EventLogTail = "log_tail"
 	// EventLogTailStop asks the agent to stop a tail session (§15). The payload is a
 	// proxymodel.LogTailStop. Pushed when the operator closes the dashboard log view.
-	EventLogTailStop = "log_tail_stop"
+	EventLogTailStop    = "log_tail_stop"
+	EventRecoveryPolicy = "recovery_policy"
+	EventRepairRequest  = "repair_request"
+	EventManagedRoutes  = "managed_routes"
 )
 
 // maxStreamsPerAgent caps how many concurrent SSE streams a single agent may
@@ -53,6 +58,17 @@ const maxStreamsPerAgent = 2
 type subscriber struct {
 	ch  chan Event
 	seq uint64 // monotonic registration order; lower == older
+}
+
+func (h *Hub) PublishManagedIntentSet(agentID string, envelope helperprotocol.ManagedIntentSetEnvelope) bool {
+	if envelope.Validate() != nil {
+		return false
+	}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return false
+	}
+	return h.Publish(agentID, Event{Type: EventManagedRoutes, Data: data})
 }
 
 // Hub tracks live agent connections and fans events out to them. It is safe for
@@ -136,8 +152,8 @@ func (h *Hub) Connected(agentID string) bool {
 }
 
 // Publish sends ev to every live connection for agentID. It never blocks: a
-// connection whose buffer is full simply drops this event. Returns true if the
-// agent had at least one connection to deliver to.
+// connection whose buffer is full simply drops this event. Returns true only if
+// at least one live connection actually enqueued the event.
 func (h *Hub) Publish(agentID string, ev Event) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -146,14 +162,16 @@ func (h *Hub) Publish(agentID string, ev Event) bool {
 	if len(set) == 0 {
 		return false
 	}
+	delivered := false
 	for sub := range set {
 		select {
 		case sub.ch <- ev:
+			delivered = true
 		default:
 			// Buffer full — drop. The agent re-syncs fully on reconnect.
 		}
 	}
-	return true
+	return delivered
 }
 
 // PublishIntents is a convenience wrapper that pushes a full intent-set snapshot
@@ -176,4 +194,25 @@ func (h *Hub) PublishIntentSet(agentID string, set proxymodel.IntentSet) bool {
 		return false
 	}
 	return h.Publish(agentID, Event{Type: EventRoutes, Data: data})
+}
+
+func (h *Hub) PublishRecoveryPolicy(agentID string, enabled bool) bool {
+	envelope := proxymodel.RecoveryPolicyEnvelope{Policy: proxymodel.RecoveryPolicy{SafeAutoRepair: enabled}}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return false
+	}
+	return h.Publish(agentID, Event{Type: EventRecoveryPolicy, Data: data})
+}
+
+func (h *Hub) PublishRepairRequest(agentID string, request recoverymodel.RepairRequest) bool {
+	envelope := proxymodel.RepairRequestEnvelope{Request: request}
+	if err := envelope.Validate(); err != nil {
+		return false
+	}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return false
+	}
+	return h.Publish(agentID, Event{Type: EventRepairRequest, Data: data})
 }

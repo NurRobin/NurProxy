@@ -31,6 +31,24 @@ type Manager struct {
 	detection       *models.ProxyDetection
 	capabilities    *models.ProxyCapabilities
 	client          *http.Client
+	// detectIP / detectIP6 resolve the host's public addresses for the
+	// registration request. Injectable (WithIPDetectors) so Register is
+	// unit-testable without real network lookups (#76); they default to the
+	// live detectors.
+	detectIP  func(context.Context) (string, error)
+	detectIP6 func(context.Context) (string, error)
+}
+
+// WithIPDetectors overrides the public-IP detectors used by Register (tests;
+// the defaults perform live lookups). Returns the receiver for chaining.
+func (m *Manager) WithIPDetectors(v4, v6 func(context.Context) (string, error)) *Manager {
+	if v4 != nil {
+		m.detectIP = v4
+	}
+	if v6 != nil {
+		m.detectIP6 = v6
+	}
+	return m
 }
 
 // registerRequest is the JSON body for POST /api/v1/agents/register.
@@ -67,6 +85,8 @@ func New(orchestratorURL, fqdn, dataDir string, apiPort int) (*Manager, error) {
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		detectIP:  detectPublicIPSimple,
+		detectIP6: ddns.DetectPublicIP6,
 	}
 
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
@@ -119,10 +139,10 @@ func (m *Manager) AgentID() string {
 
 // Register sends a registration request to the orchestrator.
 func (m *Manager) Register(ctx context.Context) error {
-	publicIP, _ := detectPublicIPSimple(ctx)
+	publicIP, _ := m.detectIP(ctx)
 	// IPv6 is best-effort and never gates registration; a v6-less host just omits
 	// it. The heartbeat re-reports both families every beat regardless.
-	publicIP6, _ := ddns.DetectPublicIP6(ctx)
+	publicIP6, _ := m.detectIP6(ctx)
 
 	apiURL := fmt.Sprintf("http://%s:%d", m.fqdn, m.apiPort)
 	if publicIP != "" {

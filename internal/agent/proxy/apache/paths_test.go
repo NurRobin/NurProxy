@@ -1,6 +1,9 @@
 package apache
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestResolveLayout(t *testing.T) {
 	tests := []struct {
@@ -104,5 +107,20 @@ func TestEnabledPath_confd_empty(t *testing.T) {
 	l := ResolveLayout("/etc/httpd/conf.d")
 	if l.EnabledPath("app.example.com") != "" {
 		t.Errorf("conf.d layout EnabledPath should be empty")
+	}
+}
+
+func TestResolveLayout_emptyDefaultsToAbsoluteRoot(t *testing.T) {
+	// Regression: an empty config dir must never yield relative paths. The
+	// exact root depends on the host (/etc/apache2 vs /etc/httpd), so assert
+	// absoluteness plus one of the two known layouts.
+	l := ResolveLayout("")
+	if !filepath.IsAbs(l.Available) {
+		t.Fatalf("ResolveLayout(\"\") yielded a relative Available %q", l.Available)
+	}
+	debian := l.Available == "/etc/apache2/sites-available" && l.Enabled == "/etc/apache2/sites-enabled"
+	rhel := l.Available == "/etc/httpd/conf.d" && l.Enabled == ""
+	if !debian && !rhel {
+		t.Errorf("ResolveLayout(\"\") = %+v, want the apache2 pair or the httpd conf.d layout", l)
 	}
 }

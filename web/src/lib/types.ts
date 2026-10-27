@@ -169,9 +169,162 @@ export interface Agent {
    * Absent in built-in mode or before the first existing-mode beat.
    */
   proxy_permissions?: ProxyPermissions;
+  safe_auto_repair_override?: boolean | null;
+  safe_auto_repair_effective: boolean;
+  recovery_capability?: RecoveryCapability;
   created_at: string;
   updated_at: string;
   servers?: Server[];
+}
+
+export type RecoveryCode =
+  | 'managed_orphan_config' | 'managed_stale_temp' | 'managed_cert_file_missing'
+  | 'managed_runtime_key_missing' | 'managed_runtime_key_mismatch'
+  | 'generated_config_invalid' | 'operator_config_invalid' | 'permission_denied'
+  | 'systemd_sandbox_denied' | 'proxy_reload_failed' | 'proxy_not_running'
+  | 'port_conflict' | 'proxy_binary_missing' | 'unknown_proxy_error';
+
+export type RecoverySeverity = 'info' | 'warning' | 'error' | 'critical';
+export type RecoveryOwnership = 'nurproxy' | 'operator' | 'system' | 'unknown';
+export type RecoveryAction =
+  | 'prune_managed_orphan' | 'remove_managed_temp' | 'rematerialize_cert_bundle'
+  | 'rematerialize_runtime_key' | 'restore_last_live_artifact';
+export type RecoveryOperationState =
+  | 'detected' | 'diagnosis_only' | 'planned' | 'snapshotted' | 'applying'
+  | 'validating' | 'succeeded' | 'rolling_back' | 'rolled_back'
+  | 'rollback_failed' | 'suppressed';
+
+export interface RecoveryCapability {
+  stage: number;
+  actions: RecoveryAction[];
+}
+
+export interface RecoveryDiagnostic {
+  id: string;
+  code: RecoveryCode;
+  subsystem: string;
+  severity: RecoverySeverity;
+  ownership: RecoveryOwnership;
+  ownership_confidence?: 'certain' | 'inferred' | 'unknown';
+  summary: string;
+  evidence: string;
+  affected_paths: string[];
+  resource_fingerprint: string;
+  proposed_action: RecoveryAction | '';
+  auto_repair_eligible: boolean;
+  hard_change: boolean;
+  repair_scope?: string;
+  repair_eligible?: boolean;
+  repair_refusal_code?: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  occurrences: number;
+  resolved_at?: string;
+  resolution_reason?: 'repaired' | 'resource_disappeared' | 'desired_state_changed'
+    | 'operator_resolved' | 'superseded' | 'condition_no_longer_observed';
+  resolution_operation_id?: string;
+  breaker?: RecoveryBreaker;
+}
+
+export type HardRecoveryAction =
+  | 'repair_agent_sandbox_paths' | 'repair_managed_path_access'
+  | 'validate_reload_proxy' | 'start_proxy' | 'restart_proxy'
+  | 'install_supported_proxy_package' | 'open_proxy_firewall_ports';
+
+export interface HardRecoveryPlanStep {
+  kind: string;
+  summary: string;
+}
+
+export interface HardRecoveryPlan {
+  agent_id: string;
+  operation_id: string;
+  helper_plan_id: string;
+  helper_instance_id: string;
+  diagnostic_id: string;
+  action: HardRecoveryAction;
+  logical_target: string;
+  display_plan_hash: string;
+  execution_plan_hash: string;
+  resource_fingerprint: string;
+  rollback_coverage: 'full' | 'partial' | 'none';
+  signed_plan: {
+    envelope: {
+      payload: {
+        steps: HardRecoveryPlanStep[];
+        expires_at: string;
+      };
+    };
+  };
+  received_at: string;
+  expires_at: string;
+  confirmation_event_ids: string[];
+  confirmation_times: string[];
+  signed_execution_grant?: unknown;
+  signed_helper_receipt?: { envelope: { payload: { state: string; sanitized_result: string } } };
+}
+
+export interface RecoveryHelperInstance {
+  agent_id: string;
+  helper_instance_id: string;
+  helper_build_id: string;
+  attestation_key_id: string;
+  hello_digest: string;
+  enrolled_at: string;
+}
+
+// Set when the newest managed apply receipt is rollback_failed: the root
+// helper has latched its persistent breaker and refuses every later apply.
+export interface ManagedApplyBreaker {
+  open: boolean;
+  operation_id: string;
+  reason: string;
+  opened_at?: string;
+}
+
+// Vhost files the newest managed apply left on disk without a desired route;
+// repeated by the helper in every receipt until they are removed.
+export interface ManagedApplyLeftovers {
+  operation_id: string;
+  files: string;
+  reported_at?: string;
+}
+
+export type RecoveryHelperStatus =
+  | { enrolled: false }
+  | {
+      enrolled: true;
+      helper: RecoveryHelperInstance;
+      managed_apply_breaker?: ManagedApplyBreaker;
+      managed_apply_leftovers?: ManagedApplyLeftovers;
+    };
+
+export interface RecoveryBreaker {
+  open: boolean;
+  reason?: 'failure_threshold' | 'rollback_failed_latched';
+  expires_at?: string;
+}
+
+export interface RecoveryStep {
+  name: string;
+  summary: string;
+  state: RecoveryOperationState;
+  at: string;
+}
+
+export interface RecoveryOperation {
+  operation_id: string;
+  diagnostic_id: string;
+  action: RecoveryAction;
+  source: 'automatic' | 'user';
+  state: RecoveryOperationState;
+  steps: RecoveryStep[];
+  snapshot_reference: string;
+  validation_outcome: string;
+  rollback_outcome: string;
+  error: string;
+  started_at: string;
+  finished_at?: string | null;
 }
 
 export interface Server {

@@ -27,6 +27,30 @@ server {
 	}
 }
 
+func TestDiscover_skipsACMEChallengeLocation(t *testing.T) {
+	// Real-world vhost shape: the app backend in `location /`, plus a shared ACME
+	// HTTP-01 challenge responder. The challenge proxy is cert tooling, not an
+	// application backend, so it must not surface as a suggestion — otherwise that
+	// one internal address (e.g. 127.0.0.1:9180) rides along on every vhost.
+	cfg := `
+server {
+    server_name radarr.example.com;
+    location / {
+        proxy_pass http://192.168.1.213:7878;
+    }
+    location ~ /.well-known/acme-challenge {
+        proxy_pass http://127.0.0.1:9180;
+    }
+}`
+	got := Discover(cfg)
+	if len(got) != 1 {
+		t.Fatalf("ACME-challenge proxy_pass must be skipped, want 1 upstream, got %d: %+v", len(got), got)
+	}
+	if got[0].Host != "192.168.1.213" || got[0].Port != 7878 {
+		t.Errorf("only the real backend should remain, got %+v", got[0])
+	}
+}
+
 func TestDiscover_namedUpstreamResolved(t *testing.T) {
 	cfg := `
 upstream backend {

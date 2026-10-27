@@ -28,6 +28,9 @@ func (d *DB) InsertAuditLog(entry *models.AuditLogEntry) error {
 	}
 	entry.ID = id
 
+	if d.auditNotify != nil {
+		d.auditNotify(*entry)
+	}
 	return nil
 }
 
@@ -77,4 +80,13 @@ func (d *DB) ListAuditLogFiltered(source string, limit, offset int) ([]models.Au
 	}
 
 	return entries, total, rows.Err()
+}
+
+// SetAuditNotify registers a callback invoked after every successful audit
+// insert — the single choke point every subsystem's lifecycle events already
+// flow through, which is what the notifier dispatcher consumes (#72). The
+// callback MUST NOT block (the dispatcher's Publish is queue-append only) and
+// runs on the inserting goroutine. Nil disables notification.
+func (d *DB) SetAuditNotify(fn func(models.AuditLogEntry)) {
+	d.auditNotify = fn
 }

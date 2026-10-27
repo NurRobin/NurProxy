@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation, Trans } from 'react-i18next';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 import { LANGUAGES } from '../lib/i18n';
 import type { Provider, Zone, Setting } from '../lib/types';
 import type { HealthResponse, TestProviderZone } from '../lib/api';
@@ -10,7 +10,7 @@ import ConfirmDialog from '../components/ConfirmDialog';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
-import { Field, Input, PasswordInput, Select } from '../components/Field';
+import { Checkbox, Field, Input, PasswordInput, Select } from '../components/Field';
 import MultiSelect from '../components/MultiSelect';
 import { useToast, errMessage } from '../components/toast-context';
 import { useUIVariant, UI_VARIANTS } from '../lib/ui-variant-context';
@@ -28,6 +28,10 @@ function Section({ title, help, action, children }: { title: string; help?: stri
     </section>
   );
 }
+
+// Let's Encrypt staging directory — issued certs are untrusted, but issuance
+// does not count against production rate limits (#76).
+const LE_STAGING_URL = 'https://acme-staging-v02.api.letsencrypt.org/directory';
 
 export default function Settings() {
   const toast = useToast();
@@ -52,11 +56,15 @@ export default function Settings() {
 
   const [deleteProviderId, setDeleteProviderId] = useState<string | null>(null);
   const [deleteZoneId, setDeleteZoneId] = useState<string | null>(null);
+  const [zoneCascadeDomains, setZoneCascadeDomains] = useState<string[] | null>(null);
 
   const [reconcilerInterval, setReconcilerInterval] = useState('');
   const [reconcilerSaving, setReconcilerSaving] = useState(false);
+  const [safeAutoRepair, setSafeAutoRepair] = useState(true);
+  const [safeAutoRepairSaving, setSafeAutoRepairSaving] = useState(false);
 
   const [acmeEmail, setAcmeEmail] = useState('');
+  const [acmeStaging, setAcmeStaging] = useState(false);
   const [acmeSaving, setAcmeSaving] = useState(false);
 
   const [currentPassword, setCurrentPassword] = useState('');
@@ -76,8 +84,12 @@ export default function Settings() {
       setProviders(p); setZones(z); setSettings(s); setHealth(h); setApiKeyInfo(k);
       const rec = s.find((st) => st.key === 'reconciler_interval');
       if (rec) setReconcilerInterval(rec.value);
+      const recovery = s.find((st) => st.key === 'safe_auto_repair');
+      setSafeAutoRepair(recovery?.value !== 'false');
       const email = s.find((st) => st.key === 'acme_email');
       if (email) setAcmeEmail(email.value);
+      const dir = s.find((st) => st.key === 'acme_directory');
+      setAcmeStaging(!!dir && dir.value === LE_STAGING_URL);
     } catch (err) {
       toast.error(errMessage(err, t('settings.loadFailed')));
     } finally {
@@ -138,7 +150,24 @@ export default function Settings() {
   async function handleDeleteZone() {
     if (!deleteZoneId) return;
     try { await api.deleteZone(deleteZoneId); toast.success(t('settings.zoneRemoved')); setDeleteZoneId(null); fetchData(); }
-    catch (err) { toast.error(errMessage(err, t('settings.zoneRemoveFailed'))); }
+    catch (err) {
+      // 409 = domains still reference this zone: offer the opt-in cascade (#104).
+      if (err instanceof ApiError && err.status === 409) {
+        const data = err.data as { domains?: string[] } | undefined;
+        setZoneCascadeDomains(data?.domains ?? []);
+      } else {
+        toast.error(errMessage(err, t('settings.zoneRemoveFailed')));
+      }
+    }
+  }
+
+  async function handleCascadeDeleteZone() {
+    if (!deleteZoneId) return;
+    try {
+      await api.deleteZone(deleteZoneId, true);
+      toast.success(t('common.cascadeScheduled'));
+      setZoneCascadeDomains(null); setDeleteZoneId(null); fetchData();
+    } catch (err) { toast.error(errMessage(err, t('settings.zoneRemoveFailed'))); }
   }
 
   async function handleSaveReconciler() {
@@ -148,13 +177,31 @@ export default function Settings() {
     finally { setReconcilerSaving(false); }
   }
 
+  async function handleSafeAutoRepair(enabled: boolean) {
+    setSafeAutoRepairSaving(true);
+    try {
+      await api.updateSetting('safe_auto_repair', enabled ? 'true' : 'false');
+      setSafeAutoRepair(enabled);
+      toast.success(t('settings.safeAutoRepairSaved'));
+    } catch (err) {
+      toast.error(errMessage(err, t('settings.saveFailedGeneric')));
+    } finally {
+      setSafeAutoRepairSaving(false);
+    }
+  }
+
   async function handleSaveAcmeEmail() {
     setAcmeSaving(true);
     try {
       await api.updateSetting('acme_email', acmeEmail.trim());
+      // Empty directory = Let's Encrypt production (the default); the staging
+      // toggle writes the LE staging URL so operators can test issuance
+      // without burning production rate limits.
+      await api.updateSetting('acme_directory', acmeStaging ? LE_STAGING_URL : '');
       setSettings((prev) => {
-        const next = prev.filter((s) => s.key !== 'acme_email');
+        const next = prev.filter((s) => s.key !== 'acme_email' && s.key !== 'acme_directory');
         next.push({ key: 'acme_email', value: acmeEmail.trim(), updated_at: new Date().toISOString() });
+        next.push({ key: 'acme_directory', value: acmeStaging ? LE_STAGING_URL : '', updated_at: new Date().toISOString() });
         return next;
       });
       toast.success(t('settings.acmeSaved'));
@@ -275,6 +322,19 @@ export default function Settings() {
         </div>
       </Section>
 
+      <Section title={t('settings.safeAutoRepair')}>
+        <p className="-mt-1 text-sm text-fg-muted">{t('settings.safeAutoRepairSub')}</p>
+        <div className="mt-4">
+          <Checkbox
+            label={t('settings.safeAutoRepairEnabled')}
+            checked={safeAutoRepair}
+            disabled={safeAutoRepairSaving}
+            onChange={(event) => handleSafeAutoRepair(event.target.checked)}
+          />
+          <p className="mt-2 text-xs text-fg-faint">{t('settings.safeAutoRepairHint')}</p>
+        </div>
+      </Section>
+
       <Section title={t('settings.tls')}>
         <p className="-mt-1 text-sm text-fg-muted">{t('settings.tlsSub')}</p>
         <Callout tone="info" title={t('settings.tlsPrivacyTitle')}>{t('settings.tlsPrivacyBody')}</Callout>
@@ -285,6 +345,10 @@ export default function Settings() {
           <Button onClick={handleSaveAcmeEmail} loading={acmeSaving} className="mb-0.5">{t('common.save')}</Button>
         </div>
         <p className="mt-2 text-xs text-fg-faint">{t('settings.acmeEmailHelp')}</p>
+        <div className="mt-3">
+          <Checkbox label={t('settings.acmeStaging')} checked={acmeStaging} onChange={(e) => setAcmeStaging(e.target.checked)} />
+          <p className="mt-1 text-xs text-fg-faint">{t('settings.acmeStagingHelp')}</p>
+        </div>
       </Section>
 
       <Section title={t('settings.authentication')}>
@@ -370,7 +434,8 @@ export default function Settings() {
       </Modal>
 
       <ConfirmDialog open={deleteProviderId !== null} onClose={() => setDeleteProviderId(null)} onConfirm={handleDeleteProvider} title={t('settings.deleteProviderTitle')} message={t('settings.deleteProviderMsg')} confirmLabel={t('common.delete')} danger confirmText={providers.find((p) => p.id === deleteProviderId)?.name} />
-      <ConfirmDialog open={deleteZoneId !== null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title={t('settings.removeZoneTitle')} message={t('settings.removeZoneMsg')} confirmLabel={t('common.remove')} danger />
+      <ConfirmDialog open={deleteZoneId !== null && zoneCascadeDomains === null} onClose={() => setDeleteZoneId(null)} onConfirm={handleDeleteZone} title={t('settings.removeZoneTitle')} message={t('settings.removeZoneMsg')} confirmLabel={t('common.remove')} danger />
+      <ConfirmDialog open={zoneCascadeDomains !== null} onClose={() => { setZoneCascadeDomains(null); setDeleteZoneId(null); }} onConfirm={handleCascadeDeleteZone} title={t('common.cascadeTitle')} message={`${t('common.cascadeMessage')} ${(zoneCascadeDomains ?? []).join(', ')}`} confirmLabel={t('common.cascadeConfirm')} danger />
     </div>
   );
 }

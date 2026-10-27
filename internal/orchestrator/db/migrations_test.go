@@ -9,6 +9,90 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 )
 
+func TestMigration24BackfillsRecoveryOperationTotals(t *testing.T) {
+	if len(migrations) < 24 {
+		t.Fatalf("expected recovery total rollup migration, have %d migrations", len(migrations))
+	}
+	dbPath := filepath.Join(t.TempDir(), "recovery-total-upgrade.db")
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", dbPath)
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.SetMaxOpenConns(1)
+	if _, err := raw.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 23; i++ {
+		if _, err := raw.Exec(migrations[i]); err != nil {
+			t.Fatalf("applying migration %d: %v", i+1, err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_version (version) VALUES (23)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO agents (id, name, fqdn) VALUES ('agent-backfill', 'Backfill', 'backfill.example.com')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO recovery_diagnostics (
+		id, agent_id, code, subsystem, severity, ownership, summary, evidence,
+		affected_paths, resource_fingerprint, proposed_action, auto_repair_eligible,
+		hard_change, first_seen_at, last_seen_at, occurrences
+	) VALUES (
+		'diagnostic-backfill', 'agent-backfill', 'managed_stale_temp', 'nginx', 'warning',
+		'nurproxy', 'stale temp', 'owned marker', '[]', 'fp-backfill',
+		'remove_managed_temp', 1, 0, 1, 1, 1
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO recovery_operations (
+		id, agent_id, diagnostic_id, action, resource_fingerprint, risk,
+		request_source, state, step_summaries, snapshot_reference,
+		validation_outcome, rollback_outcome, error, started_at, created_at,
+		received_at, finished_at
+	) VALUES (
+		'op-backfill', 'agent-backfill', 'diagnostic-backfill', 'remove_managed_temp',
+		'fp-backfill', 'safe', 'user', 'succeeded', '[]', 'recovery/op-backfill',
+		'valid', '', '', 1, 1, 1, 2
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`UPDATE recovery_diagnostics SET resolved_at = 2 WHERE id = 'diagnostic-backfill'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(dbPath, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	var count int
+	if err := d.sql.QueryRow(`SELECT count FROM recovery_operation_totals
+		WHERE action = 'remove_managed_temp' AND outcome = 'succeeded' AND request_source = 'user'`).Scan(&count); err != nil {
+		t.Fatalf("reading backfilled recovery operation total: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("backfilled recovery operation total = %d, want 1", count)
+	}
+	var confidence, scope, reason, operationID string
+	var repairEligible int
+	if err := d.sql.QueryRow(`SELECT ownership_confidence, repair_scope, repair_eligible,
+		resolution_reason, resolution_operation_id FROM recovery_diagnostics
+		WHERE id = 'diagnostic-backfill'`).Scan(&confidence, &scope, &repairEligible, &reason, &operationID); err != nil {
+		t.Fatal(err)
+	}
+	if confidence != "unknown" || scope != "ambiguous" || repairEligible != 1 || reason != "repaired" || operationID != "op-backfill" {
+		t.Fatalf("diagnostic semantic backfill = confidence=%q scope=%q eligible=%d reason=%q operation=%q", confidence, scope, repairEligible, reason, operationID)
+	}
+}
+
 // seedSchema14 opens a raw SQLite connection at dbPath, applies the first 14
 // migrations verbatim, records schema_version=14, and inserts one fully-linked
 // row chain (provider → zone → agent → server → domain) so the upgrade test can
@@ -94,8 +178,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 20 {
-		t.Fatalf("this test pins the schema target at 20 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 32 {
+		t.Fatalf("this test pins the schema target at 32 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -146,6 +230,57 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 	})
 
+	// migration 21: cert_backoff table exists and is empty.
+	t.Run("cert_backoff_table", func(t *testing.T) {
+		var n int
+		if err := d.sql.QueryRow("SELECT COUNT(*) FROM cert_backoff").Scan(&n); err != nil {
+			t.Fatalf("select from cert_backoff: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("cert_backoff should start empty, has %d rows", n)
+		}
+	})
+
+	// migration 22: pending_parent_deletions table exists and is empty.
+	t.Run("pending_parent_deletions_table", func(t *testing.T) {
+		var n int
+		if err := d.sql.QueryRow("SELECT COUNT(*) FROM pending_parent_deletions").Scan(&n); err != nil {
+			t.Fatalf("select from pending_parent_deletions: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("pending_parent_deletions should start empty, has %d rows", n)
+		}
+	})
+
+	// migration 23: recovery policy defaults to enabled globally while the
+	// per-agent override remains NULL (inherit), and recovery history starts empty.
+	t.Run("recovery_defaults", func(t *testing.T) {
+		var global string
+		if err := d.sql.QueryRow("SELECT value FROM settings WHERE key='safe_auto_repair'").Scan(&global); err != nil {
+			t.Fatalf("select safe_auto_repair: %v", err)
+		}
+		if global != "true" {
+			t.Errorf("safe_auto_repair = %q, want true", global)
+		}
+		var override, capability sql.NullString
+		if err := d.sql.QueryRow(`SELECT safe_auto_repair_override, recovery_capability FROM agents WHERE id='agent1'`).
+			Scan(&override, &capability); err != nil {
+			t.Fatalf("select recovery agent columns: %v", err)
+		}
+		if override.Valid || capability.Valid {
+			t.Errorf("legacy agent recovery columns = (%v, %v), want (NULL, NULL)", override, capability)
+		}
+		for _, table := range []string{"recovery_diagnostics", "recovery_operations"} {
+			var n int
+			if err := d.sql.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+				t.Fatalf("select from %s: %v", table, err)
+			}
+			if n != 0 {
+				t.Errorf("%s should start empty, has %d rows", table, n)
+			}
+		}
+	})
+
 	// --- seeded data is preserved -------------------------------------------
 	t.Run("data_preserved", func(t *testing.T) {
 		var fqdn string
@@ -186,5 +321,27 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	}
 	if agentCount != 1 {
 		t.Errorf("agent count = %d after second Open, want 1", agentCount)
+	}
+}
+
+func TestSchemaVersion_readOnly(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "v.db")
+	d, err := Open(dbPath, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	current, target, err := SchemaVersion(dbPath)
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if current != len(migrations) || target != len(migrations) {
+		t.Errorf("SchemaVersion = (%d, %d), want (%d, %d)", current, target, len(migrations), len(migrations))
 	}
 }

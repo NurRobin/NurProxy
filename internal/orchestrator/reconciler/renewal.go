@@ -56,13 +56,67 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		return nil, fmt.Errorf("listing certificates due for renewal: %w", err)
 	}
 
+	domains, dErr := s.db.ListDomains(db.DomainFilter{})
+	if dErr != nil {
+		return nil, fmt.Errorf("listing domains for renewal resolution: %w", dErr)
+	}
+	zoneNames := make(map[string]string, len(zones))
+	for i := range zones {
+		zoneNames[zones[i].ID] = zones[i].Name
+	}
+
+	// centralHosts is the set of FQDNs a stored cert can currently be consumed
+	// for: every non-deleting domain that resolves to the host AND wants central
+	// TLS (the same host→domain matching gatherCerts uses, and the same policy
+	// resolution the renderers use). It gates the renewal pass below.
+	centralHosts := make(map[string]bool)
+	for i := range domains {
+		dom := &domains[i]
+		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok {
+			continue
+		}
+		if caddygen.TLSPolicyForDomain(*dom) != proxymodel.TLSPolicyCentral {
+			continue
+		}
+		centralHosts[dom.FQDN(zoneName)] = true
+	}
+
+	// Hosts under an active rate-limit hold are skipped in BOTH passes: retrying
+	// before the hold elapses is guaranteed to fail and burns the remaining CA
+	// quota (#70). The hold clears itself by elapsing; success deletes the row.
+	backoffs, bErr := s.db.ActiveCertBackoffs(time.Now().UTC())
+	if bErr != nil {
+		return nil, fmt.Errorf("listing cert backoffs: %w", bErr)
+	}
+	inBackoff := func(host string) bool {
+		next, ok := backoffs[host]
+		if ok {
+			log.Printf("reconciler: renewal: %q is rate-limit backed off until %s, skipping", host, next.UTC().Format(time.RFC3339))
+		}
+		return ok
+	}
+
 	var targets []tls.RenewTarget
 	seen := make(map[string]bool)
 
 	// 1) Existing certs entering the renew window — re-issue keeping the exact name
-	//    set and wildcard scope.
+	//    set and wildcard scope. A cert with no current central-TLS consumer is
+	//    orphaned (its domain was deleted or switched policy): skip it rather than
+	//    drive ACME forever for a host nobody serves. Skip, never delete — cert
+	//    removal belongs to the teardown path, not the renewer.
 	for i := range certs {
 		c := &certs[i]
+		if !certHasCentralConsumer(c, centralHosts) {
+			log.Printf("reconciler: renewal: no central-TLS domain consumes cert host %q, skipping renewal", c.Host)
+			continue
+		}
+		if inBackoff(c.Host) {
+			continue
+		}
 		t, ok := s.resolveTarget(c.Host, append([]string(nil), c.Names...), c.IsWildcard, zones)
 		if !ok {
 			log.Printf("reconciler: renewal: cannot resolve zone/provider for cert host %q, skipping", c.Host)
@@ -76,14 +130,6 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 	//    new domain would never get a cert (the file backends then render plaintext;
 	//    built-in Caddy hides it via self-ACME). Skip domains being deleted and any
 	//    host already covered by the renewal pass above.
-	domains, dErr := s.db.ListDomains(db.DomainFilter{})
-	if dErr != nil {
-		return nil, fmt.Errorf("listing domains for first-issuance: %w", dErr)
-	}
-	zoneNames := make(map[string]string, len(zones))
-	for i := range zones {
-		zoneNames[zones[i].ID] = zones[i].Name
-	}
 	for i := range domains {
 		dom := &domains[i]
 		if dom.Status == models.DomainStatusDeleting {
@@ -102,6 +148,9 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		}
 		if _, gErr := s.db.GetCertificate(fqdn); gErr == nil {
 			continue // already have a cert (renewal pass owns expiry)
+		}
+		if inBackoff(fqdn) {
+			continue
 		}
 		t, ok := s.resolveTarget(fqdn, []string{fqdn}, false, zones)
 		if !ok {
@@ -127,6 +176,19 @@ func (s *CertRenewalStore) TargetForHost(_ context.Context, host string) (*tls.R
 	}
 	if _, err := s.db.GetCertificate(host); err == nil {
 		return nil, nil // already have a cert; let the scan handle renewal
+	}
+	// An active rate-limit hold also gates the on-create fast path: issuing now
+	// is guaranteed to fail against the CA and burn quota. The scan picks the
+	// host up once the hold elapses (#70).
+	b, err := s.db.GetCertBackoff(host)
+	if err != nil {
+		// Fail closed: an unreadable hold must not let the fast path drive ACME —
+		// a hold may well exist, and issuing through it burns CA quota.
+		return nil, fmt.Errorf("reading cert backoff for %q: %w", host, err)
+	}
+	if b != nil && b.NextAttemptAt.After(time.Now().UTC()) {
+		log.Printf("reconciler: issuance for %q is rate-limit backed off until %s, skipping", host, b.NextAttemptAt.UTC().Format(time.RFC3339))
+		return nil, nil
 	}
 	zones, err := s.db.ListZones()
 	if err != nil {
@@ -191,6 +253,75 @@ func (s *CertRenewalStore) SaveRenewed(_ context.Context, res *tls.CertResult, i
 		return fmt.Errorf("reconciler: renewal: saving renewed cert for %q: %w", res.Host, err)
 	}
 	return nil
+}
+
+// MarkRateLimited persists the rate-limit hold for host: attempts increments
+// per consecutive limit, and the next-attempt instant grows exponentially
+// (honoring a later CA retry-after). Implements the tls.RenewalStore backoff
+// half (#70).
+func (s *CertRenewalStore) MarkRateLimited(_ context.Context, host, detail string, retryAfter *time.Time) (time.Time, error) {
+	prev, err := s.db.GetCertBackoff(host)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("reading cert backoff for %q: %w", host, err)
+	}
+	attempts := 1
+	// Only a CONSECUTIVE limit escalates the hold: a leftover row whose hold
+	// elapsed more than a full backoff cap ago is stale (the host simply wasn't
+	// retried for a while — e.g. it lost its consumer), not evidence of an
+	// ongoing limit, so the counter restarts instead of drifting upward forever.
+	if prev != nil && time.Since(prev.NextAttemptAt) < tls.RateLimitBackoffCap {
+		attempts = prev.Attempts + 1
+	}
+	next := tls.NextRateLimitBackoff(time.Now().UTC(), attempts, retryAfter)
+	if err := s.db.UpsertCertBackoff(&db.CertBackoff{
+		Host: host, Attempts: attempts, NextAttemptAt: next, LastError: detail,
+	}); err != nil {
+		return time.Time{}, err
+	}
+	return next, nil
+}
+
+// ClearBackoff removes any rate-limit hold for host after a successful
+// issuance. Idempotent.
+func (s *CertRenewalStore) ClearBackoff(_ context.Context, host string) error {
+	return s.db.DeleteCertBackoff(host)
+}
+
+// certHasCentralConsumer reports whether any name the stored certificate covers
+// is currently consumed: a live central-TLS domain's FQDN equals it, or — for a
+// wildcard name — sits beneath its apex. centralHosts is the precomputed FQDN
+// set of those domains. A cert covering none of them has no consumer left and
+// must not be re-issued (DueForRenewal skips it).
+func certHasCentralConsumer(c *models.Certificate, centralHosts map[string]bool) bool {
+	names := append([]string{c.Host}, c.Names...)
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(name, "*."):
+			name = strings.TrimPrefix(name, "*.")
+		case c.IsWildcard && name == c.Host:
+			// A wildcard cert is keyed at its apex (see zoneForHost): the bare host
+			// stands for "*.host" too.
+		default:
+			// A plain SAN consumes only its exact host.
+			if centralHosts[name] {
+				return true
+			}
+			continue
+		}
+		// A wildcard name covers hosts beneath its apex, NOT the apex itself —
+		// "*.example.com" does not serve "example.com". The apex only counts when
+		// it is also listed as a plain SAN (handled above).
+		suffix := "." + name
+		for h := range centralHosts {
+			if strings.HasSuffix(h, suffix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // zoneForHost picks the zone a certificate host belongs to. For a per-host cert

@@ -18,6 +18,7 @@ import (
 	agentconfig "github.com/NurRobin/NurProxy/internal/agent/config"
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
+	"github.com/NurRobin/NurProxy/internal/agent/helperclient"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/apache" // registers the apache backend in the proxy registry
 	caddybackend "github.com/NurRobin/NurProxy/internal/agent/proxy/caddy"
@@ -25,6 +26,8 @@ import (
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/generic" // registers the custom (template) backend in the proxy registry
 	_ "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"   // registers the nginx backend in the proxy registry
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/permcheck"
+	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
@@ -32,6 +35,8 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 	"github.com/NurRobin/NurProxy/internal/shared/logging"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 var version = "dev"
@@ -84,6 +89,15 @@ func main() {
 			return
 		case "apply":
 			cmdApply(os.Args[2:])
+			return
+		case "root-helper":
+			cmdRootHelper(os.Args[2:])
+			return
+		case "helper-refresh-build":
+			cmdHelperRefreshBuild(os.Args[2:])
+			return
+		case "helper-bootstrap":
+			cmdHelperBootstrap(os.Args[2:])
 			return
 		}
 	}
@@ -158,7 +172,7 @@ func main() {
 	// which proxy is installed (+ version/paths) and which process holds :80/:443.
 	// The result rides the agent-initiated adoption + heartbeat payloads (the
 	// agent always dials out; the orchestrator never probes it inbound).
-	detection := detectProxy(ctx)
+	rawDetection, detection := detectProxy(ctx, cfg.ProxyConfigDir)
 	if detection != nil {
 		log.Printf("Proxy detection: installed=%t kind=%q version=%q config_dir=%q",
 			detection.Installed, detection.Kind, detection.Version, detection.ConfigDir)
@@ -357,11 +371,13 @@ func main() {
 	// and is reported to the dashboard as context behind the fix.
 	env := runtimeenv.Detect()
 	reconfigureDeps := proxy.ReconfigureDeps{
-		Health:    hs,
-		StopCaddy: caddyProc.Stop,
-		Env:       env,
-		CertDir:   certDir,
-		CertKey:   certKey,
+		Health:             hs,
+		StopCaddy:          caddyProc.Stop,
+		Env:                env,
+		HelperManagedApply: helperManagedApplyEnabled(env),
+		CertDir:            certDir,
+		CertKey:            certKey,
+		Detection:          rawDetection,
 		CaddyFactory: func() proxy.Proxy {
 			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort))
 			if certStore != nil {
@@ -424,6 +440,54 @@ func main() {
 		WithLogPaths(cfg.ProxyLogPaths).
 		WithCertStore(certStore)
 
+	// Recovery is optional at startup and fail-closed: if durable storage or path
+	// guards cannot be established, the agent keeps reconciling normally but does
+	// not advertise or execute automatic repairs.
+	var recoveryCoordinator *recovery.Coordinator
+	var recoverySnapshots *recovery.SnapshotStore
+	var recoveryBreaker *recovery.Breaker
+	recoveryReporter := recovery.NewBoundedReporter(256, recovery.NewHTTPReportSender(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), nil))
+	if snapshots, snapshotErr := recovery.NewSnapshotStore(cfg.DataDir); snapshotErr != nil {
+		log.Printf("WARNING: safe recovery snapshots unavailable: %v", snapshotErr)
+	} else if breaker, breakerErr := recovery.NewPersistentBreaker(cfg.DataDir); breakerErr != nil {
+		_ = snapshots.Close()
+		log.Printf("WARNING: safe recovery breaker unavailable: %v", breakerErr)
+	} else {
+		info := holder.Info()
+		roots := recoveryRootsForBackend(info, cfg.DataDir)
+		guard, guardErr := recovery.NewPathGuard(roots...)
+		if guardErr != nil {
+			_ = snapshots.Close()
+			_ = breaker.Close()
+			log.Printf("WARNING: safe recovery path guard unavailable: %v", guardErr)
+		} else {
+			recoverySnapshots, recoveryBreaker = snapshots, breaker
+			recoveryCoordinator = recovery.NewCoordinator(mgr.AgentID(), holder, snapshots, breaker, recoveryReporter, guard, nil)
+			recoveryCoordinator.SetContext(recovery.Context{AgentID: mgr.AgentID(), ProxyInfo: info, ManagedRoots: roots, AgentDataRoot: cfg.DataDir})
+			if pruneErr := snapshots.Prune(time.Now().UTC()); pruneErr != nil {
+				log.Printf("WARNING: recovery snapshot retention failed: %v", pruneErr)
+			}
+			if operationIDs, listErr := snapshots.ActiveOperationIDs(); listErr != nil {
+				log.Printf("WARNING: interrupted recovery operations could not be enumerated safely: %v", listErr)
+			} else {
+				for _, operationID := range operationIDs {
+					if report, recoverErr := recoveryCoordinator.Recover(ctx, operationID); recoverErr != nil {
+						log.Printf("WARNING: recovery operation %s restart failed in state %s: %v", operationID, report.State, recoverErr)
+					} else {
+						log.Printf("Recovered interrupted operation %s as %s", operationID, report.State)
+					}
+				}
+			}
+			capability := recoveryCoordinator.Capability()
+			recoveryReporter.Enqueue(proxymodel.RecoveryReport{Capability: &capability})
+			streamClient.WithRecovery(recoveryCoordinator)
+			go recoveryReporter.Run(ctx)
+			if existingMode && !cfg.DryRun {
+				go runHardRecoveryControl(ctx, cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, recoveryCoordinator, streamClient, recoverycontrol.DefaultStagingRoot)
+			}
+		}
+	}
+
 	// In existing mode, report the host config the agent can READ into the central
 	// store (§17 "adoption reads all files") so it shows under Config immediately —
 	// even before any domain is applied, and crucially even when the agent lacks
@@ -434,7 +498,11 @@ func main() {
 	// config through the normal apply path, so this is scoped to existing mode.
 	if holder.Mode() == "existing" {
 		if arts, rerr := holder.Current().ReadManaged(ctx); rerr != nil {
-			log.Printf("WARNING: could not read existing config for the central store: %v", rerr)
+			if reconfigureDeps.HelperManagedApply {
+				log.Printf("Direct adopted-config read unavailable at the privilege boundary; verified helper receipts attest managed artifacts: %v", rerr)
+			} else {
+				log.Printf("WARNING: could not read existing config for the central store: %v", rerr)
+			}
 		} else if perr := streamClient.ReportAdopted(ctx, cfg.FQDN, cfg.ProxyType, arts); perr != nil {
 			log.Printf("WARNING: could not report existing config to the central store: %v", perr)
 		} else if len(arts) > 0 {
@@ -447,7 +515,7 @@ func main() {
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
 	// host changes (e.g. a previously-conflicting proxy releasing :443).
-	hb.SetDetectionFn(func() *models.ProxyDetection { return detectProxy(ctx) })
+	hb.SetDetectionFn(func() *models.ProxyDetection { _, m := detectProxy(ctx, cfg.ProxyConfigDir); return m })
 	// Re-report the capability matrix on each beat so module changes (e.g.
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
@@ -462,6 +530,9 @@ func main() {
 	// clears the dashboard warning on its own — no restart. osUser names the grant
 	// commands. Built-in mode reports nothing (checked=false → nil).
 	hb.SetPermissionsFn(func() *models.ProxyPermissions {
+		if reconfigureDeps.HelperManagedApply && holder.Mode() == "existing" {
+			return nil
+		}
 		res, rem, dirs, checked := holder.ProbePermissions(ctx, env)
 		if checked {
 			// Keep health/last_error in sync with the live probe so the stale startup
@@ -475,6 +546,10 @@ func main() {
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
 	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
+	if recoveryCoordinator != nil {
+		hb.SetRecoveryCapabilityFn(func() *recoverymodel.Capability { capability := recoveryCoordinator.Capability(); return &capability })
+		hb.SetRecoveryPolicyFn(recoveryCoordinator.SetPolicy)
+	}
 	hb.Start(ctx)
 
 	// Open the stream. Runs until shutdown, reconnecting as needed.
@@ -493,6 +568,12 @@ func main() {
 	defer shutdownCancel()
 
 	hb.Stop()
+	if recoverySnapshots != nil {
+		_ = recoverySnapshots.Close()
+	}
+	if recoveryBreaker != nil {
+		_ = recoveryBreaker.Close()
+	}
 
 	if err := apiServer.Stop(shutdownCtx); err != nil {
 		log.Printf("API server shutdown error: %v", err)
@@ -503,6 +584,34 @@ func main() {
 	}
 
 	log.Printf("Agent stopped.")
+}
+
+func helperManagedApplyEnabled(env runtimeenv.Env) bool {
+	return env.OS == "linux" && !env.IsRoot
+}
+
+func recoveryRootsForBackend(info proxy.Info, dataDir string) []string {
+	roots := make([]string, 0, 1+len(info.ManagedRoots))
+	seen := make(map[string]struct{}, 1+len(info.ManagedRoots))
+	appendRoot := func(root string) {
+		if root == "" {
+			return
+		}
+		if _, exists := seen[root]; exists {
+			return
+		}
+		seen[root] = struct{}{}
+		roots = append(roots, root)
+	}
+	appendRoot(dataDir)
+	if len(info.ManagedRoots) == 0 {
+		appendRoot(info.ConfigDir)
+	} else {
+		for _, root := range info.ManagedRoots {
+			appendRoot(root)
+		}
+	}
+	return roots
 }
 
 // watchSignals blocks until a signal arrives on sigCh, then calls cancel to begin
@@ -518,14 +627,16 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 
 // detectProxy runs read-only proxy detection and converts it to the shared wire
 // model. It never mutates host state; a detection error is logged and reported
-// as nil (the orchestrator keeps any prior value), never fatal.
-func detectProxy(ctx context.Context) *models.ProxyDetection {
-	det, err := proxy.NewDetector().Detect(ctx)
+// as nil (the orchestrator keeps any prior value), never fatal. configDir is the
+// operator's optional proxy-config-dir override (empty = §9 OS default), applied
+// to both the reported config dir and upstream discovery.
+func detectProxy(ctx context.Context, configDir string) (*proxy.Detection, *models.ProxyDetection) {
+	det, err := proxy.NewDetector().WithConfigDir(configDir).Detect(ctx)
 	if err != nil {
 		log.Printf("Proxy detection failed: %v", err)
-		return nil
+		return nil, nil
 	}
-	return det.ToModel()
+	return &det, det.ToModel()
 }
 
 // toProxyPermissions maps the agent-side permcheck result + remediation into the
@@ -570,6 +681,66 @@ func toRuntimeEnv(env runtimeenv.Env) *models.RuntimeEnv {
 		Sandboxed:  env.Sandboxed,
 		User:       env.User,
 		IsRoot:     env.IsRoot,
+	}
+}
+
+func runHardRecoveryControl(ctx context.Context, orchestratorURL, agentID, token, buildID string, coordinator *recovery.Coordinator, streamClient *stream.Client, stagingRoot string) {
+	remote, err := recoverycontrol.NewHTTP(orchestratorURL, agentID, token, nil)
+	if err != nil {
+		log.Printf("WARNING: privileged recovery control is unavailable: %v", err)
+		return
+	}
+	var controller *recoverycontrol.Controller
+	retry := time.NewTicker(30 * time.Second)
+	defer retry.Stop()
+	for controller == nil {
+		pin, pinErr := remote.HelperPin(ctx)
+		if pinErr == nil {
+			client, clientErr := helperclient.New(agentID, buildID, pin)
+			if clientErr == nil {
+				_, clientErr = client.Hello(ctx)
+			}
+			if clientErr == nil {
+				controller = recoverycontrol.New(client, remote)
+				managedController, managedErr := recoverycontrol.NewManaged(client, remote, stagingRoot)
+				if managedErr != nil {
+					log.Printf("WARNING: ordinary privileged reconciliation is unavailable: %v", managedErr)
+				} else {
+					streamClient.WithManagedApply(managedController)
+				}
+				coordinator.SetPrivilegedRecoveryAvailable(true)
+				log.Printf("Privileged recovery helper identity verified")
+				break
+			}
+			pinErr = clientErr
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("Privileged recovery helper pending: %v", pinErr)
+		select {
+		case <-ctx.Done():
+			return
+		case <-retry.C:
+		}
+	}
+	reconcile := func() {
+		reconcileCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		defer cancel()
+		if err := controller.Reconcile(reconcileCtx, coordinator.ActiveDiagnostics()); err != nil && ctx.Err() == nil {
+			log.Printf("WARNING: privileged recovery reconciliation failed: %v", err)
+		}
+	}
+	reconcile()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcile()
+		}
 	}
 }
 

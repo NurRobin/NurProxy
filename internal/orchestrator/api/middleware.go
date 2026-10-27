@@ -2,9 +2,9 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -36,6 +36,10 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		// 1) Session cookie → dashboard (UI)
 		if cookie, err := r.Cookie("nurproxy_session"); err == nil {
 			if _, err := s.sessions.Verify(cookie.Value); err == nil {
+				if !cookieMutationOriginAllowed(r) {
+					writeError(w, http.StatusForbidden, "cross-site cookie-authenticated mutation rejected")
+					return
+				}
 				ctx := context.WithValue(r.Context(), ctxActor, "admin")
 				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceUI)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -49,20 +53,14 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if token := bearerToken(r); token != "" {
 			apiKey, err := s.db.GetSetting("admin_api_key")
 			if err == nil && apiKey != "" {
-				// The setting holds the key's SHA-256 (never the plaintext), so a
-				// leaked DB cannot mint admin access. Compare hash-to-hash.
-				if subtle.ConstantTimeCompare([]byte(apiKey), []byte(auth.HashToken(token))) == 1 {
-					ctx := context.WithValue(r.Context(), ctxActor, "api_key")
-					ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
-					next.ServeHTTP(w, r.WithContext(ctx))
-					return
-				}
-				// Legacy row: pre-hashing installs stored the plaintext. Accept it
-				// once and upgrade the row in place, so existing keys keep working
-				// while the stored value stops being a credential.
-				if subtle.ConstantTimeCompare([]byte(apiKey), []byte(token)) == 1 {
-					if err := s.db.SetSetting("admin_api_key", auth.HashToken(token)); err != nil {
-						log.Printf("api-key: failed to upgrade legacy plaintext key to hash: %v", err)
+				// The setting holds the key's SHA-256 (never the plaintext, so a
+				// leaked DB cannot mint admin access); legacy pre-hashing rows hold
+				// the plaintext and are upgraded in place on first use.
+				if ok, legacy := auth.MatchesStoredAPIKey(apiKey, token); ok {
+					if legacy {
+						if err := s.db.SetSetting("admin_api_key", auth.HashToken(token)); err != nil {
+							log.Printf("api-key: failed to upgrade legacy plaintext key to hash: %v", err)
+						}
 					}
 					ctx := context.WithValue(r.Context(), ctxActor, "api_key")
 					ctx = context.WithValue(ctx, ctxSource, models.AuditSourceAPI)
@@ -74,6 +72,38 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		writeError(w, http.StatusUnauthorized, "authentication required")
 	}
+}
+
+func cookieMutationOriginAllowed(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		if referer := r.Header.Get("Referer"); referer != "" {
+			parsed, err := url.Parse(referer)
+			if err != nil {
+				return false
+			}
+			origin = parsed.Scheme + "://" + parsed.Host
+		}
+	}
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	expectedScheme := "http"
+	if requestIsHTTPS(r) {
+		expectedScheme = "https"
+	}
+	return strings.EqualFold(parsed.Scheme, expectedScheme) && strings.EqualFold(parsed.Host, r.Host)
 }
 
 // requireAgentAuth wraps a handler to require agent-specific auth.

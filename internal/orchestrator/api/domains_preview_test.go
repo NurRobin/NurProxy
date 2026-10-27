@@ -60,7 +60,7 @@ func TestRenderDomainPreview_nginxAgentRendersNginx(t *testing.T) {
 	}
 	// A force-https central-TLS domain on nginx must show the 80->443 redirect,
 	// the 443 ssl listener, and the cert path (the bug was a plaintext listen 80).
-	for _, want := range []string{"listen 80", "return 301 https://", "listen 443 ssl", "ssl_certificate /var/lib/nurproxy/certs/app.example.com.crt"} {
+	for _, want := range []string{"listen 80", "return 301 https://", "listen 443 ssl", "ssl_certificate /var/lib/nurproxy-agent/certs/app.example.com.crt", "ssl_certificate_key /var/lib/nurproxy-agent/certs/app.example.com.key.plain"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("nginx preview missing %q:\n%s", want, text)
 		}

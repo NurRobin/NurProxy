@@ -1,6 +1,38 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
 
 const BASE = '/api/v1';
+
+// Registered by App.tsx: a 401 from any non-auth endpoint means the session
+// expired, so the app should drop back to the login screen instead of leaving
+// every poll toasting errors forever.
+let unauthorizedHandler: (() => void) | null = null;
+export function onUnauthorized(handler: (() => void) | null) {
+  unauthorizedHandler = handler;
+}
+
+/**
+ * Thrown on a 401 outside /auth/*. The global handler already redirects to
+ * login, so the toast layer suppresses this error (see errMessage).
+ */
+export class UnauthorizedError extends Error {
+  constructor(body: string) {
+    super(`API error 401: ${body}`);
+    this.name = 'UnauthorizedError';
+  }
+}
+
+// ApiError carries the HTTP status and the (JSON-parsed, when possible)
+// response body, so callers can branch on structured failures — e.g. the 409
+// a parent delete returns while domains still reference it (#104).
+export class ApiError extends Error {
+  status: number;
+  data: unknown;
+  constructor(status: number, body: string) {
+    super(`API error ${status}: ${body}`);
+    this.status = status;
+    try { this.data = JSON.parse(body); } catch { this.data = undefined; }
+  }
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -9,7 +41,18 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`API error ${res.status}: ${body}`);
+    // Auth endpoints legitimately return 401 (e.g. wrong password on login)
+    // and surface it inline — only a 401 elsewhere means an expired session.
+    if (res.status === 401 && !path.startsWith('/auth/')) {
+      // Defer to a macrotask so the handler runs after the caller's catch
+      // block: a catch that sets its own state (e.g. App's checkSetupWizard
+      // setting authState='error') would otherwise overwrite the redirect to
+      // login. A microtask is not enough — the awaiting catch resumes as a
+      // microtask too, after one queued here.
+      window.setTimeout(() => unauthorizedHandler?.(), 0);
+      throw new UnauthorizedError(body);
+    }
+    throw new ApiError(res.status, body);
   }
   // 204 No Content (and other empty bodies) have nothing to parse — return
   // undefined rather than letting res.json() throw on the empty stream.
@@ -35,6 +78,9 @@ export interface HealthResponse {
   dry_run?: boolean;
   dns_dry_run?: boolean;
   acme_dry_run?: boolean;
+  // checks carries subsystem states; "acme_ca" is "ok" or an unreachable
+  // detail when the orchestrator cannot reach the ACME CA (#91).
+  checks?: Record<string, string>;
 }
 
 export interface TestProviderZone {
@@ -48,6 +94,9 @@ export interface DomainConfig {
   // config is a JSON route object; for nginx/apache it is the native config text.
   backend?: string;
   config: unknown;
+  // true when the served bytes are the agent's applied artifact rather than a
+  // fresh render (optional — older orchestrators don't send it).
+  applied?: boolean;
 }
 
 export const api = {
@@ -75,7 +124,7 @@ export const api = {
   listAllZones: () => request<Zone[]>('/zones'),
   createZonesBatch: (data: { provider_id: string; zones: Array<{ external_id: string; name: string }> }) =>
     request<Array<{ id: string; name: string }>>('/zones/batch', { method: 'POST', body: JSON.stringify(data) }),
-  deleteZone: (id: string) => request<{ message: string }>(`/zones/${id}`, { method: 'DELETE' }),
+  deleteZone: (id: string, cascade = false) => request<{ message: string }>(`/zones/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
 
   // Agents
   listAgents: () => request<Agent[]>('/agents'),
@@ -84,7 +133,31 @@ export const api = {
   adoptAgent: (id: string, data: { name?: string; fqdn?: string; zone_ids?: string[]; dns_mode?: string; ddns_interval?: number }) =>
     request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
   rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
-  deleteAgent: (id: string) => request<{ message: string }>(`/agents/${id}`, { method: 'DELETE' }),
+  deleteAgent: (id: string, cascade = false) => request<{ message: string }>(`/agents/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
+  listRecoveryDiagnostics: (id: string, includeResolved = true, resolvedLimit = 100) =>
+    request<RecoveryDiagnostic[]>(`/agents/${id}/diagnostics?include_resolved=${includeResolved}${includeResolved ? `&resolved_limit=${resolvedLimit}` : ''}`),
+  listRecoveryOperations: (id: string, limit = 50) =>
+    request<RecoveryOperation[]>(`/agents/${id}/repairs?limit=${limit}`),
+  createRecoveryRepair: (id: string, diagnosticId: string, action: RecoveryAction) =>
+    request<RecoveryOperation>(`/agents/${id}/repairs`, {
+      method: 'POST', body: JSON.stringify({ diagnostic_id: diagnosticId, action }),
+    }),
+  setAgentSafeAutoRepair: (id: string, mode: 'inherit' | 'enabled' | 'disabled') =>
+    request<{ mode: string; safe_auto_repair_effective: boolean }>(`/agents/${id}/safe-auto-repair`, {
+      method: 'PUT', body: JSON.stringify({ mode }),
+    }),
+  listHardRecoveryPlans: (id: string) =>
+    request<HardRecoveryPlan[]>(`/agents/${id}/recovery/hard-plans`),
+  getRecoveryHelperStatus: (id: string) =>
+    request<RecoveryHelperStatus>(`/agents/${id}/recovery/helper-status`),
+  enrollRecoveryHelper: (id: string, signedHello: unknown) =>
+    request<RecoveryHelperInstance>(`/agents/${id}/recovery/helper`, {
+      method: 'PUT', body: JSON.stringify(signedHello),
+    }),
+  confirmHardRecoveryPlan: (id: string, planId: string, phase: 1 | 2, confirmationEventId: string, displayPlanHash: string, freshPassword?: string) =>
+    request<HardRecoveryPlan>(`/agents/${id}/recovery/plans/${planId}/confirm`, {
+      method: 'POST', body: JSON.stringify({ phase, confirmation_event_id: confirmationEventId, display_plan_hash: displayPlanHash, fresh_password: freshPassword }),
+    }),
 
   // Servers
   listServers: (agentId: string) => request<Server[]>(`/agents/${agentId}/servers`),
@@ -92,7 +165,7 @@ export const api = {
     request<Server>(`/agents/${agentId}/servers`, { method: 'POST', body: JSON.stringify(data) }),
   updateServer: (id: string, data: Partial<Server>) =>
     request<Server>(`/servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  deleteServer: (id: string) => request<{ message: string }>(`/servers/${id}`, { method: 'DELETE' }),
+  deleteServer: (id: string, cascade = false) => request<{ message: string }>(`/servers/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
 
   // Domains
   listDomains: (params?: Record<string, string>) => {

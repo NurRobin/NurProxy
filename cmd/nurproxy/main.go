@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"syscall"
 
@@ -16,12 +15,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/notifier"
+	"github.com/NurRobin/NurProxy/internal/notifier/webhook"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agentclient"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/dataperms"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/mcp"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/metrics"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/recoveryauth"
 	orchtls "github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	_ "github.com/NurRobin/NurProxy/internal/provider/cloudflare"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
@@ -33,6 +37,7 @@ import (
 var version = "dev"
 
 func main() {
+	dataperms.SetPrivateUmask()
 	// Configure structured logging first so every log line (including the legacy
 	// log.Printf calls, which slog.SetDefault bridges) honors NP_LOG_LEVEL /
 	// NP_LOG_FORMAT.
@@ -56,12 +61,21 @@ func main() {
 		case "restore":
 			cmdRestore(os.Args[2:])
 			return
+		case "db":
+			cmdDB(os.Args[2:])
+			return
+		case "permissions":
+			cmdPermissions(os.Args[2:])
+			return
 		default:
 			// Management CLI subcommands (provider/zone/agent/server/domain/...).
-			// If handled, we're done; otherwise fall through to running the server.
+			// If handled, we're done. An unhandled non-flag argument is a typo'd
+			// subcommand: refuse it instead of silently booting the server. Flags
+			// (-port, --data-dir, ...) still fall through to the server path.
 			if runCLI(os.Args[1], os.Args[2:]) {
 				return
 			}
+			failUnknownCommand(os.Args[1])
 		}
 	}
 
@@ -93,26 +107,97 @@ func main() {
 	}
 
 	// Ensure data dir exists
-	if err := os.MkdirAll(*dataDir, 0755); err != nil {
+	dataRoot, err := dataperms.OpenDir(*dataDir, true)
+	if err != nil {
 		log.Fatalf("failed to create data directory: %v", err)
+	}
+	defer dataRoot.Close()
+	if _, err := dataRoot.Harden(); err != nil {
+		log.Fatalf("failed to harden data directory: %v", err)
 	}
 
 	// Load or generate encryption key
-	cryptoKey, err := crypto.LoadOrGenerateKey(filepath.Join(*dataDir, "encryption.key"))
+	encryptionFile, encryptionCreated, err := dataRoot.OpenOrCreateRegular("encryption.key")
+	if err != nil {
+		log.Fatalf("failed to securely open encryption key: %v", err)
+	}
+	defer encryptionFile.Close()
+	cryptoKey, err := crypto.LoadOrGenerateKeyFile(encryptionFile, encryptionCreated)
 	if err != nil {
 		log.Fatalf("failed to load encryption key: %v", err)
 	}
+	if same, err := dataRoot.SameFile("encryption.key", encryptionFile); err != nil || !same {
+		log.Fatalf("encryption key name changed during startup")
+	}
+
+	// The helper grant authority is distinct from both database encryption and
+	// session signing. Only its public key is provisioned onto agent hosts.
+	recoveryAuthorityFile, recoveryAuthorityCreated, err := dataRoot.OpenOrCreateRegular("recovery-authority.key")
+	if err != nil {
+		log.Fatalf("failed to securely open recovery authority key: %v", err)
+	}
+	defer recoveryAuthorityFile.Close()
+	recoveryAuthority, err := recoveryauth.LoadOrGenerate(recoveryAuthorityFile, recoveryAuthorityCreated)
+	if err != nil {
+		log.Fatalf("failed to load recovery authority: %v", err)
+	}
+	if same, err := dataRoot.SameFile("recovery-authority.key", recoveryAuthorityFile); err != nil || !same {
+		log.Fatalf("recovery authority key name changed during startup")
+	}
 
 	// Open database
-	database, err := db.Open(filepath.Join(*dataDir, "nurproxy.db"), cryptoKey)
+	databaseFile, _, err := dataRoot.OpenOrCreateRegular("nurproxy.db")
+	if err != nil {
+		log.Fatalf("failed to securely open database file: %v", err)
+	}
+	defer databaseFile.Close()
+	databasePath, err := dataperms.BoundFilePath(databaseFile)
+	if err != nil {
+		log.Fatalf("failed to bind database file: %v", err)
+	}
+	database, err := db.Open(databasePath, cryptoKey)
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer database.Close()
+	if same, err := dataRoot.SameFile("nurproxy.db", databaseFile); err != nil || !same {
+		_ = database.Close()
+		log.Fatalf("database name changed during startup")
+	}
+	if _, err := dataRoot.Harden(); err != nil {
+		log.Fatalf("failed to harden runtime data files: %v", err)
+	}
 
 	// Root context canceled on shutdown signal.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
+
+	// Webhook notifier (#72 MVP): mirror a curated subset of audit events to an
+	// operator-configured webhook. Config lives in settings (webhook_url,
+	// optional webhook_secret for HMAC signing, optional webhook_events filter
+	// as comma-separated actions) and is resolved per delivery, so setting a
+	// URL post-boot enables delivery without restart. The dispatcher consumes
+	// the audit insert — the one choke point every subsystem's lifecycle events
+	// already flow through — asynchronously and best-effort.
+	webhookSink := webhook.New(func() (string, string) {
+		url, _ := database.GetSetting("webhook_url")
+		secret, _ := database.GetSetting("webhook_secret")
+		return url, secret
+	})
+	dispatcher := notifier.New(webhookSink, func() []string {
+		raw, _ := database.GetSetting("webhook_events")
+		if strings.TrimSpace(raw) == "" {
+			return nil // dispatcher falls back to its curated defaults
+		}
+		return strings.Split(raw, ",")
+	}, nil)
+	dispatcher.Start(rootCtx)
+	database.SetAuditNotify(func(e models.AuditLogEntry) {
+		dispatcher.Publish(notifier.Event{
+			Action: e.Action, EntityType: e.EntityType, EntityID: e.EntityID,
+			Actor: e.Actor, Source: e.Source, Details: e.Details, Time: e.CreatedAt,
+		})
+	})
 
 	// Live agent connection hub: agents dial out and hold a stream open, and the
 	// orchestrator pushes config down it the instant it changes (works behind NAT).
@@ -121,6 +206,7 @@ func main() {
 	// Start the reconciliation engine: it syncs desired state (DB) with the
 	// actual state on agents (routes) and at DNS providers (records).
 	rec := reconciler.New(database, agentclient.New(), reconcilerInterval(database))
+	rec.SetApplyAuthority(recoveryAuthority)
 	rec.SetHub(hub)
 	rec.SetDryRunDNS(dnsDryRun)
 	rec.Start(rootCtx)
@@ -132,14 +218,53 @@ func main() {
 	// inbound; certs ride the agent-initiated stream (§7). Started only when an
 	// ACME account can be constructed; failures here are non-fatal (the built-in
 	// Caddy self-ACME fallback keeps hosts served).
-	renewer := startRenewer(rootCtx, database, rec, *dataDir, dryRunConfig{dns: dnsDryRun, acme: acmeDryRun, failMode: acmeFailMode})
+	accountFile, accountCreated, accountErr := dataRoot.OpenOrCreateRegular("acme-account.key")
+	if accountErr != nil {
+		log.Printf("tls: renewal disabled: securely opening account key: %v", accountErr)
+	}
+	if accountFile != nil {
+		defer accountFile.Close()
+	}
+	var accountKey any
+	if accountFile != nil {
+		accountKey, accountErr = orchtls.LoadOrGenerateAccountKeyFile(accountFile, accountCreated)
+		if accountErr == nil {
+			if same, err := dataRoot.SameFile("acme-account.key", accountFile); err != nil || !same {
+				accountErr = fmt.Errorf("account key name changed during startup")
+			}
+		}
+		if accountErr != nil {
+			log.Printf("tls: renewal disabled: %v", accountErr)
+			accountKey = nil
+		}
+	}
+	renewer := startRenewer(rootCtx, database, rec, accountKey, dryRunConfig{dns: dnsDryRun, acme: acmeDryRun, failMode: acmeFailMode})
 
 	// Create API server, wiring in the hub + reconciler so the stream endpoint
 	// works and domain changes push to connected agents immediately.
 	srv := api.NewServer(database, version)
+	srv.SetRecoveryAuthority(recoveryAuthority)
 	srv.SetAgentHub(hub, rec)
+	// Wire the DNS-takeover override so an operator can migrate an existing domain
+	// whose public DNS predates NurProxy (overwrite a conflicting foreign record
+	// with the desired CNAME, using the provider's own stored credentials).
+	srv.SetDNSTakeover(rec)
 	// Surface sandbox state so the dashboard can show a "dry-run" banner (#93).
 	srv.SetDryRun(dnsDryRun, acmeDryRun)
+	// ACME-CA reachability probe (#91): a periodic GET of the ACME directory so
+	// an orchestrator-egress problem shows up in /health and as a dashboard
+	// banner instead of masquerading as per-domain issuance flakiness. The
+	// directory URL is resolved from settings on every probe (production vs
+	// staging switches post-boot are picked up). Skipped in ACME dry-run — the
+	// CA is never contacted there.
+	if !acmeDryRun {
+		caProber := orchtls.NewCAProber(func() string {
+			dir, _ := database.GetSetting("acme_directory")
+			return dir
+		})
+		go caProber.Start(rootCtx, orchtls.DefaultCAProbeInterval)
+		srv.SetCAStatus(caProber.Status)
+	}
 	// Wire the on-demand cert issuer so creating a central-TLS domain kicks
 	// first-issuance immediately (§7). Nil when ACME could not be set up; the
 	// periodic renewal scan remains the backstop.
@@ -159,6 +284,12 @@ func main() {
 	mcpHandler := mcp.New(database, version)
 	mux.Handle("/mcp", mcpHandler)
 	mux.Handle("/mcp/", mcpHandler)
+
+	// Prometheus metrics (#71): DB-backed gauges (agents/domains by status, cert
+	// expiry, rate-limit holds), read lazily at scrape time. Gated with the admin
+	// API key like MCP — fleet state is never world-readable; without a generated
+	// key every scrape is 401.
+	mux.Handle("/metrics", metrics.Handler(database))
 
 	if web.HasUI {
 		// Serve the embedded SPA dashboard.
@@ -221,6 +352,32 @@ func main() {
 	}
 }
 
+// usageText is the brief command overview printed for a typo'd subcommand.
+const usageText = `usage: nurproxy [command] [flags]
+
+Commands:
+  install, uninstall                                manage the system service
+  backup, restore                                   back up / restore the data directory
+  permissions                                       safely restrict orchestrator data files
+  version                                           print the version
+  provider, zone, agent, server, domain, apikey, auth
+                                                    management CLI (each supports -h)
+
+Running nurproxy without a command starts the orchestrator
+(flags: -port, -data-dir, -dry-run).
+`
+
+// failUnknownCommand exits non-zero for a typo'd subcommand. A first argument
+// that looks like a flag is not a subcommand and returns, so flag-only
+// invocations (nurproxy -port 9000) keep starting the server.
+func failUnknownCommand(arg string) {
+	if strings.HasPrefix(arg, "-") {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", arg, usageText)
+	os.Exit(1)
+}
+
 // newHTTPServer builds the orchestrator's HTTP server with hardened timeouts.
 // ReadHeaderTimeout and IdleTimeout defend the internet-facing listener against
 // Slowloris and idle-connection exhaustion, and MaxHeaderBytes caps header size.
@@ -251,10 +408,8 @@ type dryRunConfig struct {
 	failMode string
 }
 
-func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, dataDir string, dry dryRunConfig) *orchtls.Renewer {
-	accountKey, err := orchtls.LoadOrGenerateAccountKey(filepath.Join(dataDir, "acme-account.key"))
-	if err != nil {
-		log.Printf("tls: renewal disabled: %v", err)
+func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconciler, accountKey any, dry dryRunConfig) *orchtls.Renewer {
+	if accountKey == nil {
 		return nil
 	}
 

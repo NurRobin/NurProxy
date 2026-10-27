@@ -3,6 +3,7 @@ package nginx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // TestExecRunner_command_sudoAndResolve covers the §12 fix: an unprivileged agent
@@ -94,7 +96,7 @@ func newBackend(t *testing.T, r Runner) (*Backend, Layout) {
 func sampleArtifact(b *Backend, host, content string) proxy.Artifact {
 	return proxy.Artifact{
 		Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: b.layout.AvailablePath(host)},
-		Content: content,
+		Content: proxy.StampManagedArtifact(content),
 		Enabled: true,
 	}
 }
@@ -189,6 +191,37 @@ func TestPrune_removesOrphanedGeneratedKeepsOperatorAndDesired(t *testing.T) {
 	}
 	if r.reloads != 0 {
 		t.Errorf("no-op prune reloaded %d times, want 0", r.reloads)
+	}
+}
+
+func TestWildcardRecoveryDecodesHostAndRoutinePruneStillConverges(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout := newBackend(t, r)
+	ctx := context.Background()
+	wildcard := sampleArtifact(b, "*.example.com", "server { listen 80; }\n")
+	if err := b.Apply(ctx, []proxy.Artifact{wildcard}); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := b.InspectRecovery(ctx, proxy.RecoveryDesired{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].Host != "*.example.com" || candidates[0].Action != recoverymodel.ActionPruneManagedOrphan {
+		t.Fatalf("wildcard candidates = %+v", candidates)
+	}
+	if n, err := b.Prune(ctx, nil); err != nil || n != 1 {
+		t.Fatalf("wildcard routine prune = %d, %v", n, err)
+	}
+	if _, err := os.Lstat(wildcard.Target.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wildcard config survived routine prune: %v", err)
+	}
+	temp := layout.AvailablePath("*.temp.example.com") + tempSuffix
+	if err := os.WriteFile(temp, []byte(proxy.StampManagedArtifact("staged\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err = b.InspectRecovery(ctx, proxy.RecoveryDesired{})
+	if err != nil || len(candidates) != 1 || candidates[0].Host != "*.temp.example.com" || candidates[0].Action != recoverymodel.ActionRemoveManagedTemp {
+		t.Fatalf("wildcard temp candidates = %+v err=%v", candidates, err)
 	}
 }
 
@@ -291,7 +324,7 @@ func TestReadManaged_confDLayout_filePresenceIsEnabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	managed := b.layout.AvailablePath("app.example.com")
-	if err := os.WriteFile(managed, []byte("server {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(managed, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	arts, err := b.ReadManaged(context.Background())
@@ -303,6 +336,168 @@ func TestReadManaged_confDLayout_filePresenceIsEnabled(t *testing.T) {
 	}
 	if !arts[0].Enabled {
 		t.Error("on the conf.d layout a present file is enabled by definition")
+	}
+}
+
+func TestManagedProvenanceControlsReadAndPrune(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout := newBackend(t, r)
+	if err := os.MkdirAll(layout.Available, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stamped := layout.AvailablePath("stamped.example.com")
+	unmarked := layout.AvailablePath("unmarked.example.com")
+	malformed := layout.AvailablePath("malformed.example.com")
+	late := layout.AvailablePath("late.example.com")
+	for path, content := range map[string]string{
+		stamped:   proxy.StampManagedArtifact("server {}\n"),
+		unmarked:  "server {}\n",
+		malformed: proxy.ManagedArtifactMarker + " trailing\nserver {}\n",
+		late:      strings.Repeat("x", proxy.MaxManagedArtifactMarkerProbeBytes+1) + "\n" + proxy.ManagedArtifactMarker + "\n",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	symlink := layout.AvailablePath("symlink.example.com")
+	if err := os.Symlink(stamped, symlink); err != nil {
+		t.Fatal(err)
+	}
+
+	arts, err := b.ReadManaged(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := make(map[string]proxy.Artifact, len(arts))
+	for _, art := range arts {
+		byPath[art.Target.Path] = art
+	}
+	if art, ok := byPath[stamped]; !ok || art.Adopted {
+		t.Fatalf("stamped artifact = %+v, present=%v", art, ok)
+	}
+	for _, path := range []string{unmarked, malformed, late} {
+		if art, ok := byPath[path]; !ok || !art.Adopted {
+			t.Errorf("unsafe artifact %q = %+v, present=%v", path, art, ok)
+		}
+	}
+	if _, ok := byPath[symlink]; ok {
+		t.Error("ReadManaged followed a symlink entry")
+	}
+
+	removed, err := b.Prune(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d, want stamped artifact only", removed)
+	}
+	if _, err := os.Lstat(stamped); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stamped artifact survived prune: %v", err)
+	}
+	for _, path := range []string{unmarked, malformed, late, symlink} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("unsafe entry %q was pruned: %v", path, err)
+		}
+	}
+}
+
+func TestRecoveryAdapterInspectsAndExecutesOwnedFileCandidates(t *testing.T) {
+	r := &fakeRunner{}
+	b, layout, _ := newBackendWithCerts(t, r)
+	for _, dir := range []string{layout.Available, layout.Enabled, b.certs.Dir()} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	host := "orphan.example.com"
+	config := layout.AvailablePath(host)
+	if err := os.WriteFile(config, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := layout.EnabledPath(host)
+	if err := os.Symlink(config, link); err != nil {
+		t.Fatal(err)
+	}
+	auth := strings.TrimSuffix(config, confSuffix) + htpasswdSuffix
+	if err := os.WriteFile(auth, []byte("admin:x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	certInspection, err := b.certs.InspectRecovery(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{certInspection.CertPath, certInspection.SourceKeyPath, certInspection.RuntimeKeyPath} {
+		if err := os.WriteFile(path, []byte("sidecar"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	temp := layout.AvailablePath("stale.example.com") + tempSuffix
+	if err := os.WriteFile(temp, []byte(proxy.StampManagedArtifact("staged\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activeTemp := layout.AvailablePath("active.example.com") + tempSuffix
+	if err := os.WriteFile(activeTemp, []byte(proxy.StampManagedArtifact("active\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	invalidHost := "invalid-key.example.com"
+	invalidPaths := b.certs.RecoveryPaths(invalidHost)
+	if err := os.WriteFile(invalidPaths.CertPath, []byte("present-cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalidPaths.SourceKeyPath, []byte("invalid-encrypted-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := b.InspectRecovery(context.Background(), proxy.RecoveryDesired{ActiveOperationPaths: []string{activeTemp}, KeepCertHosts: []string{"missing.example.com", invalidHost}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byAction := map[recoverymodel.Action]proxy.RecoveryCandidate{}
+	for _, candidate := range candidates {
+		byAction[candidate.Action] = candidate
+		if err := candidate.Validate(); err != nil || len(candidate.Paths) != len(candidate.Identities) {
+			t.Fatalf("invalid candidate: %+v err=%v", candidate, err)
+		}
+	}
+	orphan := byAction[recoverymodel.ActionPruneManagedOrphan]
+	stale := byAction[recoverymodel.ActionRemoveManagedTemp]
+	missingCert := byAction[recoverymodel.ActionRematerializeCertBundle]
+	certHosts := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.Action == recoverymodel.ActionRematerializeCertBundle {
+			certHosts[candidate.Host] = true
+		}
+	}
+	if orphan.Host != host || len(orphan.Paths) < 3 || stale.Host != "stale.example.com" || !certHosts["missing.example.com"] || !certHosts[invalidHost] || missingCert.Host == "" {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+	if err := b.ExecuteRecovery(context.Background(), stale, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ExecuteRecovery(context.Background(), orphan, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range append(orphan.Paths, stale.Paths...) {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("recovered path %q remains: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(activeTemp); err != nil {
+		t.Fatalf("active temp was removed: %v", err)
+	}
+	if r.tests != 0 || r.reloads != 0 {
+		t.Fatalf("typed mutation unexpectedly validated/reloaded = %d/%d", r.tests, r.reloads)
+	}
+}
+
+func TestReloadRecoveryAlwaysInvokesBackendReload(t *testing.T) {
+	r := &fakeRunner{}
+	b, _ := newBackend(t, r)
+	if err := b.ReloadRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r.reloads != 1 {
+		t.Fatalf("reloads=%d", r.reloads)
 	}
 }
 
@@ -319,12 +514,15 @@ func TestApply_testFails_rollsBackNewFile_andAttributesOurError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on failing nginx -t")
 	}
-	var ce *commandError
-	if !errors.As(err, &ce) {
-		t.Fatalf("error type = %T, want *commandError", err)
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
 	}
-	if !ce.Attribution.Ours {
-		t.Errorf("Attribution.Ours = false, want true (error in our generated file)")
+	if failure.Backend != proxy.KindNginx || failure.Phase != proxy.FailurePhaseValidate || !failure.ManagedHint {
+		t.Errorf("failure = %#v, want nginx validate failure with managed hint", failure)
+	}
+	if !failure.Located || failure.File != art.Target.Path || failure.Line != 1 {
+		t.Errorf("failure location = %q:%d (located=%v), want %q:1", failure.File, failure.Line, failure.Located, art.Target.Path)
 	}
 	// New file removed on rollback (it did not exist before).
 	if _, statErr := os.Stat(art.Target.Path); !errors.Is(statErr, os.ErrNotExist) {
@@ -340,6 +538,23 @@ func TestApply_testFails_rollsBackNewFile_andAttributesOurError(t *testing.T) {
 	}
 	if r.reloads != 0 {
 		t.Errorf("reload should not run when nginx -t fails, reloads=%d", r.reloads)
+	}
+}
+
+func TestApply_testFailureInSecondArtifactHasManagedHint(t *testing.T) {
+	r := &fakeRunner{testErr: errors.New("exit 1")}
+	b, _ := newBackend(t, r)
+	first := sampleArtifact(b, "one.example.com", "server {}\n")
+	second := sampleArtifact(b, "two.example.com", "server { bad; }\n")
+	r.testOut = `nginx: [emerg] unknown directive "bad" in ` + second.Target.Path + ":1"
+
+	err := b.Apply(context.Background(), []proxy.Artifact{first, second})
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.ManagedHint || failure.File != second.Target.Path {
+		t.Fatalf("failure = %#v, want managed hint for second artifact", failure)
 	}
 }
 
@@ -362,12 +577,12 @@ func TestApply_testFails_restoresPriorContent(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	var ce *commandError
-	if !errors.As(err, &ce) {
-		t.Fatalf("want *commandError, got %T", err)
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("want *proxy.Failure, got %T", err)
 	}
-	if ce.Attribution.Ours {
-		t.Errorf("Ours = true, want false (the blamed file is the operator's other vhost)")
+	if failure.ManagedHint {
+		t.Errorf("ManagedHint = true, want false (the blamed file is the operator's other vhost)")
 	}
 	// Prior content restored.
 	got, readErr := os.ReadFile(dest)
@@ -426,7 +641,7 @@ func TestApply_symlinkFails_restoresPriorContent(t *testing.T) {
 }
 
 func TestApply_reloadFails_rollsBack(t *testing.T) {
-	r := &fakeRunner{reloadErr: errors.New("reload boom")}
+	r := &fakeRunner{reloadErr: fmt.Errorf("reload boom: %w", os.ErrPermission)}
 	b, _ := newBackend(t, r)
 	art := sampleArtifact(b, "app.example.com", "server { listen 80; }\n")
 
@@ -434,12 +649,175 @@ func TestApply_reloadFails_rollsBack(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on reload failure")
 	}
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) || failure.Backend != proxy.KindNginx || failure.Phase != proxy.FailurePhaseReload {
+		t.Fatalf("reload error = %#v, want typed nginx reload failure", err)
+	}
+	if !failure.Permission {
+		t.Fatalf("reload failure = %#v, want permission detection from wrapped error", failure)
+	}
 	// New file rolled back even though nginx -t passed.
 	if _, statErr := os.Stat(art.Target.Path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("file should be rolled back on reload failure, stat err = %v", statErr)
 	}
 	if r.tests != 1 || r.reloads != 1 {
 		t.Errorf("tests=%d reloads=%d, want 1 and 1", r.tests, r.reloads)
+	}
+}
+
+func TestExecRunnerTestBoundsCombinedOutput(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	script := filepath.Join(t.TempDir(), "noisy-nginx-test")
+	body := "#!/bin/sh\nprintf 'nginx-test-stdout\\n'\nprintf 'nginx-test-stderr\\n' >&2\nhead -c 4194304 /dev/zero | tr '\\000' x\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := (&execRunner{testCmd: script}).Test(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) > proxy.MaxFailureCaptureBytes || !strings.Contains(out, proxy.FailureOutputTruncated) {
+		t.Fatalf("captured bytes=%d marker=%v", len(out), strings.Contains(out, proxy.FailureOutputTruncated))
+	}
+}
+
+func TestValidate_untypedBinaryMissingIsUnknown(t *testing.T) {
+	b, _ := newBackend(t, &fakeRunner{testErr: exec.ErrNotFound})
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if failure.BinaryMissing || failure.Phase != proxy.FailurePhaseValidate {
+		t.Fatalf("failure = %#v, want unverified binary error to stay unknown", failure)
+	}
+}
+
+func TestValidate_missingNginxExecutableReturnsBinaryFailure(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	missing := filepath.Join(t.TempDir(), "nginx")
+	b, _ := newBackend(t, &execRunner{binary: missing})
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.BinaryMissing {
+		t.Fatalf("failure = %#v, want verified missing nginx", failure)
+	}
+	var executionErr *proxy.ExecutionError
+	if !errors.As(failure, &executionErr) || executionErr.Role != proxy.ExecutionRoleBackend {
+		t.Fatalf("execution error = %#v, want backend role", executionErr)
+	}
+}
+
+func TestExecRunnerSameNameOverridesAreNotBackendBinaryFailures(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	for _, step := range []string{"test", "reload"} {
+		t.Run(step, func(t *testing.T) {
+			missing := filepath.Join(t.TempDir(), "nginx")
+			r := &execRunner{binary: "/usr/sbin/nginx"}
+			var err error
+			if step == "test" {
+				r.testCmd = missing
+				_, err = r.Test(context.Background())
+			} else {
+				r.reloadCmd = missing
+				err = r.Reload(context.Background())
+			}
+			failure := proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, "", err)
+			if failure.BinaryMissing {
+				t.Fatalf("same-name %s override was mistaken for backend binary: %#v", step, failure)
+			}
+			var executionErr *proxy.ExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Role != proxy.ExecutionRoleOverride {
+				t.Fatalf("execution error = %#v, want override role", executionErr)
+			}
+		})
+	}
+}
+
+func TestExecRunnerExecutionMetadataDistinguishesBackendAndOverrides(t *testing.T) {
+	r := &execRunner{
+		binary:    "/tmp/configured/nginx",
+		testCmd:   "/tmp/override/nginx -t",
+		reloadCmd: "/tmp/override/nginx -s reload",
+	}
+	tests := []struct {
+		name     string
+		override string
+		args     []string
+		wantPath string
+		wantRole proxy.ExecutionRole
+	}{
+		{name: "backend test", args: []string{"-t"}, wantPath: r.binary, wantRole: proxy.ExecutionRoleBackend},
+		{name: "backend reload", args: []string{"-s", "reload"}, wantPath: r.binary, wantRole: proxy.ExecutionRoleBackend},
+		{name: "override test", override: r.testCmd, args: []string{"-t"}, wantPath: "/tmp/override/nginx", wantRole: proxy.ExecutionRoleOverride},
+		{name: "override reload", override: r.reloadCmd, args: []string{"-s", "reload"}, wantPath: "/tmp/override/nginx", wantRole: proxy.ExecutionRoleOverride},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, target, role := r.execution(context.Background(), tt.override, tt.args...)
+			if target != tt.wantPath || role != tt.wantRole {
+				t.Fatalf("target/role = %q/%q, want %q/%q", target, role, tt.wantPath, tt.wantRole)
+			}
+		})
+	}
+}
+
+func TestExecRunnerReloadCanonicalCaptureClassifiesRealOutput(t *testing.T) {
+	t.Setenv("NURPROXY_NO_SUDO", "1")
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{name: "nginx alert", output: `nginx: [alert] open() "/run/nginx.pid" failed (1: Operation not permitted)`},
+		{name: "sudo denial", output: "sudo: a password is required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "reload-check")
+			body := "#!/bin/sh\nprintf '%s\\n' '" + tt.output + "' >&2\nexit 1\n"
+			if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err := (&execRunner{binary: "/usr/sbin/nginx", reloadCmd: script}).Reload(context.Background())
+			failure := proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
+			if !failure.Permission || failure.Output != tt.output+"\n" {
+				t.Fatalf("failure = %#v, want canonical permission output %q", failure, tt.output+"\n")
+			}
+			if strings.Contains(failure.Output, "starting proxy executable failed") {
+				t.Fatalf("Failure.Output used wrapper text: %q", failure.Output)
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(failure, &exitErr) {
+				t.Fatal("reload ExitError chain was not preserved")
+			}
+		})
+	}
+}
+
+func TestValidate_permissionErrorReturnsTypedFailure(t *testing.T) {
+	b, _ := newBackend(t, &fakeRunner{testErr: fmt.Errorf("validate: %w", os.ErrPermission)})
+	err := b.Validate(context.Background())
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if !failure.Permission {
+		t.Fatalf("failure = %#v, want permission detection from wrapped error", failure)
+	}
+}
+
+func TestInstallCerts_failureReturnsTypedFailure(t *testing.T) {
+	b := New(proxy.Config{Type: "nginx", ConfigDir: t.TempDir(), CertDir: t.TempDir()})
+	err := b.InstallCerts(context.Background(), []proxy.CertBundle{{Host: "app.example.com"}})
+	var failure *proxy.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want *proxy.Failure", err)
+	}
+	if failure.Backend != proxy.KindNginx || failure.Phase != proxy.FailurePhaseCertInstall {
+		t.Fatalf("failure = %#v, want nginx cert_install failure", failure)
 	}
 }
 
@@ -473,6 +851,21 @@ func TestRender_structuredRoute_producesFileArtifact(t *testing.T) {
 	if art.Content == "" {
 		t.Error("Render produced empty content")
 	}
+	if !proxy.HasManagedArtifactMarker(art.Content) || strings.Count(art.Content, proxy.ManagedArtifactMarker) != 1 {
+		t.Fatalf("Render content has no single managed marker: %q", art.Content)
+	}
+}
+
+func TestRender_rawRouteStampsManagedArtifactMarkerOnce(t *testing.T) {
+	b, _ := newBackend(t, &fakeRunner{})
+	raw := "server { listen 80; }\n" + proxy.ManagedArtifactMarker + "\n"
+	art, err := b.Render(context.Background(), proxymodel.Route{Host: "raw.example.com", Raw: proxymodel.RawConfig{Backend: "nginx", Content: raw}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proxy.HasManagedArtifactMarker(art.Content) || strings.Count(art.Content, proxy.ManagedArtifactMarker) != 1 {
+		t.Fatalf("raw Render marker = %q", art.Content)
+	}
 }
 
 func TestReadManaged_adoptsAllFiles_taggingManagedVsOperator(t *testing.T) {
@@ -483,7 +876,7 @@ func TestReadManaged_adoptsAllFiles_taggingManagedVsOperator(t *testing.T) {
 	// One NurProxy-managed file, one operator file: adoption reads BOTH (§4, no
 	// whitelist), tagging only the operator file Adopted.
 	managed := b.layout.AvailablePath("app.example.com")
-	if err := os.WriteFile(managed, []byte("server {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(managed, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	operator := filepath.Join(b.layout.Available, "operator-site.conf")
@@ -622,6 +1015,31 @@ func TestInfo_reportsNginxKindAndPaths(t *testing.T) {
 	}
 	if info.ConfigDir != "/etc/nginx/sites-available" {
 		t.Errorf("ConfigDir = %q", info.ConfigDir)
+	}
+	wantRoots := []string{"/etc/nginx/sites-available", "/etc/nginx/sites-enabled"}
+	if len(info.ManagedRoots) != len(wantRoots) {
+		t.Fatalf("ManagedRoots = %v, want %v", info.ManagedRoots, wantRoots)
+	}
+	for i := range wantRoots {
+		if info.ManagedRoots[i] != wantRoots[i] {
+			t.Fatalf("ManagedRoots = %v, want %v", info.ManagedRoots, wantRoots)
+		}
+	}
+}
+
+func TestInfo_reportsOnlyConfDRootForFlatNginxLayout(t *testing.T) {
+	info := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/conf.d"}).Info()
+	if len(info.ManagedRoots) != 1 || info.ManagedRoots[0] != "/etc/nginx/conf.d" {
+		t.Fatalf("ManagedRoots = %v, want exact conf.d root", info.ManagedRoots)
+	}
+}
+
+func TestNew_versionFromConfig(t *testing.T) {
+	// Config.Version is honored without a separate WithVersion call (it selects the
+	// HTTP/2 render syntax); a non-empty value means New does not probe the binary.
+	b := New(proxy.Config{Type: "nginx", ConfigDir: "/etc/nginx/sites-available", Version: "1.18.0"})
+	if got := b.Info().Version; got != "1.18.0" {
+		t.Errorf("Info().Version = %q, want 1.18.0 (from Config.Version)", got)
 	}
 }
 
@@ -808,7 +1226,7 @@ func TestPrune_scrubsCertArtifacts(t *testing.T) {
 	orphanConf := layout.AvailablePath(orphanHost)
 	keepConf := layout.AvailablePath(keepHost)
 	for _, p := range []string{orphanConf, keepConf} {
-		if err := os.WriteFile(p, []byte("server {}\n"), 0o644); err != nil {
+		if err := os.WriteFile(p, []byte(proxy.StampManagedArtifact("server {}\n")), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

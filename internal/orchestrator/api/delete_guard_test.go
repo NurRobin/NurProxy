@@ -88,3 +88,42 @@ func TestDeleteParent_AllowedWhenNoDomains(t *testing.T) {
 		t.Fatalf("DELETE agent with no domains: got %d, want 200", w.Code)
 	}
 }
+
+// TestDeleteParent_CascadeDefersAndTearsDown covers the opt-in cascade (#104):
+// ?cascade=true marks every referencing domain status=deleting (the audited
+// reconciler teardown path) and records the parent in
+// pending_parent_deletions instead of removing the row — a raw DB cascade
+// would orphan DNS records/certs at the provider.
+func TestDeleteParent_CascadeDefersAndTearsDown(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+
+	database.CreateProvider(&models.Provider{ID: "prov-1", Type: "cloudflare", Name: "CF", Config: `{"api_token":"test"}`})
+	database.CreateZone(&models.Zone{ID: "zone-1", ProviderID: "prov-1", ExternalID: "ext-1", Name: "example.com"})
+	database.CreateAgent(&models.Agent{ID: "agent-1", Name: "Agent", FQDN: "agent.example.com", DNSMode: models.DNSModeStatic, Status: models.AgentStatusAdopted})
+	database.CreateServer(&models.Server{ID: "srv-1", AgentID: "agent-1", Name: "S1", Address: "10.0.0.1"})
+	if err := database.CreateDomain(&models.Domain{Subdomain: "app", ZoneID: "zone-1", ServerID: "srv-1", Port: 80, SSLMode: models.SSLModeAuto, Status: models.DomainStatusActive}); err != nil {
+		t.Fatalf("CreateDomain: %v", err)
+	}
+
+	w := doRequest(t, handler, "DELETE", "/api/v1/servers/srv-1?cascade=true", nil, cookie)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("cascade delete: got %d, want 202: %s", w.Code, w.Body.String())
+	}
+
+	// The domain is marked deleting (NOT hard-removed) …
+	doms, _ := database.ListDomains(db.DomainFilter{ServerID: "srv-1"})
+	if len(doms) != 1 || doms[0].Status != models.DomainStatusDeleting {
+		t.Fatalf("domain after cascade = %+v, want status deleting", doms)
+	}
+	// … the server row still exists …
+	if _, err := database.GetServer("srv-1"); err != nil {
+		t.Fatalf("server must survive until the reconciler finalizes: %v", err)
+	}
+	// … and the deferred intent is recorded.
+	pending, err := database.ListPendingParentDeletions()
+	if err != nil || len(pending) != 1 || pending[0].EntityType != "server" || pending[0].EntityID != "srv-1" {
+		t.Fatalf("pending deletions = %+v (%v), want the server intent", pending, err)
+	}
+}
