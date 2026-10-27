@@ -64,6 +64,12 @@ type managedCompiledLink struct {
 type managedCompilation struct {
 	Files []managedCompiledFile `json:"files"`
 	Links []managedCompiledLink `json:"links"`
+	// RetainedCertificates names unretained certificate bases that were kept
+	// because surviving proxy config still references them.
+	RetainedCertificates []string `json:"retained_certificates,omitempty"`
+	// UnmarkedDeletions names tombstoned hosts whose vhost carries no NurProxy
+	// marker (a preserved raw config); the helper never deletes those files.
+	UnmarkedDeletions []string `json:"unmarked_deletions,omitempty"`
 }
 
 type managedFileSnapshot struct {
@@ -245,13 +251,13 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		if err != nil {
 			return ActionResult{}, fmt.Errorf("managed proxy artifact attestation failed: %w", err)
 		}
-		return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged", ManagedArtifacts: artifacts}, nil
+		return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged" + compilation.retentionNote(), ManagedArtifacts: artifacts}, nil
 	}
 	artifacts, err := a.attestManagedArtifacts(compilation)
 	if err != nil {
 		return ActionResult{Mutated: true}, fmt.Errorf("managed proxy artifact attestation failed: %w", err)
 	}
-	return ActionResult{Mutated: true, Validated: true, SanitizedResult: fmt.Sprintf("applied %d managed files and %d activation links", len(compilation.Files), len(compilation.Links)), ManagedArtifacts: artifacts}, nil
+	return ActionResult{Mutated: true, Validated: true, SanitizedResult: fmt.Sprintf("applied %d managed files and %d activation links", len(compilation.Files), len(compilation.Links)) + compilation.retentionNote(), ManagedArtifacts: artifacts}, nil
 }
 
 func (a *managedApplyAction) Rollback(ctx context.Context, operationID string, _ helperprotocol.ManagedApplyPlan, _ helperprotocol.ApplyIntent, prepared PreparedAction) error {
@@ -408,6 +414,14 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			return managedCompilation{}, fmt.Errorf("managed deletion backend does not match root-owned proxy mapping")
 		}
 		available := filepath.Join(a.layout.AvailableDir, managedFileName(a.target.Kind, deletion.Host))
+		unmarked, err := unmarkedRegularFile(available)
+		if err != nil {
+			return managedCompilation{}, err
+		}
+		if unmarked {
+			compilation.UnmarkedDeletions = append(compilation.UnmarkedDeletions, deletion.Host)
+			continue
+		}
 		compilation.Files = append(compilation.Files, managedCompiledFile{Path: available, Class: "vhost", Delete: true})
 		compilation.Files = append(compilation.Files,
 			managedCompiledFile{Path: managedAuthFilePath(authDir, deletion.Host), Class: "auth", Delete: true},
@@ -426,6 +440,10 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		if err != nil {
 			return managedCompilation{}, fmt.Errorf("read exclusive managed certificate directory: %w", err)
 		}
+		type pruneCandidate struct{ base, name string }
+		var candidates []pruneCandidate
+		var candidateBases []string
+		seenBases := make(map[string]struct{})
 		for _, entry := range entries {
 			name := entry.Name()
 			if host, ok := managedAuthFileHost(name); ok {
@@ -443,7 +461,26 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			if _, retained := keep[base]; retained {
 				continue
 			}
-			compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, name), Class: "secret", Delete: true})
+			candidates = append(candidates, pruneCandidate{base: base, name: name})
+			if _, seen := seenBases[base]; !seen {
+				seenBases[base] = struct{}{}
+				candidateBases = append(candidateBases, base)
+			}
+		}
+		referenced, err := a.referencedCertificateBases(compilation, candidateBases)
+		if err != nil {
+			return managedCompilation{}, err
+		}
+		stillReferenced := make(map[string]struct{}, len(referenced))
+		for _, base := range referenced {
+			stillReferenced[base] = struct{}{}
+		}
+		compilation.RetainedCertificates = referenced
+		for _, candidate := range candidates {
+			if _, inUse := stillReferenced[candidate.base]; inUse {
+				continue
+			}
+			compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, candidate.name), Class: "secret", Delete: true})
 		}
 		authEntries, err := os.ReadDir(authDir)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
