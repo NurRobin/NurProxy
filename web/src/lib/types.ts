@@ -282,9 +282,22 @@ export interface ManagedApplyBreaker {
   opened_at?: string;
 }
 
+// Vhost files the newest managed apply left on disk without a desired route;
+// repeated by the helper in every receipt until they are removed.
+export interface ManagedApplyLeftovers {
+  operation_id: string;
+  files: string;
+  reported_at?: string;
+}
+
 export type RecoveryHelperStatus =
   | { enrolled: false }
-  | { enrolled: true; helper: RecoveryHelperInstance; managed_apply_breaker?: ManagedApplyBreaker };
+  | {
+      enrolled: true;
+      helper: RecoveryHelperInstance;
+      managed_apply_breaker?: ManagedApplyBreaker;
+      managed_apply_leftovers?: ManagedApplyLeftovers;
+    };
 
 export interface RecoveryBreaker {
   open: boolean;

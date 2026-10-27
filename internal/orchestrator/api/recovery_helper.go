@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
@@ -91,7 +92,7 @@ func (s *Server) handleGetRecoveryHelperAdmin(w http.ResponseWriter, r *http.Req
 		return
 	}
 	status := map[string]any{"enrolled": true, "helper": instance}
-	breaker, err := s.managedApplyBreaker(agentID)
+	breaker, leftovers, err := s.managedApplyFindings(agentID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to read managed apply history")
 		return
@@ -99,7 +100,33 @@ func (s *Server) handleGetRecoveryHelperAdmin(w http.ResponseWriter, r *http.Req
 	if breaker != nil {
 		status["managed_apply_breaker"] = breaker
 	}
+	if leftovers != nil {
+		status["managed_apply_leftovers"] = leftovers
+	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+// managedApplyLeftoversView lists the vhost files the newest managed apply
+// reported as left on disk without a desired route. The helper repeats the
+// list in every receipt until the files are gone.
+type managedApplyLeftoversView struct {
+	OperationID string     `json:"operation_id"`
+	Files       string     `json:"files"`
+	ReportedAt  *time.Time `json:"reported_at,omitempty"`
+}
+
+// leftoverVhostsFromReceipt extracts the leftover list the helper appends to
+// its receipt message, or "" when there is none.
+func leftoverVhostsFromReceipt(message string) string {
+	index := strings.Index(message, helperprotocol.ManagedLeftoverVhostsNote)
+	if index < 0 {
+		return ""
+	}
+	list := message[index+len(helperprotocol.ManagedLeftoverVhostsNote):]
+	if end := strings.Index(list, "; "); end >= 0 {
+		list = list[:end]
+	}
+	return strings.TrimSpace(list)
 }
 
 // managedApplyBreakerView describes the helper's persistent breaker as seen
@@ -113,19 +140,33 @@ type managedApplyBreakerView struct {
 	OpenedAt    *time.Time `json:"opened_at,omitempty"`
 }
 
-func (s *Server) managedApplyBreaker(agentID string) (*managedApplyBreakerView, error) {
+// managedReceiptLatchesBreaker reports the terminal states after which the
+// helper has written its permanent breaker: a rollback it could not prove, and
+// an execution its journal recovered as indeterminate after a crash.
+func managedReceiptLatchesBreaker(state helperprotocol.JournalState) bool {
+	return state == helperprotocol.JournalRollbackFailed || state == helperprotocol.JournalOutcomeIndeterminate
+}
+
+// managedApplyFindings derives the open breaker and the reported leftover
+// vhosts from the newest managed apply receipt; either is nil when absent.
+func (s *Server) managedApplyFindings(agentID string) (*managedApplyBreakerView, *managedApplyLeftoversView, error) {
 	execution, err := s.db.GetLatestReceiptedManagedApply(agentID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	receipt := execution.SignedReceipt.Envelope.Payload
-	if receipt.State != helperprotocol.JournalRollbackFailed {
-		return nil, nil
+	var breaker *managedApplyBreakerView
+	if managedReceiptLatchesBreaker(receipt.State) {
+		breaker = &managedApplyBreakerView{
+			Open: true, OperationID: receipt.OperationID, Reason: receipt.SanitizedResult, OpenedAt: execution.ReceiptReceivedAt,
+		}
 	}
-	return &managedApplyBreakerView{
-		Open: true, OperationID: receipt.OperationID, Reason: receipt.SanitizedResult, OpenedAt: execution.ReceiptReceivedAt,
-	}, nil
+	var leftovers *managedApplyLeftoversView
+	if files := leftoverVhostsFromReceipt(receipt.SanitizedResult); files != "" {
+		leftovers = &managedApplyLeftoversView{OperationID: receipt.OperationID, Files: files, ReportedAt: execution.ReceiptReceivedAt}
+	}
+	return breaker, leftovers, nil
 }
