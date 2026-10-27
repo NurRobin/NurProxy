@@ -394,6 +394,144 @@ func TestRender_validation_errors(t *testing.T) {
 	}
 }
 
+// TestRender_accessControlGolden pins the exact access-control block. Apache
+// accepts Require and <RequireAll> only in directory context, so every rule
+// must sit inside <Location /> and never directly in <VirtualHost> (#166).
+// IP rules and basic auth share one <RequireAll>: both must pass, as with
+// nginx's default `satisfy all`.
+func TestRender_accessControlGolden(t *testing.T) {
+	const authFile = "/etc/nurproxy/auth/app.htpasswd"
+	const head = "<VirtualHost *:80>\n    ServerName app.example.com\n"
+	const tail = "\n    RequestHeader set X-Forwarded-Proto http\n" +
+		"    ProxyPreserveHost On\n\n" +
+		"    ProxyPass / http://10.0.0.4:8080/\n" +
+		"    ProxyPassReverse / http://10.0.0.4:8080/\n" +
+		"</VirtualHost>\n"
+	const authHead = "        AuthType Basic\n" +
+		"        AuthName \"Restricted: app.example.com\"\n" +
+		"        AuthUserFile " + authFile + "\n"
+	tests := []struct {
+		name      string
+		allow     []string
+		block     []string
+		basicAuth bool
+		want      string
+	}{
+		{
+			name: "no_access_rules",
+			want: "",
+		},
+		{
+			name:  "allowlist",
+			allow: []string{"10.0.0.0/8", "192.168.1.0/24"},
+			want: "\n    <Location />\n" +
+				"        <RequireAll>\n" +
+				"            Require ip 10.0.0.0/8 192.168.1.0/24\n" +
+				"        </RequireAll>\n" +
+				"    </Location>\n",
+		},
+		{
+			name:  "denylist",
+			block: []string{"1.2.3.4/32", "5.6.7.0/24"},
+			want: "\n    <Location />\n" +
+				"        <RequireAll>\n" +
+				"            Require all granted\n" +
+				"            Require not ip 1.2.3.4/32\n" +
+				"            Require not ip 5.6.7.0/24\n" +
+				"        </RequireAll>\n" +
+				"    </Location>\n",
+		},
+		{
+			name:  "allowlist_and_denylist",
+			allow: []string{"10.0.0.0/8"},
+			block: []string{"10.1.2.3/32"},
+			want: "\n    <Location />\n" +
+				"        <RequireAll>\n" +
+				"            Require ip 10.0.0.0/8\n" +
+				"            Require not ip 10.1.2.3/32\n" +
+				"        </RequireAll>\n" +
+				"    </Location>\n",
+		},
+		{
+			name:      "basic_auth",
+			basicAuth: true,
+			want: "\n    <Location />\n" + authHead +
+				"        Require valid-user\n" +
+				"    </Location>\n",
+		},
+		{
+			name:      "basic_auth_and_allowlist",
+			allow:     []string{"127.0.0.1"},
+			basicAuth: true,
+			want: "\n    <Location />\n" + authHead +
+				"        <RequireAll>\n" +
+				"            Require ip 127.0.0.1\n" +
+				"            Require valid-user\n" +
+				"        </RequireAll>\n" +
+				"    </Location>\n",
+		},
+		{
+			name:      "basic_auth_and_denylist",
+			block:     []string{"1.2.3.4/32"},
+			basicAuth: true,
+			want: "\n    <Location />\n" + authHead +
+				"        <RequireAll>\n" +
+				"            Require not ip 1.2.3.4/32\n" +
+				"            Require valid-user\n" +
+				"        </RequireAll>\n" +
+				"    </Location>\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := baseRoute()
+			r.IPAllowlist = tt.allow
+			r.IPBlocklist = tt.block
+			in := Input{Route: r}
+			if tt.basicAuth {
+				r.BasicAuth = &proxymodel.BasicAuth{Username: "u", PasswordHash: "h"}
+				in = Input{Route: r, AuthFile: authFile}
+			}
+			res, err := Render(in)
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			if len(res.Warnings) != 0 {
+				t.Fatalf("unexpected warnings: %v", res.Warnings)
+			}
+			if want := head + tt.want + tail; res.VHost != want {
+				t.Fatalf("vhost mismatch\n--- want ---\n%s\n--- got ---\n%s", want, res.VHost)
+			}
+		})
+	}
+}
+
+// TestRender_forceHTTPSRedirectHasNoAccessRules keeps the :80 redirect host a
+// bare redirect, as nginx's redirect server is: the access rules apply on the
+// TLS host the client is sent to.
+func TestRender_forceHTTPSRedirectHasNoAccessRules(t *testing.T) {
+	r := baseRoute()
+	r.TLS = proxymodel.TLSConfig{Policy: proxymodel.TLSPolicyCentral}
+	r.ForceHTTPS = true
+	r.IPAllowlist = []string{"10.0.0.0/8"}
+	r.BasicAuth = &proxymodel.BasicAuth{Username: "u", PasswordHash: "h"}
+	res, err := Render(Input{Route: r, CertPath: "/c.pem", KeyPath: "/k.pem", AuthFile: "/a.htpasswd"})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	const redirect = "<VirtualHost *:80>\n" +
+		"    ServerName app.example.com\n" +
+		"    Redirect permanent / https://app.example.com/\n" +
+		"</VirtualHost>\n\n"
+	if !strings.HasPrefix(res.VHost, redirect) {
+		t.Fatalf("redirect host changed:\n%s", res.VHost)
+	}
+	main := strings.TrimPrefix(res.VHost, redirect)
+	if strings.Count(main, "<Location />") != 1 || !strings.Contains(main, "Require ip 10.0.0.0/8") {
+		t.Fatalf("TLS host lost its access rules:\n%s", main)
+	}
+}
+
 // TestRender_deterministic guards byte-stable output across runs (maps iterate
 // in random order; sortedKeys must defeat that).
 func TestRender_deterministic(t *testing.T) {

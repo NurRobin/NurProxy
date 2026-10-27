@@ -164,40 +164,20 @@ func Render(in Input) (Result, error) {
 		fmt.Fprintf(&b, "\n    LimitRequestBody %s\n", size)
 	}
 
-	// IP allow/block. Apache 2.4 uses mod_authz_host's Require directives inside a
-	// <RequireAll> so a blocklist (Require not ip) and an allowlist (Require ip)
-	// compose. With only a blocklist, deny those and allow the rest; with an
-	// allowlist, permit only the listed ranges.
-	if len(route.IPBlocklist) > 0 || len(route.IPAllowlist) > 0 {
-		b.WriteString("\n    <RequireAll>\n")
-		if len(route.IPAllowlist) > 0 {
-			fmt.Fprintf(&b, "        Require ip %s\n", strings.Join(route.IPAllowlist, " "))
-		} else {
-			// No allowlist: everyone is allowed except the blocked ranges below.
-			b.WriteString("        Require all granted\n")
-		}
-		for _, cidr := range route.IPBlocklist {
-			fmt.Fprintf(&b, "        Require not ip %s\n", cidr)
-		}
-		b.WriteString("    </RequireAll>\n")
-	}
-
-	// Basic auth references an htpasswd file the agent maintains. Apache scopes
-	// auth to a <Location />; AuthType Basic + AuthUserFile + a Require valid-user
-	// inside its own <RequireAll>-free block. When IP rules are present they live
-	// at vhost scope above; auth here is independent.
+	// Access control (IP allow/block and basic auth). Apache accepts Require and
+	// <RequireAll> only in directory context, never directly in <VirtualHost>,
+	// so the rules go in a <Location /> covering every request the vhost
+	// proxies. With both an IP rule and basic auth a request must pass both,
+	// matching nginx's default `satisfy all`.
+	authFile := ""
 	if route.BasicAuth != nil {
 		if in.AuthFile != "" {
-			b.WriteString("\n    <Location />\n")
-			fmt.Fprintf(&b, "        AuthType Basic\n")
-			fmt.Fprintf(&b, "        AuthName %s\n", quoteValue(basicAuthRealm(route.Host)))
-			fmt.Fprintf(&b, "        AuthUserFile %s\n", in.AuthFile)
-			fmt.Fprintf(&b, "        Require valid-user\n")
-			b.WriteString("    </Location>\n")
+			authFile = in.AuthFile
 		} else {
 			warn("basic_auth", "no htpasswd file path provided; basic auth dropped")
 		}
 	}
+	writeAccessControl(&b, route, authFile)
 
 	// Response headers via mod_headers (always set, even on proxied/error
 	// responses, matching nginx's "always").
@@ -285,6 +265,47 @@ func Render(in Input) (Result, error) {
 		VHost:    b.String(),
 		Warnings: warnings,
 	}, nil
+}
+
+// writeAccessControl renders the <Location /> block holding the route's
+// authorization rules, or nothing when the route has none. authFile is the
+// htpasswd path; empty means no basic auth.
+//
+// The IP rules and `Require valid-user` share one <RequireAll>, so every rule
+// must pass. Apache refuses a <RequireAll> made only of negations, so a
+// blocklist gets `Require all granted` beside its `Require not ip` lines
+// unless an allowlist or valid-user already supplies the positive rule.
+func writeAccessControl(b *strings.Builder, route proxymodel.Route, authFile string) {
+	hasIP := len(route.IPAllowlist) > 0 || len(route.IPBlocklist) > 0
+	if !hasIP && authFile == "" {
+		return
+	}
+	b.WriteString("\n    <Location />\n")
+	if authFile != "" {
+		b.WriteString("        AuthType Basic\n")
+		fmt.Fprintf(b, "        AuthName %s\n", quoteValue(basicAuthRealm(route.Host)))
+		fmt.Fprintf(b, "        AuthUserFile %s\n", authFile)
+	}
+	if !hasIP {
+		b.WriteString("        Require valid-user\n")
+		b.WriteString("    </Location>\n")
+		return
+	}
+	b.WriteString("        <RequireAll>\n")
+	switch {
+	case len(route.IPAllowlist) > 0:
+		fmt.Fprintf(b, "            Require ip %s\n", strings.Join(route.IPAllowlist, " "))
+	case authFile == "":
+		b.WriteString("            Require all granted\n")
+	}
+	for _, cidr := range route.IPBlocklist {
+		fmt.Fprintf(b, "            Require not ip %s\n", cidr)
+	}
+	if authFile != "" {
+		b.WriteString("            Require valid-user\n")
+	}
+	b.WriteString("        </RequireAll>\n")
+	b.WriteString("    </Location>\n")
 }
 
 // resolveTLS decides whether the VirtualHost gets a TLS listener (:443 +

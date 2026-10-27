@@ -5,6 +5,16 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1]
+
+### Fixed
+
+- **Apache domains with an IP allowlist or blocklist pass `httpd -t` again
+  (#166).** The rules were rendered as a `<RequireAll>` directly inside
+  `<VirtualHost>`, which Apache rejects, so the agent could not apply the
+  domain. They now go in a `<Location />` block. When a domain has both IP
+  rules and basic auth, a request has to pass both, the same as on nginx.
+
 ## [0.5.0] - 2026-10-27
 
 First stable release of the 0.5 line. It contains everything from
