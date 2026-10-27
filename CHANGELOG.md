@@ -5,10 +5,20 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.1]
+## [0.5.1] - 2026-10-27
 
 ### Fixed
 
+- **Saving a domain in the dashboard no longer drops proxy settings it doesn't
+  show (#163).** The General and Headers tabs sent only their own fields, and
+  the API replaced the whole stored proxy config with them. Basic auth, IP
+  allow/block lists, TLS policy, raw config, response headers, timeouts, rate
+  limit, path rules and upstream scheme set through the API or CLI were
+  silently cleared, so a protected site could become public. The dashboard now
+  sends only the settings you changed, and `PUT /api/v1/domains/{id}`
+  merges `proxy_config` key by key: keys left out keep their stored value,
+  `null` clears a field (for example `"basic_auth": null`), and any other value
+  replaces that field as a whole.
 - **Apache domains with an IP allowlist or blocklist pass `httpd -t` again
   (#166).** The rules were rendered as a `<RequireAll>` directly inside
   `<VirtualHost>`, which Apache rejects, so the agent could not apply the
@@ -319,6 +329,7 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.5.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.1
 [0.5.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0
 [0.5.0-rc.3]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.3
 [0.5.0-rc.2]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.2
