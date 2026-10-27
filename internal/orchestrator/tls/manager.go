@@ -62,6 +62,10 @@ type RenewTarget struct {
 	// cert is due/in-window and the whole point of the scan is to re-issue it, so
 	// it must never be collapsed by a "cert exists" check.
 	FirstIssue bool
+	// PriorCertPEM is the stored cert_pem when the target was resolved, "" when
+	// the host had no cert. SaveRenewed only overwrites a row that still holds it,
+	// so an operator import (#80) that lands while the order runs is kept.
+	PriorCertPEM string
 	// Provider is the DNS provider plugin for this host's zone.
 	Provider provider.Provider
 	// Config is the decrypted provider config (with the zone id merged in) used to
@@ -87,9 +91,11 @@ type RenewalStore interface {
 	// zone/provider, a non-central TLS policy, or a current cert already on file —
 	// so the caller treats it as a no-op.
 	TargetForHost(ctx context.Context, host string) (*RenewTarget, error)
-	// SaveRenewed persists a freshly issued bundle, overwriting the prior cert for
-	// the host in place (the encrypted-at-rest store keys on host).
-	SaveRenewed(ctx context.Context, res *CertResult, isWildcard bool) error
+	// SaveRenewed persists a freshly issued bundle for t, overwriting the prior
+	// cert for the host in place (the encrypted-at-rest store keys on host). It
+	// returns ErrCertSuperseded, storing nothing, when the stored cert no longer
+	// matches t.PriorCertPEM.
+	SaveRenewed(ctx context.Context, res *CertResult, t RenewTarget) error
 	// MarkRateLimited records that issuance for host was rate-limited by the CA:
 	// the store persists an exponentially growing hold (honoring retryAfter when
 	// the CA gave a later instant) and returns when the next attempt may run.
@@ -147,6 +153,21 @@ type Renewer struct {
 	// *sync.Mutex values (created once per host) so the critical section can be
 	// held across the full issue→save sequence.
 	hostLocks sync.Map // map[string]*sync.Mutex
+}
+
+// ErrCertSuperseded reports that the stored certificate changed while an ACME
+// order ran, so the freshly issued one was discarded instead of overwriting it.
+var ErrCertSuperseded = errors.New("tls: stored certificate changed while the order ran")
+
+// TryLockHost takes the per-host issuance lock without waiting, for writers
+// outside the renewer (the certificate import, #80). ok is false while an order
+// for host is running; otherwise the caller must call unlock when done.
+func (r *Renewer) TryLockHost(host string) (unlock func(), ok bool) {
+	lk := r.hostLock(host)
+	if !lk.TryLock() {
+		return nil, false
+	}
+	return lk.Unlock, true
 }
 
 // hostLock returns the per-host issuance mutex, creating it on first use. The
@@ -438,7 +459,14 @@ func (r *Renewer) issueAndSave(ctx context.Context, t RenewTarget) error {
 		return fmt.Errorf("re-issuing %s: %w", t.Host, err)
 	}
 
-	if err := r.store.SaveRenewed(ctx, res, t.IsWildcard); err != nil {
+	if err := r.store.SaveRenewed(ctx, res, t); err != nil {
+		if errors.Is(err, ErrCertSuperseded) {
+			r.logger.WarnContext(ctx, "tls: stored certificate changed during issuance, keeping it",
+				slog.String("host", t.Host))
+			r.auditEvent("certificate", t.Host, "renew_superseded",
+				"the stored certificate changed while the ACME order ran (for example an operator import); kept it and discarded the new one")
+			return nil
+		}
 		return fmt.Errorf("saving renewed %s: %w", t.Host, err)
 	}
 	// Success ends any recorded rate-limit hold. Best-effort: a leftover hold

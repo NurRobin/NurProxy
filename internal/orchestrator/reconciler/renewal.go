@@ -108,8 +108,17 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 	//    orphaned (its domain was deleted or switched policy): skip it rather than
 	//    drive ACME forever for a host nobody serves. Skip, never delete — cert
 	//    removal belongs to the teardown path, not the renewer.
+	//
+	//    An imported cert (#80) is the exception: its SANs were chosen by the
+	//    operator's CA and may span zones NurProxy cannot solve DNS-01 for. Central
+	//    renewal takes it over for the one host it is stored under, which is all
+	//    the consuming domain needs; the renewed cert is an ordinary ACME cert.
 	for i := range certs {
 		c := &certs[i]
+		prior := c.CertPEM
+		if c.Source == models.CertSourceImported {
+			c = &models.Certificate{Host: c.Host, Names: []string{c.Host}}
+		}
 		if !certHasCentralConsumer(c, centralHosts) {
 			log.Printf("reconciler: renewal: no central-TLS domain consumes cert host %q, skipping renewal", c.Host)
 			continue
@@ -122,6 +131,7 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 			log.Printf("reconciler: renewal: cannot resolve zone/provider for cert host %q, skipping", c.Host)
 			continue
 		}
+		t.PriorCertPEM = prior
 		targets = append(targets, t)
 		seen[c.Host] = true
 	}
@@ -233,7 +243,9 @@ func (s *CertRenewalStore) resolveTarget(host string, names []string, isWildcard
 // SaveRenewed overwrites the stored certificate for the host in place with the
 // freshly issued bundle, re-encrypting the key at rest and recording the new
 // expiry parsed from the leaf so the next scan computes the window correctly.
-func (s *CertRenewalStore) SaveRenewed(_ context.Context, res *tls.CertResult, isWildcard bool) error {
+// The write only happens while the row still holds t.PriorCertPEM; otherwise it
+// returns tls.ErrCertSuperseded and keeps what is stored.
+func (s *CertRenewalStore) SaveRenewed(_ context.Context, res *tls.CertResult, t tls.RenewTarget) error {
 	if res == nil || res.Host == "" {
 		return fmt.Errorf("reconciler: renewal: nil/empty cert result")
 	}
@@ -241,16 +253,21 @@ func (s *CertRenewalStore) SaveRenewed(_ context.Context, res *tls.CertResult, i
 		ID:         res.Host, // host-keyed; upsert is ON CONFLICT(host)
 		Host:       res.Host,
 		Names:      res.Names,
-		IsWildcard: isWildcard,
+		IsWildcard: t.IsWildcard,
 		CertPEM:    string(res.CertPEM),
 		KeyPEM:     string(res.KeyPEM),
+		Source:     models.CertSourceACME,
 	}
 	if notAfter, err := tls.LeafNotAfter(res.CertPEM); err == nil {
 		cert.ExpiresAt = notAfter
 	}
 	cert.IssuedAt = time.Now().UTC()
-	if err := s.db.UpsertCertificate(cert); err != nil {
+	saved, err := s.db.ReplaceCertificateIfUnchanged(cert, t.PriorCertPEM)
+	if err != nil {
 		return fmt.Errorf("reconciler: renewal: saving renewed cert for %q: %w", res.Host, err)
+	}
+	if !saved {
+		return tls.ErrCertSuperseded
 	}
 	return nil
 }

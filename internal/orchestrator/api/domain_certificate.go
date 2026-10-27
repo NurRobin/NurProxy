@@ -1,0 +1,122 @@
+package api
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
+	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+)
+
+// certHostLocker is implemented by the TLS renewer: it exposes the per-host
+// issuance lock so an import never races an ACME order for the same host.
+type certHostLocker interface {
+	TryLockHost(host string) (unlock func(), ok bool)
+}
+
+// PUT /api/v1/domains/{id}/certificate imports an operator-provided certificate
+// for the domain's host (#80). It is the migration path for a host that already
+// has a valid certificate, typically when Let's Encrypt would refuse a duplicate
+// order. The bundle is validated, stored host-keyed with its key encrypted like
+// an issued cert, and pushed to the serving agent right away. Central renewal
+// replaces it with an ACME cert for the same host once it enters the renew window.
+func (s *Server) handleImportDomainCertificate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid domain ID")
+		return
+	}
+	dom, err := s.db.GetDomain(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+	if dom.Status == models.DomainStatusDeleting {
+		writeError(w, http.StatusConflict, "domain is being deleted")
+		return
+	}
+	// Only central-TLS domains are served from the certificate store. Importing
+	// for self-acme or TLS-off would store a cert nothing ever uses.
+	if policy := caddygen.TLSPolicyForDomain(*dom); policy != proxymodel.TLSPolicyCentral {
+		writeError(w, http.StatusConflict, fmt.Sprintf("domain TLS policy is %q; imported certificates are only served for central TLS", policy))
+		return
+	}
+	zone, err := s.db.GetZone(dom.ZoneID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot resolve domain zone")
+		return
+	}
+	host := dom.FQDN(zone.Name)
+
+	var req struct {
+		CertPEM string `json:"cert_pem"`
+		KeyPEM  string `json:"key_pem"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	bundle, err := tls.ValidateImportedBundle([]byte(req.CertPEM), []byte(req.KeyPEM), host, time.Now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "certificate rejected: "+err.Error())
+		return
+	}
+
+	// Hold the renewer's per-host lock while writing, so an ACME order for the
+	// same host cannot finish in between and overwrite the import. Refuse rather
+	// than wait: an order can take minutes.
+	if locker, ok := s.issuer.(certHostLocker); ok {
+		unlock, locked := locker.TryLockHost(host)
+		if !locked {
+			writeError(w, http.StatusConflict, "certificate issuance for "+host+" is in progress; retry in a minute")
+			return
+		}
+		defer unlock()
+	}
+
+	now := time.Now().UTC()
+	cert := &models.Certificate{
+		ID:        host, // host-keyed like issued certs; the upsert replaces any existing one
+		Host:      host,
+		Names:     bundle.Names,
+		CertPEM:   bundle.CertPEM,
+		KeyPEM:    bundle.KeyPEM,
+		IssuedAt:  bundle.NotBefore,
+		ExpiresAt: bundle.NotAfter,
+		Source:    models.CertSourceImported,
+	}
+	if err := s.db.ImportCertificateForDomain(dom.ID, cert); err != nil {
+		if errors.Is(err, db.ErrDomainDeleting) {
+			writeError(w, http.StatusConflict, "domain is being deleted")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to store certificate")
+		return
+	}
+
+	renewFrom := bundle.NotAfter.Add(-tls.DefaultRenewWindow).UTC()
+	s.audit(r, "certificate", host, "cert_imported",
+		fmt.Sprintf("domain %d, %d name(s), expires %s; ACME renewal takes over from %s",
+			dom.ID, len(bundle.Names), bundle.NotAfter.UTC().Format("2006-01-02"), renewFrom.Format("2006-01-02")))
+
+	s.triggerAgentPush(dom.ServerID)
+
+	resp := map[string]any{
+		"message":       "certificate imported; pushing to the serving agent",
+		"host":          host,
+		"names":         bundle.Names,
+		"source":        models.CertSourceImported,
+		"expires_at":    bundle.NotAfter.UTC(),
+		"renewal_after": renewFrom,
+	}
+	if !renewFrom.After(now) {
+		resp["warning"] = "certificate is already inside the renew window; ACME renewal will replace it on the next scan"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}

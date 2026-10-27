@@ -2111,6 +2111,75 @@ func TestDueForRenewal_skipsCertsWithoutCentralConsumer(t *testing.T) {
 	}
 }
 
+// TestDueForRenewal_importedCertRenewsForItsHostOnly covers the #80 hand-over:
+// an imported cert in the renew window is re-issued by ACME for the host it is
+// stored under, never for the SAN set the operator's CA put on it, and only a
+// domain on that exact host counts as its consumer.
+func TestDueForRenewal_importedCertRenewsForItsHostOnly(t *testing.T) {
+	registerMockProvider(t)
+
+	soon := time.Now().UTC().Add(24 * time.Hour)
+	later := time.Now().UTC().Add(90 * 24 * time.Hour)
+	imported := func(host string, names []string, expires time.Time) models.Certificate {
+		return models.Certificate{ID: host, Host: host, Names: names, CertPEM: "C", KeyPEM: "K", ExpiresAt: expires, Source: models.CertSourceImported}
+	}
+
+	tests := []struct {
+		name      string
+		certs     []models.Certificate
+		wantHost  string // "" means no renewal target
+		wantNames []string
+	}{
+		{
+			name:      "imported wildcard with foreign SANs renews the host alone",
+			certs:     []models.Certificate{imported("app.example.com", []string{"*.example.com", "shop.other.net"}, soon)},
+			wantHost:  "app.example.com",
+			wantNames: []string{"app.example.com"},
+		},
+		{
+			name:  "imported cert outside the window is left alone",
+			certs: []models.Certificate{imported("app.example.com", []string{"app.example.com"}, later)},
+		},
+		{
+			// The wildcard SAN covers the live app.example.com, but the import was
+			// made for gone.example.com, which nothing serves any more.
+			name: "wildcard SAN does not make another domain its consumer",
+			certs: []models.Certificate{
+				{ID: "app.example.com", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K", ExpiresAt: later},
+				imported("gone.example.com", []string{"*.example.com"}, soon),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			setupScenario(t, d)
+			for i := range tt.certs {
+				if err := d.UpsertCertificate(&tt.certs[i]); err != nil {
+					t.Fatalf("UpsertCertificate: %v", err)
+				}
+			}
+
+			targets, err := NewCertRenewalStore(d).DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+			if err != nil {
+				t.Fatalf("DueForRenewal: %v", err)
+			}
+			if tt.wantHost == "" {
+				if len(targets) != 0 {
+					t.Fatalf("renewal targets = %+v, want none", targets)
+				}
+				return
+			}
+			if len(targets) != 1 || targets[0].Host != tt.wantHost {
+				t.Fatalf("renewal targets = %+v, want exactly %q", targets, tt.wantHost)
+			}
+			if strings.Join(targets[0].Names, ",") != strings.Join(tt.wantNames, ",") || targets[0].IsWildcard {
+				t.Errorf("target names = %v wildcard=%v, want %v and no wildcard", targets[0].Names, targets[0].IsWildcard, tt.wantNames)
+			}
+		})
+	}
+}
+
 // TestCertOnly_excludedFromRoutesAndCertGathered asserts a cert-only domain (§7)
 // gets its certificate gathered for the agent push and flips active, but is never
 // rendered as a route (no vhost — the operator hand-writes the config).

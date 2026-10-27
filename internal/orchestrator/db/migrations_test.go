@@ -144,6 +144,9 @@ func seedSchema14(t *testing.T, dbPath string) {
 	if _, err := raw.Exec(`INSERT INTO domains (id, subdomain, zone_id, server_id, port) VALUES (1, 'app', 'zone1', 'srv1', 8080)`); err != nil {
 		t.Fatalf("seed domain: %v", err)
 	}
+	if _, err := raw.Exec(`INSERT INTO certificates (id, host, cert_pem, key_pem_enc) VALUES ('app.example.com', 'app.example.com', 'cert', 'key')`); err != nil {
+		t.Fatalf("seed certificate: %v", err)
+	}
 }
 
 // schemaVersion reads the recorded max schema version.
@@ -178,8 +181,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 33 {
-		t.Fatalf("this test pins the schema target at 33 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 34 {
+		t.Fatalf("this test pins the schema target at 34 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -289,6 +292,21 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 			if n != 0 {
 				t.Errorf("%s should start empty, has %d rows", table, n)
 			}
+		}
+	})
+
+	// migration 34: a certificate stored before imports existed was issued by
+	// NurProxy, so it defaults to source 'acme'; anything else is refused.
+	t.Run("certificate_source_default", func(t *testing.T) {
+		var source string
+		if err := d.sql.QueryRow("SELECT source FROM certificates WHERE host='app.example.com'").Scan(&source); err != nil {
+			t.Fatalf("select certificates.source: %v", err)
+		}
+		if source != "acme" {
+			t.Errorf("certificates.source = %q, want acme (default on pre-existing row)", source)
+		}
+		if _, err := d.sql.Exec("UPDATE certificates SET source='manual' WHERE host='app.example.com'"); err == nil {
+			t.Error("certificates.source accepted a value outside acme|imported")
 		}
 	})
 

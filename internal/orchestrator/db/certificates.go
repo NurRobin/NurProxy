@@ -16,11 +16,81 @@ import (
 // decryption failure via errors.Is.
 var ErrCertNotFound = errors.New("certificate not found")
 
+// ErrDomainDeleting rejects writing a certificate for a domain that is gone or
+// being torn down; the teardown would never clean the new row up.
+var ErrDomainDeleting = errors.New("domain is missing or being deleted")
+
 // UpsertCertificate inserts or replaces the certificate for a host. The private
 // key (KeyPEM) is encrypted with the existing AES-256-GCM key before storage;
 // the leaf certificate is public and stored as-is. One certificate per host
 // (UNIQUE(host)); re-issuance overwrites in place and bumps updated_at.
 func (d *DB) UpsertCertificate(c *models.Certificate) error {
+	return d.upsertCertificate(d.sql, c)
+}
+
+// ReplaceCertificateIfUnchanged writes c only while the host's stored cert_pem
+// still equals prior ("" meaning no row). It reports false and writes nothing
+// when the row changed in between, e.g. an operator import (#80) landed while an
+// ACME order for the same host was running.
+func (d *DB) ReplaceCertificateIfUnchanged(c *models.Certificate, prior string) (bool, error) {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return false, fmt.Errorf("beginning certificate replace: %w", err)
+	}
+	defer tx.Rollback()
+	var current string
+	switch err := tx.QueryRow("SELECT cert_pem FROM certificates WHERE host = ?", c.Host).Scan(&current); {
+	case errors.Is(err, sql.ErrNoRows):
+		current = ""
+	case err != nil:
+		return false, fmt.Errorf("reading stored certificate: %w", err)
+	}
+	if current != prior {
+		return false, nil
+	}
+	if err := d.upsertCertificate(tx, c); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("committing certificate replace: %w", err)
+	}
+	return true, nil
+}
+
+// ImportCertificateForDomain stores c for domainID, checking in the same
+// transaction that the domain still exists and is not being deleted. A separate
+// check-then-write could store the cert just after teardown cleaned up the host,
+// leaving an orphan row that nothing removes.
+func (d *DB) ImportCertificateForDomain(domainID int64, c *models.Certificate) error {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning certificate import: %w", err)
+	}
+	defer tx.Rollback()
+	var status string
+	switch err := tx.QueryRow("SELECT status FROM domains WHERE id = ?", domainID).Scan(&status); {
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrDomainDeleting
+	case err != nil:
+		return fmt.Errorf("reading domain status: %w", err)
+	}
+	if status == string(models.DomainStatusDeleting) {
+		return ErrDomainDeleting
+	}
+	if err := d.upsertCertificate(tx, c); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing certificate import: %w", err)
+	}
+	return nil
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func (d *DB) upsertCertificate(exec sqlExecer, c *models.Certificate) error {
 	encKey, err := crypto.EncryptString(d.cryptoKey, c.KeyPEM)
 	if err != nil {
 		return fmt.Errorf("encrypting certificate key: %w", err)
@@ -41,14 +111,18 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 	if c.IsWildcard {
 		isWildcard = 1
 	}
+	source := c.Source
+	if source == "" {
+		source = models.CertSourceACME
+	}
 	expires := ""
 	if !c.ExpiresAt.IsZero() {
 		expires = c.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 
-	_, err = d.sql.Exec(`
-		INSERT INTO certificates (id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err = exec.Exec(`
+		INSERT INTO certificates (id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(host) DO UPDATE SET
 			names = excluded.names,
 			is_wildcard = excluded.is_wildcard,
@@ -56,9 +130,10 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 			key_pem_enc = excluded.key_pem_enc,
 			issued_at = excluded.issued_at,
 			expires_at = excluded.expires_at,
-			updated_at = excluded.updated_at`,
+			updated_at = excluded.updated_at,
+			source = excluded.source`,
 		c.ID, c.Host, string(names), isWildcard, c.CertPEM, encKey,
-		c.IssuedAt.UTC().Format(time.RFC3339), expires, now.Format(time.RFC3339),
+		c.IssuedAt.UTC().Format(time.RFC3339), expires, now.Format(time.RFC3339), source,
 	)
 	if err != nil {
 		return fmt.Errorf("upserting certificate: %w", err)
@@ -70,7 +145,7 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 // key. Returns an error if not found.
 func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
 	row := d.read.QueryRow(`
-		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
+		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source
 		FROM certificates WHERE host = ?`, host)
 	c, err := d.scanCertificate(row)
 	if err == sql.ErrNoRows {
@@ -85,7 +160,7 @@ func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
 // ListCertificates returns all stored certificates with private keys decrypted.
 func (d *DB) ListCertificates() ([]models.Certificate, error) {
 	rows, err := d.read.Query(`
-		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
+		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source
 		FROM certificates ORDER BY host`)
 	if err != nil {
 		return nil, fmt.Errorf("listing certificates: %w", err)
@@ -109,7 +184,7 @@ func (d *DB) ListCertificates() ([]models.Certificate, error) {
 func (d *DB) CertificatesDueForRenewal(window time.Duration) ([]models.Certificate, error) {
 	cutoff := time.Now().UTC().Add(window).Format(time.RFC3339)
 	rows, err := d.read.Query(`
-		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
+		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source
 		FROM certificates
 		WHERE expires_at != '' AND expires_at <= ?
 		ORDER BY expires_at`, cutoff)
@@ -157,7 +232,7 @@ func (d *DB) scanCertificate(s scanner) (*models.Certificate, error) {
 		expiresAt  string
 		updatedAt  string
 	)
-	if err := s.Scan(&c.ID, &c.Host, &namesJSON, &isWildcard, &c.CertPEM, &encKey, &issuedAt, &expiresAt, &updatedAt); err != nil {
+	if err := s.Scan(&c.ID, &c.Host, &namesJSON, &isWildcard, &c.CertPEM, &encKey, &issuedAt, &expiresAt, &updatedAt, &c.Source); err != nil {
 		return nil, err
 	}
 

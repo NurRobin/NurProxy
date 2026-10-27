@@ -506,8 +506,30 @@ func cmdDomain(args []string) {
 		}
 		c.emit(raw, "DNS takeover applied for domain "+id)
 
+	case "set-cert":
+		var certFile, keyFile string
+		c, _, id := parseClient("domain set-cert", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&certFile, "cert", "", "PEM file with the certificate, leaf first, chain optional (e.g. fullchain.pem)")
+			fs.StringVar(&keyFile, "key", "", "PEM file with the unencrypted private key (e.g. privkey.pem)")
+		})
+		if certFile == "" || keyFile == "" {
+			fatalf("domain set-cert: --cert and --key are required")
+		}
+		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id+"/certificate", map[string]string{
+			"cert_pem": string(readFileArg(certFile)),
+			"key_pem":  string(readFileArg(keyFile)),
+		})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		msg := "certificate imported for domain " + id + ", expires " + gjson(raw, "expires_at")
+		if warning := gjson(raw, "warning"); warning != "" {
+			msg += "\nwarning: " + warning
+		}
+		c.emit(raw, msg)
+
 	default:
-		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>")
+		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE")
 	}
 }
 

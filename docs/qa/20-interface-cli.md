@@ -58,6 +58,7 @@ the same calls regardless of dry/real; only the orchestrator behind it differs.
 - [ ] `domain add` (`--subdomain`, `--zone`, `--server`, `--port`, `--websocket`, `--force-https`, `--ssl-mode`, `--proxy-config-file`)
 - [ ] `domain update <id>` (same flags; tri-state bool handling)
 - [ ] `domain delete <id>`
+- [ ] `domain set-cert <id> --cert FILE --key FILE` (import an existing certificate; see 06-tls-acme §16)
 - [ ] `apikey show`
 - [ ] `apikey create`
 - [ ] `apikey revoke`
