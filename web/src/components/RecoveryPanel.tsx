@@ -57,6 +57,7 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
   const [operations, setOperations] = useState<RecoveryOperation[]>([]);
   const [hardPlans, setHardPlans] = useState<HardRecoveryPlan[]>([]);
   const [helperStatus, setHelperStatus] = useState<RecoveryHelperStatus | null>(null);
+  const managedBreaker = helperStatus?.enrolled ? helperStatus.managed_apply_breaker : undefined;
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [repair, setRepair] = useState<RecoveryDiagnostic | null>(null);
@@ -224,6 +225,17 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
           </Button>
         </div>
       ) : null}
+      {managedBreaker?.open && (
+        <div className="mt-4"><Callout tone="danger" title={t('recovery.helperBreakerTitle')}>
+          <p>{t('recovery.helperBreakerBody')}</p>
+          <p className="mt-2 break-words font-mono text-xs">{managedBreaker.reason}</p>
+          <p className="mt-2 text-xs">
+            {t('recovery.helperBreakerOperation')}: <code className="font-mono">{managedBreaker.operation_id}</code>
+            {managedBreaker.opened_at && <> · {formatRelativeTime(managedBreaker.opened_at)}</>}
+          </p>
+          <p className="mt-2 text-xs">{t('recovery.helperBreakerClear')}</p>
+        </Callout></div>
+      )}
       {operationError && (
         <div className="mt-4"><Callout tone="danger" title={t('recovery.repairFailed')}>
           <p>{operationError.message}</p>
@@ -234,7 +246,7 @@ export default function RecoveryPanel({ agent, onAgentChanged }: RecoveryPanelPr
 
       {loading ? (
         <p className="mt-4 text-sm text-fg-faint">{t('common.loading')}</p>
-      ) : diagnostics.length === 0 ? (
+      ) : diagnostics.length === 0 && managedBreaker?.open ? null : diagnostics.length === 0 ? (
         <div className="mt-4"><Callout tone="success" title={t('recovery.healthy')}>{t('recovery.healthyBody')}</Callout></div>
       ) : (
         <div className="mt-4 space-y-3">

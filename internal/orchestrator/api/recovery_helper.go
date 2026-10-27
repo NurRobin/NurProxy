@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/ed25519"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -89,5 +90,42 @@ func (s *Server) handleGetRecoveryHelperAdmin(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "failed to read helper enrollment")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"enrolled": true, "helper": instance})
+	status := map[string]any{"enrolled": true, "helper": instance}
+	breaker, err := s.managedApplyBreaker(agentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read managed apply history")
+		return
+	}
+	if breaker != nil {
+		status["managed_apply_breaker"] = breaker
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// managedApplyBreakerView describes the helper's persistent breaker as seen
+// from the orchestrator. The helper latches it whenever a managed apply ends
+// as rollback_failed and then refuses every later apply without a receipt, so
+// the newest receipt the orchestrator holds tells whether it is still open.
+type managedApplyBreakerView struct {
+	Open        bool       `json:"open"`
+	OperationID string     `json:"operation_id"`
+	Reason      string     `json:"reason"`
+	OpenedAt    *time.Time `json:"opened_at,omitempty"`
+}
+
+func (s *Server) managedApplyBreaker(agentID string) (*managedApplyBreakerView, error) {
+	execution, err := s.db.GetLatestReceiptedManagedApply(agentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	receipt := execution.SignedReceipt.Envelope.Payload
+	if receipt.State != helperprotocol.JournalRollbackFailed {
+		return nil, nil
+	}
+	return &managedApplyBreakerView{
+		Open: true, OperationID: receipt.OperationID, Reason: receipt.SanitizedResult, OpenedAt: execution.ReceiptReceivedAt,
+	}, nil
 }

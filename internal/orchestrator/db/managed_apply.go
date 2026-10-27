@@ -96,8 +96,12 @@ func (d *DB) StoreManagedApplyIntent(agentID string, signed helperprotocol.Signe
 	if count >= maxManagedApplyExecutionsPerAgent {
 		result, deleteErr := tx.Exec(`DELETE FROM managed_apply_executions WHERE rowid = (
 			SELECT rowid FROM managed_apply_executions WHERE agent_id = ? AND is_current = 0
+				AND rowid IS NOT (
+					SELECT rowid FROM managed_apply_executions WHERE agent_id = ? AND signed_receipt != ''
+					ORDER BY receipt_received_at DESC LIMIT 1
+				)
 			ORDER BY intent_received_at ASC LIMIT 1
-		)`, agentID)
+		)`, agentID, agentID)
 		if deleteErr != nil {
 			return fmt.Errorf("prune managed apply execution: %w", deleteErr)
 		}
@@ -123,6 +127,18 @@ func (d *DB) GetCurrentManagedApply(agentID string) (*ManagedApplyExecution, err
 		return nil, fmt.Errorf("managed apply agent identity is required")
 	}
 	return getManagedApply(d.read.QueryRow(managedApplySelect+` WHERE agent_id = ? AND is_current = 1`, agentID))
+}
+
+// GetLatestReceiptedManagedApply returns the agent's managed apply execution
+// whose helper receipt arrived last, or sql.ErrNoRows when none has one. The
+// execution pruning above never removes this row, so a terminal failure stays
+// visible while later intents pile up unexecuted.
+func (d *DB) GetLatestReceiptedManagedApply(agentID string) (*ManagedApplyExecution, error) {
+	if !validRecoverySemanticID(agentID) {
+		return nil, fmt.Errorf("managed apply agent identity is required")
+	}
+	return getManagedApply(d.read.QueryRow(managedApplySelect+` WHERE agent_id = ? AND signed_receipt != ''
+		ORDER BY receipt_received_at DESC LIMIT 1`, agentID))
 }
 
 func (d *DB) GetManagedApply(agentID, operationID string) (*ManagedApplyExecution, error) {
