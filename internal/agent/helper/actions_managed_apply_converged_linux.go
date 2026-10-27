@@ -5,8 +5,11 @@ package helper
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 )
@@ -40,7 +43,7 @@ func (a *managedApplyAction) Converged(ctx context.Context, plan helperprotocol.
 		}
 	}
 	for _, file := range compilation.Files {
-		if file.Delete {
+		if file.Delete && !isManagedAuthDeletion(file) {
 			if pending, err := pendingFile(file); err != nil || pending {
 				return ActionResult{}, false, err
 			}
@@ -56,6 +59,14 @@ func (a *managedApplyAction) Converged(ctx context.Context, plan helperprotocol.
 	for _, link := range compilation.Links {
 		if !link.Delete && !link.Preserve {
 			if pending, err := pendingLink(link); err != nil || pending {
+				return ActionResult{}, false, err
+			}
+		}
+	}
+	// Execute removes auth files after the reload; any still on disk is pending.
+	for _, file := range compilation.Files {
+		if isManagedAuthDeletion(file) {
+			if pending, err := pendingFile(file); err != nil || pending {
 				return ActionResult{}, false, err
 			}
 		}
@@ -84,6 +95,12 @@ func managedFileChangePending(file managedCompiledFile, ownerUID uint32) (bool, 
 	if file.Delete && !current.Exists {
 		return false, nil
 	}
+	if file.Class == "auth" && !file.Delete {
+		dirPending, err := managedAuthDirectoryPending(filepath.Dir(file.Path), ownerUID, file.GID)
+		if err != nil || dirPending {
+			return dirPending, err
+		}
+	}
 	if err := validatePrivilegedManagedDirectory(filepath.Dir(file.Path), ownerUID); err != nil {
 		return false, err
 	}
@@ -91,6 +108,24 @@ func managedFileChangePending(file managedCompiledFile, ownerUID uint32) (bool, 
 		return true, nil
 	}
 	return !managedFileConverged(current, file), nil
+}
+
+// managedAuthDirectoryPending reports whether ensureManagedAuthDirectory would
+// create the auth directory or repair its group or mode. A directory it would
+// refuse (wrong type, symlink, foreign owner, unsafe parent) is an error.
+func managedAuthDirectoryPending(dir string, ownerUID, gid uint32) (bool, error) {
+	info, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, validatePrivilegedManagedDirectory(filepath.Dir(dir), ownerUID)
+	}
+	if err != nil {
+		return false, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || stat.Uid != ownerUID {
+		return false, fmt.Errorf("managed auth directory is not owned by the configured privileged identity")
+	}
+	return stat.Gid != gid || info.Mode().Perm() != 0o750 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0, nil
 }
 
 // managedLinkChangePending is the same decision for an activation symlink.
@@ -108,9 +143,10 @@ func managedLinkChangePending(link managedCompiledLink, ownerUID uint32) (bool, 
 	return link.Delete || !current.Exists, nil
 }
 
-// managedFileConverged: present, same permission bits, same bytes. Ownership is
-// enforced by inspectManagedPath, which refuses a file not owned by the
-// privileged identity before this is reached.
+// managedFileConverged: present, same permission bits, same bytes, and for
+// auth files the worker group. Owner is enforced by inspectManagedPath, which
+// refuses a file not owned by the privileged identity before this is reached.
 func managedFileConverged(current managedFileSnapshot, file managedCompiledFile) bool {
-	return current.Exists && current.Mode == file.Mode && bytes.Equal(current.Content, file.Content)
+	return current.Exists && current.Mode == file.Mode && bytes.Equal(current.Content, file.Content) &&
+		(file.Class != "auth" || current.GID == file.GID)
 }

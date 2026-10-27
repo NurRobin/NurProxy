@@ -54,6 +54,12 @@ type ManagedApplyTargetConfig struct {
 	ProxyVersion        string `json:"proxy_version"`
 }
 
+// AuthDir is where basic-auth user files live: a sibling of CertificateDir that
+// the proxy worker group may read, so certs/ (with plaintext keys) stays 0700.
+func (c ManagedApplyTargetConfig) AuthDir() string {
+	return filepath.Join(filepath.Dir(c.CertificateDir), "auth")
+}
+
 type PackageTargetConfig struct {
 	Manager string `json:"manager"`
 	Package string `json:"package"`

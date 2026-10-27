@@ -37,6 +37,19 @@ func installExactRoute(t *testing.T, compilation managedCompilation) {
 	linkManagedTarget(t, compilation)
 }
 
+// installExactAuthRoute turns the route into a basic-auth route whose worker
+// group is a supplementary group (when there is one) and applies it once
+// under a separate operation, leaving vhost, link, auth dir and auth file exact.
+func installExactAuthRoute(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent) {
+	t.Helper()
+	gid := testWorkerGID()
+	action.workerGroup = func() (uint32, error) { return gid, nil }
+	intent.Routes[0].Route.BasicAuth = &proxymodel.BasicAuth{Username: "operator", PasswordHash: testAuthHash}
+	setup := *intent
+	setup.OperationID = "apply-operation-auth-setup"
+	runManagedApply(t, action, setup)
+}
+
 func deleteRouteIntent(intent *helperprotocol.ApplyIntent) {
 	intent.DesiredStateRevision = strings.Repeat("2", 64)
 	intent.Resources = []string{}
@@ -48,11 +61,12 @@ func deleteRouteIntent(intent *helperprotocol.ApplyIntent) {
 // nor refuse; whenever Execute would fail it must not claim convergence.
 func TestManagedApplyConvergedAgreesWithExecute(t *testing.T) {
 	tests := []struct {
-		name           string
-		rootOnly       bool
-		setup          func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, route managedCompilation)
-		wantConverged  bool
-		wantExecuteErr bool
+		name            string
+		rootOnly        bool
+		needsOtherGroup bool
+		setup           func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, route managedCompilation)
+		wantConverged   bool
+		wantExecuteErr  bool
 	}{
 		{
 			name: "exact bytes, mode and link",
@@ -164,11 +178,57 @@ func TestManagedApplyConvergedAgreesWithExecute(t *testing.T) {
 			},
 			wantConverged: true,
 		},
+		{
+			name: "basic-auth file and directory exact",
+			setup: func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, _ managedCompilation) {
+				installExactAuthRoute(t, action, intent)
+			},
+			wantConverged: true,
+		},
+		{
+			name:            "basic-auth file with wrong group",
+			needsOtherGroup: true,
+			setup: func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, _ managedCompilation) {
+				installExactAuthRoute(t, action, intent)
+				if err := os.Chown(filepath.Join(action.layout.AuthDir(), "auth-app.example.com.htpasswd"), -1, os.Getgid()); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:            "basic-auth directory with wrong group",
+			needsOtherGroup: true,
+			setup: func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, _ managedCompilation) {
+				installExactAuthRoute(t, action, intent)
+				if err := os.Chown(action.layout.AuthDir(), -1, os.Getgid()); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "basic-auth directory with wrong mode",
+			setup: func(t *testing.T, action *managedApplyAction, intent *helperprotocol.ApplyIntent, _ managedCompilation) {
+				installExactAuthRoute(t, action, intent)
+				if err := os.Chmod(action.layout.AuthDir(), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "stale certs/ auth file pending deletion",
+			setup: func(t *testing.T, action *managedApplyAction, _ *helperprotocol.ApplyIntent, route managedCompilation) {
+				installExactRoute(t, route)
+				writeManagedTarget(t, filepath.Join(action.layout.CertificateDir, "auth-app.example.com.htpasswd"), []byte("operator:hash\n"), 0o600)
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.rootOnly && os.Getuid() != 0 {
 				t.Skip("changing a directory owner needs root")
+			}
+			if tt.needsOtherGroup && testWorkerGID() == uint32(os.Getgid()) {
+				t.Skip("needs a supplementary group to model group drift")
 			}
 			action, intent, host := newManagedApplyTest(t)
 			route, err := action.compile(intent)
@@ -176,6 +236,11 @@ func TestManagedApplyConvergedAgreesWithExecute(t *testing.T) {
 				t.Fatal(err)
 			}
 			tt.setup(t, action, &intent, route)
+			mutationsBefore := len(host.mutations)
+			snapshotsBefore, err := os.ReadDir(action.journal.snapshotsDir)
+			if err != nil {
+				t.Fatal(err)
+			}
 			material, err := action.Plan(context.Background(), intent)
 			if err != nil {
 				t.Fatal(err)
@@ -193,11 +258,11 @@ func TestManagedApplyConvergedAgreesWithExecute(t *testing.T) {
 			if tt.wantExecuteErr && checkErr == nil {
 				t.Fatal("convergence check accepted a target Execute refuses")
 			}
-			if len(host.mutations) != 0 {
+			if len(host.mutations) != mutationsBefore {
 				t.Fatalf("convergence check mutated the proxy: %v", host.mutations)
 			}
 			snapshots, err := os.ReadDir(action.journal.snapshotsDir)
-			if err != nil || len(snapshots) != 0 {
+			if err != nil || len(snapshots) != len(snapshotsBefore) {
 				t.Fatalf("convergence check stored snapshots: %d, %v", len(snapshots), err)
 			}
 

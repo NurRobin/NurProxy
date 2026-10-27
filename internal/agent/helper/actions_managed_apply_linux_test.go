@@ -92,7 +92,8 @@ func newManagedApplyTest(t *testing.T) (*managedApplyAction, helperprotocol.Appl
 	}}
 	action := &managedApplyAction{
 		agentUID: uint32(os.Getuid()), ownerUID: uint32(os.Getuid()), stagingRootUID: uint32(os.Getuid()), journal: journal, host: host,
-		target: ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
+		workerGroup: func() (uint32, error) { return uint32(os.Getgid()), nil },
+		target:      ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
 		layout: ManagedApplyTargetConfig{
 			StagingDir: filepath.Join(root, "staging"), AvailableDir: filepath.Join(root, "available"), EnabledDir: filepath.Join(root, "enabled"),
 			CertificateDir: filepath.Join(root, "certs"), CustomPolicyVersion: "proxy-policy-v1", ProxyVersion: "1.22.1",
@@ -552,12 +553,15 @@ func TestManagedApplyPreservesExactLegacyGeneratedBasicAuthSidecarLayout(t *test
 	if err := os.WriteFile(legacyAuthPath, []byte("operator:hash\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The preserved vhost reads its own sidecar, so no auth/ file is written
+	// and the worker group is never needed.
+	action.workerGroup = func() (uint32, error) { return 0, errors.New("worker group must not be resolved") }
 	material, err := action.Plan(context.Background(), intent)
 	if err != nil {
 		t.Fatal(err)
 	}
 	compilation, err := action.compile(intent)
-	if err != nil || len(compilation.Files) != 2 || !compilation.Files[1].Preserve || !compilation.Links[0].Preserve || material.ExecutionPlanHash == "" {
+	if err != nil || len(compilation.Files) != 1 || !compilation.Files[0].Preserve || !compilation.Links[0].Preserve || material.ExecutionPlanHash == "" {
 		t.Fatalf("legacy auth sidecar route was not preserve-only: %+v, %v", compilation, err)
 	}
 }
