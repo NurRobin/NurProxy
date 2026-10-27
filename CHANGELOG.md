@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allow/block lists, TLS policy, raw config, response headers, timeouts, rate
   limit, path rules and upstream scheme set through the API or CLI were
   silently cleared, so a protected site could become public. The dashboard now
-  sends the stored config with its edits applied, and `PUT /api/v1/domains/{id}`
+  sends only the settings you changed, and `PUT /api/v1/domains/{id}`
   merges `proxy_config` key by key: keys left out keep their stored value,
   `null` clears a field (for example `"basic_auth": null`), and any other value
   replaces that field as a whole.

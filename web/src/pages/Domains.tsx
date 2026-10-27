@@ -5,7 +5,7 @@ import { usePolling } from '../lib/usePolling';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
-import { proxyConfigForSave } from '../lib/proxy-config';
+import { proxyConfigChanges } from '../lib/proxy-config';
 import type { Domain, Agent, Server, Zone, ProxyCapabilities } from '../lib/types';
 import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
@@ -184,7 +184,7 @@ export default function Domains() {
     try {
       await api.updateDomain(detailDomain.id, {
         websocket: editWebsocket, force_https: editForceHttps,
-        proxy_config: proxyConfigForSave(detailDomain.proxy_config, {
+        proxy_config: proxyConfigChanges(detailDomain.proxy_config, {
           websocket: editWebsocket, force_https: editForceHttps,
           max_body_size: editMaxBody, custom_request_headers: editHeaders,
         }),

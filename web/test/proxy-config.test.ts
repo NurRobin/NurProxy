@@ -1,58 +1,49 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { proxyConfigForSave } from '../src/lib/proxy-config.ts';
+import { proxyConfigChanges, type ProxyConfigFormEdits } from '../src/lib/proxy-config.ts';
 import type { ProxyConfig } from '../src/lib/types.ts';
 
 const stored = {
   websocket: true,
   max_body_size: '10m',
-  custom_request_headers: { 'X-Old': '1' },
-  custom_response_headers: { 'X-Frame-Options': 'DENY' },
-  upstream_scheme: 'https',
+  custom_request_headers: { 'X-A': '1', 'X-B': '2' },
   tls_policy: 'self-acme',
   basic_auth: { username: 'admin', password: '$2a$10$hash' },
   ip_allowlist: ['10.0.0.0/8'],
-  raw_config: { backend: 'caddy', content: '{}' },
-  timeout_read: 30,
 } as ProxyConfig;
 
-const edits = {
-  websocket: false,
-  force_https: true,
-  max_body_size: '20m',
-  custom_request_headers: [{ key: ' X-New ', value: '2' }, { key: '', value: 'ignored' }],
+// The form as openDetail fills it from `stored`, with nothing edited.
+const unchanged: ProxyConfigFormEdits = {
+  websocket: true,
+  force_https: false,
+  max_body_size: '10m',
+  custom_request_headers: [{ key: 'X-B', value: '2' }, { key: 'X-A', value: '1' }],
 };
 
-test('keeps stored settings the form does not show (#163)', () => {
-  const body = proxyConfigForSave(stored, edits);
-  assert.deepEqual(body, {
-    ...stored,
-    websocket: false,
-    force_https: true,
-    max_body_size: '20m',
-    custom_request_headers: { 'X-New': '2' },
+test('nothing changed sends no proxy_config', () => {
+  assert.equal(proxyConfigChanges(stored, unchanged), undefined);
+});
+
+test('sends only the changed keys, never hidden settings like basic auth (#163)', () => {
+  const body = proxyConfigChanges(stored, { ...unchanged, force_https: true, max_body_size: '20m' });
+  assert.deepEqual(body, { force_https: true, max_body_size: '20m' });
+});
+
+test('a changed header list is sent whole, trimmed and without blank keys', () => {
+  const body = proxyConfigChanges(stored, {
+    ...unchanged,
+    custom_request_headers: [{ key: ' X-A ', value: '1' }, { key: 'X-C', value: '3' }, { key: '', value: 'x' }],
   });
+  assert.deepEqual(body, { custom_request_headers: { 'X-A': '1', 'X-C': '3' } });
 });
 
-test('does not modify the stored config', () => {
-  const before = structuredClone(stored);
-  const body = proxyConfigForSave(stored, edits);
-  (body.basic_auth as { username: string }).username = 'changed';
-  assert.deepEqual(stored, before);
-});
-
-test('emptied fields are sent as null so the API clears them', () => {
-  const body = proxyConfigForSave(stored, { ...edits, max_body_size: '', custom_request_headers: [] });
-  assert.equal(body.max_body_size, null);
-  assert.equal(body.custom_request_headers, null);
-  assert.deepEqual(body.basic_auth, stored.basic_auth);
+test('fields emptied by the user are sent as null', () => {
+  const body = proxyConfigChanges(stored, { ...unchanged, websocket: false, max_body_size: '', custom_request_headers: [] });
+  assert.deepEqual(body, { websocket: false, max_body_size: null, custom_request_headers: null });
 });
 
 test('works without a stored config', () => {
-  assert.deepEqual(proxyConfigForSave(undefined, edits), {
-    websocket: false,
-    force_https: true,
-    max_body_size: '20m',
-    custom_request_headers: { 'X-New': '2' },
-  });
+  const empty: ProxyConfigFormEdits = { websocket: false, force_https: false, max_body_size: '', custom_request_headers: [] };
+  assert.equal(proxyConfigChanges(undefined, empty), undefined);
+  assert.deepEqual(proxyConfigChanges(undefined, { ...empty, websocket: true }), { websocket: true });
 });
