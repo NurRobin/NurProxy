@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-domain access log and error log level (#150).** A domain can turn its
+  access log off (`access_log: off`) and set a minimum error log level
+  (`error_log_level`: info … emerg), so visitor IPs of that domain stay out of
+  the host-wide logs. nginx renders `access_log off;` and
+  `error_log /var/log/nginx/error.log <level>;`, Apache `CustomLog /dev/null`
+  and `LogLevel`. The built-in Caddy writes no access log anyway and has no
+  per-domain error level. nginx only offers the error level when the host's
+  error log is `/var/log/nginx/error.log`. The orchestrator refuses a setting
+  the domain's agent doesn't offer. Available in the API, CLI
+  (`--access-log`, `--error-log-level`), MCP and the domain settings in the
+  dashboard. Domains without the settings render exactly as before.
+
 ### Fixed
 
 - **Renaming a domain or moving it to another zone cleans up the old name

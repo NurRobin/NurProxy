@@ -18,21 +18,20 @@
 
     LimitRequestBody 50000000
 
-    <RequireAll>
-        Require ip 10.0.0.0/8
-        Require not ip 10.6.6.6/32
-    </RequireAll>
-
     <Location />
         AuthType Basic
         AuthName "Restricted: app.example.com"
         AuthUserFile /etc/apache2/nurproxy-auth/app.example.com.htpasswd
-        Require valid-user
+        <RequireAll>
+            Require ip 10.0.0.0/8
+            Require not ip 10.6.6.6/32
+            Require valid-user
+        </RequireAll>
     </Location>
 
-    Header always set X-Frame-Options DENY
+    Header always set X-Frame-Options "DENY"
 
-    RequestHeader set X-Team edge
+    RequestHeader set X-Team "edge"
 
     RequestHeader set X-Forwarded-Proto https
     ProxyPreserveHost On

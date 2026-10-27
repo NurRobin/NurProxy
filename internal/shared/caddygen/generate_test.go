@@ -599,6 +599,9 @@ func TestConfigFromDomain_Logging(t *testing.T) {
 		{"unset", models.ProxyConfig{}, proxymodel.AccessLogDefault, ""},
 		{"explicit default", models.ProxyConfig{AccessLog: "default", ErrorLogLevel: "default"}, proxymodel.AccessLogDefault, ""},
 		{"off and crit", models.ProxyConfig{AccessLog: "off", ErrorLogLevel: "crit"}, proxymodel.AccessLogOff, "crit"},
+		// Invalid stored values pass through, so Route validation refuses them
+		// and the reconciler holds the domain back instead of rendering a default.
+		{"invalid passes through", models.ProxyConfig{AccessLog: "on", ErrorLogLevel: "debug"}, "on", "debug"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

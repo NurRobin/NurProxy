@@ -222,3 +222,20 @@ func TestRoute_JSONOmitsDefaultLogging(t *testing.T) {
 		t.Fatalf("logging did not round-trip: %+v", back)
 	}
 }
+
+// The API validates stored settings through ValidateOptions, so the logging
+// values must be checked there and not only in Validate.
+func TestRoute_ValidateOptions_logging(t *testing.T) {
+	for _, tt := range []struct {
+		access  AccessLogMode
+		level   string
+		wantErr bool
+	}{
+		{"", "", false}, {AccessLogOff, "crit", false}, {"on", "", true}, {"", "debug", true}, {"", "crit;", true},
+	} {
+		r := Route{AccessLog: tt.access, ErrorLogLevel: tt.level}
+		if err := r.ValidateOptions(); (err != nil) != tt.wantErr {
+			t.Errorf("ValidateOptions(access=%q, level=%q) error = %v, wantErr %v", tt.access, tt.level, err, tt.wantErr)
+		}
+	}
+}

@@ -59,6 +59,10 @@ var policyTestAccepted = map[string]string{
 	"header without always":     strings.Replace(policyTestValid, "DENY always", "DENY", 1),
 	"timeout without unit":      strings.Replace(policyTestValid, "proxy_pass", "proxy_read_timeout 60;\n        proxy_pass", 1),
 	"body size and access list": strings.Replace(policyTestValid, "add_header", "client_max_body_size 10m;\n    deny 1.2.3.4/32;\n    allow 10.0.0.0/8;\n    allow ::1;\n    deny all;\n    add_header", 1),
+	"access log off":            policyTestInServer("access_log off;"),
+	"stock error log level":     policyTestInServer("error_log /var/log/nginx/error.log crit;"),
+	"logging in both servers": strings.Replace(policyTestInRedirect("access_log off;\n    error_log /var/log/nginx/error.log emerg;"),
+		"    location / {", "    access_log off;\n    error_log /var/log/nginx/error.log emerg;\n    location / {", 1),
 }
 
 func TestValidateManagedAdmitsBoundedVHost(t *testing.T) {
@@ -100,6 +104,26 @@ var policyTestRefused = []struct {
 	{"include in location", policyTestInLocation("include /etc/nginx/mime.types;")},
 	{"error_log in server", policyTestInServer("error_log /tmp/x.log info;")},
 	{"access_log in location", policyTestInLocation("access_log /tmp/x.log;")},
+
+	// Per-domain logging (#150): only `access_log off;` and the stock error
+	// log with a level from proxymodel.ErrorLogLevels, only at server scope.
+	{"access_log to file", policyTestInServer("access_log /var/log/nginx/app.log;")},
+	{"access_log to syslog", policyTestInServer("access_log syslog:server=10.0.0.1;")},
+	{"access_log off with format", policyTestInServer("access_log off combined;")},
+	{"access_log quoted off", policyTestInServer(`access_log "off";`)},
+	{"access_log off in location", policyTestInLocation("access_log off;")},
+	{"error_log stock path without level", policyTestInServer("error_log /var/log/nginx/error.log;")},
+	{"error_log debug", policyTestInServer("error_log /var/log/nginx/error.log debug;")},
+	{"error_log uppercase level", policyTestInServer("error_log /var/log/nginx/error.log CRIT;")},
+	{"error_log extra argument", policyTestInServer("error_log /var/log/nginx/error.log crit warn;")},
+	{"error_log quoted path", policyTestInServer(`error_log "/var/log/nginx/error.log" crit;`)},
+	{"error_log sibling path", policyTestInServer("error_log /var/log/nginx/error.log.1 crit;")},
+	{"error_log traversal", policyTestInServer("error_log /var/log/nginx/../../../etc/cron.d/x crit;")},
+	{"error_log stderr", policyTestInServer("error_log stderr crit;")},
+	{"error_log memory", policyTestInServer("error_log memory:32m debug;")},
+	{"error_log in location", policyTestInLocation("error_log /var/log/nginx/error.log crit;")},
+	{"redirect error_log debug", policyTestInRedirect("error_log /var/log/nginx/error.log debug;")},
+	{"redirect access_log to file", policyTestInRedirect("access_log /var/log/nginx/app.log;")},
 
 	{"quote inside header value", policyTestInServer(`add_header X-A a"; error_log /tmp/x.log info; #";`)},
 	{"single quote inside header value", policyTestInServer(`add_header X-A a'; error_log /tmp/x.log info; #';`)},
@@ -224,6 +248,12 @@ func policyTestGeneratedConfigs(t *testing.T) map[string]policyTestGenerated {
 		"basic auth": func(r *proxymodel.Route) {
 			r.BasicAuth = &proxymodel.BasicAuth{Username: "admin", PasswordHash: "$2y$10$abc"}
 		},
+		"access log off": func(r *proxymodel.Route) { r.AccessLog = proxymodel.AccessLogOff },
+		"error log crit": func(r *proxymodel.Route) { r.ErrorLogLevel = "crit" },
+		"logging every level": func(r *proxymodel.Route) {
+			r.AccessLog = proxymodel.AccessLogOff
+			r.ErrorLogLevel = "emerg"
+		},
 		"rate limit":    func(r *proxymodel.Route) { r.RateLimit.RequestsPerSecond = 10 },
 		"slow rate":     func(r *proxymodel.Route) { r.RateLimit.RequestsPerSecond = 0.5 },
 		"wildcard host": func(r *proxymodel.Route) { r.Host = "*.example.test" },
@@ -237,7 +267,15 @@ func policyTestGeneratedConfigs(t *testing.T) map[string]policyTestGenerated {
 			r.Timeouts = proxymodel.Timeouts{Read: 5, Write: 5}
 			r.BasicAuth = &proxymodel.BasicAuth{Username: "admin", PasswordHash: "$2y$10$abc"}
 			r.RateLimit.RequestsPerSecond = 3
+			r.AccessLog = proxymodel.AccessLogOff
+			r.ErrorLogLevel = "error"
 		},
+	}
+	for _, level := range proxymodel.ErrorLogLevels {
+		variants["error log "+level+" with access off"] = func(r *proxymodel.Route) {
+			r.AccessLog = proxymodel.AccessLogOff
+			r.ErrorLogLevel = level
+		}
 	}
 	tlsModes := []struct {
 		name       string
