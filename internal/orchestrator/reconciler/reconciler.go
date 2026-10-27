@@ -1049,7 +1049,16 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 		proxiedDrift := rec.Proxied != wantProxied
 		if contentDrift || proxiedDrift {
 			log.Printf("reconciler: DNS drift for %s: have %s (proxied=%t), want %s (proxied=%t)", fqdn, rec.Content, rec.Proxied, expectedTarget, wantProxied)
-			if uErr := dnsProvider.UpdateRecord(ctx, provConfig, dom.DNSRecordID, provider.Record{
+			// Patch only the fields that drifted, so a provider that supports it
+			// keeps the record's comment, tags and settings.
+			var patch provider.RecordPatch
+			if contentDrift {
+				patch.Content = &expectedTarget
+			}
+			if proxiedDrift {
+				patch.Proxied = &wantProxied
+			}
+			if uErr := provider.PatchOrUpdate(ctx, dnsProvider, provConfig, dom.DNSRecordID, patch, provider.Record{
 				Type:    "CNAME",
 				Name:    fqdn,
 				Content: expectedTarget,
@@ -1169,7 +1178,7 @@ func (r *Reconciler) enforceProxied(ctx context.Context, dom *models.Domain, fqd
 	}
 	upd := *rec
 	upd.Proxied = want
-	if err := p.UpdateRecord(ctx, cfg, rec.ID, upd); err != nil {
+	if err := provider.PatchOrUpdate(ctx, p, cfg, rec.ID, provider.RecordPatch{Proxied: &want}, upd); err != nil {
 		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", err.Error())
 		return err
 	}
@@ -1501,7 +1510,7 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 		return // already up to date — avoid an unnecessary API call
 	}
 	rec.Proxied = existing.Proxied
-	if uErr := dnsProvider.UpdateRecord(ctx, provConfig, recordID, rec); uErr != nil {
+	if uErr := provider.PatchOrUpdate(ctx, dnsProvider, provConfig, recordID, provider.RecordPatch{Content: &ip}, rec); uErr != nil {
 		log.Printf("reconciler: failed to update %s record for agent %s: %v", recordType, a.ID, uErr)
 		r.auditDNS("agent", a.ID, action+"_update_failed", uErr.Error())
 		return

@@ -126,6 +126,35 @@ func TestDomainProxied_update(t *testing.T) {
 	}
 }
 
+// The provider list tells the dashboard which zones can be proxied.
+func TestListProviders_supportsProxied(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+	proxiedFixture(t, database)
+
+	w := doRequest(t, handler, "GET", "/api/v1/providers", nil, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var list []struct {
+		ID              string `json:"id"`
+		SupportsProxied bool   `json:"supports_proxied"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"prov-cf": true, "prov-other": false}
+	for _, p := range list {
+		if p.SupportsProxied != want[p.ID] {
+			t.Errorf("%s supports_proxied = %v, want %v", p.ID, p.SupportsProxied, want[p.ID])
+		}
+	}
+	if len(list) != 2 {
+		t.Fatalf("got %d providers, want 2", len(list))
+	}
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 func sameBoolPtr(a, b *bool) bool {

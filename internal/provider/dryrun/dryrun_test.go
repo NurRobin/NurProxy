@@ -181,6 +181,49 @@ func TestProxiedRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPatchRecordKeepsOtherFields asserts PatchRecord changes only the given
+// fields, like Cloudflare's PATCH.
+func TestPatchRecordKeepsOtherFields(t *testing.T) {
+	ctx := context.Background()
+	d := newWrapped()
+	cfg := json.RawMessage(`{}`)
+	id, err := d.CreateRecord(ctx, cfg, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "old.example.com", TTL: 300})
+	if err != nil {
+		t.Fatalf("CreateRecord: %v", err)
+	}
+	rp, ok := d.(provider.RecordPatcher)
+	if !ok {
+		t.Fatal("dry-run provider does not implement RecordPatcher")
+	}
+	on := true
+	target := "edge.example.com"
+	tests := []struct {
+		name  string
+		patch provider.RecordPatch
+		want  provider.Record
+	}{
+		{"proxy only", provider.RecordPatch{Proxied: &on}, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "old.example.com", TTL: 300, Proxied: true}},
+		{"target only", provider.RecordPatch{Content: &target}, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "edge.example.com", TTL: 300, Proxied: true}},
+	}
+	for _, tc := range tests {
+		if err := rp.PatchRecord(ctx, cfg, id, tc.patch); err != nil {
+			t.Fatalf("%s: PatchRecord: %v", tc.name, err)
+		}
+		got, _ := d.GetRecord(ctx, cfg, id)
+		tc.want.ID = id
+		if *got != tc.want {
+			t.Fatalf("%s: record = %+v, want %+v", tc.name, *got, tc.want)
+		}
+	}
+	if err := rp.PatchRecord(ctx, cfg, "missing", provider.RecordPatch{Proxied: &on}); err == nil {
+		t.Fatal("PatchRecord on unknown record succeeded")
+	}
+	txt, _ := d.CreateRecord(ctx, cfg, provider.Record{Type: "TXT", Name: "_acme-challenge.app.example.com", Content: "tok"})
+	if err := rp.PatchRecord(ctx, cfg, txt, provider.RecordPatch{Proxied: &on}); err == nil {
+		t.Fatal("PatchRecord proxied a TXT record")
+	}
+}
+
 func TestUpdateUnknownFails(t *testing.T) {
 	d := newWrapped()
 	err := d.UpdateRecord(context.Background(), json.RawMessage(`{}`), "missing", provider.Record{Type: "A", Name: "x", Content: "1.2.3.4"})

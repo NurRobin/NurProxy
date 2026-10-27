@@ -370,9 +370,27 @@ func TestSandboxEndToEnd(t *testing.T) {
 	}
 	api.put(fmt.Sprintf("/api/v1/domains/%d", apex.ID), map[string]any{"proxied": false}, nil)
 	api.post(fmt.Sprintf("/api/v1/domains/%d/dns/takeover", apex.ID), map[string]any{}, nil)
+	// A background reconcile may enforce the setting before the takeover does,
+	// so only require that the flip happened, not who did it.
 	flipped := auditFor(apex.ID, "dns_proxied_updated")
-	if len(flipped) != 1 || !strings.Contains(flipped[0], "from proxied to DNS only") {
-		t.Fatalf("explicit proxied=false was not enforced on the existing record; dns_proxied_updated audit = %q", flipped)
+	if len(flipped) == 0 {
+		t.Fatal("explicit proxied=false was not enforced on the existing record: no dns_proxied_updated audit entry")
+	}
+	for _, f := range flipped {
+		if !strings.Contains(f, "from proxied to DNS only") {
+			t.Fatalf("unexpected proxy change: %q", f)
+		}
+	}
+	// A second takeover reports the record's live state in its audit text.
+	api.post(fmt.Sprintf("/api/v1/domains/%d/dns/takeover", apex.ID), map[string]any{}, nil)
+	sawDNSOnly := false
+	for _, d := range auditFor(apex.ID, "dns_takeover") {
+		if strings.Contains(d, "(DNS only)") {
+			sawDNSOnly = true
+		}
+	}
+	if !sawDNSOnly {
+		t.Fatalf("apex record is still proxied after the flip; dns_takeover audit = %q", auditFor(apex.ID, "dns_takeover"))
 	}
 	var apexAfter struct {
 		Proxied *bool `json:"proxied"`

@@ -40,6 +40,9 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 		Name      string `json:"name"`
 		IsDefault bool   `json:"is_default"`
 		CreatedAt string `json:"created_at"`
+		// SupportsProxied tells the dashboard whether to offer the per-domain
+		// proxy setting for this provider's zones (#126).
+		SupportsProxied bool `json:"supports_proxied"`
 	}
 	resp := make([]providerResponse, len(providers))
 	for i, p := range providers {
@@ -49,6 +52,8 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 			Name:      p.Name,
 			IsDefault: p.IsDefault,
 			CreatedAt: p.CreatedAt.String(),
+
+			SupportsProxied: provider.SupportsProxied(p.Type),
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

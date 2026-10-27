@@ -125,7 +125,7 @@ export default function Domains() {
   // The proxy setting only means something on Cloudflare zones (#126).
   const zoneSupportsProxy = (zoneId: string) => {
     const zone = zones.find((z) => z.id === zoneId);
-    return !!zone && providers.find((p) => p.id === zone.provider_id)?.type === 'cloudflare';
+    return !!zone && !!providers.find((p) => p.id === zone.provider_id)?.supports_proxied;
   };
 
   // Resolve the agent that will serve a domain (via its server) so the edit form

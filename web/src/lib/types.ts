@@ -4,6 +4,8 @@ export interface Provider {
   name: string;
   is_default: boolean;
   created_at: string;
+  /** Whether zones of this provider can proxy records (Cloudflare orange cloud). */
+  supports_proxied?: boolean;
 }
 
 export interface Zone {
