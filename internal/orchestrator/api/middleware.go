@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		// 1) Session cookie → dashboard (UI)
 		if cookie, err := r.Cookie("nurproxy_session"); err == nil {
 			if _, err := s.sessions.Verify(cookie.Value); err == nil {
+				if !cookieMutationOriginAllowed(r) {
+					writeError(w, http.StatusForbidden, "cross-site cookie-authenticated mutation rejected")
+					return
+				}
 				ctx := context.WithValue(r.Context(), ctxActor, "admin")
 				ctx = context.WithValue(ctx, ctxSource, models.AuditSourceUI)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -67,6 +72,38 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		writeError(w, http.StatusUnauthorized, "authentication required")
 	}
+}
+
+func cookieMutationOriginAllowed(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		if referer := r.Header.Get("Referer"); referer != "" {
+			parsed, err := url.Parse(referer)
+			if err != nil {
+				return false
+			}
+			origin = parsed.Scheme + "://" + parsed.Host
+		}
+	}
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	expectedScheme := "http"
+	if requestIsHTTPS(r) {
+		expectedScheme = "https"
+	}
+	return strings.EqualFold(parsed.Scheme, expectedScheme) && strings.EqualFold(parsed.Host, r.Host)
 }
 
 // requireAgentAuth wraps a handler to require agent-specific auth.

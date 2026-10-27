@@ -16,6 +16,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // stubPusher publishes a fixed intent set whenever the handler asks to push,
@@ -141,6 +142,61 @@ func TestAgentStream_DeliversRoutesAndMarksOnline(t *testing.T) {
 	}
 }
 
+func TestAgentStream_ReplaysDurablePendingManualRepair(t *testing.T) {
+	srv, database := testServer(t)
+	token := makeAgent(t, database, "agent-1", "edge1.example.com", models.AgentStatusAdopted, nil)
+	diagnostic := recoveryDiagnostic("agent-1")
+	if err := database.UpsertDiagnostic("agent-1", diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	operation := recoverymodel.OperationReport{
+		OperationID: "op-reconnect", DiagnosticID: diagnostic.ID, Action: diagnostic.ProposedAction,
+		Source: recoverymodel.RequestSourceUser, State: recoverymodel.OperationStatePlanned,
+		StartedAt: now, Steps: []recoverymodel.Step{{Name: "planned", Summary: "safe typed repair requested", State: recoverymodel.OperationStatePlanned, At: now}},
+	}
+	if err := database.CreateRepairOperationIfNoActive("agent-1", operation, diagnostic.ResourceFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetAgentHub(agenthub.New(), nil)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/v1/agents/agent-1/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	scanner := bufio.NewScanner(resp.Body)
+	sawRepair := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event:") && strings.Contains(line, agenthub.EventRepairRequest) {
+			sawRepair = true
+			continue
+		}
+		if sawRepair && strings.HasPrefix(line, "data:") {
+			var envelope proxymodel.RepairRequestEnvelope
+			if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Request.OperationID != operation.OperationID || !envelope.Request.StartedAt.Equal(operation.StartedAt) {
+				t.Fatalf("replayed request = %#v", envelope.Request)
+			}
+			return
+		}
+	}
+	t.Fatalf("pending repair event not received: %v", scanner.Err())
+}
+
 func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 	srv, database := testServer(t)
 	token := makeAgent(t, database, "agent-1", "edge1.example.com", models.AgentStatusAdopted, nil)
@@ -168,6 +224,14 @@ func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 
 	artifactID := fmt.Sprintf("dom-%d", dom.ID)
 	content := `{"@id":"r1","match":[{"host":["app.example.com"]}]}`
+	adoptedID := "adopt-agent-1-caddy-caddy-route-r1"
+	if err := database.CreateConfigArtifact(&models.ConfigArtifact{
+		ID: adoptedID, AgentID: "agent-1", Backend: "caddy",
+		Target: models.Target{Kind: "caddy-route", Path: "caddy:route:r1"},
+		Source: models.ArtifactSourceGenerated, Content: content,
+	}, "agent:agent-1", "restart adoption race"); err != nil {
+		t.Fatalf("seed adopted target occupant: %v", err)
+	}
 	ack := proxymodel.ApplyAck{Reports: []proxymodel.ArtifactReport{{
 		ArtifactID: artifactID,
 		Host:       "app.example.com",
@@ -211,6 +275,9 @@ func TestAgentRoutesAck_UpdatesDomainStatus(t *testing.T) {
 	}
 	if art.DomainID == nil || *art.DomainID != dom.ID {
 		t.Errorf("artifact domain id = %v, want %d", art.DomainID, dom.ID)
+	}
+	if _, err := database.GetConfigArtifact(adoptedID); err == nil {
+		t.Error("temporary adopted identity still occupies the canonical managed target")
 	}
 
 	// A re-apply of byte-identical content must NOT spawn a phantom version.

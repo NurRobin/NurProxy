@@ -13,10 +13,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -25,8 +27,16 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/logtail"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
+	apacheproxy "github.com/NurRobin/NurProxy/internal/agent/proxy/apache"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
+	nginxproxy "github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
+	"github.com/NurRobin/NurProxy/internal/agent/recovery"
+	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverypolicy"
 )
 
 const (
@@ -53,6 +63,7 @@ const (
 // separate from a single Apply so the classic ports-80/443 bind-failure stays
 // distinctly attributed (and clears health on success), exactly as before.
 type caddyBackend interface {
+	Info() proxy.Info
 	EnsureServer(ctx context.Context) error
 	ClearRoutes(ctx context.Context) error
 	AddRoute(ctx context.Context, route json.RawMessage) error
@@ -88,6 +99,14 @@ type managedArtifact struct {
 	targetKind string
 	targetPath string
 	checksum   string
+}
+
+type ManagedApplier interface {
+	Apply(context.Context, helperprotocol.ManagedIntentSetEnvelope) (helperprotocol.Signed[helperprotocol.HelperReceipt], error)
+}
+
+type managedArtifactReader interface {
+	ReadManaged(context.Context) ([]proxy.Artifact, error)
 }
 
 // Client manages the agent's stream connection and applies pushed routes.
@@ -132,8 +151,23 @@ type Client struct {
 	// tailsMu guards tails, the live on-demand tail sessions keyed by session ID.
 	// Each session has a cancel func that the matching stop event (or Run's
 	// shutdown) calls to end the tailer.
-	tailsMu sync.Mutex
-	tails   map[string]context.CancelFunc
+	tailsMu        sync.Mutex
+	tails          map[string]context.CancelFunc
+	recovery       *recovery.Coordinator
+	managedApplyMu sync.RWMutex
+	managedApply   ManagedApplier
+}
+
+func (c *Client) WithRecovery(coordinator *recovery.Coordinator) *Client {
+	c.recovery = coordinator
+	return c
+}
+
+func (c *Client) WithManagedApply(applier ManagedApplier) *Client {
+	c.managedApplyMu.Lock()
+	c.managedApply = applier
+	c.managedApplyMu.Unlock()
+	return c
 }
 
 // New creates a stream Client. backend is the bundled-Caddy proxy backend the
@@ -299,6 +333,13 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			return
 		}
 		c.applyIntents(ctx, set)
+	case "managed_routes":
+		envelope, err := helperprotocol.Decode[helperprotocol.ManagedIntentSetEnvelope]([]byte(data))
+		if err != nil || envelope.Validate() != nil || envelope.Intent.Envelope.Payload.AgentID != c.agentID {
+			log.Printf("Stream: bad managed intent payload")
+			return
+		}
+		c.applyManagedIntents(ctx, envelope)
 	case "ping":
 		// Liveness only — nothing to do.
 	case "log_tail":
@@ -315,9 +356,214 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			return
 		}
 		c.stopLogTail(stop.SessionID)
+	case "recovery_policy":
+		if c.recovery == nil {
+			return
+		}
+		var envelope struct {
+			Policy struct {
+				SafeAutoRepair *bool `json:"safe_auto_repair"`
+			} `json:"policy"`
+		}
+		if err := recoverymodel.DecodeStrict([]byte(data), &envelope); err != nil || envelope.Policy.SafeAutoRepair == nil {
+			log.Printf("Stream: bad recovery_policy payload")
+			return
+		}
+		c.recovery.SetPolicy(*envelope.Policy.SafeAutoRepair)
+	case "repair_request":
+		if c.recovery == nil {
+			return
+		}
+		var envelope proxymodel.RepairRequestEnvelope
+		if err := recoverymodel.DecodeStrict([]byte(data), &envelope); err != nil || envelope.Validate() != nil {
+			log.Printf("Stream: bad repair_request payload")
+			return
+		}
+		if _, err := c.recovery.HandleRequest(ctx, envelope.Request); err != nil {
+			log.Printf("Stream: rejected repair request %q: %v", envelope.Request.OperationID, err)
+		}
+		c.syncRecoveryHealth()
 	default:
 		log.Printf("Stream: ignoring unknown event %q", eventType)
 	}
+}
+
+func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotocol.ManagedIntentSetEnvelope) {
+	c.managedApplyMu.RLock()
+	applier := c.managedApply
+	c.managedApplyMu.RUnlock()
+	if applier == nil {
+		log.Printf("Stream: managed desired state pending verified root helper")
+		if c.health != nil {
+			c.health.SetError("managed desired state pending verified root helper")
+		}
+		return
+	}
+	receipt, err := applier.Apply(ctx, envelope)
+	if err != nil {
+		if errors.Is(err, recoverycontrol.ErrManagedStagingAccess) && c.recovery != nil {
+			info := c.caddy.Info()
+			c.recovery.Observe(ctx, &proxy.Failure{
+				Backend: info.Kind, Phase: proxy.FailurePhaseValidate, Permission: true,
+				Output: recoverypolicy.ExclusiveManagedDirectoryEvidence, Err: recoverycontrol.ErrManagedStagingAccess,
+			})
+			c.syncRecoveryHealth()
+		}
+		log.Printf("Stream: privileged managed apply failed: %v", err)
+		if c.health != nil {
+			c.health.SetError("privileged managed proxy reconciliation failed")
+		}
+		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed", nil)
+		return
+	}
+	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
+		log.Printf("Stream: privileged managed apply %s ended as %s: %s", receipt.Envelope.Payload.OperationID,
+			receipt.Envelope.Payload.State, receipt.Envelope.Payload.SanitizedResult)
+		if c.health != nil {
+			c.health.SetError("privileged managed proxy reconciliation did not succeed")
+		}
+		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation did not succeed", nil)
+		return
+	}
+	if c.health != nil {
+		c.health.SetError("")
+	}
+	c.sendManagedAck(ctx, envelope.IntentSet, "", receipt.Envelope.Payload.ManagedArtifacts)
+}
+
+func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string, attested []helperprotocol.ManagedArtifactReceipt) {
+	var reports []proxymodel.ArtifactReport
+	var managed map[string]managedArtifact
+	if applyError == "" {
+		reports, managed = c.managedAckReportsFromReceipt(set, attested)
+	} else {
+		reports, managed = c.managedAckReports(ctx, set, applyError)
+	}
+	if applyError == "" {
+		c.carryKeepManaged(set.Keep, managed)
+		c.setManaged(managed)
+		c.applyStateMu.Lock()
+		c.lastApplyClean = false
+		c.applyStateMu.Unlock()
+	}
+	c.sendAck(ctx, reports)
+}
+
+func (c *Client) managedAckReportsFromReceipt(set proxymodel.IntentSet, attested []helperprotocol.ManagedArtifactReceipt) ([]proxymodel.ArtifactReport, map[string]managedArtifact) {
+	reports := make([]proxymodel.ArtifactReport, 0, len(set.Intents))
+	managed := make(map[string]managedArtifact, len(set.Intents))
+	byID := make(map[string]helperprotocol.ManagedArtifactReceipt, len(attested))
+	invalidSet := len(attested) != len(set.Intents)
+	for _, artifact := range attested {
+		if artifact.Validate() != nil {
+			invalidSet = true
+		}
+		if _, duplicate := byID[artifact.ArtifactID]; duplicate {
+			invalidSet = true
+		}
+		byID[artifact.ArtifactID] = artifact
+	}
+	info := c.caddy.Info()
+	for _, intent := range set.Intents {
+		report := proxymodel.ArtifactReport{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Backend: intent.Backend}
+		artifact, found := byID[intent.ArtifactID]
+		target, targetErr := managedFileTarget(info, intent)
+		if invalidSet || !found || targetErr != nil || artifact.Backend != intent.Backend || artifact.TargetKind != string(proxy.TargetKindFile) ||
+			artifact.TargetPath != target.Path || !artifact.Enabled {
+			report.Error = "post-apply attested artifact verification failed"
+			reports = append(reports, report)
+			continue
+		}
+		report.TargetKind = artifact.TargetKind
+		report.TargetPath = artifact.TargetPath
+		report.Content = artifact.Content
+		report.Checksum = artifact.Checksum
+		report.Enabled = artifact.Enabled
+		report.Warnings = append([]string(nil), artifact.Warnings...)
+		managed[intent.ArtifactID] = managedArtifact{targetKind: report.TargetKind, targetPath: report.TargetPath, checksum: report.Checksum}
+		reports = append(reports, report)
+	}
+	return reports, managed
+}
+
+func (c *Client) managedAckReports(ctx context.Context, set proxymodel.IntentSet, applyError string) ([]proxymodel.ArtifactReport, map[string]managedArtifact) {
+	reports := make([]proxymodel.ArtifactReport, 0, len(set.Intents))
+	managed := make(map[string]managedArtifact, len(set.Intents))
+	info := c.caddy.Info()
+	var liveByPath map[string]proxy.Artifact
+	var liveReadError string
+	if applyError == "" && (info.Kind == proxy.KindNginx || info.Kind == proxy.KindApache) {
+		reader, ok := c.caddy.(managedArtifactReader)
+		if !ok {
+			liveReadError = "post-apply live artifact reader unavailable"
+		} else if live, err := reader.ReadManaged(ctx); err != nil {
+			liveReadError = "post-apply live artifact read failed"
+		} else {
+			liveByPath = make(map[string]proxy.Artifact, len(live))
+			for _, artifact := range live {
+				if _, duplicate := liveByPath[artifact.Target.Path]; duplicate {
+					liveReadError = "post-apply live artifact identity is ambiguous"
+					break
+				}
+				liveByPath[artifact.Target.Path] = artifact
+			}
+		}
+	}
+	for _, intent := range set.Intents {
+		report := proxymodel.ArtifactReport{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Backend: intent.Backend, Error: applyError}
+		if applyError == "" {
+			var artifact proxy.Artifact
+			var err error
+			if info.Kind == proxy.KindNginx || info.Kind == proxy.KindApache {
+				if liveReadError != "" {
+					report.Error = liveReadError
+				} else {
+					var target proxy.Target
+					target, err = managedFileTarget(info, intent)
+					if err == nil {
+						var found bool
+						artifact, found = liveByPath[target.Path]
+						if !found || artifact.Target.Kind != proxy.TargetKindFile || artifact.Adopted || !artifact.Enabled || !proxy.HasManagedArtifactMarker(artifact.Content) {
+							err = fmt.Errorf("helper-installed artifact is absent or lacks exact provenance")
+						}
+					}
+				}
+			} else {
+				artifact, err = c.caddy.Render(ctx, intent.Route)
+			}
+			if report.Error == "" {
+				if err != nil {
+					report.Error = "post-apply live artifact verification failed"
+				} else {
+					report.TargetKind = string(artifact.Target.Kind)
+					report.TargetPath = artifact.Target.Path
+					report.Content = artifact.Content
+					report.Checksum = checksum(artifact.Content)
+					report.Enabled = artifact.Enabled
+					report.Warnings = artifact.Warnings
+					managed[intent.ArtifactID] = managedArtifact{targetKind: report.TargetKind, targetPath: report.TargetPath, checksum: report.Checksum}
+				}
+			}
+		}
+		reports = append(reports, report)
+	}
+	return reports, managed
+}
+
+func managedFileTarget(info proxy.Info, intent proxymodel.RouteIntent) (proxy.Target, error) {
+	if intent.Backend != string(info.Kind) || !filepath.IsAbs(info.ConfigDir) || filepath.Clean(info.ConfigDir) != info.ConfigDir {
+		return proxy.Target{}, fmt.Errorf("managed file target does not match the detected root-owned backend")
+	}
+	var name string
+	switch info.Kind {
+	case proxy.KindNginx:
+		name = nginxproxy.ManagedFileName(intent.Route.Host)
+	case proxy.KindApache:
+		name = apacheproxy.ManagedFileName(intent.Route.Host)
+	default:
+		return proxy.Target{}, fmt.Errorf("managed file target is unavailable for backend")
+	}
+	return proxy.Target{Kind: proxy.TargetKindFile, Path: filepath.Join(info.ConfigDir, name)}, nil
 }
 
 // startLogTail begins an on-demand tail for the requested session (§15). The path
@@ -424,6 +670,46 @@ func (c *Client) sendLogChunk(ctx context.Context, sessionID, path string, ch lo
 // (which can self-ACME as a fallback, §7); file backends that hard-require the
 // cert will fail their own validate, attributed per-artifact.
 func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
+	desired := recovery.DesiredState{Recovery: proxy.RecoveryDesired{KeepCertHosts: append([]string(nil), set.CertKeep...)}, Bundles: recoveryBundles(set.Certs)}
+	if infoProvider, ok := c.caddy.(interface{ Info() proxy.Info }); ok {
+		desired.Classification.ProxyInfo = infoProvider.Info()
+		desired.Classification.ManagedRoots = append([]string(nil), desired.Classification.ProxyInfo.ManagedRoots...)
+		if len(desired.Classification.ManagedRoots) == 0 && desired.Classification.ProxyInfo.ConfigDir != "" {
+			desired.Classification.ManagedRoots = []string{desired.Classification.ProxyInfo.ConfigDir}
+		}
+	}
+	for _, path := range set.Keep {
+		desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, proxy.Target{Kind: proxy.TargetKindFile, Path: path})
+	}
+	for _, intent := range set.Intents {
+		if target := desiredTarget(desired.Classification.ProxyInfo, intent.Route.Host); target.Path != "" {
+			desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, target)
+			bundle, hasBundle := desired.Bundles[intent.Route.Host]
+			validBundle := hasBundle && len(bundle.CertPEM) > 0 && len(bundle.KeyPEM) > 0
+			desired.Classification.DesiredResources = append(desired.Classification.DesiredResources, recovery.DesiredResource{ArtifactID: intent.ArtifactID, Host: intent.Route.Host, Target: target, Source: models.ArtifactSourceGenerated, ApplyState: models.ArtifactStateLive, ValidBundle: validBundle})
+		}
+	}
+	if c.recovery != nil {
+		initialDesired := desired
+		c.recovery.SetDesired(func() recovery.DesiredState { return initialDesired })
+		diagnostics, err := c.recovery.Inspect(ctx)
+		if err != nil {
+			log.Printf("Stream: recovery inspection failed: %v", err)
+		} else {
+			for _, diagnostic := range diagnostics {
+				report, repairErr := c.recovery.AutoRepair(ctx, diagnostic)
+				if repairErr != nil {
+					log.Printf("Stream: safe recovery failed for %s: %v", diagnostic.Code, repairErr)
+				}
+				if report.State == recoverymodel.OperationStateSucceeded {
+					c.applyStateMu.Lock()
+					c.lastApplyClean = false
+					c.applyStateMu.Unlock()
+				}
+			}
+		}
+		c.syncRecoveryHealth()
+	}
 	certsOK := c.installCerts(ctx, set.Certs)
 
 	// On a full push, scrub cert-store entries for hosts no longer managed (§7) —
@@ -478,6 +764,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		art, err := c.caddy.Render(ctx, in.Route)
 		if err != nil {
 			log.Printf("Stream: failed to render intent for %s: %v", host, err)
+			c.observeRecovery(ctx, err)
 			reports = append(reports, proxymodel.ArtifactReport{
 				ArtifactID: in.ArtifactID,
 				Host:       host,
@@ -512,6 +799,17 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		} else {
 			caddyArts = append(caddyArts, caddyArtifact{intent: in, art: art, reportIdx: len(reports) - 1})
 		}
+	}
+
+	// Inspect the backend's owned artifacts after the desired set has been fully
+	// rendered, but before the route apply. A successful safe repair is followed
+	// by this same invocation's normal reconcile; no recursive apply is scheduled.
+	if c.recovery != nil {
+		for _, fa := range fileArts {
+			desired.Recovery.KeepTargets = append(desired.Recovery.KeepTargets, fa.art.Target)
+		}
+		finalDesired := desired
+		c.recovery.SetDesired(func() recovery.DesiredState { return finalDesired })
 	}
 
 	// Change suppression: the periodic reconcile tick re-pushes the same desired
@@ -558,6 +856,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	// them only when the current backend implements them).
 	if err := c.caddy.EnsureServer(ctx); err != nil {
 		log.Printf("Stream: failed to ensure server: %v", err)
+		c.observeRecovery(ctx, err)
 		clean = false
 		if c.health != nil {
 			c.health.SetCaddyRunning(false)
@@ -570,6 +869,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	}
 	if err := c.caddy.ClearRoutes(ctx); err != nil {
 		log.Printf("Stream: failed to clear routes: %v", err)
+		c.observeRecovery(ctx, err)
 		clean = false
 	}
 
@@ -594,6 +894,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	for _, ca := range caddyArts {
 		if err := c.caddy.AddRoute(ctx, json.RawMessage(ca.art.Content)); err != nil {
 			log.Printf("Stream: failed to apply route for %s: %v", ca.intent.Route.Host, err)
+			c.observeRecovery(ctx, err)
 			reports[ca.reportIdx].Error = err.Error()
 			clean = false
 			continue
@@ -608,6 +909,27 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 				targetPath: rep.TargetPath,
 				checksum:   rep.Checksum,
 			}
+		}
+	}
+
+	// Prune file-backed orphans before validating the desired batch. A deleted
+	// TLS vhost can otherwise keep referencing a certificate that deletion has
+	// already scrubbed; nginx -t then fails before the post-apply prune can remove
+	// that same vhost, leaving the agent permanently wedged.
+	fileKeep := make([]proxy.Target, 0, len(fileArts)+len(set.Keep))
+	for _, fa := range fileArts {
+		fileKeep = append(fileKeep, fa.art.Target)
+	}
+	for _, p := range set.Keep {
+		fileKeep = append(fileKeep, proxy.Target{Kind: proxy.TargetKindFile, Path: p})
+	}
+	if len(fileArts) > 0 {
+		if n, err := c.caddy.Prune(ctx, fileKeep); err != nil {
+			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
+			c.observeRecovery(ctx, err)
+			clean = false
+		} else if n > 0 {
+			log.Printf("Stream: pruned %d orphaned vhost(s)", n)
 		}
 	}
 
@@ -631,6 +953,7 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 			for _, fa := range fileArts {
 				reports[fa.reportIdx].Error = err.Error()
 			}
+			c.observeRecovery(ctx, err)
 		} else {
 			if c.health != nil {
 				c.health.SetError("")
@@ -649,28 +972,17 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 		}
 	}
 
-	// Prune ghost vhosts: any NurProxy-generated file on disk that is NOT in this
-	// (authoritative) desired set is a deleted domain's leftover. The backend removes
-	// it and reloads — over the dial-out stream, never an inbound probe (§3,
-	// invariant #2). Caddy is a no-op (ClearRoutes already handled it). Skipped when
-	// the file apply rolled back, so we never disturb the restored prior state.
-	if fileApplyOK {
-		keep := make([]proxy.Target, 0, len(fileArts)+len(set.Keep))
-		for _, fa := range fileArts {
-			keep = append(keep, fa.art.Target)
-		}
-		// set.Keep carries generated files the orchestrator deliberately did NOT push
-		// this round but the agent must retain — currently drifted artifacts awaiting
-		// review. Including them stops the prune from clobbering a drifted file
-		// (invariant #3, no overwrite while drifted).
-		for _, p := range set.Keep {
-			keep = append(keep, proxy.Target{Kind: proxy.TargetKindFile, Path: p})
-		}
+	// The built-in Caddy path still prunes after AddRoute, because its live route
+	// targets are only known once the additions above have succeeded. File-backed
+	// agents were already pruned before batch validation.
+	if len(fileArts) == 0 && fileApplyOK {
+		keep := append([]proxy.Target(nil), fileKeep...)
 		// Built-in-Caddy routes applied above are admin-API targets, not files; include
 		// them so Prune retains their (still-wanted) cert material instead of scrubbing it.
 		keep = append(keep, caddyKept...)
 		if n, err := c.caddy.Prune(ctx, keep); err != nil {
 			log.Printf("Stream: prune of orphaned vhosts failed: %v", err)
+			c.observeRecovery(ctx, err)
 			clean = false
 		} else if n > 0 {
 			log.Printf("Stream: pruned %d orphaned vhost(s)", n)
@@ -690,9 +1002,57 @@ func (c *Client) applyIntents(ctx context.Context, set proxymodel.IntentSet) {
 	c.lastApplyClean = clean
 	c.lastFullApply = time.Now()
 	c.applyStateMu.Unlock()
+	if clean && c.recovery != nil {
+		if err := c.recovery.ReconcileSucceeded(ctx); err != nil {
+			log.Printf("Stream: post-reconcile recovery inspection failed: %v", err)
+		}
+		c.syncRecoveryHealth()
+	}
 
 	log.Printf("Stream: applied %d/%d intents", applied, len(intents))
 	c.sendAck(ctx, reports)
+}
+
+func desiredTarget(info proxy.Info, host string) proxy.Target {
+	switch info.Kind {
+	case proxy.KindNginx:
+		return proxy.Target{Kind: proxy.TargetKindFile, Path: nginxproxy.ResolveLayout(info.ConfigDir).AvailablePath(host)}
+	case proxy.KindApache:
+		return proxy.Target{Kind: proxy.TargetKindFile, Path: apacheproxy.ResolveLayout(info.ConfigDir).AvailablePath(host)}
+	default:
+		return proxy.Target{}
+	}
+}
+
+func recoveryBundles(wire []proxymodel.CertBundle) map[string]proxy.CertBundle {
+	bundles := make(map[string]proxy.CertBundle, len(wire))
+	for _, bundle := range wire {
+		bundles[bundle.Host] = proxy.CertBundle{Host: bundle.Host, CertPEM: []byte(bundle.CertPEM), KeyPEM: []byte(bundle.KeyPEM), MaterializeKey: bundle.MaterializeKey}
+	}
+	return bundles
+}
+
+func (c *Client) observeRecovery(ctx context.Context, err error) {
+	if c.recovery == nil || err == nil {
+		return
+	}
+	diagnostic := c.recovery.Observe(ctx, err)
+	if diagnostic.AutoRepairEligible {
+		if report, repairErr := c.recovery.AutoRepair(ctx, diagnostic); repairErr != nil {
+			log.Printf("Stream: recovery of %s failed: %v", diagnostic.Code, repairErr)
+		} else if report.State == recoverymodel.OperationStateSucceeded {
+			c.applyStateMu.Lock()
+			c.lastApplyClean = false
+			c.applyStateMu.Unlock()
+		}
+	}
+	c.syncRecoveryHealth()
+}
+
+func (c *Client) syncRecoveryHealth() {
+	if c.recovery != nil && c.health != nil {
+		c.health.SetDiagnostics(c.recovery.ActiveDiagnostics())
+	}
 }
 
 // carryKeepManaged carries forward the managed entries for Keep'd paths (drifted
@@ -772,6 +1132,7 @@ func (c *Client) installCerts(ctx context.Context, certs []proxymodel.CertBundle
 	}
 	if err := c.caddy.InstallCerts(ctx, bundles); err != nil {
 		log.Printf("Stream: failed to install %d cert bundle(s): %v", len(bundles), err)
+		c.observeRecovery(ctx, err)
 		if c.health != nil {
 			c.health.SetError(fmt.Sprintf("failed to install TLS certificates: %v", err))
 		}
@@ -806,6 +1167,7 @@ func (c *Client) applyServerTLS(ctx context.Context, intents []proxymodel.RouteI
 	}
 	if err := c.caddy.EnsureServerTLS(ctx, tlsIntents); err != nil {
 		log.Printf("Stream: failed to configure TLS strategy: %v", err)
+		c.observeRecovery(ctx, err)
 		if c.health != nil {
 			c.health.SetError(fmt.Sprintf("failed to configure TLS strategy: %v", err))
 		}

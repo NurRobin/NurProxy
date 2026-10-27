@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -45,6 +46,49 @@ func LoadOrGenerateAccountKey(path string) (crypto.PrivateKey, error) {
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
 		return nil, fmt.Errorf("tls: writing ACME account key %s: %w", path, err)
+	}
+	return key, nil
+}
+
+func LoadOrGenerateAccountKeyFile(file *os.File, created bool) (crypto.PrivateKey, error) {
+	if err := file.Chmod(0o600); err != nil {
+		return nil, err
+	}
+	if !created {
+		if _, err := file.Seek(0, 0); err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return nil, fmt.Errorf("tls: reading account key descriptor: %w", err)
+		}
+		block, _ := pem.Decode(data)
+		if block == nil {
+			return nil, fmt.Errorf("tls: account key descriptor is not valid PEM")
+		}
+		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("tls: parsing account key descriptor: %w", err)
+		}
+		return key, nil
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("tls: generating ACME account key: %w", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("tls: marshaling ACME account key: %w", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if _, err := file.WriteAt(pemBytes, 0); err != nil {
+		return nil, fmt.Errorf("tls: writing ACME account key descriptor: %w", err)
+	}
+	if err := file.Truncate(int64(len(pemBytes))); err != nil {
+		return nil, err
+	}
+	if err := file.Sync(); err != nil {
+		return nil, err
 	}
 	return key, nil
 }

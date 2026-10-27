@@ -37,6 +37,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // backendName is the registry key for the externally-installed nginx backend.
@@ -52,30 +53,6 @@ func init() {
 		b := New(cfg)
 		return b, nil
 	})
-}
-
-// commandError carries an nginx -t failure with its attribution so Apply can
-// surface "we broke it" distinctly from "your existing config was already
-// broken" (§10). It is returned by Validate's internal test step and unwrapped by
-// callers that want the structured attribution; its Error() yields a
-// human-readable message with the jump-to-file location.
-type commandError struct {
-	// Attribution classifies the failure (ours vs the operator's config).
-	Attribution ErrAttribution
-}
-
-func (e *commandError) Error() string {
-	a := e.Attribution
-	if !a.Located {
-		if a.Permission {
-			return fmt.Sprintf("nginx -t could not complete with the agent's privileges — permission denied reading nginx files (e.g. other vhosts' TLS keys or the error log). Grant the agent privilege to run 'nginx -t' / 'nginx -s reload' (see the agent's permission remediation). nginx output: %s", strings.TrimSpace(a.Raw))
-		}
-		return fmt.Sprintf("nginx -t failed: %s", strings.TrimSpace(a.Raw))
-	}
-	if a.Ours {
-		return fmt.Sprintf("nginx -t failed in the generated config at %s:%d", a.File, a.Line)
-	}
-	return fmt.Sprintf("nginx -t failed: error in your existing config at %s:%d", a.File, a.Line)
 }
 
 // Runner abstracts the two privileged host commands the backend needs (§12):
@@ -173,11 +150,12 @@ func (b *Backend) WithVersion(v string) *Backend {
 // sites-available directory the backend owns.
 func (b *Backend) Info() proxy.Info {
 	return proxy.Info{
-		Kind:       proxy.KindNginx,
-		Version:    b.version,
-		BinaryPath: b.binary,
-		ConfigDir:  b.layout.Available,
-		LogPaths:   b.logPaths,
+		Kind:         proxy.KindNginx,
+		Version:      b.version,
+		BinaryPath:   b.binary,
+		ConfigDir:    b.layout.Available,
+		ManagedRoots: b.ProbeDirs(),
+		LogPaths:     b.logPaths,
 	}
 }
 
@@ -267,7 +245,7 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 			Kind: proxy.TargetKindFile,
 			Path: b.layout.AvailablePath(route.Host),
 		},
-		Content:  content.String(),
+		Content:  proxy.StampManagedArtifact(content.String()),
 		Enabled:  true,
 		Warnings: warnings,
 	}, nil
@@ -277,8 +255,8 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 // drift checks (§4, §11). It reads ALL files (no whitelist): Existing-mode
 // adoption tracks the operator's hand-written vhosts too — there is nothing to
 // guard against by scoping, because NurProxy never auto-overwrites a file
-// without an explicit Accept. Files NurProxy generated (the nurproxy- prefix)
-// are returned with Adopted=false for drift comparison; every other file is an
+// without an explicit Accept. Files with both the managed filename and exact
+// on-disk provenance marker are returned with Adopted=false; every other file is an
 // operator-authored config, returned with Adopted=true so the orchestrator
 // stores it as Source: manual, version 1. Enabled reports whether the
 // sites-enabled symlink is present.
@@ -302,8 +280,11 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 			continue
 		}
 		path := filepath.Join(b.layout.Available, name)
-		data, err := os.ReadFile(path)
+		data, marked, _, err := proxy.ReadManagedArtifactFile(path)
 		if err != nil {
+			if errors.Is(err, proxy.ErrManagedArtifactNotRegular) {
+				continue
+			}
 			return nil, fmt.Errorf("reading nginx config %q: %w", path, err)
 		}
 		// Debian: activation is an entry in sites-enabled — a symlink (canonical) or
@@ -318,7 +299,7 @@ func (b *Backend) ReadManaged(ctx context.Context) ([]proxy.Artifact, error) {
 			Target:  proxy.Target{Kind: proxy.TargetKindFile, Path: path},
 			Content: string(data),
 			Enabled: enabled,
-			Adopted: !IsManagedFile(name),
+			Adopted: !IsManagedFile(name) || !marked,
 		})
 	}
 	return arts, nil
@@ -405,14 +386,14 @@ func (b *Backend) Apply(ctx context.Context, arts []proxy.Artifact) error {
 
 	out, err := b.runner.Test(ctx)
 	if err != nil {
-		attr := AttributeNginxTestError(out, primaryTarget(arts))
+		attr := AttributeNginxTestError(out, artifactTargets(arts)...)
 		rollback()
-		return &commandError{Attribution: attr}
+		return validationFailure(out, err, attr)
 	}
 
 	if err := b.runner.Reload(ctx); err != nil {
 		rollback()
-		return fmt.Errorf("nginx -s reload failed after passing nginx -t: %w", err)
+		return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
 	}
 
 	// Commit: the staged content is live and valid; drop the temps and mark
@@ -456,7 +437,7 @@ func (b *Backend) Remove(ctx context.Context, target proxy.Target) error {
 	b.removeCerts(ctx, target.Path)
 	if b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
-			return fmt.Errorf("nginx -s reload after remove failed: %w", err)
+			return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
 		}
 	}
 	return nil
@@ -483,12 +464,12 @@ func (b *Backend) removeCerts(ctx context.Context, configPath string) {
 	}
 }
 
-// Prune removes every NurProxy-generated vhost (the nurproxy- prefix) in
+// Prune removes every marker-proven NurProxy-generated vhost in
 // sites-available whose path is not in keep, then reloads once if anything was
 // removed (§3, no ghost vhosts on domain delete). It rides the agent's dial-out
 // stream — applyIntents calls it with the full desired set, so a deleted domain's
 // file is gone on the next push without any inbound probe (invariant #2). Operator
-// configs (no nurproxy- prefix) are never touched. A missing file is not an error.
+// unproven configs are never touched. A missing file is not an error.
 func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 	wanted := make(map[string]bool, len(keep))
 	for _, t := range keep {
@@ -517,25 +498,36 @@ func (b *Backend) Prune(ctx context.Context, keep []proxy.Target) (int, error) {
 		if wanted[path] {
 			continue
 		}
+		identity, marked, err := proxy.CaptureManagedRecoveryPath(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, proxy.ErrManagedArtifactNotRegular) {
+				continue
+			}
+			return removed, fmt.Errorf("checking orphan config %q: %w", path, err)
+		}
+		if !marked {
+			continue
+		}
+		host := recoveryHostFromFileBase(strings.TrimSuffix(strings.TrimPrefix(name, managedPrefix), confSuffix))
+		identities := []proxy.RecoveryPathIdentity{identity}
 		if !b.layout.IsConfD() {
 			link := b.enabledLinkFor(path)
-			if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return removed, fmt.Errorf("removing orphan symlink %q: %w", link, err)
+			if linkIdentity, linkErr := proxy.CaptureRecoveryPath(link); linkErr == nil && linkIdentity.Exists && recoveryLinkTargets(linkIdentity, filepath.Dir(linkIdentity.Path), identity.Path) {
+				identities = append(identities, linkIdentity)
 			}
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		identities = appendExistingRecoveryPaths(identities, strings.TrimSuffix(path, confSuffix)+htpasswdSuffix)
+		if b.certs != nil {
+			identities = appendExistingRecoveryPaths(identities, b.certs.AllRecoveryPaths(host)...)
+		}
+		if err := proxy.RemoveRecoveryCandidatePaths(proxy.NewRecoveryCandidate(recoverymodel.ActionPruneManagedOrphan, host, identities...)); err != nil {
 			return removed, fmt.Errorf("removing orphan config %q: %w", path, err)
 		}
-		// Drop the orphaned vhost's htpasswd sidecar too, if any.
-		_ = os.Remove(strings.TrimSuffix(path, confSuffix) + htpasswdSuffix)
-		// Scrub the orphaned vhost's centrally-issued cert/key artifacts so a
-		// deleted domain leaves no decrypted private key behind.
-		b.removeCerts(ctx, path)
 		removed++
 	}
 	if removed > 0 && b.runner != nil {
 		if err := b.runner.Reload(ctx); err != nil {
-			return removed, fmt.Errorf("nginx -s reload after prune failed: %w", err)
+			return removed, proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseReload, err.Error(), err)
 		}
 	}
 	return removed, nil
@@ -550,7 +542,7 @@ func (b *Backend) Validate(ctx context.Context) error {
 	}
 	out, err := b.runner.Test(ctx)
 	if err != nil {
-		return &commandError{Attribution: AttributeNginxTestError(out, "")}
+		return validationFailure(out, err, AttributeNginxTestError(out, ""))
 	}
 	return nil
 }
@@ -572,7 +564,7 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 	for _, c := range certs {
 		paths, err := b.certs.Install(certstore.Bundle{Host: c.Host, CertPEM: c.CertPEM, KeyPEM: c.KeyPEM, MaterializePlain: c.MaterializeKey})
 		if err != nil {
-			return fmt.Errorf("installing cert for %q: %w", c.Host, err)
+			return proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseCertInstall, err.Error(), err)
 		}
 		slog.InfoContext(ctx, "nginx: installed central cert bundle",
 			slog.String("host", c.Host),
@@ -580,6 +572,15 @@ func (b *Backend) InstallCerts(ctx context.Context, certs []proxy.CertBundle) er
 			slog.Bool("key_encrypted_at_rest", paths.Encrypted))
 	}
 	return nil
+}
+
+func validationFailure(output string, err error, attr ErrAttribution) *proxy.Failure {
+	failure := proxy.NewFailure(proxy.KindNginx, proxy.FailurePhaseValidate, output, err)
+	if attr.Located {
+		failure.SetLocation(attr.File, attr.Line, attr.Ours)
+	}
+	failure.Permission = failure.Permission || attr.Permission
+	return failure
 }
 
 // enabledLinkFor returns the sites-enabled symlink path for a sites-available
@@ -670,15 +671,14 @@ func (b *Backend) ResolvedCommands() (test string, reload string) {
 	return bin + " -t", bin + " -s reload"
 }
 
-// primaryTarget returns the first artifact's target path, used as "our file" for
-// error attribution. A single-domain apply has exactly one; for a multi-file
-// apply the first is a reasonable anchor (the attribution still compares the
-// blamed file against it by base name).
-func primaryTarget(arts []proxy.Artifact) string {
-	if len(arts) == 0 {
-		return ""
+func artifactTargets(arts []proxy.Artifact) []string {
+	targets := make([]string, 0, len(arts))
+	for _, art := range arts {
+		if art.Target.Path != "" {
+			targets = append(targets, art.Target.Path)
+		}
 	}
-	return arts[0].Target.Path
+	return targets
 }
 
 // execRunner is the default Runner: it shells out to the nginx binary for -t and
@@ -693,15 +693,14 @@ type execRunner struct {
 
 // Test runs nginx -t (or the configured override) and returns combined output.
 func (r *execRunner) Test(ctx context.Context) (string, error) {
-	cmd := r.command(ctx, r.testCmd, "-t")
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	cmd, target, role := r.execution(ctx, r.testCmd, "-t")
+	return proxy.RunTargetCombinedOutput(cmd, target, role)
 }
 
 // Reload runs nginx -s reload (or the configured override).
 func (r *execRunner) Reload(ctx context.Context) error {
-	cmd := r.command(ctx, r.reloadCmd, "-s", "reload")
-	out, err := cmd.CombinedOutput()
+	cmd, target, role := r.execution(ctx, r.reloadCmd, "-s", "reload")
+	out, err := proxy.RunTargetCombinedOutput(cmd, target, role)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -715,12 +714,22 @@ func (r *execRunner) Reload(ctx context.Context) error {
 // must read every vhost's TLS key, which are root-owned, so an unprivileged agent
 // genuinely needs this elevation.
 func (r *execRunner) command(ctx context.Context, override string, defaultArgs ...string) *exec.Cmd {
+	cmd, _, _ := r.execution(ctx, override, defaultArgs...)
+	return cmd
+}
+
+func (r *execRunner) execution(ctx context.Context, override string, defaultArgs ...string) (*exec.Cmd, string, proxy.ExecutionRole) {
 	name, args := r.spec(override, defaultArgs)
+	target := name
+	targetRole := proxy.ExecutionRoleBackend
+	if override != "" {
+		targetRole = proxy.ExecutionRoleOverride
+	}
 	if elevateNeeded() && filepath.Base(name) != "sudo" {
 		args = append([]string{"-n", name}, args...)
 		name = "sudo"
 	}
-	return exec.CommandContext(ctx, name, args...)
+	return exec.CommandContext(ctx, name, args...), target, targetRole
 }
 
 // spec resolves a step to its (name, args) WITHOUT sudo: a per-agent override

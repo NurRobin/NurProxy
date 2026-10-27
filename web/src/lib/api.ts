@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView } from './types';
+import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
 
 const BASE = '/api/v1';
 
@@ -134,6 +134,30 @@ export const api = {
     request<Agent>(`/agents/${id}/adopt`, { method: 'PUT', body: JSON.stringify(data) }),
   rejectAgent: (id: string) => request<{ message: string }>(`/agents/${id}/reject`, { method: 'PUT' }),
   deleteAgent: (id: string, cascade = false) => request<{ message: string }>(`/agents/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
+  listRecoveryDiagnostics: (id: string, includeResolved = true, resolvedLimit = 100) =>
+    request<RecoveryDiagnostic[]>(`/agents/${id}/diagnostics?include_resolved=${includeResolved}${includeResolved ? `&resolved_limit=${resolvedLimit}` : ''}`),
+  listRecoveryOperations: (id: string, limit = 50) =>
+    request<RecoveryOperation[]>(`/agents/${id}/repairs?limit=${limit}`),
+  createRecoveryRepair: (id: string, diagnosticId: string, action: RecoveryAction) =>
+    request<RecoveryOperation>(`/agents/${id}/repairs`, {
+      method: 'POST', body: JSON.stringify({ diagnostic_id: diagnosticId, action }),
+    }),
+  setAgentSafeAutoRepair: (id: string, mode: 'inherit' | 'enabled' | 'disabled') =>
+    request<{ mode: string; safe_auto_repair_effective: boolean }>(`/agents/${id}/safe-auto-repair`, {
+      method: 'PUT', body: JSON.stringify({ mode }),
+    }),
+  listHardRecoveryPlans: (id: string) =>
+    request<HardRecoveryPlan[]>(`/agents/${id}/recovery/hard-plans`),
+  getRecoveryHelperStatus: (id: string) =>
+    request<RecoveryHelperStatus>(`/agents/${id}/recovery/helper-status`),
+  enrollRecoveryHelper: (id: string, signedHello: unknown) =>
+    request<RecoveryHelperInstance>(`/agents/${id}/recovery/helper`, {
+      method: 'PUT', body: JSON.stringify(signedHello),
+    }),
+  confirmHardRecoveryPlan: (id: string, planId: string, phase: 1 | 2, confirmationEventId: string, displayPlanHash: string, freshPassword?: string) =>
+    request<HardRecoveryPlan>(`/agents/${id}/recovery/plans/${planId}/confirm`, {
+      method: 'POST', body: JSON.stringify({ phase, confirmation_event_id: confirmationEventId, display_plan_hash: displayPlanHash, fresh_password: freshPassword }),
+    }),
 
   // Servers
   listServers: (agentId: string) => request<Server[]>(`/agents/${agentId}/servers`),

@@ -10,6 +10,7 @@
 package install
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -19,41 +20,118 @@ import (
 	"strings"
 )
 
-// AgentProxyWritePaths are the proxy-backend trees the agent must be able to
-// write/reload through ProtectSystem=strict: config under /etc, plus the log,
-// cache and runtime dirs that nginx -t / -s reload (and apache/caddy) touch.
-// Each is prefixed with "-" so systemd ignores a path absent on this host
-// instead of refusing to start the unit — only the installed backend's dirs
-// exist on any given box. This is what makes the dashboard's "config writable"
-// and "reloadable" checks pass for a file-based backend; without it the mount
-// stays read-only regardless of group/ownership, surfacing as EROFS.
-var AgentProxyWritePaths = []string{
-	"-/etc/nginx", "-/var/log/nginx", "-/var/lib/nginx", "-/var/cache/nginx",
-	"-/etc/apache2", "-/etc/httpd", "-/var/log/apache2", "-/var/log/httpd",
-	"-/etc/caddy", "-/var/lib/caddy", "-/var/log/caddy",
-	"-/run",
+func ParseEnvironmentDataDir(r io.Reader) (string, bool, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	var logical string
+	continuing := false
+	var value string
+	found := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		for _, ch := range line {
+			if ch < 0x20 && ch != '\t' {
+				return "", false, fmt.Errorf("EnvironmentFile contains a control character")
+			}
+		}
+		logical += line
+		if hasUnescapedTrailingBackslash(logical) {
+			logical = logical[:len(logical)-1]
+			continuing = true
+			continue
+		}
+		continuing = false
+		parsed, ok, err := parseEnvironmentDataDirLine(logical)
+		logical = ""
+		if err != nil {
+			return "", false, err
+		}
+		if !ok {
+			continue
+		}
+		if found {
+			return "", false, fmt.Errorf("NP_DATA_DIR is defined more than once")
+		}
+		value, found = parsed, true
+	}
+	if err := scanner.Err(); err != nil {
+		return "", false, err
+	}
+	if continuing {
+		return "", false, fmt.Errorf("NP_DATA_DIR has an unterminated continuation")
+	}
+	return value, found, nil
 }
 
-// AgentCapabilities are the Linux capabilities the agent unit keeps. The agent
-// runs as root but with a restricted bounding set, so it only holds what it
-// needs:
-//   - CAP_NET_BIND_SERVICE: the bundled Caddy binds :80/:443 without full root.
-//   - CAP_DAC_OVERRIDE: in existing mode the agent drives a host nginx/Apache,
-//     and `nginx -t` must read the proxy's TLS private keys (mode 0600, often
-//     not owned by the agent) and write its log files (often owned by www-data).
-//     Without it a root agent obeys the file-permission bits and the reload
-//     self-test fails with "permission denied" on the key or log — even though
-//     ReadWritePaths already made the mount writable (DAC and the read-only
-//     mount are independent). The bundled-Caddy path does not need it, but the
-//     unit is static and cannot know the mode at install time.
-//   - CAP_CHOWN: `nginx -t` (started as root by the agent) runs ngx_create_paths,
-//     which chown()s the temp dirs (client_body_temp_path etc.) to the worker
-//     user. Changing a file's owner requires CAP_CHOWN; with it dropped, the
-//     process falls under the normal chown() permission check and gets EPERM —
-//     nginx attempts the chown unconditionally, even when the dir already has
-//     the right owner — so every config test fails ("chown(...) failed (1:
-//     Operation not permitted)") and no config can ever be applied.
-var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE", "CAP_DAC_OVERRIDE", "CAP_CHOWN"}
+func hasUnescapedTrailingBackslash(s string) bool {
+	count := 0
+	for i := len(s) - 1; i >= 0 && s[i] == '\\'; i-- {
+		count++
+	}
+	return count%2 == 1
+}
+
+func parseEnvironmentDataDirLine(line string) (string, bool, error) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+		return "", false, nil
+	}
+	eq := strings.IndexByte(trimmed, '=')
+	if eq < 0 {
+		if strings.TrimSpace(trimmed) == "NP_DATA_DIR" {
+			return "", true, fmt.Errorf("NP_DATA_DIR is missing =")
+		}
+		return "", false, nil
+	}
+	if strings.TrimSpace(trimmed[:eq]) != "NP_DATA_DIR" {
+		return "", false, nil
+	}
+	raw := strings.TrimSpace(trimmed[eq+1:])
+	if raw == "" {
+		return "", true, fmt.Errorf("NP_DATA_DIR is empty")
+	}
+	quote := byte(0)
+	if raw[0] == '\'' || raw[0] == '"' {
+		quote = raw[0]
+		raw = raw[1:]
+	}
+	var b strings.Builder
+	closed := quote == 0
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if quote != 0 && ch == quote {
+			if strings.TrimSpace(raw[i+1:]) != "" {
+				return "", true, fmt.Errorf("NP_DATA_DIR has trailing characters after quote")
+			}
+			closed = true
+			break
+		}
+		if ch == '\\' && quote != '\'' {
+			i++
+			if i >= len(raw) {
+				return "", true, fmt.Errorf("NP_DATA_DIR has a trailing escape")
+			}
+			ch = raw[i]
+		}
+		if quote == 0 && (ch == '\'' || ch == '"') {
+			return "", true, fmt.Errorf("NP_DATA_DIR has misplaced quoting")
+		}
+		if ch < 0x20 || ch == 0x7f {
+			return "", true, fmt.Errorf("NP_DATA_DIR contains a control character")
+		}
+		b.WriteByte(ch)
+	}
+	if !closed {
+		return "", true, fmt.Errorf("NP_DATA_DIR has an unterminated quote")
+	}
+	return b.String(), true, nil
+}
+
+// AgentCapabilities contains the only privilege retained by the unprivileged
+// network-facing agent. It is needed solely when the bundled Caddy child binds
+// ports 80/443. Existing nginx/apache mutation, validation and reload are typed
+// root-helper transactions; the main agent never receives DAC/CHOWN bypasses.
+var AgentCapabilities = []string{"CAP_NET_BIND_SERVICE"}
 
 // Service describes a NurProxy service to install. The same descriptor is
 // consumed by every Manager; fields without meaning on a given OS are ignored.
@@ -63,13 +141,17 @@ type Service struct {
 	BinaryPath   string            // absolute path to the executable
 	Args         []string          // extra ExecStart arguments
 	User         string            // service user (e.g. "root")
+	Group        string            // optional primary service group (systemd)
 	DataDir      string            // data directory (made ReadWritePaths)
 	WritePaths   []string          // extra ReadWritePaths to punch through ProtectSystem=strict (e.g. proxy config/log/cache trees); prefix an entry with "-" to ignore it when absent
+	AfterUnits   []string          // additional systemd ordering dependencies
+	WantsUnits   []string          // additional weak systemd dependencies
 	EnvFile      string            // optional EnvironmentFile path (systemd)
 	Env          map[string]string // environment variables for the service
 	ConfigFile   string            // optional extra config file to write (e.g. agent.yaml)
 	ConfigData   string            // contents of ConfigFile
 	Capabilities []string          // ambient capabilities, e.g. CAP_NET_BIND_SERVICE (systemd-only)
+	PrivateData  bool              // owner-only data dir (orchestrator); agent defaults retain service-user layout
 }
 
 // fprintf writes progress to the caller's writer; output errors are non-fatal.
@@ -100,13 +182,24 @@ func RenderUnit(s Service) string {
 
 	w("[Unit]\n")
 	w("Description=%s\n", s.Description)
-	w("After=network-online.target\n")
-	w("Wants=network-online.target\n\n")
+	w("After=network-online.target")
+	for _, unit := range s.AfterUnits {
+		w(" %s", unit)
+	}
+	w("\n")
+	w("Wants=network-online.target")
+	for _, unit := range s.WantsUnits {
+		w(" %s", unit)
+	}
+	w("\n\n")
 
 	w("[Service]\n")
 	w("Type=simple\n")
 	if s.User != "" {
 		w("User=%s\n", s.User)
+	}
+	if s.Group != "" {
+		w("Group=%s\n", s.Group)
 	}
 	if s.EnvFile != "" {
 		w("EnvironmentFile=%s\n", s.EnvFile)
@@ -118,6 +211,7 @@ func RenderUnit(s Service) string {
 	w("ExecStart=%s\n", execStart)
 	w("Restart=on-failure\n")
 	w("RestartSec=5\n")
+	w("UMask=0077\n")
 
 	// Security hardening.
 	w("NoNewPrivileges=true\n")
@@ -154,6 +248,63 @@ func RenderEnv(env map[string]string) string {
 		fmt.Fprintf(&b, "%s=%s\n", k, env[k])
 	}
 	return b.String()
+}
+
+func RenderDataDirDropIn(dataDir string) (string, error) {
+	if !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir || dataDir == string(filepath.Separator) {
+		return "", fmt.Errorf("data dir must be a canonical absolute non-root path")
+	}
+	for _, r := range dataDir {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '/' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return "", fmt.Errorf("data dir contains an unsafe character")
+	}
+	for _, blocked := range []string{"/home", "/root", "/tmp", "/var/tmp", "/proc", "/sys", "/dev", "/run/user"} {
+		if dataDir == blocked || strings.HasPrefix(dataDir, blocked+"/") {
+			return "", fmt.Errorf("data dir %s is inaccessible under the packaged service sandbox", dataDir)
+		}
+	}
+	return "[Service]\nReadWritePaths=\nReadWritePaths=" + dataDir + "\n", nil
+}
+
+func WriteDataDirDropIn(path, dataDir string) error {
+	body, err := RenderDataDirDropIn(dataDir)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating drop-in directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".data-dir.conf-*")
+	if err != nil {
+		return fmt.Errorf("creating data-dir drop-in: %w", err)
+	}
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := tmp.WriteString(body); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("installing data-dir drop-in: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // runTool runs an external service tool (systemctl, launchctl, rc-service,

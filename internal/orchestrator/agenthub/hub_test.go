@@ -1,11 +1,95 @@
 package agenthub
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
+
+func TestPublishRecoveryPolicyTyped(t *testing.T) {
+	h := New()
+	ch, unsub := h.Subscribe("a1")
+	defer unsub()
+
+	if !h.PublishRecoveryPolicy("a1", true) {
+		t.Fatal("policy should be delivered")
+	}
+	ev := <-ch
+	if ev.Type != EventRecoveryPolicy {
+		t.Fatalf("event type = %q, want %q", ev.Type, EventRecoveryPolicy)
+	}
+	var got proxymodel.RecoveryPolicyEnvelope
+	if err := json.Unmarshal(ev.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Policy.SafeAutoRepair {
+		t.Fatal("safe auto repair policy was not preserved")
+	}
+}
+
+func TestPublishManagedIntentSetKeepsSignedDesiredStateAtomic(t *testing.T) {
+	h := New()
+	ch, unsub := h.Subscribe("a1")
+	defer unsub()
+	set := helperprotocol.NormalizeManagedIntentSet(proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-1", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.2", Port: 8080}}}}})
+	now := time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC)
+	revision, err := helperprotocol.Digest(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := helperprotocol.ApplyIntent{AgentID: "a1", HelperInstanceID: "helper-1", OperationID: "apply-1", DesiredStateRevision: revision, Resources: []string{"dom-1"}, Artifacts: []helperprotocol.LogicalArtifact{}, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: set.Intents, CertificateKeep: []string{}, AuthorizationKind: helperprotocol.AuthorizationStoredConvergence, AuthorizationEventID: "event-1", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)}
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := helperprotocol.Sign("key-1", private, helperprotocol.NewEnvelope(helperprotocol.MessageApplyIntent, intent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.PublishManagedIntentSet("a1", helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed}) {
+		t.Fatal("managed intent set was not delivered")
+	}
+	event := <-ch
+	if event.Type != EventManagedRoutes {
+		t.Fatalf("event type = %q", event.Type)
+	}
+	var decoded helperprotocol.ManagedIntentSetEnvelope
+	if err := json.Unmarshal(event.Data, &decoded); err != nil || decoded.Validate() != nil {
+		t.Fatalf("invalid managed envelope: %v", err)
+	}
+}
+
+func TestPublishRepairRequestTyped(t *testing.T) {
+	h := New()
+	ch, unsub := h.Subscribe("a1")
+	defer unsub()
+	now := time.Now().UTC()
+	want := recoverymodel.RepairRequest{OperationID: "op-1", DiagnosticID: "diag-1", Action: recoverymodel.ActionRemoveManagedTemp, StartedAt: now, InitialStep: recoverymodel.Step{Name: "planned", State: recoverymodel.OperationStatePlanned, At: now}}
+
+	if !h.PublishRepairRequest("a1", want) {
+		t.Fatal("repair request should be delivered")
+	}
+	ev := <-ch
+	if ev.Type != EventRepairRequest {
+		t.Fatalf("event type = %q, want %q", ev.Type, EventRepairRequest)
+	}
+	var got proxymodel.RepairRequestEnvelope
+	if err := json.Unmarshal(ev.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Request != want {
+		t.Fatalf("request = %#v, want %#v", got.Request, want)
+	}
+	if h.PublishRepairRequest("a1", recoverymodel.RepairRequest{}) {
+		t.Fatal("invalid repair request must fail closed")
+	}
+}
 
 func TestPublishToSubscriber(t *testing.T) {
 	h := New()
@@ -208,5 +292,27 @@ func TestPublishDoesNotBlockWhenBufferFull(t *testing.T) {
 	defer unsub()
 	for i := 0; i < 100; i++ {
 		h.Publish("a1", Event{Type: EventPing})
+	}
+}
+
+func TestPublishReportsWhetherAnySubscriberActuallyEnqueued(t *testing.T) {
+	h := New()
+	first, unsubFirst := h.Subscribe("a1")
+	defer unsubFirst()
+	second, unsubSecond := h.Subscribe("a1")
+	defer unsubSecond()
+
+	for i := 0; i < cap(first); i++ {
+		if !h.Publish("a1", Event{Type: EventPing}) {
+			t.Fatalf("fill publish %d unexpectedly failed", i)
+		}
+	}
+	if h.Publish("a1", Event{Type: EventPing}) {
+		t.Fatal("publish with every subscriber buffer full reported delivery")
+	}
+
+	<-second
+	if !h.Publish("a1", Event{Type: EventPing}) {
+		t.Fatal("publish with one available subscriber did not report delivery")
 	}
 }

@@ -3,6 +3,9 @@ package health
 import (
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 func TestState_New_startsHealthy(t *testing.T) {
@@ -45,4 +48,23 @@ func TestState_concurrentAccess(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestStateDerivesLastErrorFromHighestSeverityActiveDiagnostic(t *testing.T) {
+	s := New()
+	s.SetError("legacy error")
+	now := time.Now().UTC()
+	s.SetDiagnostics([]recoverymodel.Diagnostic{
+		{ID: "warning", Code: recoverymodel.CodeManagedStaleTemp, Subsystem: "proxy", Severity: recoverymodel.SeverityWarning, Ownership: recoverymodel.OwnershipNurProxy, Summary: "stale temp", ResourceFingerprint: "fp-warning", ProposedAction: recoverymodel.ActionRemoveManagedTemp, AutoRepairEligible: true, FirstSeenAt: now, LastSeenAt: now, Occurrences: 1},
+		{ID: "critical", Code: recoverymodel.CodeUnknownProxyError, Subsystem: "proxy", Severity: recoverymodel.SeverityCritical, Ownership: recoverymodel.OwnershipUnknown, Summary: "proxy unsafe", ResourceFingerprint: "fp-critical", FirstSeenAt: now, LastSeenAt: now, Occurrences: 1},
+	})
+	_, lastErr := s.Snapshot()
+	if lastErr != "proxy unsafe" {
+		t.Fatalf("last_error=%q", lastErr)
+	}
+	s.SetDiagnostics(nil)
+	_, lastErr = s.Snapshot()
+	if lastErr != "legacy error" {
+		t.Fatalf("legacy fallback=%q", lastErr)
+	}
 }

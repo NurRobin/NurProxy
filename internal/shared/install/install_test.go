@@ -1,9 +1,87 @@
 package install
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestParseEnvironmentDataDirSupportsSystemdQuotingAndEscapes(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{"NP_DATA_DIR=/srv/nurproxy\n", "/srv/nurproxy"},
+		{"NP_DATA_DIR=\"/srv/nurproxy\"\n", "/srv/nurproxy"},
+		{"NP_DATA_DIR='/srv/nurproxy'\n", "/srv/nurproxy"},
+		{"NP_DATA_DIR=\\/srv\\/nurproxy\n", "/srv/nurproxy"},
+		{"# comment\nNP_PORT=8080\n NP_DATA_DIR = \"/srv/nurproxy\" \n", "/srv/nurproxy"},
+	} {
+		got, found, err := ParseEnvironmentDataDir(strings.NewReader(tt.input))
+		if err != nil || !found || got != tt.want {
+			t.Errorf("parse %q = %q,%v,%v want %q,true,nil", tt.input, got, found, err, tt.want)
+		}
+	}
+}
+
+func TestParseEnvironmentDataDirFailsClosed(t *testing.T) {
+	for _, input := range []string{
+		"NP_DATA_DIR=/srv/one\nNP_DATA_DIR=/srv/two\n",
+		"NP_DATA_DIR=\"/srv/unterminated\n",
+		"NP_DATA_DIR=/srv/trailing\\\n",
+		"NP_DATA_DIR=/srv/control\x00name\n",
+		"NP_DATA_DIR='one' trailing\n",
+		"NP_DATA_DIR\n",
+	} {
+		if _, _, err := ParseEnvironmentDataDir(strings.NewReader(input)); err == nil {
+			t.Errorf("accepted malformed input %q", input)
+		}
+	}
+}
+
+func TestRenderDataDirDropInPinsExactWritablePath(t *testing.T) {
+	got, err := RenderDataDirDropIn("/srv/nurproxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "[Service]\nReadWritePaths=\nReadWritePaths=/srv/nurproxy\n"
+	if got != want {
+		t.Fatalf("drop-in = %q, want %q", got, want)
+	}
+}
+
+func TestRenderDataDirDropInRejectsUnsafeOrSandboxInaccessiblePaths(t *testing.T) {
+	for _, path := range []string{"relative/data", "/", "/srv/../etc", "/srv/bad path", "/home/main/data", "/root/data", "/tmp/data", "/var/tmp/data", "/proc/data", "/sys/data", "/dev/data", "/run/user/1000/data"} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := RenderDataDirDropIn(path); err == nil {
+				t.Fatalf("accepted unsafe data dir %q", path)
+			}
+		})
+	}
+}
+
+func TestWriteDataDirDropInAtomicallyReplacesLinkedDestination(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "data-dir.conf")
+	if err := os.Symlink(outside, dest); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteDataDirDropIn(dest, "/srv/nurproxy"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "unchanged" {
+		t.Fatalf("outside changed: %q", got)
+	}
+	info, err := os.Lstat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o644 {
+		t.Fatalf("drop-in mode/type = %v", info.Mode())
+	}
+}
 
 func TestRenderUnitHardening(t *testing.T) {
 	s := Service{
@@ -22,6 +100,7 @@ func TestRenderUnitHardening(t *testing.T) {
 		"After=network-online.target",
 		"ExecStart=/usr/local/bin/nurproxy-agent --data-dir /var/lib/nurproxy-agent",
 		"Restart=on-failure",
+		"UMask=0077",
 		"NoNewPrivileges=true",
 		"ProtectSystem=strict",
 		"ProtectHome=true",

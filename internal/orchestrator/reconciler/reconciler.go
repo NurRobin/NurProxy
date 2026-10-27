@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/configeq/caddyeq"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -59,14 +61,31 @@ type Reconciler struct {
 	// while non-DNS reconciler events (route push, drift, agent status) stay
 	// "system", since those are not simulated by DNS sandbox mode.
 	dnsDryRun bool
+
+	// anchorRenameGrace is how long an old anchor record released by a rename
+	// is kept before it may be deleted, for CNAMEs NurProxy does not track.
+	anchorRenameGrace time.Duration
+	// anchorWarnAt rate-limits the warning about failing anchor cleanups.
+	anchorWarnAt time.Time
+
+	applyAuthority interface {
+		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
+	}
+}
+
+func (r *Reconciler) SetApplyAuthority(authority interface {
+	SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
+}) {
+	r.applyAuthority = authority
 }
 
 // New creates a Reconciler.
 func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reconciler {
 	return &Reconciler{
-		db:          database,
-		agentClient: agentClient,
-		interval:    interval,
+		db:                database,
+		agentClient:       agentClient,
+		interval:          interval,
+		anchorRenameGrace: defaultAnchorRenameGrace,
 	}
 }
 
@@ -109,8 +128,159 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 	if err != nil {
 		return err
 	}
-	r.hub.PublishIntentSet(agentID, r.intentSetFor(agent, desired, keepExtra))
+	r.publishIntentSet(agentID, r.intentSetFor(agent, desired, keepExtra))
 	return nil
+}
+
+func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) bool {
+	agent, err := r.db.GetAgent(agentID)
+	if err != nil {
+		log.Printf("reconciler: cannot resolve backend for agent %s: %v", agentID, err)
+		return false
+	}
+	backend := backendForAgent(agent)
+	if backend != "nginx" && backend != "apache" {
+		return r.hub.PublishIntentSet(agentID, set)
+	}
+	for _, intent := range set.Intents {
+		if intent.Backend != backend {
+			return r.hub.PublishIntentSet(agentID, set)
+		}
+	}
+	managedHub, managed := r.hub.(interface {
+		PublishManagedIntentSet(string, helperprotocol.ManagedIntentSetEnvelope) bool
+	})
+	if !managed || r.applyAuthority == nil {
+		return r.hub.PublishIntentSet(agentID, set)
+	}
+	set = helperprotocol.NormalizeManagedIntentSet(set)
+	helper, err := r.db.GetRecoveryHelper(agentID)
+	if err != nil {
+		return r.hub.PublishIntentSet(agentID, set)
+	}
+	deletions, err := r.db.ListManagedRouteTombstones(agentID)
+	if err != nil {
+		log.Printf("reconciler: cannot load managed route tombstones for agent %s: %v", agentID, err)
+		return false
+	}
+	deletions = deletionsOutsideDesired(deletions, set.Intents)
+	now := time.Now().UTC()
+	revision, err := helperprotocol.Digest(set)
+	if err != nil {
+		log.Printf("reconciler: cannot digest managed desired state for agent %s: %v", agentID, err)
+		return false
+	}
+	if current, currentErr := r.db.GetCurrentManagedApply(agentID); currentErr == nil &&
+		current.HelperInstanceID == helper.HelperInstanceID && current.DesiredStateRevision == revision &&
+		current.IntentExpiresAt.After(now.Add(30*time.Second)) {
+		currentDeletionDigest, currentDigestErr := helperprotocol.Digest(current.SignedIntent.Envelope.Payload.DeletionSet)
+		deletionDigest, deletionDigestErr := helperprotocol.Digest(deletions)
+		if currentDigestErr == nil && deletionDigestErr == nil && currentDeletionDigest == deletionDigest {
+			return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: current.SignedIntent})
+		}
+	}
+	intent, err := buildApplyIntent(agentID, helper.HelperInstanceID, set, now)
+	if err != nil {
+		log.Printf("reconciler: cannot build managed apply intent for agent %s: %v", agentID, err)
+		return false
+	}
+	intent.DeletionSet = append([]helperprotocol.ManagedDeletion{}, deletions...)
+	if err := intent.Validate(); err != nil {
+		log.Printf("reconciler: managed deletion set is invalid for agent %s: %v", agentID, err)
+		return false
+	}
+	signed, err := r.applyAuthority.SignApplyIntent(intent)
+	if err != nil {
+		log.Printf("reconciler: cannot sign managed apply intent for agent %s: %v", agentID, err)
+		return false
+	}
+	if err := r.db.StoreManagedApplyIntent(agentID, signed, now); err != nil {
+		log.Printf("reconciler: cannot persist managed apply intent for agent %s: %v", agentID, err)
+		return false
+	}
+	return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed})
+}
+
+// deletionsOutsideDesired drops tombstones that collide with the agent's
+// desired routes or with each other. A tombstone whose resource or host is
+// rendered again (a domain moved away and back, or a new domain reusing a
+// deleted host) and a second tombstone for an already listed host would put
+// the same vhost file into one signed apply twice; the helper rejects that,
+// and every apply on the agent would stay blocked. Hosts are compared by the
+// managed vhost file they map to, which is case-sensitive: App.example.com
+// and app.example.com are two files, and the tombstone for one must not be
+// dropped because the other is rendered.
+func deletionsOutsideDesired(deletions []helperprotocol.ManagedDeletion, intents []proxymodel.RouteIntent) []helperprotocol.ManagedDeletion {
+	resources := make(map[string]struct{}, len(intents))
+	files := make(map[string]struct{}, len(intents)+len(deletions))
+	for _, intent := range intents {
+		resources[intent.ArtifactID] = struct{}{}
+		files[helperprotocol.ManagedVhostKey(intent.Route.Host)] = struct{}{}
+	}
+	kept := make([]helperprotocol.ManagedDeletion, 0, len(deletions))
+	for _, deletion := range deletions {
+		if _, rendered := resources[deletion.ResourceID]; rendered {
+			continue
+		}
+		key := helperprotocol.ManagedVhostKey(deletion.Host)
+		if _, taken := files[key]; taken {
+			continue
+		}
+		files[key] = struct{}{}
+		kept = append(kept, deletion)
+	}
+	return kept
+}
+
+func buildApplyIntent(agentID, helperInstanceID string, set proxymodel.IntentSet, issued time.Time) (helperprotocol.ApplyIntent, error) {
+	set = helperprotocol.NormalizeManagedIntentSet(set)
+	if err := set.Validate(); err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	revision, err := helperprotocol.Digest(set)
+	if err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	resources := make([]string, 0, len(set.Intents))
+	resourceSet := make(map[string]struct{}, len(set.Intents)+len(set.Certs))
+	routes := append([]proxymodel.RouteIntent(nil), set.Intents...)
+	for _, route := range routes {
+		if _, exists := resourceSet[route.ArtifactID]; !exists {
+			resources = append(resources, route.ArtifactID)
+			resourceSet[route.ArtifactID] = struct{}{}
+		}
+	}
+	for _, certificate := range set.Certs {
+		resourceID := helperprotocol.CertificateResourceID(certificate.Host)
+		if _, exists := resourceSet[resourceID]; !exists {
+			resources = append(resources, resourceID)
+			resourceSet[resourceID] = struct{}{}
+		}
+	}
+	sort.Strings(resources)
+	artifacts, err := helperprotocol.CertificateArtifacts(set.Certs)
+	if err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	if artifacts == nil {
+		artifacts = []helperprotocol.LogicalArtifact{}
+	}
+	if routes == nil {
+		routes = []proxymodel.RouteIntent{}
+	}
+	intent := helperprotocol.ApplyIntent{
+		AgentID: agentID, HelperInstanceID: helperInstanceID,
+		OperationID: "apply-" + revision[:24] + "-" + strconv.FormatInt(issued.UnixNano(), 36), DesiredStateRevision: revision,
+		Resources: resources, Artifacts: artifacts, DeletionSet: []helperprotocol.ManagedDeletion{}, Routes: routes,
+		PruneCertificates: set.PruneCerts, CertificateKeep: append([]string{}, set.CertKeep...),
+		AuthorizationKind:    helperprotocol.AuthorizationStoredConvergence,
+		AuthorizationEventID: "desired-" + revision[:24],
+		IssuedAt:             issued.Format(time.RFC3339Nano), ExpiresAt: issued.Add(5 * time.Minute).Format(time.RFC3339Nano),
+	}
+	if err := intent.Validate(); err != nil {
+		return helperprotocol.ApplyIntent{}, err
+	}
+	return intent, nil
 }
 
 // intentSetFor assembles the complete stream push for an agent: the rendered
@@ -126,15 +296,62 @@ func (r *Reconciler) PushAgentRoutes(agentID string) error {
 func (r *Reconciler) intentSetFor(agent *models.Agent, desired map[string]desiredRoute, keepExtra []string) proxymodel.IntentSet {
 	certs := r.gatherCerts(desired)
 	certs = append(certs, r.gatherCertOnlyCerts(agent)...)
-	certKeep := make([]string, 0, len(certs))
+	certKeepSet := make(map[string]struct{}, len(certs))
 	for i := range certs {
-		certKeep = append(certKeep, certs[i].Host)
+		certKeepSet[certs[i].Host] = struct{}{}
 	}
+	for _, host := range r.liveCertificateKeep(agent) {
+		certKeepSet[host] = struct{}{}
+	}
+	certKeep := make([]string, 0, len(certKeepSet))
+	for host := range certKeepSet {
+		certKeep = append(certKeep, host)
+	}
+	sort.Strings(certKeep)
+	// desired is a map, so both slices come out in random order. The managed
+	// apply revision is a digest of this set; without a stable order an unchanged
+	// desired state gets a new revision, and a new signed intent, on every tick.
+	sort.SliceStable(certs, func(i, j int) bool { return certs[i].Host < certs[j].Host })
+	intents := intentsFromDesired(desired, backendForAgent(agent))
+	sort.Slice(intents, func(i, j int) bool {
+		if intents[i].ArtifactID != intents[j].ArtifactID {
+			return intents[i].ArtifactID < intents[j].ArtifactID
+		}
+		return intents[i].Route.Host < intents[j].Route.Host
+	})
 	return proxymodel.IntentSet{
-		Intents: intentsFromDesired(desired, backendForAgent(agent)),
+		Intents: intents,
 		Certs:   certs, Keep: keepExtra,
 		PruneCerts: true, CertKeep: certKeep,
 	}
+}
+
+func (r *Reconciler) liveCertificateKeep(agent *models.Agent) []string {
+	domains, err := r.db.ListDomainsByAgent(agent.ID)
+	if err != nil {
+		log.Printf("reconciler: cannot list live certificate consumers for agent %s: %v", agent.ID, err)
+		return nil
+	}
+	zoneNames := make(map[string]string)
+	hosts := make([]string, 0, len(domains))
+	for i := range domains {
+		domain := &domains[i]
+		if domain.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zoneName, ok := zoneNames[domain.ZoneID]
+		if !ok {
+			zone, zoneErr := r.db.GetZone(domain.ZoneID)
+			if zoneErr != nil {
+				continue
+			}
+			zoneName = zone.Name
+			zoneNames[domain.ZoneID] = zoneName
+		}
+		hosts = append(hosts, domain.FQDN(zoneName))
+	}
+	sort.Strings(hosts)
+	return hosts
 }
 
 // gatherCertOnlyCerts collects the cert bundles for an agent's cert-only domains
@@ -403,6 +620,13 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 		log.Printf("reconciler: agent DNS phase failed: %v", err)
 	}
 
+	// Delete anchor records released by agent renames/deletions (#152). Runs
+	// after reconcileAgentDNS so a record an agent re-adopted this cycle has
+	// already been taken back out of the queue.
+	if err := r.reconcileAgentAnchorCleanups(ctx); err != nil {
+		log.Printf("reconciler: anchor cleanup phase failed: %v", err)
+	}
+
 	log.Println("reconciler: cycle complete")
 	return nil
 }
@@ -622,7 +846,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		// agent that missed the instant push (or lost its cert store) keeps
 		// receiving TLS configs it can never validate — and deleted hosts' certs
 		// would never get scrubbed by the tick.
-		r.hub.PublishIntentSet(agent.ID, r.intentSetFor(agent, desiredByFQDN, keepExtra))
+		r.publishIntentSet(agent.ID, r.intentSetFor(agent, desiredByFQDN, keepExtra))
 		return nil
 	}
 
@@ -825,6 +1049,7 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 				Name:    fqdn,
 				Content: expectedTarget,
 				TTL:     0,
+				Proxied: rec.Proxied,
 			}); uErr != nil {
 				log.Printf("reconciler: failed to update DNS record for %s: %v", fqdn, uErr)
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", uErr)); dErr != nil {
@@ -961,12 +1186,14 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
 		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s", fqdn, target))
 	} else {
 		// Delete every conflicting record at this name, then create the CNAME.
+		wasProxied := false
 		for i := range existing {
+			wasProxied = wasProxied || existing[i].Proxied
 			if dErr := dnsProvider.DeleteRecord(ctx, provConfig, existing[i].ID); dErr != nil {
 				return fmt.Errorf("deleting conflicting record %s (%s): %w", existing[i].ID, existing[i].Type, dErr)
 			}
 		}
-		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0})
+		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: wasProxied})
 		if cErr != nil {
 			return fmt.Errorf("creating CNAME for %s: %w", fqdn, cErr)
 		}
@@ -1108,17 +1335,15 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 		// agent reported a routable IPv6 — both families coexist on the same FQDN,
 		// each tracked by its own provider record ID so DDNS updates them
 		// independently.
-		r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "A", a.PublicIP, a.DNSRecordID, func(id string) {
-			a.DNSRecordID = id
-			if uErr := r.db.UpdateAgentDNSRecord(a.ID, id); uErr != nil {
-				log.Printf("reconciler: failed to persist A record id for agent %s: %v", a.ID, uErr)
+		r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "A", a.PublicIP, a.DNSRecordID, func(id string, owned bool) {
+			if stored, ok := r.persistAgentAnchor(a, "A", id, zone.ID, owned); ok {
+				a.DNSRecordID, a.DNSRecordOwned, a.DNSRecordZoneID = id, stored, zone.ID
 			}
 		})
 		if a.PublicIP6 != "" {
-			r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "AAAA", a.PublicIP6, a.DNSRecordID6, func(id string) {
-				a.DNSRecordID6 = id
-				if uErr := r.db.UpdateAgentDNSRecord6(a.ID, id); uErr != nil {
-					log.Printf("reconciler: failed to persist AAAA record id for agent %s: %v", a.ID, uErr)
+			r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "AAAA", a.PublicIP6, a.DNSRecordID6, func(id string, owned bool) {
+				if stored, ok := r.persistAgentAnchor(a, "AAAA", id, zone.ID, owned); ok {
+					a.DNSRecordID6, a.DNSRecordOwned6, a.DNSRecordZoneID6 = id, stored, zone.ID
 				}
 			})
 		}
@@ -1131,9 +1356,10 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 // address record — A or AAAA — for the agent's anchor FQDN. A and AAAA legitimately
 // coexist on the same name, so the only hard conflict is a CNAME already sitting
 // there. persist stores the resolved provider record ID (in memory + DB) for the
-// family; recordID is the currently stored ID ("" if none yet). All failures are
-// logged + audited and never abort the surrounding reconcile loop.
-func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Agent, dnsProvider provider.Provider, provConfig json.RawMessage, recordType, ip, recordID string, persist func(string)) {
+// family, with owned=true only when this call created the record; recordID is
+// the currently stored ID ("" if none yet). All failures are logged + audited
+// and never abort the surrounding reconcile loop.
+func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Agent, dnsProvider provider.Provider, provConfig json.RawMessage, recordType, ip, recordID string, persist func(id string, owned bool)) {
 	action := strings.ToLower(recordType) + "_record" // "a_record" | "aaaa_record"
 	rec := provider.Record{Type: recordType, Name: a.FQDN, Content: ip, TTL: 0}
 
@@ -1160,7 +1386,7 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 				return
 			}
 			// Content matches what we'd set: adopt it (record its ID).
-			persist(adopt.ID)
+			persist(adopt.ID, false)
 			r.auditDNS("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted existing %s %s -> %s", recordType, a.FQDN, ip))
 			return
 		}
@@ -1178,7 +1404,7 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 			r.auditDNS("agent", a.ID, action+"_create_failed", cErr.Error())
 			return
 		}
-		persist(newID)
+		persist(newID, true)
 		r.auditDNS("agent", a.ID, action+"_created", fmt.Sprintf("created %s %s -> %s", recordType, a.FQDN, ip))
 		return
 	}
@@ -1200,6 +1426,7 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 	if existing.Content == ip {
 		return // already up to date — avoid an unnecessary API call
 	}
+	rec.Proxied = existing.Proxied
 	if uErr := dnsProvider.UpdateRecord(ctx, provConfig, recordID, rec); uErr != nil {
 		log.Printf("reconciler: failed to update %s record for agent %s: %v", recordType, a.ID, uErr)
 		r.auditDNS("agent", a.ID, action+"_update_failed", uErr.Error())
@@ -1334,6 +1561,27 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 		// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
 		// applied) is fine.
 		artifactID := artifactIDForDomain(dom.ID)
+		if !dom.CertOnly {
+			srv, srvErr := r.db.GetServer(dom.ServerID)
+			if srvErr != nil {
+				log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
+				continue
+			}
+			agent, agentErr := r.db.GetAgent(srv.AgentID)
+			zone, zoneErr := r.db.GetZone(dom.ZoneID)
+			if agentErr != nil || zoneErr != nil {
+				log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
+				continue
+			}
+			backend := backendForAgent(agent)
+			if backend == "nginx" || backend == "apache" {
+				deletion := helperprotocol.ManagedDeletion{ResourceID: artifactID, Host: dom.FQDN(zone.Name), Backend: backend}
+				if tombstoneErr := r.db.UpsertManagedRouteTombstone(agent.ID, deletion, time.Now().UTC()); tombstoneErr != nil {
+					log.Printf("reconciler: cannot persist route deletion for domain %d: %v", dom.ID, tombstoneErr)
+					continue
+				}
+			}
+		}
 		if _, aErr := r.db.GetConfigArtifact(artifactID); aErr == nil {
 			if dErr := r.db.DeleteConfigArtifact(artifactID); dErr != nil {
 				log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -21,6 +22,27 @@ import (
 type captureHub struct {
 	mu   sync.Mutex
 	sets []proxymodel.IntentSet
+}
+
+func TestDeleteDomainPersistsManagedRouteTombstoneBeforeImmediatePush(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+	domainID, fqdn := seedDomainTopology(t, srv, cookie)
+
+	w := doRequest(t, handler, http.MethodDelete, "/api/v1/domains/"+strconv.FormatInt(domainID, 10), nil, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete domain: %d: %s", w.Code, w.Body.String())
+	}
+	deletions, err := database.ListManagedRouteTombstones("agent-1")
+	want := helperprotocol.ManagedDeletion{ResourceID: fmt.Sprintf("dom-%d", domainID), Host: fqdn, Backend: "nginx"}
+	if err != nil || len(deletions) != 1 || deletions[0] != want {
+		t.Fatalf("managed deletion tombstones = %#v, err=%v, want %#v", deletions, err, want)
+	}
+	domain, err := database.GetDomain(domainID)
+	if err != nil || domain.Status != models.DomainStatusDeleting {
+		t.Fatalf("domain state after tombstone = %#v, err=%v", domain, err)
+	}
 }
 
 func (h *captureHub) Connected(string) bool                                { return true }
@@ -55,13 +77,12 @@ func TestDomainConfig_ResetAndUpdate_resetManualArtifact(t *testing.T) {
 	const newManual = `{"handle":[{"handler":"static_response","body":"new-manual"}]}`
 
 	cases := []struct {
-		name         string
-		acceptDrift  bool // promote the artifact to Source=manual first
-		method       string
-		pathSuffix   string // appended to /api/v1/domains/{id}
-		body         interface{}
-		wantArtifact bool   // artifact row still present after the call
-		wantRaw      string // "" = next push must render from the domain model
+		name        string
+		acceptDrift bool // promote the artifact to Source=manual first
+		method      string
+		pathSuffix  string // appended to /api/v1/domains/{id}
+		body        interface{}
+		wantRaw     string // "" = next push must render from the domain model
 	}{
 		{
 			name:        "reset after drift-accept renders from the domain model",
@@ -78,10 +99,9 @@ func TestDomainConfig_ResetAndUpdate_resetManualArtifact(t *testing.T) {
 			wantRaw:     newManual,
 		},
 		{
-			name:         "reset with a generated artifact keeps its history",
-			method:       "POST",
-			pathSuffix:   "/config/reset",
-			wantArtifact: true,
+			name:       "reset removes a stale generated artifact before rendering the model",
+			method:     "POST",
+			pathSuffix: "/config/reset",
 		},
 	}
 
@@ -112,16 +132,14 @@ func TestDomainConfig_ResetAndUpdate_resetManualArtifact(t *testing.T) {
 				t.Fatalf("%s %s: %d %s", tc.method, path, w.Code, w.Body.String())
 			}
 
-			_, artErr := database.GetConfigArtifact(artifactID)
-			if tc.wantArtifact && artErr != nil {
-				t.Fatalf("generated artifact should survive a reset: %v", artErr)
+			artifact, artErr := database.GetConfigArtifact(artifactID)
+			if artErr != nil {
+				t.Fatalf("canonical artifact identity should survive config reset: %v", artErr)
 			}
-			if !tc.wantArtifact {
-				if artErr == nil {
-					t.Fatal("manual artifact should be deleted so the next push renders from the domain model")
-				}
-				assertAuditEntry(t, database, "config_artifact", artifactID, "reset")
+			if artifact.Source != models.ArtifactSourceGenerated || artifact.Drifted {
+				t.Fatalf("artifact authority was not reset to the domain model: %+v", artifact)
 			}
+			assertAuditEntry(t, database, "config_artifact", artifactID, "reset")
 
 			// "Next push": exactly what the reconciler would deliver to the agent now.
 			hub := &captureHub{}

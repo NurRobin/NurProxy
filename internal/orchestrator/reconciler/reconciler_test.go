@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
@@ -29,6 +31,21 @@ type mockAgentClient struct {
 	pushCalls        int
 	deleteRouteCalls int              // inbound DeleteRoute invocations (must stay 0 for stream-connected agents)
 	pushErrors       map[string]error // fqdn -> error
+}
+
+func TestBuildApplyIntentBindsDesiredRoutesToEnrolledHelper(t *testing.T) {
+	set := proxymodel.IntentSet{Intents: []proxymodel.RouteIntent{{ArtifactID: "dom-7", Backend: "nginx", Route: proxymodel.Route{Host: "app.example", Upstream: proxymodel.Upstream{Addr: "10.0.0.7", Port: 8080}}}}}
+	issued := time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC)
+	intent, err := buildApplyIntent("agent-1", "helper-1", set, issued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.AgentID != "agent-1" || intent.HelperInstanceID != "helper-1" || intent.Resources[0] != "dom-7" || len(intent.Routes) != 1 || intent.AuthorizationKind != helperprotocol.AuthorizationStoredConvergence {
+		t.Fatalf("unexpected apply intent: %+v", intent)
+	}
+	if len(intent.DesiredStateRevision) != 64 || !strings.HasPrefix(intent.OperationID, "apply-") {
+		t.Fatalf("intent has no stable desired-state identity: %+v", intent)
+	}
 }
 
 func newMockAgentClient() *mockAgentClient {
@@ -545,6 +562,10 @@ func TestBuildDesiredRoutes_SkipsDriftedArtifact(t *testing.T) {
 	if len(keep) != 1 {
 		t.Errorf("drifted artifact path should be in keep, got %d keep paths", len(keep))
 	}
+	set := r.intentSetFor(agent, desired, keep)
+	if !slices.Contains(set.CertKeep, "app.example.com") {
+		t.Fatalf("drifted live vhost certificate was not retained: %+v", set.CertKeep)
+	}
 
 	// With auto-reconcile enabled, the domain is pushed again (and not in keep-extra).
 	if err := d.SetAgentAutoReconcileConfig(agent.ID, true); err != nil {
@@ -886,6 +907,7 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 		Type:    "CNAME",
 		Name:    "app.example.com",
 		Content: "old-agent.example.com", // Wrong target.
+		Proxied: true,
 	}
 	mp.mu.Unlock()
 
@@ -908,6 +930,9 @@ func TestReconcileDNS_FixDrift(t *testing.T) {
 	}
 	if rec.Content != "agent1.example.com" {
 		t.Errorf("record content: got %q, want agent1.example.com", rec.Content)
+	}
+	if !rec.Proxied {
+		t.Error("DNS drift correction changed a proxied record to DNS-only")
 	}
 
 	// Audit log should reflect the update.
@@ -1241,6 +1266,10 @@ func TestReconcileAgentDNS_CreateAndDDNSUpdate(t *testing.T) {
 	if !ok || rec.Type != "A" || rec.Content != "203.0.113.10" || rec.Name != "agent1.example.com" {
 		t.Fatalf("unexpected A record: %+v (ok=%v)", rec, ok)
 	}
+	rec.Proxied = true
+	mp.mu.Lock()
+	mp.records[got.DNSRecordID] = rec
+	mp.mu.Unlock()
 
 	// IP changes — a DDNS cycle should update the record.
 	got.PublicIP = "203.0.113.99"
@@ -1253,6 +1282,9 @@ func TestReconcileAgentDNS_CreateAndDDNSUpdate(t *testing.T) {
 	rec, _ = mp.getRecord(got.DNSRecordID)
 	if rec.Content != "203.0.113.99" {
 		t.Errorf("DDNS did not update record: got %q, want 203.0.113.99", rec.Content)
+	}
+	if !rec.Proxied {
+		t.Error("DDNS update changed a proxied record to DNS-only")
 	}
 
 	entries, _, _ := d.ListAuditLog(20, 0)
@@ -1306,6 +1338,10 @@ func TestReconcileAgentDNS_CreatesAAAAForIPv6(t *testing.T) {
 	if !ok || a6.Type != "AAAA" || a6.Content != "2001:db8::10" || a6.Name != "agent1.example.com" {
 		t.Fatalf("AAAA record: %+v (ok=%v)", a6, ok)
 	}
+	a6.Proxied = true
+	mp.mu.Lock()
+	mp.records[got.DNSRecordID6] = a6
+	mp.mu.Unlock()
 
 	// A v6 change updates only the AAAA record.
 	got.PublicIP6 = "2001:db8::99"
@@ -1318,6 +1354,9 @@ func TestReconcileAgentDNS_CreatesAAAAForIPv6(t *testing.T) {
 	a6, _ = mp.getRecord(got.DNSRecordID6)
 	if a6.Content != "2001:db8::99" {
 		t.Errorf("DDNS did not update AAAA: got %q, want 2001:db8::99", a6.Content)
+	}
+	if !a6.Proxied {
+		t.Error("AAAA DDNS update changed a proxied record to DNS-only")
 	}
 }
 
@@ -1721,7 +1760,7 @@ func TestTakeoverDomainDNS(t *testing.T) {
 	_, _, agent, _, dom := setupScenario(t, d)
 
 	// Seed a conflicting A record on the same name (the pre-NurProxy DNS).
-	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99"})
+	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99", Proxied: true})
 
 	r := New(d, newMockAgentClient(), time.Minute)
 	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
@@ -1740,6 +1779,9 @@ func TestTakeoverDomainDNS(t *testing.T) {
 	}
 	if !strings.EqualFold(recs[0].Type, "CNAME") || recs[0].Content != agent.FQDN {
 		t.Errorf("expected CNAME -> %s, got %s -> %s", agent.FQDN, recs[0].Type, recs[0].Content)
+	}
+	if !recs[0].Proxied {
+		t.Error("takeover changed a proxied record to DNS-only")
 	}
 
 	// The domain now owns a managed record and the conflict error is cleared.

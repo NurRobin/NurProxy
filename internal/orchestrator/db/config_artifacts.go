@@ -93,6 +93,60 @@ func (d *DB) CreateConfigArtifact(art *models.ConfigArtifact, actor, note string
 	return tx.Commit()
 }
 
+func (d *DB) ReplaceConfigArtifactTarget(existingID string, art *models.ConfigArtifact, actor, note string) error {
+	if existingID == "" || art == nil || art.ID == "" || existingID == art.ID {
+		return fmt.Errorf("config artifact replacement identity is invalid")
+	}
+	now := time.Now().UTC()
+	art.UpdatedAt = now
+	art.Checksum = ChecksumContent(art.Content)
+	art.LiveVersion = 1
+	if art.Source == "" {
+		art.Source = models.ArtifactSourceGenerated
+	}
+	if art.ApplyState == "" {
+		art.ApplyState = models.ArtifactStateLive
+	}
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning artifact target replacement: %w", err)
+	}
+	defer tx.Rollback()
+	var existingAgent, existingKind, existingPath string
+	if err := tx.QueryRow(`SELECT agent_id, target_kind, target_path FROM config_artifacts WHERE id = ?`, existingID).
+		Scan(&existingAgent, &existingKind, &existingPath); err != nil {
+		return fmt.Errorf("querying replaced artifact target: %w", err)
+	}
+	if existingAgent != art.AgentID || existingKind != art.Target.Kind || existingPath != art.Target.Path {
+		return fmt.Errorf("config artifact replacement target does not match")
+	}
+	if _, err := tx.Exec(`DELETE FROM config_artifacts WHERE id = ?`, existingID); err != nil {
+		return fmt.Errorf("deleting replaced artifact identity: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO config_artifacts (id, agent_id, backend, target_kind, target_path,
+			source, domain_id, content, checksum, live_version, enabled, drifted,
+			apply_state, last_error, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		art.ID, art.AgentID, art.Backend, art.Target.Kind, art.Target.Path,
+		art.Source, art.DomainID, art.Content, art.Checksum, art.LiveVersion,
+		boolToInt(art.Enabled), boolToInt(art.Drifted), art.ApplyState,
+		art.LastError, now.Format(time.RFC3339),
+	); err != nil {
+		return fmt.Errorf("inserting canonical replacement artifact: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO config_artifact_versions (artifact_id, version, content, checksum,
+			source, actor, note, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		art.ID, art.LiveVersion, art.Content, art.Checksum, art.Source,
+		actor, note, now.Format(time.RFC3339),
+	); err != nil {
+		return fmt.Errorf("inserting canonical replacement version: %w", err)
+	}
+	return tx.Commit()
+}
+
 const configArtifactColumns = `id, agent_id, backend, target_kind, target_path,
 	source, domain_id, content, checksum, live_version, enabled, drifted,
 	apply_state, last_error, drift_content, updated_at`
@@ -491,6 +545,23 @@ func (d *DB) RejectConfigArtifactDrift(id string) (*models.ConfigArtifact, error
 		return nil, fmt.Errorf("config artifact not found: %s", id)
 	}
 	return d.GetConfigArtifact(id)
+}
+
+func (d *DB) ResetConfigArtifactToDomainModel(id string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`
+		UPDATE config_artifacts
+		SET source = ?, drifted = 0, apply_state = ?, last_error = '', drift_content = '', updated_at = ?
+		WHERE id = ?`,
+		models.ArtifactSourceGenerated, models.ArtifactStateLive, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("resetting artifact authority to domain model: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return fmt.Errorf("%w: %s", ErrArtifactNotFound, id)
+	}
+	return nil
 }
 
 // RollbackConfigArtifact promotes a prior version's content to a new live version

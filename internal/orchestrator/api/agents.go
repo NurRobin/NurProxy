@@ -14,6 +14,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
+	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
 // registerLimiter blunts abuse of the unauthenticated /agents/register endpoint:
@@ -390,9 +391,10 @@ func (e *fqdnError) Error() string { return e.msg }
 
 // applyFQDNChange validates and applies an FQDN (anchor hostname) override onto
 // the agent in place. A blank fqdn or one equal to the current value is a no-op.
-// When the anchor actually moves, it clears the stored A- and AAAA-record ids
-// (so the reconciler recreates both at the new name and the old records don't
-// leak at the prior name) and any stale last_error.
+// When the anchor actually moves, it clears the A- and AAAA-record ids on the
+// struct (so the reconciler recreates both at the new name) and any stale
+// dns_error. The old records themselves are released by db.UpdateAgent, which
+// queues them for the reconciler to delete if NurProxy created them.
 func (s *Server) applyFQDNChange(agent *models.Agent, fqdn string) *fqdnError {
 	fqdn = strings.TrimSpace(strings.ToLower(fqdn))
 	if fqdn == "" || fqdn == agent.FQDN {
@@ -406,7 +408,7 @@ func (s *Server) applyFQDNChange(agent *models.Agent, fqdn string) *fqdnError {
 	}
 	agent.FQDN = fqdn
 	agent.DNSRecordID = ""  // anchor moved — recreate the A record at the new name
-	agent.DNSRecordID6 = "" // and the AAAA record, else the old one leaks at the prior name
+	agent.DNSRecordID6 = "" // and the AAAA record
 	agent.DNSError = ""     // clear any stale "FQDN outside zone" error
 	return nil
 }
@@ -478,7 +480,8 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// artifact's on-disk/live checksum (§11). The orchestrator compares each
 		// against the accepted state and flags drift (on-disk != accepted), never
 		// overwriting while unresolved. Empty/omitted leaves drift state untouched.
-		ArtifactChecksums []proxymodel.ArtifactChecksum `json:"artifact_checksums"`
+		ArtifactChecksums  []proxymodel.ArtifactChecksum `json:"artifact_checksums"`
+		RecoveryCapability *recoverymodel.Capability     `json:"recovery_capability"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -528,6 +531,12 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if uerr := s.db.UpdateAgentPermissions(id, req.ProxyPermissions); uerr != nil {
 		log.Printf("failed to update agent %s permissions: %v", id, uerr)
 	}
+	if req.RecoveryCapability != nil {
+		if uerr := s.db.UpdateAgentRecoveryCapability(id, req.RecoveryCapability); uerr != nil {
+			writeError(w, http.StatusBadRequest, "invalid recovery capability")
+			return
+		}
+	}
 
 	// A heartbeat is proof of life: an agent the orchestrator had marked offline
 	// is back. Adoption state itself is owned by the operator, so we only flip
@@ -565,10 +574,11 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update version if it changed.
+	// Update version if it changed. A narrow write: a full-row UpdateAgent from
+	// this snapshot could revert a rename made concurrently through the API.
 	if req.Version != "" && agent.Version != req.Version {
 		agent.Version = req.Version
-		if uerr := s.db.UpdateAgent(agent); uerr != nil {
+		if uerr := s.db.UpdateAgentVersion(id, req.Version); uerr != nil {
 			log.Printf("failed to update agent version: %v", uerr)
 		}
 	}
@@ -579,8 +589,46 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	s.reconcileArtifactChecksums(r, id, req.ArtifactChecksums)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":    agent.Status,
-		"last_seen": agent.LastSeen,
+		"status":                     agent.Status,
+		"last_seen":                  agent.LastSeen,
+		"safe_auto_repair_effective": agent.SafeAutoRepairEffective,
+	})
+}
+
+// PUT /api/v1/agents/{id}/safe-auto-repair
+func (s *Server) handleSetSafeAutoRepair(w http.ResponseWriter, r *http.Request) {
+	id := pathParam(r, "id")
+	var req safeAutoRepairRequest
+	if err := readRecoveryJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var override *bool
+	switch req.Mode {
+	case "inherit":
+	case "enabled":
+		enabled := true
+		override = &enabled
+	case "disabled":
+		enabled := false
+		override = &enabled
+	default:
+		writeError(w, http.StatusBadRequest, "mode must be inherit, enabled, or disabled")
+		return
+	}
+	if err := s.db.SetAgentSafeAutoRepairOverride(id, override); err != nil {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	agent, err := s.db.GetAgent(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load effective recovery policy")
+		return
+	}
+	s.publishRecoveryPolicy(id, agent.SafeAutoRepairEffective)
+	s.audit(r, "agent", id, "safe_auto_repair", "mode="+req.Mode)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"mode": req.Mode, "safe_auto_repair_effective": agent.SafeAutoRepairEffective,
 	})
 }
 

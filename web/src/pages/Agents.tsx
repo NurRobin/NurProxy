@@ -22,6 +22,7 @@ import { Field, Input } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
 import ExistingSetup from './ExistingSetup';
 import LogTailViewer from '../components/LogTailViewer';
+import RecoveryPanel from '../components/RecoveryPanel';
 
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.never'));
 
@@ -405,6 +406,7 @@ export default function Agents() {
                 )}
 
                 {selected.status !== 'pending' && <DetectedProxy agent={selected} />}
+                {selected.status !== 'pending' && <RecoveryPanel key={selected.id} agent={selected} onAgentChanged={fetchData} />}
               </div>
             )}
           </div>

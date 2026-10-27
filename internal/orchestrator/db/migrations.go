@@ -501,6 +501,297 @@ var migrations = []string{
 		PRIMARY KEY (entity_type, entity_id)
 	);
 	`,
+
+	// Migration 23: structured recovery state and nullable per-agent policy.
+	`
+	ALTER TABLE agents ADD COLUMN safe_auto_repair_override INTEGER;
+	ALTER TABLE agents ADD COLUMN recovery_capability TEXT;
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('safe_auto_repair', 'true');
+
+	CREATE TABLE recovery_diagnostics (
+		id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL REFERENCES agents(id),
+		code TEXT NOT NULL CHECK (code IN (
+			'managed_orphan_config', 'managed_stale_temp', 'managed_cert_file_missing',
+			'managed_runtime_key_missing', 'managed_runtime_key_mismatch',
+			'generated_config_invalid', 'operator_config_invalid', 'permission_denied',
+			'systemd_sandbox_denied', 'proxy_reload_failed', 'proxy_not_running',
+			'port_conflict', 'proxy_binary_missing', 'unknown_proxy_error'
+		)),
+		subsystem TEXT NOT NULL,
+		severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+		ownership TEXT NOT NULL CHECK (ownership IN ('nurproxy', 'operator', 'system', 'unknown')),
+		summary TEXT NOT NULL,
+		evidence TEXT NOT NULL DEFAULT '',
+		affected_paths TEXT NOT NULL DEFAULT '[]',
+		resource_fingerprint TEXT NOT NULL,
+		proposed_action TEXT NOT NULL DEFAULT '' CHECK (proposed_action IN (
+			'', 'prune_managed_orphan', 'remove_managed_temp', 'rematerialize_cert_bundle',
+			'rematerialize_runtime_key', 'restore_last_live_artifact'
+		)),
+		auto_repair_eligible INTEGER NOT NULL DEFAULT 0 CHECK (auto_repair_eligible IN (0, 1)),
+		hard_change INTEGER NOT NULL DEFAULT 0 CHECK (hard_change IN (0, 1)),
+		first_seen_at INTEGER NOT NULL,
+		last_seen_at INTEGER NOT NULL,
+		occurrences INTEGER NOT NULL DEFAULT 1 CHECK (occurrences >= 1),
+		resolved_at INTEGER,
+		UNIQUE(agent_id, id)
+	);
+	CREATE UNIQUE INDEX idx_recovery_diagnostics_identity
+		ON recovery_diagnostics(agent_id, code, resource_fingerprint);
+	CREATE INDEX idx_recovery_diagnostics_agent_active
+		ON recovery_diagnostics(agent_id, resolved_at, last_seen_at DESC, id);
+	CREATE INDEX idx_recovery_diagnostics_agent_seen
+		ON recovery_diagnostics(agent_id, last_seen_at DESC, id);
+
+	CREATE TABLE recovery_operations (
+		id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL REFERENCES agents(id),
+		diagnostic_id TEXT NOT NULL,
+		action TEXT NOT NULL CHECK (action IN (
+			'prune_managed_orphan', 'remove_managed_temp', 'rematerialize_cert_bundle',
+			'rematerialize_runtime_key', 'restore_last_live_artifact'
+		)),
+		resource_fingerprint TEXT NOT NULL,
+		risk TEXT NOT NULL DEFAULT 'safe' CHECK (risk = 'safe'),
+		request_source TEXT NOT NULL CHECK (request_source IN ('automatic', 'user')),
+		state TEXT NOT NULL CHECK (state IN (
+			'detected', 'diagnosis_only', 'planned', 'snapshotted', 'applying',
+			'validating', 'succeeded', 'rolling_back', 'rolled_back',
+			'rollback_failed', 'suppressed'
+		)),
+		step_summaries TEXT NOT NULL DEFAULT '[]',
+		snapshot_reference TEXT NOT NULL DEFAULT '',
+		validation_outcome TEXT NOT NULL DEFAULT '',
+		rollback_outcome TEXT NOT NULL DEFAULT '',
+		error TEXT NOT NULL DEFAULT '',
+		started_at INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		received_at INTEGER NOT NULL,
+		finished_at INTEGER,
+		FOREIGN KEY (agent_id, diagnostic_id) REFERENCES recovery_diagnostics(agent_id, id)
+	);
+	CREATE INDEX idx_recovery_operations_agent_created
+		ON recovery_operations(agent_id, created_at DESC, id DESC);
+	CREATE INDEX idx_recovery_operations_agent_received
+		ON recovery_operations(agent_id, received_at);
+	CREATE INDEX idx_recovery_operations_breaker
+		ON recovery_operations(agent_id, action, resource_fingerprint, state, received_at);
+	`,
+
+	// Migration 24: monotonic recovery-operation counters survive receipt retention
+	// and agent deletion. Existing terminal receipts are folded into the rollup once
+	// while this migration and its schema-version record share one transaction.
+	`
+	CREATE TABLE recovery_operation_totals (
+		action TEXT NOT NULL CHECK (action IN (
+			'prune_managed_orphan', 'remove_managed_temp', 'rematerialize_cert_bundle',
+			'rematerialize_runtime_key', 'restore_last_live_artifact'
+		)),
+		outcome TEXT NOT NULL CHECK (outcome IN (
+			'diagnosis_only', 'succeeded', 'rolled_back', 'rollback_failed', 'suppressed'
+		)),
+		request_source TEXT NOT NULL CHECK (request_source IN ('automatic', 'user')),
+		count INTEGER NOT NULL CHECK (count >= 1),
+		PRIMARY KEY (action, outcome, request_source)
+	);
+	INSERT INTO recovery_operation_totals (action, outcome, request_source, count)
+		SELECT action, state, request_source, COUNT(*)
+		FROM recovery_operations
+		WHERE state IN ('diagnosis_only', 'succeeded', 'rolled_back', 'rollback_failed', 'suppressed')
+		GROUP BY action, state, request_source;
+	`,
+
+	// Migration 25: support bounded latest-outcome breaker projection lookups.
+	`
+	CREATE INDEX idx_recovery_operations_breaker_source
+		ON recovery_operations(agent_id, action, resource_fingerprint, state, request_source, received_at DESC);
+	`,
+
+	// Migration 26: separate diagnosis, ownership confidence, repair scope and
+	// resolution mechanism so "resolved" never implies a repair succeeded.
+	`
+	ALTER TABLE recovery_diagnostics ADD COLUMN ownership_confidence TEXT NOT NULL DEFAULT 'unknown'
+		CHECK (ownership_confidence IN ('certain', 'inferred', 'unknown'));
+	ALTER TABLE recovery_diagnostics ADD COLUMN repair_scope TEXT NOT NULL DEFAULT 'ambiguous'
+		CHECK (repair_scope IN (
+			'exact_provenanced_file', 'exclusive_managed_directory', 'shared_backend_namespace',
+			'agent_sandbox', 'detected_proxy_service', 'supported_package', 'local_firewall',
+			'outside_managed_roots', 'ambiguous', 'unsupported_environment'
+		));
+	ALTER TABLE recovery_diagnostics ADD COLUMN repair_eligible INTEGER NOT NULL DEFAULT 0
+		CHECK (repair_eligible IN (0, 1));
+	ALTER TABLE recovery_diagnostics ADD COLUMN repair_refusal_code TEXT NOT NULL DEFAULT '';
+	ALTER TABLE recovery_diagnostics ADD COLUMN resolution_reason TEXT NOT NULL DEFAULT ''
+		CHECK (resolution_reason IN (
+			'', 'repaired', 'resource_disappeared', 'desired_state_changed',
+			'operator_resolved', 'superseded', 'condition_no_longer_observed'
+		));
+	ALTER TABLE recovery_diagnostics ADD COLUMN resolution_operation_id TEXT NOT NULL DEFAULT '';
+	UPDATE recovery_diagnostics SET repair_eligible = auto_repair_eligible;
+	UPDATE recovery_diagnostics SET
+		resolution_reason = 'repaired',
+		resolution_operation_id = COALESCE((
+			SELECT operation.id FROM recovery_operations AS operation
+			WHERE operation.agent_id = recovery_diagnostics.agent_id
+				AND operation.diagnostic_id = recovery_diagnostics.id
+				AND operation.state = 'succeeded'
+			ORDER BY operation.received_at DESC LIMIT 1
+		), '')
+		WHERE resolved_at IS NOT NULL AND EXISTS (
+			SELECT 1 FROM recovery_operations AS operation
+			WHERE operation.agent_id = recovery_diagnostics.agent_id
+				AND operation.diagnostic_id = recovery_diagnostics.id
+				AND operation.state = 'succeeded'
+		);
+	UPDATE recovery_diagnostics SET resolution_reason = 'condition_no_longer_observed'
+		WHERE resolved_at IS NOT NULL AND resolution_reason = '';
+	`,
+
+	// Migration 27: root-helper attestation identities are explicitly enrolled
+	// per agent and cannot be silently rebound across hosts.
+	`
+	CREATE TABLE recovery_helper_instances (
+		agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+		helper_instance_id TEXT NOT NULL UNIQUE,
+		helper_build_id TEXT NOT NULL,
+		attestation_key_id TEXT NOT NULL,
+		attestation_public_key TEXT NOT NULL,
+		hello_digest TEXT NOT NULL,
+		enrolled_at INTEGER NOT NULL
+	);
+	CREATE UNIQUE INDEX idx_recovery_helper_attestation_key
+		ON recovery_helper_instances(attestation_key_id);
+	CREATE UNIQUE INDEX idx_recovery_helper_agent_instance
+		ON recovery_helper_instances(agent_id, helper_instance_id);
+	`,
+
+	// Migration 28: helper-attested hard-recovery plans and the two independent
+	// confirmation events that authorize an orchestrator-signed execution grant.
+	`
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_helper_agent_instance
+		ON recovery_helper_instances(agent_id, helper_instance_id);
+	CREATE TABLE recovery_execution_plans (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		helper_plan_id TEXT NOT NULL,
+		operation_id TEXT NOT NULL UNIQUE,
+		helper_instance_id TEXT NOT NULL,
+		diagnostic_id TEXT NOT NULL,
+		action TEXT NOT NULL,
+		logical_target TEXT NOT NULL,
+		display_plan_hash TEXT NOT NULL,
+		execution_plan_hash TEXT NOT NULL,
+		resource_fingerprint TEXT NOT NULL,
+		rollback_coverage TEXT NOT NULL,
+		signed_plan TEXT NOT NULL,
+		plan_digest TEXT NOT NULL,
+		received_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		confirmation_1_id TEXT NOT NULL DEFAULT '',
+		confirmation_1_at INTEGER,
+		confirmation_2_id TEXT NOT NULL DEFAULT '',
+		confirmation_2_at INTEGER,
+		signed_grant TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (agent_id, helper_plan_id),
+		FOREIGN KEY (agent_id, helper_instance_id)
+			REFERENCES recovery_helper_instances(agent_id, helper_instance_id)
+	);
+	CREATE INDEX idx_recovery_execution_plans_agent_received
+		ON recovery_execution_plans(agent_id, received_at DESC, helper_plan_id);
+	`,
+
+	// Migration 29: helper-attested execution outcomes remain bound to the exact
+	// canonical execute request and survive agent retries and restarts.
+	`
+	ALTER TABLE recovery_execution_plans ADD COLUMN signed_receipt TEXT NOT NULL DEFAULT '';
+	ALTER TABLE recovery_execution_plans ADD COLUMN receipt_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE recovery_execution_plans ADD COLUMN receipt_received_at INTEGER;
+	`,
+
+	// Migration 30: ordinary desired-state changes use the same attested helper
+	// protocol without borrowing the interactive hard-repair confirmation flow.
+	`
+	CREATE TABLE managed_apply_executions (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		operation_id TEXT NOT NULL,
+		helper_instance_id TEXT NOT NULL,
+		desired_state_revision TEXT NOT NULL,
+		signed_intent TEXT NOT NULL,
+		intent_digest TEXT NOT NULL,
+		intent_received_at INTEGER NOT NULL,
+		intent_expires_at INTEGER NOT NULL,
+		is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+		helper_plan_id TEXT NOT NULL DEFAULT '',
+		signed_plan TEXT NOT NULL DEFAULT '',
+		plan_digest TEXT NOT NULL DEFAULT '',
+		plan_received_at INTEGER,
+		plan_expires_at INTEGER,
+		signed_grant TEXT NOT NULL DEFAULT '',
+		grant_digest TEXT NOT NULL DEFAULT '',
+		signed_receipt TEXT NOT NULL DEFAULT '',
+		receipt_digest TEXT NOT NULL DEFAULT '',
+		receipt_received_at INTEGER,
+		PRIMARY KEY (agent_id, operation_id),
+		FOREIGN KEY (agent_id, helper_instance_id)
+			REFERENCES recovery_helper_instances(agent_id, helper_instance_id)
+	);
+	CREATE UNIQUE INDEX idx_managed_apply_current_agent
+		ON managed_apply_executions(agent_id) WHERE is_current = 1;
+	CREATE UNIQUE INDEX idx_managed_apply_helper_plan
+		ON managed_apply_executions(agent_id, helper_plan_id) WHERE helper_plan_id != '';
+	CREATE INDEX idx_managed_apply_agent_received
+		ON managed_apply_executions(agent_id, intent_received_at DESC);
+	`,
+
+	// Migration 31: route deletions survive domain/artifact teardown and offline
+	// agents until a helper-attested managed apply receipt proves removal.
+	`
+	CREATE TABLE managed_route_tombstones (
+		agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		resource_id TEXT NOT NULL,
+		host TEXT NOT NULL,
+		backend TEXT NOT NULL CHECK (backend IN ('nginx', 'apache')),
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (agent_id, resource_id)
+	);
+	CREATE INDEX idx_managed_route_tombstones_agent_created
+		ON managed_route_tombstones(agent_id, created_at, resource_id);
+	`,
+
+	// Migration 32: ownership of the agent anchor records (#152). The *_owned
+	// columns say whether NurProxy CREATED the A / AAAA record (1) or adopted one
+	// that already existed (0); the *_zone_id columns name the zone it was made
+	// in. Existing rows default to 0 — provenance unknown means "adopted", so a
+	// pre-existing anchor is never auto-deleted (fail closed).
+	//
+	// agent_anchor_cleanups holds anchor records released by an agent rename or
+	// delete. A row stays until the provider delete succeeds (or the record is
+	// already gone), so a failed delete is retried by the next reconcile cycle.
+	// provider_id / zone_external_id snapshot the ORIGINAL provider and zone, so
+	// later zone reassignment cannot redirect the delete. No FK to agents: the
+	// agent row may already be gone.
+	`
+	ALTER TABLE agents ADD COLUMN dns_record_owned    INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE agents ADD COLUMN dns_record_owned6   INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE agents ADD COLUMN dns_record_zone_id  TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN dns_record_zone_id6 TEXT NOT NULL DEFAULT '';
+	CREATE TABLE agent_anchor_cleanups (
+		id               INTEGER PRIMARY KEY AUTOINCREMENT,
+		agent_id         TEXT NOT NULL,
+		fqdn             TEXT NOT NULL,
+		record_type      TEXT NOT NULL CHECK (record_type IN ('A', 'AAAA')),
+		record_id        TEXT NOT NULL,
+		owned            INTEGER NOT NULL DEFAULT 0 CHECK (owned IN (0, 1)),
+		zone_id          TEXT NOT NULL DEFAULT '',
+		provider_id      TEXT NOT NULL DEFAULT '',
+		zone_external_id TEXT NOT NULL DEFAULT '',
+		reason           TEXT NOT NULL DEFAULT '',
+		attempts         INTEGER NOT NULL DEFAULT 0,
+		last_error       TEXT NOT NULL DEFAULT '',
+		created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE (zone_id, record_id)
+	);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

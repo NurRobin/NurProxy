@@ -1,7 +1,7 @@
 # Backup & Restore
 
 > **Scope:** the `nurproxy backup` / `nurproxy restore` data-dir snapshot round-trip — what the archive captures, the restore safety guards (no-clobber, path-traversal rejection), and verifying a restored dir boots and decrypts cleanly in dry mode.
-> **Code:** `cmd/nurproxy/backup.go` (backup + restore commands), `internal/orchestrator/db/db.go` `SnapshotTo` (consistent DB snapshot via `VACUUM INTO`), `cmd/nurproxy/main.go` (subcommand dispatch at `main.go:53-57` + data-dir resolution + key load), `internal/orchestrator/api/system.go` `handleHealth`, `internal/orchestrator/api/auth.go` `handleAuthStatus`, `internal/orchestrator/db/providers.go` `GetProvider` (provider-config decrypt).
+> **Code:** `cmd/nurproxy/backup.go` (backup + restore commands), `internal/orchestrator/dataperms/permissions.go` (non-recursive descriptor-based permission migration), `internal/orchestrator/db/db.go` `SnapshotTo` (consistent DB snapshot via `VACUUM INTO`), `cmd/nurproxy/main.go` (subcommand dispatch + data-dir hardening + key load), `internal/orchestrator/api/system.go` `handleHealth`, `internal/orchestrator/api/auth.go` `handleAuthStatus`, `internal/orchestrator/db/providers.go` `GetProvider` (provider-config decrypt).
 > **Coverage legend:** D = coverable dry, R = needs a real run.
 
 ## Prerequisites
@@ -20,6 +20,8 @@
 - [ ] Missing-key warning (key file absent → warns to stderr, omits from archive, backup still succeeds).
 - [ ] Backup fails cleanly when there is no DB at the data dir.
 - [ ] Archive + restored files written `0600`.
+- [ ] Data directory remains `0700`; live DB/WAL/SHM, keys, restore staging files, and backup archives remain `0600` even under a permissive caller umask.
+- [ ] `nurproxy permissions` safely migrates existing installs without following links or traversing unrelated entries.
 - [ ] `nurproxy restore` refuses to overwrite an existing DB without `--force`.
 - [ ] `nurproxy restore` with `--force` overwrites.
 - [ ] Restore rejects path-traversal / unexpected entries (only the three known flat filenames are extracted).
@@ -28,6 +30,24 @@
 - [ ] Round-trip verify: restored key checksums match originals; dry boot on the restored dir → `/health database:ok`, `auth/status setup_required:false`, reconciler loads entities and decrypts the provider config (proves `encryption.key` round-tripped).
 
 ## Tests
+
+### Private data permission invariant and existing-install migration
+- **Must:** the orchestrator sets umask `0077` before any subcommand or runtime file creation. Its data directory is `0700`; `nurproxy.db`, `nurproxy.db-wal`, `nurproxy.db-shm`, `encryption.key`, `acme-account.key`, restore staging files, explicitly named raw DB backups (`nurproxy.db.backup-*` / `nurproxy.db.bak-*` with a non-empty safe basename suffix), restored final files, and built-in backup archives are `0600`. Reusing an existing wider backup output narrows it to `0600`.
+- **Access:** automatic at every orchestrator start and package upgrade; manual and idempotent with `nurproxy permissions --data-dir DIR`.
+- **Safety boundary:** every data-directory component is opened successively with `openat` + `O_NOFOLLOW`, and the resulting root descriptor stays bound for the operation. Migration recognizes only the five live filenames and the two exact raw-DB backup prefix spaces above (suffix characters limited to ASCII letters, digits, `.`, `_`, `-`; no empty suffix, slash, or control character). Restore staging names are deliberately **not** migration-wildcarded: each stage is created exclusively and tracked through the already-bound directory descriptor. Migration never recurses. Unknown files/directories are reported and unchanged. A linked path component, managed hardlink, symlink, or non-regular entry fails startup/upgrade rather than touching another inode.
+- **Verify (non-secret output only):** cautiously substitute the configured data directory if it is not `/var/lib/nurproxy`.
+  ```bash
+  sudo /usr/bin/nurproxy permissions --data-dir /var/lib/nurproxy
+  sudo find /var/lib/nurproxy -maxdepth 1 -printf '%y %m %f\n' | sort
+  systemctl show nurproxy.service -p UMask
+  systemctl is-active nurproxy.service
+  /usr/bin/nurproxy db version --data-dir /var/lib/nurproxy
+  sqlite3 /var/lib/nurproxy/nurproxy.db 'PRAGMA integrity_check;'
+  ```
+- **Pass:** the directory prints `d 700`; every present managed regular filename/raw backup prints `f 600`; `UMask=0077`; service is active; schema is readable; integrity check is `ok`. Do not print file contents, keys, database rows, hashes of secrets, or API credentials.
+- **Diagnostics:** `opening data directory without following links` means the configured data-dir itself is linked or not a directory. `unsafe managed data entries: ...` means a reserved filename is a symlink/non-regular file or could not be safely opened/chmodded. `permissions: skipped ...: not managed` is informational for unrelated top-level entries.
+- **Backup/restore replacement:** backup holds final DB/key file descriptors (not merely `parentfd/name` paths), snapshots SQLite through the held DB descriptor, and installs a completed archive by same-directory atomic rename. An existing output symlink/hardlink is rejected and never truncated. Restore creates, removes, and renames every stage with `*at` operations against one held data-dir descriptor, so replacing the textual path during extraction cannot redirect the commit.
+- **Rollback limitation:** this migration only narrows mode bits and preserves ownership/content. There is deliberately no automatic mode rollback because the prior wider modes are not retained and restoring world/group readability could re-expose secrets. If an operator intentionally needs different access, apply a reviewed ownership/group/ACL policy explicitly; do not roll back to `0644` wholesale.
 
 ### Backup: file set, naming, and `-o`
 - **Must:** `nurproxy backup` writes a gzipped tar containing exactly the present subset of `nurproxy.db`, `encryption.key`, `acme-account.key` as flat top-level entries (`cmd/nurproxy/backup.go:22-26,93-108`). With no `-o`, the file is named `nurproxy-backup-<UTC timestamp>.tar.gz` using layout `20060102-150405` (`backup.go:53-55`). On success it prints `Backup written to <path>` (`backup.go:60`).
@@ -74,7 +94,7 @@
 
 ### Restore: no-clobber guard and `--force`
 - **Must:** `nurproxy restore <archive>` refuses to extract if the target data dir already contains `nurproxy.db`, failing with `<dir> already has a nurproxy.db — refusing to overwrite (pass --force to replace it)` (`backup.go:147-149`). `--force` overrides the guard (`backup.go:126,134`). On success it prints `Restored <n> file(s) into <dir>` and `Start the orchestrator against this data dir to bring it back up.` (`backup.go:138-139`).
-- **Access:** CLI only. `nurproxy restore [--data-dir DIR] [--force] ARCHIVE` (`backup.go:123-127`). Exactly one archive argument is required; otherwise it errors `exactly one archive argument is required` (`backup.go:129-131`).
+- **Access:** CLI only. `nurproxy restore [--data-dir DIR] [--force] ARCHIVE` (`backup.go:123-127`). Exactly one archive argument is required (flags may come before or after it); a missing archive errors `restore: missing archive argument`, an extra one `restore: unexpected argument ...`.
 - **Prerequisites:** a valid backup archive (from the backup test) and an empty target dir.
 - **Steps:**
   ```bash

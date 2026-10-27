@@ -5,6 +5,187 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-27
+
+First stable release of the 0.5 line. It contains everything from
+`0.5.0-rc.2` and `0.5.0-rc.3` below, unchanged since `rc.3`. `rc.3` ran on the
+production orchestrator and three nginx agents (amd64 and arm64) before this
+tag.
+
+Upgrade notes:
+
+- Install the orchestrator first, then the agents; both directions work during
+  the rollout. Back up with `nurproxy backup` before upgrading the orchestrator
+  (migration 32 runs on start).
+- On agents that ran a `0.4.x` dev build with the root helper, the first start
+  prunes the old helper journal in the background. On our hosts this took
+  several minutes and freed 8 to 12 GB.
+- A helper breaker that was opened by an earlier build stays open after the
+  upgrade. Check `nginx -t`, then move `/var/lib/nurproxy-agent/helper/breaker.json`
+  away and restart `nurproxy-agent-helper` and `nurproxy-agent`.
+
+## [0.5.0-rc.3] - 2026-10-27
+
+Fixes found while running `rc.2`-era builds in production. No new features.
+
+### Fixed
+
+- **Moving a domain to another agent cleans up the old agent (#148).** The old
+  agent now gets a tombstone for the vhost, so the vhost and its certificate are
+  removed together. Before, the certificate was pruned while the vhost stayed,
+  `nginx -t` failed after commit, rollback could not be proven and the helper
+  opened a permanent breaker. The helper also keeps any certificate that a
+  remaining config file still references, reports NurProxy-named vhost files
+  that no route covers, and includes the `nginx -t` / `apachectl configtest`
+  output in failed receipts. An open helper breaker (`rollback_failed` or
+  `outcome_indeterminate`) is now shown in the agent's Diagnosis & recovery
+  panel. The REST API and the MCP `update_domain` tool share the same move
+  logic.
+- **Basic auth works on nginx and Apache agents (#147).** htpasswd files moved
+  to `/var/lib/nurproxy-agent/auth/` (`0750 root:<worker group>`, files `0640`),
+  so the proxy worker can read them. The worker group comes from the nginx
+  `user` directive or Apache's `Group` / `APACHE_RUN_GROUP`; if it can't be
+  determined, the apply fails with a message naming the host. Old
+  `certs/auth-*.htpasswd` files are removed once nothing references them.
+- **The helper journal no longer grows without bound (#146).** Finished
+  operations are pruned with their grant and snapshot (newest 50 per action and
+  everything younger than 14 days are kept). Managed applies that would change
+  nothing no longer write to the journal, and the orchestrator no longer
+  produces a new intent every tick because of random map order. On hosts with a
+  large journal, the first pruning pass runs in the background after the
+  upgrade.
+- **Agent rename and deletion clean up the agent's A/AAAA records (#152).**
+  Ownership is now stored per record (migration 32). Only records NurProxy
+  created are deleted, through the provider and zone they were created in;
+  records from before this release count as adopted and are left alone. After a
+  rename, the old record is deleted only after a one-hour grace period, once the
+  new record exists and no domain points at the old name.
+- **CLI flags after a positional argument are no longer ignored (#145).**
+  `nurproxy domain update 83 --force-https` now applies the flag. Unexpected or
+  missing positional arguments are an error.
+
+## [0.5.0-rc.2] - 2026-08-29
+
+This release candidate introduces NurProxy's privilege-separated agent and its
+safe recovery system. It also collects the DNS, TLS, observability, lifecycle,
+and operator-safety work completed since 0.4.0. It is intended for release-branch
+testing before the final 0.5.0 release. The `rc.1` tag failed during the
+cross-platform build before GoReleaser published a release or any artifacts;
+`rc.2` contains the portability fix and a pre-tag matrix gate.
+
+### Highlights
+
+- **Unprivileged agent with a typed root helper.** The network-facing agent now
+  runs as the dedicated `nurproxy` user. A socket-activated, root-owned helper
+  performs only fixed protocol actions; it has no shell or arbitrary argv/path
+  endpoint. Execution grants, local plan re-discovery, durable journals,
+  privileged snapshots, signed receipts, replay protection, and a persistent
+  breaker bind every privileged change to the approved host state.
+- **Ordinary proxy reconciliation uses the same constrained transaction path.**
+  Create, edit, delete, certificate materialization, validation, and reload can
+  be committed atomically without granting the agent write access to shared
+  nginx or Apache directories. Exact provenance and policy checks protect
+  operator-owned configuration and preserve legacy managed artifacts during the
+  migration.
+- **Structured diagnosis and recovery.** The agent classifies bounded proxy and
+  host failures, automatically repairs only proven low-risk managed state, and
+  exposes explicit plans and confirmations for supported hard recovery actions.
+  The dashboard shows diagnostics, refusal reasons, rollback coverage, breaker
+  state, and operation history instead of collapsing every disappearance into a
+  claimed successful repair.
+- **Safer DNS and route lifecycle.** Apex domains use the `@` sentinel, existing
+  DNS records can be explicitly taken over, and opt-in parent cascade deletion
+  tears domains down through the reconciler before removing a server, agent, or
+  zone. Route tombstones ensure an offline agent must attest deletion before
+  central certificate state is pruned.
+- **Operations and observability.** Authenticated Prometheus metrics, webhook
+  audit-event notifications, `nurproxy db version`, richer agent health, ACME
+  rate-limit backoff, and distinct ACME-CA reachability errors make fleet state
+  easier to inspect without exposing it publicly.
+
+### Added
+
+- Socket-activated `nurproxy-agent-helper.service` and `.socket` units, strict
+  helper configuration, helper-instance enrollment, and build-ID handshakes.
+- Typed helper actions for exact managed-file access, proxy validation/reload or
+  start/restart, supported package installation, and bounded local firewall
+  changes. Ambiguous targets and unsupported environments remain diagnosis-only.
+- Durable recovery diagnostics, operation receipts, rollback snapshots,
+  confirmation-bound execution grants, metrics, API endpoints, and dashboard
+  controls.
+- Safe automatic recovery for exact-provenance temporary files, orphaned managed
+  artifacts, certificate bundles, runtime keys, and last-known-live generated
+  configuration.
+- Authenticated `/metrics` output for agent/domain state, certificate expiry,
+  ACME backoff, recovery health, and scrape errors.
+- Configurable webhook delivery for curated audit events.
+- CLI/API/dashboard support for opt-in cascade deletion of servers, agents, and
+  zones through the normal audited teardown path.
+- Apex/root domains, DNS-record takeover, schema-version inspection, and a
+  versioned certificate-export wire contract for forward-compatible agents.
+
+### Changed
+
+- Packaged agents run as `nurproxy:nurproxy`; mutable state moves beneath
+  `/var/lib/nurproxy-agent/state`, helper staging is isolated, and privileged
+  state stays root-owned beneath `/var/lib/nurproxy-agent/helper`.
+- Agent packages install and enable the helper socket, migrate legacy state, and
+  quarantine only unmodified NurProxy legacy privilege drop-ins. Modified or
+  ambiguous operator files cause a fail-closed upgrade instead of being replaced.
+- Orchestrator package upgrades run the no-follow `nurproxy permissions`
+  migration before restart, enforce private data modes, and install an exact
+  systemd data-directory sandbox drop-in.
+- Live backups now use SQLite's online backup API instead of manipulating a live
+  WAL database externally; restores remove stale WAL/SHM sidecars.
+- ACME rate-limit retries use persistent exponential backoff with jitter, while
+  CA reachability failures are reported separately.
+- The release pipeline emits helper-aware agent archives/packages and keeps RCs
+  out of `:latest`, Homebrew, AUR, and the stable APT/YUM repository.
+
+### Fixed
+
+- Release builds now compile recovery snapshot metadata portably on 32-bit ARM,
+  use a no-follow directory walker on Darwin/FreeBSD, and explicitly refuse the
+  Linux-only helper bootstrap on other platforms. Branch CI cross-builds the
+  complete GoReleaser target matrix so these failures are caught before tagging.
+- Cloudflare record updates preserve the existing `proxied` flag.
+- Deleted TLS routes are pruned before backend validation, preventing stale
+  vhosts from deadlocking reconciliation after their certificate is removed.
+- Existing-mode agents resolve default proxy configuration paths correctly and
+  normalize upstream addresses that already contain a port.
+- Raw custom routes re-materialize their plaintext runtime key after certificate
+  renewal, reset, or reconnect.
+- Managed apply retries return the original receipt without repeating mutation;
+  converged state, exact pre-marker routes, auth sidecars, and protected operator
+  files remain untouched.
+- First-time admin setup and session-secret creation converge atomically under
+  concurrent requests, and hashed admin API keys work consistently for MCP and
+  metrics authentication.
+- Reconciler teardown preserves certificate state until route deletion is
+  attested and avoids deleting or overwriting newer desired-state generations.
+
+## Upgrade notes
+
+- **Back up the orchestrator before upgrading.** Run `nurproxy backup` (safe
+  while the service is live in this release line) or stop the service and copy
+  the complete data directory. Database migrations advance automatically through
+  schema 31 and are not intended to be rolled back by an older binary.
+- **Upgrade the orchestrator first, then agents one at a time.** Confirm health
+  and route continuity between hosts. New agents fail closed when helper and
+  orchestrator authorization/build identities do not match.
+- **Prefer the DEB/RPM or install-script upgrade path for agents.** It installs
+  the helper units, moves legacy state into `/var/lib/nurproxy-agent/state`, and
+  refreshes the root-owned helper identity before restarting the unprivileged
+  main agent. A binary-only swap is not a complete 0.5.0 agent upgrade.
+- **Custom orchestrator data directories require the permission migration.** For
+  a manual binary upgrade, stop the service, replace the binary, run
+  `nurproxy permissions --data-dir <dir>`, then start it. Do not work around a
+  refusal with recursive `chmod`/`chown`; inspect the exact conflicting path.
+- **Review custom proxy configuration before enabling hard recovery.** Native
+  syntax validity alone does not establish ownership. Unsupported directives,
+  ambiguous services, shared-directory access requests, MAC-policy denials,
+  read-only filesystems, and immutable targets are deliberately refused.
+
 ## [0.3.0] - 2026-06-07
 
 A hardening and developer-experience release: the control plane can now be
@@ -128,4 +309,7 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.5.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0
+[0.5.0-rc.3]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.3
+[0.5.0-rc.2]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.2
 [0.3.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.3.0

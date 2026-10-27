@@ -10,6 +10,7 @@ EnvironmentFile=/etc/nurproxy/nurproxy.env
 ExecStart=/usr/bin/nurproxy
 Restart=on-failure
 RestartSec=5
+UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

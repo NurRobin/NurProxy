@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -29,6 +30,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			} else {
 				checks["acme_ca"] = st.Detail
 			}
+		}
+	}
+	// Old agent anchor records queued for deletion (#152). Counts only: the
+	// endpoint is unauthenticated, so the provider errors stay in the log.
+	if pending, failing, err := s.db.AgentAnchorCleanupCounts(ctx); err == nil && pending > 0 {
+		if failing > 0 {
+			checks["agent_dns_cleanup"] = fmt.Sprintf("%d old agent DNS record(s) queued for deletion, %d failing (see orchestrator log)", pending, failing)
+		} else {
+			checks["agent_dns_cleanup"] = fmt.Sprintf("ok (%d old agent DNS record(s) queued for deletion)", pending)
 		}
 	}
 	resp := map[string]any{
@@ -194,6 +204,10 @@ func (s *Server) handleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if key == "safe_auto_repair" && req.Value != "true" && req.Value != "false" {
+		writeError(w, http.StatusBadRequest, "safe_auto_repair must be true or false")
+		return
+	}
 
 	if err := s.db.SetSetting(key, req.Value); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update setting")
@@ -201,6 +215,16 @@ func (s *Server) handleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "setting", key, "update", "")
+	if key == "safe_auto_repair" {
+		agents, err := s.db.ListAgents()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to publish recovery policy")
+			return
+		}
+		for _, agent := range agents {
+			s.publishRecoveryPolicy(agent.ID, agent.SafeAutoRepairEffective)
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"key":   key,

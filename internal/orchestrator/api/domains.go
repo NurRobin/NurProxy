@@ -15,6 +15,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
+	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -122,6 +123,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "create", dom.Subdomain)
+	if err := s.db.ClaimDomainRoute(dom); err != nil {
+		log.Printf("create: cannot drop colliding route tombstones for domain %d: %v", dom.ID, err)
+	}
 	s.triggerAgentPush(dom.ServerID)
 	s.triggerCertIssuance(dom)
 
@@ -185,6 +189,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
 	}
+	// Snapshot the stored domain before any requested field is applied: a move
+	// must tombstone the OLD host on the OLD agent even when the same request
+	// also renames the domain.
+	before := *dom
 
 	var req struct {
 		Subdomain   *string             `json:"subdomain"`
@@ -215,9 +223,6 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 		dom.ZoneID = *req.ZoneID
 	}
-	// Capture the prior server so a move can clean up the artifact on the old
-	// agent (no ghost vhosts, §3).
-	oldServerID := dom.ServerID
 	if req.ServerID != nil {
 		if _, err := s.db.GetServer(*req.ServerID); err != nil {
 			writeError(w, http.StatusBadRequest, "server not found")
@@ -244,65 +249,45 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	// Mark as pending for reconciler to pick up
 	dom.Status = models.DomainStatusPending
 
+	// A move to another agent must leave a route tombstone for the old host on
+	// the old agent before any push stops retaining the route's certificate
+	// there; otherwise the old vhost survives while its certificate is pruned
+	// (#148).
+	var move *db.DomainMove
+	if req.ServerID != nil && before.ServerID != dom.ServerID {
+		move, err = s.db.BeginDomainMove(&before, dom.ServerID, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to persist managed deletion identity for the old agent")
+			return
+		}
+	}
+
 	if err := s.db.UpdateDomain(dom); err != nil {
+		s.db.AbortDomainMove(move)
 		writeError(w, http.StatusInternalServerError, "failed to update domain")
 		return
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "update", dom.Subdomain)
 
-	// Domain lifecycle: a server move (to a server on a different agent) must
-	// remove the artifact on the OLD agent and (re-)render the intent on the new
-	// one — no ghost vhosts (§3). The artifact row is keyed by agent_id, so we drop
-	// the stale row; the old agent's next full-sync push (below) no longer lists
-	// this domain, so it clears the route, and the new agent renders + reports a
-	// fresh artifact in its apply-ACK.
-	if req.ServerID != nil && oldServerID != dom.ServerID {
-		s.handleArtifactServerMove(r, dom.ID, oldServerID, dom.ServerID)
+	// The artifact row is keyed to the old agent, so a cross-agent move drops
+	// it; the new agent renders and reports a fresh one in its apply-ACK (§3).
+	if removed, err := s.db.CompleteDomainMove(move); err != nil {
+		log.Printf("move: failed to delete stale artifact for domain %d: %v", dom.ID, err)
+	} else if removed {
+		s.audit(r, "config_artifact", move.ArtifactID, "remove", "domain moved to another agent")
+	}
+	if err := s.db.ClaimDomainRoute(dom); err != nil {
+		log.Printf("update: cannot drop colliding route tombstones for domain %d: %v", dom.ID, err)
+	}
+	if move != nil {
+		// Push the old agent so it removes the route at once.
+		s.pushAgent(move.OldAgentID)
 	}
 
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, dom)
-}
-
-// handleArtifactServerMove cleans up a domain's config artifact after it moves
-// from one server to another (§3). When the move crosses agents, it deletes the
-// stale artifact row (keyed to the old agent) so no orphaned/ghost artifact
-// lingers, and pushes the old agent's now-shrunk intent set so it drops the
-// route on disk. The new agent re-renders the intent and round-trips a fresh
-// artifact on its next apply-ACK. A move within the same agent is a no-op here
-// (the artifact stays valid; the agent just re-applies it).
-func (s *Server) handleArtifactServerMove(r *http.Request, domainID int64, oldServerID, newServerID string) {
-	oldAgentID := s.agentIDForServer(oldServerID)
-	newAgentID := s.agentIDForServer(newServerID)
-	if oldAgentID == "" || oldAgentID == newAgentID {
-		return // same agent (or unresolvable old server) — nothing to clean up.
-	}
-
-	artifactID := artifactIDForDomainID(domainID)
-	if _, err := s.db.GetConfigArtifact(artifactID); err == nil {
-		if dErr := s.db.DeleteConfigArtifact(artifactID); dErr != nil {
-			log.Printf("move: failed to delete stale artifact %s: %v", artifactID, dErr)
-		} else {
-			s.audit(r, "config_artifact", artifactID, "remove", "domain moved to another agent")
-		}
-	}
-
-	// Push the old agent so it drops the now-unmanaged route (no ghost vhost).
-	s.pushAgent(oldAgentID)
-}
-
-// agentIDForServer resolves a server ID to its owning agent ID, or "" on error.
-func (s *Server) agentIDForServer(serverID string) string {
-	if serverID == "" {
-		return ""
-	}
-	srv, err := s.db.GetServer(serverID)
-	if err != nil {
-		return ""
-	}
-	return srv.AgentID
 }
 
 // artifactIDForDomainID derives the stable artifact identity for a generated
@@ -349,12 +334,42 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the owning server before we flip status, so we can push the new
-	// (route-removed) set to the agent immediately.
-	dom, _ := s.db.GetDomain(id)
+	// Persist the exact file-backend tombstone before the immediate push can stop
+	// retaining the route's certificate.
+	dom, err := s.db.GetDomain(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+	var tombstoneAgentID string
+	var tombstone *helperprotocol.ManagedDeletion
+	if !dom.CertOnly {
+		srv, srvErr := s.db.GetServer(dom.ServerID)
+		zone, zoneErr := s.db.GetZone(dom.ZoneID)
+		if srvErr != nil || zoneErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to resolve managed deletion identity")
+			return
+		}
+		backend := s.backendForDomain(srv)
+		if backend == "nginx" || backend == "apache" {
+			deletion := helperprotocol.ManagedDeletion{
+				ResourceID: artifactIDForDomainID(dom.ID),
+				Host:       dom.FQDN(zone.Name),
+				Backend:    backend,
+			}
+			if err := s.db.UpsertManagedRouteTombstone(srv.AgentID, deletion, time.Now().UTC()); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to persist managed deletion identity")
+				return
+			}
+			tombstoneAgentID, tombstone = srv.AgentID, &deletion
+		}
+	}
 
 	// Set status to "deleting" — reconciler handles actual cleanup
 	if err := s.db.UpdateDomainStatus(id, models.DomainStatusDeleting, ""); err != nil {
+		if tombstone != nil {
+			_ = s.db.DeleteManagedRouteTombstones(tombstoneAgentID, []helperprotocol.ManagedDeletion{*tombstone})
+		}
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
 	}
@@ -362,9 +377,7 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "delete", "")
 	// A full-sync push now excludes the deleting domain, so a connected agent
 	// drops the route at once; DNS record + row cleanup follow in the reconciler.
-	if dom != nil {
-		s.triggerAgentPush(dom.ServerID)
-	}
+	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "domain marked for deletion"})
 }
@@ -623,44 +636,34 @@ func (s *Server) handleUpdateDomainConfig(w http.ResponseWriter, r *http.Request
 	// Same trap as reset: a drift-accepted (manual) artifact outranks the row in
 	// the reconciler, so the OLD manual bytes would keep deploying instead of the
 	// config just stored. Remove it so the push below carries the new override.
-	s.resetManualArtifact(r, id)
+	s.resetDomainArtifact(r, id)
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "manual config set"})
 }
 
-// resetManualArtifact deletes the domain's "dom-<id>" config artifact when its
-// Source is manual (drift-accept, raw edit, or rollback to a manual version).
+// resetDomainArtifact returns the domain's current "dom-<id>" artifact to model
+// authority before a config edit or reset is pushed.
 // The reconciler treats a manual artifact as authoritative and pushes its stored
 // bytes verbatim, ignoring the domain row entirely — so after a config reset (or
 // a new manual config on the row) the old bytes would be re-pushed, the agent
 // would ACK identical content, and AppendConfigArtifactVersion's semantic-equality
 // gate would return before the source-updating UPDATE: source stays "manual" and
-// the row change never reaches the agent. Deleting the artifact breaks that loop
-// safely — the reconciler renders from the domain model when no artifact exists,
-// and the agent's next apply-ACK recreates the row with source=generated and the
-// agent's real rendered content. A generated artifact already follows the domain
-// model, so it is left alone (its version history is worth keeping).
-func (s *Server) resetManualArtifact(r *http.Request, domainID int64) {
+// the row change never reaches the agent. Resetting source/drift authority breaks
+// that loop while retaining the canonical target identity and version history.
+func (s *Server) resetDomainArtifact(r *http.Request, domainID int64) {
 	artifactID := artifactIDForDomainID(domainID)
-	art, err := s.db.GetConfigArtifact(artifactID)
+	err := s.db.ResetConfigArtifactToDomainModel(artifactID)
 	if err != nil {
 		// No artifact is the common case (nothing to reset); anything else is a
 		// real lookup failure that would leave a stale manual artifact silently
 		// overriding the domain row — make it visible.
 		if !errors.Is(err, db.ErrArtifactNotFound) {
-			log.Printf("resetManualArtifact: looking up artifact %s: %v", artifactID, err)
+			log.Printf("resetDomainArtifact: resetting artifact %s: %v", artifactID, err)
 		}
 		return
 	}
-	if art.Source != models.ArtifactSourceManual {
-		return
-	}
-	if dErr := s.db.DeleteConfigArtifact(artifactID); dErr != nil {
-		log.Printf("resetManualArtifact: failed to delete manual artifact %s: %v", artifactID, dErr)
-		return
-	}
-	s.audit(r, "config_artifact", artifactID, "reset", "manual artifact removed; agent re-renders from the domain model")
+	s.audit(r, "config_artifact", artifactID, "reset", "artifact authority reset; agent re-renders from the domain model")
 }
 
 // POST /api/v1/domains/{id}/config/reset
@@ -689,7 +692,7 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "reset_config", "manual config cleared")
 	// A drift-accepted (manual) artifact would override the cleared row on the
 	// next push; remove it so the push below renders from the domain model again.
-	s.resetManualArtifact(r, id)
+	s.resetDomainArtifact(r, id)
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "config reset to auto-generated"})

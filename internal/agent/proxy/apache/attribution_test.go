@@ -41,6 +41,24 @@ func TestAttributeConfigtestError(t *testing.T) {
 			wantLine:    3,
 		},
 		{
+			name:        "same basename in foreign root is not ours",
+			out:         "Syntax error on line 8 of /tmp/nurproxy-app.example.com.conf:",
+			ourFile:     ourFile,
+			wantLocated: true,
+			wantOurs:    false,
+			wantFile:    "/tmp/nurproxy-app.example.com.conf",
+			wantLine:    8,
+		},
+		{
+			name:        "case mismatch is not ours",
+			out:         "Syntax error on line 8 of /etc/apache2/sites-enabled/NURPROXY-app.example.com.conf:",
+			ourFile:     ourFile,
+			wantLocated: true,
+			wantOurs:    false,
+			wantFile:    "/etc/apache2/sites-enabled/NURPROXY-app.example.com.conf",
+			wantLine:    8,
+		},
+		{
 			name:        "no_location_unattributed",
 			out:         "httpd: could not open error log file /var/log/httpd/error_log. Permission denied",
 			ourFile:     ourFile,
@@ -93,5 +111,43 @@ func TestAttributeConfigtestError(t *testing.T) {
 				t.Errorf("Raw not preserved")
 			}
 		})
+	}
+}
+
+func TestAttributeConfigtestErrorMatchesAnyArtifactInBatch(t *testing.T) {
+	first := "/etc/apache2/sites-available/nurproxy-one.example.com.conf"
+	second := "/etc/apache2/sites-available/nurproxy-two.example.com.conf"
+	out := "Syntax error on line 6 of /etc/apache2/sites-enabled/nurproxy-two.example.com.conf:"
+	got := AttributeConfigtestError(out, first, second)
+	if !got.Ours || !got.Located {
+		t.Fatalf("attribution = %#v, want second batch artifact", got)
+	}
+}
+
+func TestAttributeConfigtestErrorPermissionRequiresCommandLineShape(t *testing.T) {
+	if got := AttributeConfigtestError("documentation mentions permission denied handling"); got.Permission {
+		t.Fatalf("prose gained Permission: %#v", got)
+	}
+	if got := AttributeConfigtestError("sudo: a password is required"); !got.Permission {
+		t.Fatalf("sudo denial lacked Permission: %#v", got)
+	}
+	for _, out := range []string{
+		`(13)Permission denied: AH00091: apache2: could not open error log file /var/log/apache2/error.log.`,
+		`(1)Operation not permitted: AH00091: httpd: could not open error log file /var/log/httpd/error_log.`,
+	} {
+		if got := AttributeConfigtestError(out); !got.Permission {
+			t.Fatalf("real AH00091 denial lacked Permission: %#v", got)
+		}
+	}
+	if got := AttributeConfigtestError("guide: (13)Permission denied: AH00091: apache2"); got.Permission {
+		t.Fatalf("prefixed prose gained Permission: %#v", got)
+	}
+}
+
+func TestAttributeConfigtestErrorDetectsPermissionDenied(t *testing.T) {
+	out := "httpd: could not open error log file /var/log/httpd/error_log. Permission denied"
+	got := AttributeConfigtestError(out, "/etc/apache2/sites-available/nurproxy-app.conf")
+	if !got.Permission {
+		t.Fatal("Permission = false, want true")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -177,6 +178,36 @@ func TestReconfigureBuiltInToExisting_BogusDirFailsButSwaps(t *testing.T) {
 	lastErr, _, _ := hs.snapshot()
 	if lastErr == "" {
 		t.Error("expected an actionable health error to be set on a failing probe")
+	}
+}
+
+func TestReconfigureHelperManagedBoundaryNeverRecommendsSharedDirectoryWrite(t *testing.T) {
+	h := proxy.NewHolder(seedBackend{}, "built-in")
+	hs := &fakeHealth{}
+
+	res := h.Reconfigure(context.Background(), proxy.ReconfigureRequest{
+		Mode:      "existing",
+		Type:      "nginx",
+		ConfigDir: "/nonexistent/nurproxy/helper-owned-layout",
+		TestCmd:   allowedReloadStub(t),
+	}, proxy.ReconfigureDeps{
+		Health:             hs,
+		StopCaddy:          func() error { return nil },
+		Env:                runtimeenv.Env{User: "nurproxy", IsRoot: false},
+		HelperManagedApply: true,
+	})
+
+	if !res.OK || res.Remediation != nil {
+		t.Fatalf("helper-managed switch requested direct host grants: %+v", res)
+	}
+	if !strings.Contains(res.Message, "privileged helper") || strings.Contains(res.Message, "ReadWritePaths") {
+		t.Fatalf("helper-managed switch message is unsafe or unclear: %q", res.Message)
+	}
+	if lastErr, _, _ := hs.snapshot(); lastErr != "" {
+		t.Fatalf("helper-managed switch published a direct-write health error: %q", lastErr)
+	}
+	if got := h.Current().Info().Kind; got != "nginx" {
+		t.Fatalf("helper-managed switch did not select nginx: %q", got)
 	}
 }
 

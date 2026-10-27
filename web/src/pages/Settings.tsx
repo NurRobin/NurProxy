@@ -60,6 +60,8 @@ export default function Settings() {
 
   const [reconcilerInterval, setReconcilerInterval] = useState('');
   const [reconcilerSaving, setReconcilerSaving] = useState(false);
+  const [safeAutoRepair, setSafeAutoRepair] = useState(true);
+  const [safeAutoRepairSaving, setSafeAutoRepairSaving] = useState(false);
 
   const [acmeEmail, setAcmeEmail] = useState('');
   const [acmeStaging, setAcmeStaging] = useState(false);
@@ -82,6 +84,8 @@ export default function Settings() {
       setProviders(p); setZones(z); setSettings(s); setHealth(h); setApiKeyInfo(k);
       const rec = s.find((st) => st.key === 'reconciler_interval');
       if (rec) setReconcilerInterval(rec.value);
+      const recovery = s.find((st) => st.key === 'safe_auto_repair');
+      setSafeAutoRepair(recovery?.value !== 'false');
       const email = s.find((st) => st.key === 'acme_email');
       if (email) setAcmeEmail(email.value);
       const dir = s.find((st) => st.key === 'acme_directory');
@@ -171,6 +175,19 @@ export default function Settings() {
     try { await api.updateSetting('reconciler_interval', reconcilerInterval); toast.success(t('settings.intervalSaved')); }
     catch (err) { toast.error(errMessage(err, t('settings.saveFailedGeneric'))); }
     finally { setReconcilerSaving(false); }
+  }
+
+  async function handleSafeAutoRepair(enabled: boolean) {
+    setSafeAutoRepairSaving(true);
+    try {
+      await api.updateSetting('safe_auto_repair', enabled ? 'true' : 'false');
+      setSafeAutoRepair(enabled);
+      toast.success(t('settings.safeAutoRepairSaved'));
+    } catch (err) {
+      toast.error(errMessage(err, t('settings.saveFailedGeneric')));
+    } finally {
+      setSafeAutoRepairSaving(false);
+    }
   }
 
   async function handleSaveAcmeEmail() {
@@ -302,6 +319,19 @@ export default function Settings() {
             <Input type="number" value={reconcilerInterval} onChange={(e) => setReconcilerInterval(e.target.value)} min={5} />
           </Field>
           <Button onClick={handleSaveReconciler} loading={reconcilerSaving} className="mb-0.5">{t('common.save')}</Button>
+        </div>
+      </Section>
+
+      <Section title={t('settings.safeAutoRepair')}>
+        <p className="-mt-1 text-sm text-fg-muted">{t('settings.safeAutoRepairSub')}</p>
+        <div className="mt-4">
+          <Checkbox
+            label={t('settings.safeAutoRepairEnabled')}
+            checked={safeAutoRepair}
+            disabled={safeAutoRepairSaving}
+            onChange={(event) => handleSafeAutoRepair(event.target.checked)}
+          />
+          <p className="mt-2 text-xs text-fg-faint">{t('settings.safeAutoRepairHint')}</p>
         </div>
       </Section>
 

@@ -17,13 +17,39 @@
 package certstore
 
 import (
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/shared/crypto"
 )
+
+const maxRecoveryPEMBytes = 1 << 20
+
+type RuntimeKeyState string
+
+const (
+	RuntimeKeyNotApplicable RuntimeKeyState = "not_applicable"
+	RuntimeKeyMissing       RuntimeKeyState = "missing"
+	RuntimeKeyMismatch      RuntimeKeyState = "mismatch"
+	RuntimeKeyValid         RuntimeKeyState = "valid"
+)
+
+type RecoveryInspection struct {
+	Host            string
+	CertPath        string
+	SourceKeyPath   string
+	RuntimeKeyPath  string
+	BundlePresent   bool
+	BundleValid     bool
+	RuntimeKeyState RuntimeKeyState
+}
+
+type RecoveryWriteFunc func(path string, data []byte, mode os.FileMode) error
 
 const (
 	// certSuffix is appended to the sanitized host for the public leaf+chain file.
@@ -163,6 +189,36 @@ func (s *Store) Install(b Bundle) (InstalledPaths, error) {
 	return InstalledPaths{CertPath: certPath, KeyPath: keyPath, Encrypted: encrypted}, nil
 }
 
+func (s *Store) InstallRecoveryBundle(b Bundle, write RecoveryWriteFunc) error {
+	if _, err := tls.X509KeyPair(b.CertPEM, b.KeyPEM); err != nil {
+		return fmt.Errorf("certstore: recovery bundle for %q is not a matching certificate/key pair", b.Host)
+	}
+	if write == nil {
+		return fmt.Errorf("certstore: recovery writer unavailable")
+	}
+	paths := s.recoveryPaths(b.Host)
+	keyBytes := b.KeyPEM
+	if len(s.encryptKey) > 0 {
+		var err error
+		keyBytes, err = crypto.Encrypt(s.encryptKey, b.KeyPEM)
+		if err != nil {
+			return fmt.Errorf("certstore: encrypting recovery key for %q: %w", b.Host, err)
+		}
+	}
+	if err := write(paths.CertPath, b.CertPEM, certMode); err != nil {
+		return fmt.Errorf("certstore: writing recovery cert for %q: %w", b.Host, err)
+	}
+	if err := write(paths.SourceKeyPath, keyBytes, keyMode); err != nil {
+		return fmt.Errorf("certstore: writing recovery key for %q: %w", b.Host, err)
+	}
+	if len(s.encryptKey) > 0 && b.MaterializePlain {
+		if err := write(paths.RuntimeKeyPath, b.KeyPEM, keyMode); err != nil {
+			return fmt.Errorf("certstore: materializing recovery key for %q: %w", b.Host, err)
+		}
+	}
+	return nil
+}
+
 // ReadKey reads back a host's private key, decrypting it if it was stored
 // encrypted at rest. It is the inverse of Install for the key half, used by
 // backends that must hand the proxy plaintext key material (e.g. feeding Caddy's
@@ -235,6 +291,163 @@ func (s *Store) CertPaths(host string) (ProxyPaths, error) {
 		return ProxyPaths{}, fmt.Errorf("certstore: materializing plaintext key for %q: %w", host, err)
 	}
 	return ProxyPaths{CertPath: certPath, KeyPath: plainPath}, nil
+}
+
+func (s *Store) InspectRecovery(host string) (RecoveryInspection, error) {
+	inspection := s.recoveryPaths(host)
+	certPEM, certPresent, err := readRegularBounded(inspection.CertPath, maxRecoveryPEMBytes)
+	if err != nil {
+		return inspection, fmt.Errorf("certstore: inspecting certificate for %q: %w", host, err)
+	}
+	onDiskKey, keyPresent, err := readRegularBounded(inspection.SourceKeyPath, maxRecoveryPEMBytes)
+	if err != nil {
+		return inspection, fmt.Errorf("certstore: inspecting source key for %q: %w", host, err)
+	}
+	inspection.BundlePresent = certPresent && keyPresent
+	if !inspection.BundlePresent {
+		return inspection, nil
+	}
+	keyPEM := onDiskKey
+	if len(s.encryptKey) > 0 {
+		keyPEM, err = crypto.Decrypt(s.encryptKey, onDiskKey)
+		if err != nil {
+			return inspection, nil
+		}
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return inspection, nil
+	}
+	inspection.BundleValid = true
+	if len(s.encryptKey) == 0 {
+		inspection.RuntimeKeyState = RuntimeKeyValid
+		return inspection, nil
+	}
+	runtimeKey, present, err := readRegularBounded(inspection.RuntimeKeyPath, maxRecoveryPEMBytes)
+	if err != nil {
+		return inspection, fmt.Errorf("certstore: inspecting runtime key for %q: %w", host, err)
+	}
+	if !present {
+		inspection.RuntimeKeyState = RuntimeKeyMissing
+		return inspection, nil
+	}
+	if _, err := tls.X509KeyPair(certPEM, runtimeKey); err != nil {
+		inspection.RuntimeKeyState = RuntimeKeyMismatch
+		return inspection, nil
+	}
+	inspection.RuntimeKeyState = RuntimeKeyValid
+	return inspection, nil
+}
+
+func (s *Store) RefreshRuntimeKey(host string, write RecoveryWriteFunc) error {
+	inspection := s.recoveryPaths(host)
+	certPEM, certPresent, err := readRegularBounded(inspection.CertPath, maxRecoveryPEMBytes)
+	if err != nil || !certPresent {
+		return fmt.Errorf("certstore: recovery certificate unavailable for %q", host)
+	}
+	keyPEM, keyPresent, err := s.readRecoverySourceKey(inspection.SourceKeyPath)
+	if err != nil || !keyPresent {
+		return fmt.Errorf("certstore: recovery source key unavailable for %q", host)
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return fmt.Errorf("certstore: recovery bundle mismatch for %q", host)
+	}
+	if len(s.encryptKey) == 0 {
+		return nil
+	}
+	if write == nil {
+		return fmt.Errorf("certstore: recovery writer unavailable")
+	}
+	if err := write(inspection.RuntimeKeyPath, keyPEM, keyMode); err != nil {
+		return fmt.Errorf("certstore: refreshing runtime key for %q: %w", host, err)
+	}
+	return nil
+}
+
+func (s *Store) recoveryPaths(host string) RecoveryInspection {
+	base := SanitizeHost(host)
+	dir := s.dir
+	if canonical, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = canonical
+	}
+	sourceSuffix := keyPlainSuffix
+	runtimeSuffix := keyPlainSuffix
+	state := RuntimeKeyNotApplicable
+	if len(s.encryptKey) > 0 {
+		sourceSuffix = keySuffix
+		runtimeSuffix = keyMaterializedSuffix
+		state = RuntimeKeyMissing
+	}
+	return RecoveryInspection{
+		Host: host, CertPath: filepath.Join(dir, base+certSuffix),
+		SourceKeyPath: filepath.Join(dir, base+sourceSuffix), RuntimeKeyPath: filepath.Join(dir, base+runtimeSuffix),
+		RuntimeKeyState: state,
+	}
+}
+
+func (s *Store) RecoveryPaths(host string) RecoveryInspection {
+	return s.recoveryPaths(host)
+}
+
+func (s *Store) AllRecoveryPaths(host string) []string {
+	base := SanitizeHost(host)
+	dir := s.dir
+	if canonical, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = canonical
+	}
+	return []string{
+		filepath.Join(dir, base+certSuffix), filepath.Join(dir, base+keySuffix),
+		filepath.Join(dir, base+keyPlainSuffix), filepath.Join(dir, base+keyMaterializedSuffix),
+	}
+}
+
+func (s *Store) readRecoverySourceKey(path string) ([]byte, bool, error) {
+	onDisk, present, err := readRegularBounded(path, maxRecoveryPEMBytes)
+	if err != nil || !present || len(s.encryptKey) == 0 {
+		return onDisk, present, err
+	}
+	plain, err := crypto.Decrypt(s.encryptKey, onDisk)
+	if err != nil {
+		return nil, true, err
+	}
+	return plain, true, nil
+}
+
+func readRegularBounded(path string, maxBytes int64) ([]byte, bool, error) {
+	before, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, true, err
+	}
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		_ = file.Close()
+		return nil, true, fmt.Errorf("file identity changed while opening")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, true, readErr
+	}
+	if closeErr != nil {
+		return nil, true, closeErr
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, true, fmt.Errorf("file exceeds recovery size limit")
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(opened, after) || opened.Size() != after.Size() || opened.ModTime() != after.ModTime() {
+		return nil, true, fmt.Errorf("file identity changed while reading")
+	}
+	return data, true, nil
 }
 
 // Remove deletes every on-disk artifact for a host: the public leaf+chain
