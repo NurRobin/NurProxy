@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merges `proxy_config` key by key: keys left out keep their stored value,
   `null` clears a field (for example `"basic_auth": null`), and any other value
   replaces that field as a whole.
+- **Apache domains with an IP allowlist or blocklist pass `httpd -t` again
+  (#166).** The rules were rendered as a `<RequireAll>` directly inside
+  `<VirtualHost>`, which Apache rejects, so the agent could not apply the
+  domain. They now go in a `<Location />` block. When a domain has both IP
+  rules and basic auth, a request has to pass both, the same as on nginx.
 
 ## [0.5.0] - 2026-10-27
 
