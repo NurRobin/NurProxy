@@ -439,6 +439,29 @@ func TestRender_deterministic(t *testing.T) {
 	}
 }
 
+func TestQuoteHeaderValue(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", `""`},
+		{"DENY", "DENY"},
+		{"$host", "$host"},
+		{"a b", `"a b"`},
+		{"a;b", `"a;b"`},
+		{`say "hi"`, `"say \"hi\""`},
+		{"it's", `"it's"`},
+		{"#a", `"#a"`},
+		{"a#b", `"a#b"`},
+		{"{x}", `"{x}"`},
+		{`a\b`, `"a\\b"`},
+		{`\";include /etc/x;#`, `"\\\";include /etc/x;#"`},
+		{`x\`, `"x\\"`},
+	}
+	for _, tt := range tests {
+		if got := quoteHeaderValue(tt.in); got != tt.want {
+			t.Errorf("quoteHeaderValue(%q) = %s, want %s", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestNormalizeBodySize(t *testing.T) {
 	tests := []struct {
 		in, want string

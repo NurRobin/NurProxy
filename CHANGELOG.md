@@ -24,6 +24,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<VirtualHost>`, which Apache rejects, so the agent could not apply the
   domain. They now go in a `<Location />` block. When a domain has both IP
   rules and basic auth, a request has to pass both, the same as on nginx.
+- **IPv6 upstreams are rendered with brackets** (`http://[fd00::5]:8080`) in
+  nginx and Apache configs, and upstream names may end in a dot (`ai.lan.`).
+
+### Security
+
+- **Raw nginx configs are checked the way nginx reads them.** The helper's
+  raw config check now splits a config into directives with nginx's own
+  tokenizer rules: quotes and `#` only count at the start of a word, and
+  backslashes escape the next character. Before, the check could read some
+  configs differently from nginx. Every directive in the proxied server, its
+  `location /` and the port-80 redirect server must now be on a fixed list
+  for that block, and directive names must be plain words. A raw config that
+  uses quoted directive names, single-quoted values, backslashes outside a
+  `rewrite` pattern, `#` or braces inside a word, comments in the middle of a
+  directive, a word or comment over 4000 bytes (nginx fails above 4096), or
+  a redirect server with anything other
+  than `listen 80`, one `server_name` for the domain and one `return 301
+  https://$host$request_uri` is refused. Listeners must match what NurProxy
+  renders: no options on port 80, and `ssl` (plus `http2` on older nginx) on
+  port 443, because nginx applies listen options to every vhost on that
+  port. As before, a refused config is kept only if the exact bytes are
+  already installed. Configs rendered from the dashboard form still pass.
+- **Rendered vhosts get the same check.** The helper now runs every nginx
+  vhost it renders from a domain's settings through the same check (with
+  basic auth and rate limits allowed in the form NurProxy renders them) and
+  refuses to write one that fails.
+- **Proxy settings are validated before they reach a config.** Header names
+  may only contain letters, digits, `-` and `_`. Header values may not contain
+  control characters or backslashes, may not start with a quote or with
+  `expr=` (also after leading spaces or quotes), and are limited to 3900
+  bytes. Hosts and upstream addresses must be DNS names or IP
+  addresses, IP lists must hold IPs or CIDR ranges, body sizes must be whole
+  sizes like `10m`, `1GB`, `0` or `unlimited`, path rules may not contain
+  whitespace, quotes, braces, `#`, `;` or backslashes, and basic-auth user
+  names may not contain `:`. The API checks the merged settings when a domain
+  is saved, and the nginx and Apache renderers and the helper refuse such
+  values. Header values that contain `'`, `#` or braces are now rendered in
+  double quotes, so nginx reads them as one value; the nginx renderer also
+  escapes backslashes inside quotes as a second safeguard. Apache header
+  values and the basic-auth realm are always rendered as one double-quoted
+  word with backslashes and quotes escaped, and header values have `%` and
+  `\` doubled, so mod_headers sets them literally instead of expanding
+  format sequences such as `%{NAME}e`.
+- **A domain with invalid stored settings no longer blocks its agent.** The
+  reconciler holds back only that domain, keeps its current config and
+  certificate on the agent, and marks the domain as failed with the reason,
+  until the settings are corrected.
 
 ## [0.5.0] - 2026-10-27
 

@@ -139,9 +139,9 @@ func TestRender_structured_intentToConfig(t *testing.T) {
 				return Input{Route: r}
 			}(),
 			wantVHost: []string{
-				"RequestHeader set A-Req two",
-				"RequestHeader set X-Req one",
-				"Header always set X-Resp yes",
+				`RequestHeader set A-Req "two"`,
+				`RequestHeader set X-Req "one"`,
+				`Header always set X-Resp "yes"`,
 			},
 			wantNoWarns: true,
 		},
@@ -278,7 +278,7 @@ func TestRender_structured_intentToConfig(t *testing.T) {
 			name: "max_body_size_unparseable_dropped",
 			input: func() Input {
 				r := baseRoute()
-				r.MaxBodySize = "lots"
+				r.MaxBodySize = "99999999999999999999g" // passes validation, overflows int64
 				return Input{Route: r}
 			}(),
 			notVHost: []string{"LimitRequestBody"},

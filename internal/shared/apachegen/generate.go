@@ -110,6 +110,12 @@ func Render(in Input) (Result, error) {
 	if route.Upstream.Port <= 0 || route.Upstream.Port > 65535 {
 		return Result{}, fmt.Errorf("upstream port %d out of range (1-65535)", route.Upstream.Port)
 	}
+	// Apache reads one directive per line and has no policy check on the
+	// rendered vhost, so every interpolated value must pass the model's value
+	// checks (plain names, no control characters or backslashes).
+	if err := route.Validate(); err != nil {
+		return Result{}, err
+	}
 
 	var warnings []Warning
 	warn := func(option, reason string) {
@@ -184,7 +190,7 @@ func Render(in Input) (Result, error) {
 	if len(route.ResponseHeaders) > 0 {
 		b.WriteString("\n")
 		for _, k := range sortedKeys(route.ResponseHeaders) {
-			fmt.Fprintf(&b, "    Header always set %s %s\n", k, quoteValue(route.ResponseHeaders[k]))
+			fmt.Fprintf(&b, "    Header always set %s %s\n", k, headerValue(route.ResponseHeaders[k]))
 		}
 	}
 
@@ -193,7 +199,7 @@ func Render(in Input) (Result, error) {
 	if len(route.RequestHeaders) > 0 {
 		b.WriteString("\n")
 		for _, k := range sortedKeys(route.RequestHeaders) {
-			fmt.Fprintf(&b, "    RequestHeader set %s %s\n", k, quoteValue(route.RequestHeaders[k]))
+			fmt.Fprintf(&b, "    RequestHeader set %s %s\n", k, headerValue(route.RequestHeaders[k]))
 		}
 	}
 
@@ -215,7 +221,7 @@ func Render(in Input) (Result, error) {
 	if route.EffectiveScheme() == proxymodel.SchemeHTTPS {
 		upstreamScheme = "https"
 	}
-	upstreamBase := fmt.Sprintf("%s://%s:%d", upstreamScheme, route.Upstream.Addr, route.Upstream.Port)
+	upstreamBase := upstreamScheme + "://" + proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port)
 
 	// Path handling. Apache expresses prefix strip / rewrite via mod_rewrite;
 	// otherwise a plain ProxyPass at "/" forwards everything.
@@ -244,7 +250,7 @@ func Render(in Input) (Result, error) {
 			}
 			b.WriteString("    RewriteEngine On\n")
 			b.WriteString("    RewriteCond %{HTTP:Upgrade} =websocket [NC]\n")
-			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s:%d/$1 [P,L]\n", wsScheme, route.Upstream.Addr, route.Upstream.Port)
+			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s/$1 [P,L]\n", wsScheme, proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port))
 		}
 		fmt.Fprintf(&b, "    ProxyPass / %s/", upstreamBase)
 		// Upstream timeouts map onto ProxyPass connectiontimeout/timeout key=value
@@ -388,18 +394,26 @@ func parseSizeToBytes(s string) (int64, bool) {
 // basicAuthRealm builds the AuthName realm string for a host.
 func basicAuthRealm(host string) string { return "Restricted: " + host }
 
-// quoteValue wraps an Apache directive argument in double quotes when it
-// contains whitespace, which Apache would otherwise tokenize into multiple
-// arguments. Embedded double quotes are backslash-escaped. An empty value is
-// rendered as an explicit empty-string token.
+// headerValue renders a Header or RequestHeader value so mod_headers sets it
+// literally. mod_headers reads the value as a format string: "%" starts a
+// format specifier such as %{NAME}e (an environment variable) and "\"
+// starts an escape such as \n, so both are doubled. The result is then
+// written as one quoted word. proxymodel refuses values that start with
+// "expr=" (also behind leading quotes or spaces), which mod_headers would
+// evaluate as an expression.
+func headerValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	return quoteValue(strings.ReplaceAll(v, "%", "%%"))
+}
+
+// quoteValue renders v as one double-quoted Apache directive argument, so
+// the word Apache's config tokenizer (ap_getword_conf) hands to the
+// directive is exactly v. Inside double quotes that tokenizer turns `\\`
+// into `\` and `\"` into `"` and keeps every other character as is, so
+// backslashes are escaped before double quotes.
 func quoteValue(v string) string {
-	if v == "" {
-		return `""`
-	}
-	if strings.ContainsAny(v, " \t\"") {
-		return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
-	}
-	return v
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
 }
 
 // regexpEscape escapes the regex metacharacters that can appear in a URL path

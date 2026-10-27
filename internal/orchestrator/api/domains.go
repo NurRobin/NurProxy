@@ -41,6 +41,14 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, domains)
 }
 
+// validateProxyOptions checks the proxy settings that renderers interpolate
+// into native configs (headers, body size, path rules, IP lists, basic auth)
+// with the same rules the agent's helper applies, so a value the helper would
+// refuse is rejected when it is saved.
+func validateProxyOptions(dom models.Domain) error {
+	return caddygen.ConfigFromDomain(dom, "", "").ValidateOptions()
+}
+
 // POST /api/v1/domains
 func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -116,6 +124,10 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 
 	if req.ProxyConfig != nil {
 		dom.ProxyConfig = *req.ProxyConfig
+		if err := validateProxyOptions(*dom); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	if err := s.db.CreateDomain(dom); err != nil {
@@ -250,6 +262,12 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dom.ProxyConfig = merged
+		// Validate the merged result: keys the request left out keep their
+		// stored value and are rendered too.
+		if err := validateProxyOptions(*dom); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	// Mark as pending for reconciler to pick up
