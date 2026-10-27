@@ -792,6 +792,14 @@ var migrations = []string{
 		UNIQUE (zone_id, record_id)
 	);
 	`,
+
+	// Migration 33: per-domain Cloudflare proxy (orange cloud) setting (#126).
+	// NULL means "not set": the reconciler keeps whatever proxy state the live
+	// record has, so existing domains keep today's behavior. 0 / 1 are an
+	// explicit operator choice that the reconciler enforces.
+	`
+	ALTER TABLE domains ADD COLUMN proxied INTEGER CHECK (proxied IS NULL OR proxied IN (0, 1));
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

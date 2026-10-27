@@ -178,8 +178,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 32 {
-		t.Fatalf("this test pins the schema target at 32 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 33 {
+		t.Fatalf("this test pins the schema target at 33 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -227,6 +227,17 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if certOnly != 0 {
 			t.Errorf("domains.cert_only = %d, want 0 (default on pre-existing row)", certOnly)
+		}
+	})
+
+	// migration 33: domains.proxied is NULL (not set) on pre-existing rows.
+	t.Run("domain_proxied_default", func(t *testing.T) {
+		var proxied sql.NullInt64
+		if err := d.sql.QueryRow("SELECT proxied FROM domains WHERE id=1").Scan(&proxied); err != nil {
+			t.Fatalf("select proxied: %v", err)
+		}
+		if proxied.Valid {
+			t.Errorf("domains.proxied = %d, want NULL (default on pre-existing row)", proxied.Int64)
 		}
 	})
 

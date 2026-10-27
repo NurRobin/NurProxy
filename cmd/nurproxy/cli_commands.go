@@ -410,13 +410,13 @@ func cmdDomain(args []string) {
 		for i, d := range domains {
 			rows[i] = []string{
 				strconv.FormatInt(d.ID, 10), d.Subdomain, d.ServerID,
-				strconv.Itoa(d.Port), string(d.Status),
+				strconv.Itoa(d.Port), proxiedCell(d.Proxied), string(d.Status),
 			}
 		}
-		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "STATUS"}, rows)
+		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "PROXIED", "STATUS"}, rows)
 
 	case "add":
-		var subdomain, zone, server, sslMode, proxyFile string
+		var subdomain, zone, server, sslMode, proxyFile, proxied string
 		var port int
 		var ws, forceHTTPS bool
 		c, _, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
@@ -428,6 +428,7 @@ func cmdDomain(args []string) {
 			fs.BoolVar(&forceHTTPS, "force-https", false, "Force HTTPS redirect")
 			fs.StringVar(&sslMode, "ssl-mode", "", "SSL mode (auto, ...)")
 			fs.StringVar(&proxyFile, "proxy-config-file", "", "Path to a ProxyConfig JSON file (advanced)")
+			fs.StringVar(&proxied, "proxied", "", proxiedFlagHelp)
 		})
 		if subdomain == "" || zone == "" || server == "" || port == 0 {
 			fatalf("--subdomain, --zone, --server and --port are required")
@@ -437,6 +438,9 @@ func cmdDomain(args []string) {
 			"websocket": ws, "force_https": forceHTTPS,
 		}
 		putStr(body, "ssl_mode", sslMode)
+		if proxied != "" {
+			body["proxied"] = parseProxiedFlag(proxied)
+		}
 		if proxyFile != "" {
 			body["proxy_config"] = json.RawMessage(readFileArg(proxyFile))
 		}
@@ -447,7 +451,7 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain created: "+gjson(raw, "id"))
 
 	case "update":
-		var subdomain, zone, server, sslMode string
+		var subdomain, zone, server, sslMode, proxied string
 		var port int
 		var ws, forceHTTPS bool
 		c, fs, id := parseClient("domain update", rest, "domain id", func(fs *flag.FlagSet) {
@@ -458,6 +462,7 @@ func cmdDomain(args []string) {
 			fs.BoolVar(&ws, "websocket", false, "Enable WebSocket support")
 			fs.BoolVar(&forceHTTPS, "force-https", false, "Force HTTPS redirect")
 			fs.StringVar(&sslMode, "ssl-mode", "", "SSL mode")
+			fs.StringVar(&proxied, "proxied", "", proxiedFlagHelp)
 		})
 		body := map[string]interface{}{}
 		putStr(body, "subdomain", subdomain)
@@ -475,6 +480,8 @@ func cmdDomain(args []string) {
 				body["websocket"] = ws
 			case "force-https":
 				body["force_https"] = forceHTTPS
+			case "proxied":
+				body["proxied"] = parseProxiedFlag(proxied)
 			}
 		})
 		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id, body)
@@ -648,6 +655,35 @@ func splitCSV(s string) []string {
 func putStr(m map[string]interface{}, key, val string) {
 	if val != "" {
 		m[key] = val
+	}
+}
+
+const proxiedFlagHelp = "Cloudflare proxy (orange cloud): on, off, or keep (keep whatever the existing record has; the default)"
+
+// parseProxiedFlag maps --proxied to the API's tri-state value. keep becomes
+// JSON null, which the API reads as "not set".
+func parseProxiedFlag(v string) interface{} {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "true", "yes":
+		return true
+	case "off", "false", "no":
+		return false
+	case "keep", "auto", "unset":
+		return nil
+	}
+	fatalf("--proxied must be on, off or keep (got %q)", v)
+	return nil
+}
+
+// proxiedCell renders a domain's proxied setting for table output.
+func proxiedCell(p *bool) string {
+	switch {
+	case p == nil:
+		return "keep"
+	case *p:
+		return "on"
+	default:
+		return "off"
 	}
 }
 

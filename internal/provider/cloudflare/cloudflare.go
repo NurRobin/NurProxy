@@ -83,6 +83,8 @@ func (p *CloudflareProvider) Info() provider.ProviderInfo {
 		Description: "Cloudflare DNS management via API v4",
 		Website:     "https://www.cloudflare.com",
 		RecordTypes: []string{"A", "AAAA", "CNAME", "TXT"},
+		// Orange-cloud proxying (#126).
+		SupportsProxied: true,
 	}
 }
 
@@ -296,6 +298,31 @@ func (p *CloudflareProvider) UpdateRecord(ctx context.Context, config json.RawMe
 	_, err = p.doRequest(ctx, cfg.APIToken, http.MethodPut, path, payloadBytes)
 	if err != nil {
 		return fmt.Errorf("cloudflare: update record request failed: %w", err)
+	}
+	return nil
+}
+
+// PatchRecord sends only the given fields as a PATCH ("Update DNS Record"),
+// so the record's comment, tags and settings survive. UpdateRecord is a PUT
+// that replaces the whole record.
+func (p *CloudflareProvider) PatchRecord(ctx context.Context, config json.RawMessage, recordID string, patch provider.RecordPatch) error {
+	cfg, err := parseConfig(config)
+	if err != nil {
+		return err
+	}
+	if cfg.ZoneID == "" {
+		return fmt.Errorf("cloudflare: zone_id is required to update a record")
+	}
+	if patch.Content == nil && patch.Proxied == nil {
+		return nil
+	}
+	payloadBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("cloudflare: failed to marshal record patch: %w", err)
+	}
+	path := fmt.Sprintf("/zones/%s/dns_records/%s", cfg.ZoneID, recordID)
+	if _, err := p.doRequest(ctx, cfg.APIToken, http.MethodPatch, path, payloadBytes); err != nil {
+		return fmt.Errorf("cloudflare: patch record request failed: %w", err)
 	}
 	return nil
 }

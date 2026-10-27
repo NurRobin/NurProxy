@@ -133,6 +133,9 @@ func TestValidateRecord(t *testing.T) {
 		{"missing name", provider.Record{Type: "A", Content: "1.2.3.4"}, true},
 		{"missing content", provider.Record{Type: "A", Name: "x.example.com"}, true},
 		{"negative ttl", provider.Record{Type: "A", Name: "x.example.com", Content: "1.2.3.4", TTL: -1}, true},
+		{"proxied cname", provider.Record{Type: "CNAME", Name: "x.example.com", Content: "edge.example.com", Proxied: true}, false},
+		{"proxied a", provider.Record{Type: "A", Name: "x.example.com", Content: "1.2.3.4", Proxied: true}, false},
+		{"proxied txt rejected", provider.Record{Type: "TXT", Name: "_acme-challenge.x.example.com", Content: "tok", Proxied: true}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -141,6 +144,83 @@ func TestValidateRecord(t *testing.T) {
 				t.Fatalf("CreateRecord err=%v, wantErr=%v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestProxiedRoundTrip asserts the in-memory store keeps the proxied bit across
+// create, read, list and update, so reconciler drift checks see what was written.
+func TestProxiedRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	d := newWrapped()
+	cfg := json.RawMessage(`{}`)
+	rec := provider.Record{Type: "CNAME", Name: "app.example.com", Content: "edge.example.com", Proxied: true}
+	id, err := d.CreateRecord(ctx, cfg, rec)
+	if err != nil {
+		t.Fatalf("CreateRecord: %v", err)
+	}
+	got, err := d.GetRecord(ctx, cfg, id)
+	if err != nil || !got.Proxied {
+		t.Fatalf("GetRecord proxied = %v (err %v), want true", got != nil && got.Proxied, err)
+	}
+	list, err := d.ListRecords(ctx, cfg, "app.example.com", "")
+	if err != nil || len(list) != 1 || !list[0].Proxied {
+		t.Fatalf("ListRecords = %+v (err %v), want one proxied record", list, err)
+	}
+	rec.Proxied = false
+	if err := d.UpdateRecord(ctx, cfg, id, rec); err != nil {
+		t.Fatalf("UpdateRecord: %v", err)
+	}
+	got, _ = d.GetRecord(ctx, cfg, id)
+	if got.Proxied {
+		t.Fatal("UpdateRecord did not clear proxied")
+	}
+	rec.Type = "TXT"
+	rec.Proxied = true
+	if err := d.UpdateRecord(ctx, cfg, id, rec); err == nil {
+		t.Fatal("UpdateRecord accepted a proxied TXT record")
+	}
+}
+
+// TestPatchRecordKeepsOtherFields asserts PatchRecord changes only the given
+// fields, like Cloudflare's PATCH.
+func TestPatchRecordKeepsOtherFields(t *testing.T) {
+	ctx := context.Background()
+	d := newWrapped()
+	cfg := json.RawMessage(`{}`)
+	id, err := d.CreateRecord(ctx, cfg, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "old.example.com", TTL: 300})
+	if err != nil {
+		t.Fatalf("CreateRecord: %v", err)
+	}
+	rp, ok := d.(provider.RecordPatcher)
+	if !ok {
+		t.Fatal("dry-run provider does not implement RecordPatcher")
+	}
+	on := true
+	target := "edge.example.com"
+	tests := []struct {
+		name  string
+		patch provider.RecordPatch
+		want  provider.Record
+	}{
+		{"proxy only", provider.RecordPatch{Proxied: &on}, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "old.example.com", TTL: 300, Proxied: true}},
+		{"target only", provider.RecordPatch{Content: &target}, provider.Record{Type: "CNAME", Name: "app.example.com", Content: "edge.example.com", TTL: 300, Proxied: true}},
+	}
+	for _, tc := range tests {
+		if err := rp.PatchRecord(ctx, cfg, id, tc.patch); err != nil {
+			t.Fatalf("%s: PatchRecord: %v", tc.name, err)
+		}
+		got, _ := d.GetRecord(ctx, cfg, id)
+		tc.want.ID = id
+		if *got != tc.want {
+			t.Fatalf("%s: record = %+v, want %+v", tc.name, *got, tc.want)
+		}
+	}
+	if err := rp.PatchRecord(ctx, cfg, "missing", provider.RecordPatch{Proxied: &on}); err == nil {
+		t.Fatal("PatchRecord on unknown record succeeded")
+	}
+	txt, _ := d.CreateRecord(ctx, cfg, provider.Record{Type: "TXT", Name: "_acme-challenge.app.example.com", Content: "tok"})
+	if err := rp.PatchRecord(ctx, cfg, txt, provider.RecordPatch{Proxied: &on}); err == nil {
+		t.Fatal("PatchRecord proxied a TXT record")
 	}
 }
 

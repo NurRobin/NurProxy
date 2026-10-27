@@ -4,6 +4,8 @@ export interface Provider {
   name: string;
   is_default: boolean;
   created_at: string;
+  /** Whether zones of this provider can proxy records (Cloudflare orange cloud). */
+  supports_proxied?: boolean;
 }
 
 export interface Zone {
@@ -350,6 +352,9 @@ export interface Domain {
   /** cert_only: NurProxy issues + renews the TLS cert and installs it on the
    *  agent without serving a vhost; the operator hand-writes the config. */
   cert_only?: boolean;
+  /** Cloudflare proxy (orange cloud) setting. null/absent keeps whatever the
+   *  live record has; true/false is enforced. Only Cloudflare zones accept true. */
+  proxied?: boolean | null;
   dns_record_id?: string;
   status: 'pending' | 'active' | 'error' | 'deleting' | 'degraded';
   error_msg?: string;

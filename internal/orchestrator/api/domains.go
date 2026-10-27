@@ -54,6 +54,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		// CertOnly issues + renews a cert for this host and installs it on the
 		// agent without serving a vhost (§7). No upstream/port is needed.
 		CertOnly bool `json:"cert_only"`
+		// Proxied is the Cloudflare orange-cloud setting (#126): omitted/null
+		// keeps whatever the live record has, true/false is enforced.
+		Proxied *bool `json:"proxied"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -87,6 +90,11 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.db.ValidateDomainProxied(req.ZoneID, req.CertOnly, req.Proxied); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Check subdomain uniqueness within zone
 	existing, _ := s.db.ListDomains(db.DomainFilter{})
 	for _, d := range existing {
@@ -110,6 +118,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		ForceHTTPS: req.ForceHTTPS,
 		SSLMode:    sslMode,
 		CertOnly:   req.CertOnly,
+		Proxied:    req.Proxied,
 		Status:     models.DomainStatusPending,
 	}
 
@@ -203,6 +212,9 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		ForceHTTPS  *bool               `json:"force_https"`
 		SSLMode     *models.SSLMode     `json:"ssl_mode"`
 		ProxyConfig *models.ProxyConfig `json:"proxy_config"`
+		// Proxied: absent leaves the setting alone, null clears it back to
+		// "keep existing", true/false sets it (#126).
+		Proxied models.OptionalBool `json:"proxied"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -245,6 +257,15 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	if req.ProxyConfig != nil {
 		dom.ProxyConfig = *req.ProxyConfig
 	}
+	if req.Proxied.Set {
+		dom.Proxied = req.Proxied.Value
+	}
+	// Checked against the final zone, so moving a proxied domain into a zone
+	// whose provider cannot proxy is refused too.
+	if err := s.db.ValidateDomainProxied(dom.ZoneID, dom.CertOnly, dom.Proxied); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Mark as pending for reconciler to pick up
 	dom.Status = models.DomainStatusPending
@@ -269,6 +290,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "update", dom.Subdomain)
+	if models.ProxiedLabel(before.Proxied) != models.ProxiedLabel(dom.Proxied) {
+		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "proxied_set",
+			fmt.Sprintf("%s: %s -> %s", dom.Subdomain, models.ProxiedLabel(before.Proxied), models.ProxiedLabel(dom.Proxied)))
+	}
 
 	// The artifact row is keyed to the old agent, so a cross-agent move drops
 	// it; the new agent renders and reports a fresh one in its apply-ACK (§3).

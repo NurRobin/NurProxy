@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,12 +154,14 @@ func TestSandboxEndToEnd(t *testing.T) {
 	// converge through the same dry pipeline — DNS record created at the zone apex
 	// (FQDN == bare zone), cert issued for the bare zone, route rendered. Created
 	// now so it converges in the same reconciler cycle as "app" (no extra wait).
+	// It is also the Cloudflare-proxied domain (#126): its CNAME must be created
+	// with the orange cloud on.
 	var apex struct {
 		ID int `json:"id"`
 	}
 	api.post("/api/v1/domains", map[string]any{
 		"subdomain": "@", "zone_id": zone.ID, "server_id": server.ID,
-		"port": 8080, "ssl_mode": "central",
+		"port": 8080, "ssl_mode": "central", "proxied": true,
 	}, &apex)
 
 	// --- assert convergence ---------------------------------------------------
@@ -337,6 +340,64 @@ func TestSandboxEndToEnd(t *testing.T) {
 	}
 	if got, err := os.ReadFile(managedPath); err != nil || !bytes.Equal(got, managedBefore) {
 		t.Fatalf("unknown validation failure did not roll back managed config: err=%v", err)
+	}
+
+	// --- Cloudflare proxy state (#126) -----------------------------------------
+	// The apex was created with proxied=true, so its simulated CNAME must have
+	// been created proxied. Turning the setting off and running the synchronous
+	// DNS takeover must flip the existing record to DNS only, audited as such.
+	auditFor := func(entityID int, action string) []string {
+		var log struct {
+			Entries []struct {
+				EntityType string `json:"entity_type"`
+				EntityID   string `json:"entity_id"`
+				Action     string `json:"action"`
+				Details    string `json:"details"`
+			} `json:"entries"`
+		}
+		api.get("/api/v1/audit-log?limit=500", &log)
+		var out []string
+		for _, e := range log.Entries {
+			if e.EntityType == "domain" && e.EntityID == fmt.Sprint(entityID) && e.Action == action {
+				out = append(out, e.Details)
+			}
+		}
+		return out
+	}
+	created := auditFor(apex.ID, "dns_created")
+	if len(created) != 1 || !strings.Contains(created[0], "(proxied)") {
+		t.Fatalf("apex CNAME was not created proxied; dns_created audit = %q", created)
+	}
+	api.put(fmt.Sprintf("/api/v1/domains/%d", apex.ID), map[string]any{"proxied": false}, nil)
+	api.post(fmt.Sprintf("/api/v1/domains/%d/dns/takeover", apex.ID), map[string]any{}, nil)
+	// A background reconcile may enforce the setting before the takeover does,
+	// so only require that the flip happened, not who did it.
+	flipped := auditFor(apex.ID, "dns_proxied_updated")
+	if len(flipped) == 0 {
+		t.Fatal("explicit proxied=false was not enforced on the existing record: no dns_proxied_updated audit entry")
+	}
+	for _, f := range flipped {
+		if !strings.Contains(f, "from proxied to DNS only") {
+			t.Fatalf("unexpected proxy change: %q", f)
+		}
+	}
+	// A second takeover reports the record's live state in its audit text.
+	api.post(fmt.Sprintf("/api/v1/domains/%d/dns/takeover", apex.ID), map[string]any{}, nil)
+	sawDNSOnly := false
+	for _, d := range auditFor(apex.ID, "dns_takeover") {
+		if strings.Contains(d, "(DNS only)") {
+			sawDNSOnly = true
+		}
+	}
+	if !sawDNSOnly {
+		t.Fatalf("apex record is still proxied after the flip; dns_takeover audit = %q", auditFor(apex.ID, "dns_takeover"))
+	}
+	var apexAfter struct {
+		Proxied *bool `json:"proxied"`
+	}
+	api.get(fmt.Sprintf("/api/v1/domains/%d", apex.ID), &apexAfter)
+	if apexAfter.Proxied == nil || *apexAfter.Proxied {
+		t.Fatalf("apex proxied setting = %v, want false", apexAfter.Proxied)
 	}
 
 	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; stale managed temp auto-healed and an unclassified validation failure remained diagnosis-only (validator/reload are hermetic fixtures, not native nginx proof)", dom.DNSRecordID)
