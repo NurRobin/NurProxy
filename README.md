@@ -106,6 +106,7 @@ There is no extra proxy layer, no port conflict, and no TLS delegation chain. Th
 
 - **Central TLS issuance**: The orchestrator issues Let's Encrypt certificates via DNS-01, using the DNS provider credentials it already has. Certificates are stored encrypted at rest and pushed to agents, so you don't need port-80 challenge traffic.
 - **Automatic renewal**: A background loop renews certificates before expiry and re-pushes them to the serving agent.
+- **Certificate import**: Moving a host that already has a valid certificate? Upload it with `nurproxy domain set-cert <id> --cert fullchain.pem --key privkey.pem` (or `PUT /api/v1/domains/{id}/certificate`) instead of ordering a new one. NurProxy checks that the key matches, the certificate covers the host (wildcards included), the chain is in order and the certificate is currently valid, then stores it encrypted and pushes it to the agent. It is not renewed until it is 30 days from expiry; from then on central ACME renewal issues a regular certificate for that host and replaces it. Only domains on central TLS accept an import.
 - **Backend-aware**: Built-in Caddy agents can also use self-managed ACME as fallback. Existing nginx/Apache agents receive centrally issued certificates with paths that match their config conventions.
 - **ACME email setup**: Configurable in the setup wizard or settings. Issuance stays inactive until an email is set, and the dashboard warns when central-TLS domains exist without one.
 

@@ -23,6 +23,7 @@
 - [ ] Wildcard issuance + the shared-private-key warning (`WildcardSharedKeyWarning`).
 - [ ] ACME account key: P-256, persisted at `<data-dir>/acme-account.key` (0600), reused across restarts.
 - [ ] `ErrACMENotConfigured` — issuance skipped quietly until `acme_email` is set; no restart needed.
+- [ ] Operator-imported certificates: validation, storage as `source=imported`, push to the agent, ACME take-over in the renew window.
 - [ ] Settings wiring: `acme_email`, `acme_directory` read lazily at issuance time.
 - [ ] Dry failure injection: `NP_DRY_RUN_FAIL=ratelimit|challenge|propagation`; self-signed dry cert (90d validity).
 - [ ] `NP_DNS_DRY_RUN` + real ACME always fails DNS-01 (regression-guard pitfall).
@@ -254,6 +255,19 @@
 - **Coverage:** R.
 - **Pitfalls:** LE **production** rate limits — test with staging (`acme_directory` = staging URL) first; staging certs won't validate without `-k`. Issuance does not require inbound `:80`/`:443` (DNS-01), but **serving** does. See RELEASE-QA §2.5b (built-in Caddy central-TLS serving is HIGH RISK / the default mode) and the known route-apply caveat (issue #106).
 
+### 16. Operator-imported certificates (#80)
+- **Must:** `PUT /api/v1/domains/{id}/certificate` (CLI `nurproxy domain set-cert <id> --cert FILE --key FILE`) accepts `{cert_pem, key_pem}` for a central-TLS domain and stores it host-keyed in `certificates` with `source='imported'` (migration 33), key encrypted like an issued one (`internal/orchestrator/api/domain_certificate.go`, `internal/orchestrator/tls/import.go`).
+  - Validation: key matches the leaf; leaf covers the domain FQDN (a `*.zone` SAN covers one label, never the apex); every chain cert signs the one before it (leaf first); leaf is inside `NotBefore`..`NotAfter`; EKU allows server auth; no encrypted keys; each PEM ≤ 1 MiB. The chain is **not** checked against a trusted root, so internal-CA and registrar certs import fine.
+  - Stored `cert_pem` holds only the re-encoded CERTIFICATE blocks: a private key pasted into the cert file is dropped, never stored as public data.
+  - Domains on `self-acme` or `off` get 409; a domain in `deleting` gets 409.
+  - Renewal: nothing happens until the cert enters the 30-day renew window. Then the renewal scan issues an ACME cert for **the stored host only** (not the imported SAN list, which may name hosts in zones NurProxy cannot solve) and the row flips back to `source='acme'`. The response carries `renewal_after` and a `warning` when the import is already inside the window.
+  - Delivery: the import triggers the same push as a renewal; the bundle rides `IntentSet.Certs`, is listed in `CertKeep`, and becomes `certificate` + `source_key` artifacts in the signed managed-apply intent, so the helper materializes it and prune keeps it.
+- **Access:** REST, CLI. No dashboard control yet.
+- **Steps (dry):** in the sandbox, mint a self-signed cert for a seeded central domain (`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=<host> -addext subjectAltName=DNS:<host> -keyout k.pem -out c.pem`), run `nurproxy domain set-cert <id> --cert c.pem --key k.pem`, then check the agent's `<data-dir>/certs/<host>.crt` equals `c.pem` and the audit log has `cert_imported`.
+- **Pass:** 200 with `source:"imported"`; agent cert file replaced; wrong host / mismatched key / expired / not-yet-valid / out-of-order chain each give 400 with a readable reason and leave the stored cert untouched.
+- **Coverage:** D (`test/sandbox` asserts the agent receives it). R (served leaf via `openssl s_client` after import on a real agent).
+- **Pitfalls:** an ACME issuance already running for the host when the import lands can overwrite it; re-import if so. An imported cert with less than 30 days left is replaced on the next scan, which can hit the very rate limit the import was meant to avoid; the per-host backoff (#70) then applies.
+
 ## Acceptance checklist
 
 ### Dry (every RC)
@@ -269,6 +283,7 @@
 - [ ] `/api/v1/health` reports `acme_dry_run`/`dns_dry_run`/`dry_run`.
 - [ ] No-email instance skips issuance quietly (no `renew_failed` spam); setting `acme_email` enables issuance without restart.
 - [ ] Audit events for renewal carry `source=dryrun` in sandbox.
+- [ ] Certificate import: valid bundle stored as `source=imported` and installed on the agent; wrong host, key mismatch, expired and out-of-order chain rejected with 400; self-acme/off domains get 409.
 
 ### Real run (before final)
 - [ ] Real central domain → DNS-01 solve → real LE cert obtained, served on `:443`, SAN matches host (`openssl s_client`), `curl -k` succeeds.

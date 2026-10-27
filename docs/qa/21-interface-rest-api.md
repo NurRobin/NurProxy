@@ -124,6 +124,7 @@
   | GET | `/api/v1/domains/{id}/config` | auth | rendered/manual config preview | — |
   | PUT | `/api/v1/domains/{id}/config` | auth | set a manual config override | `{"config": <json|string>}` |
   | POST | `/api/v1/domains/{id}/config/reset` | auth | clear manual override | — |
+  | PUT | `/api/v1/domains/{id}/certificate` | auth | import an operator certificate (central TLS only; see 06-tls-acme §16) | `{"cert_pem","key_pem"}` |
 
   **Config artifacts + drift (§11/§6)**
   | Method | Path | Auth | Purpose | Body |
