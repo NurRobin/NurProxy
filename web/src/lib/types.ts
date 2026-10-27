@@ -131,6 +131,9 @@ export interface ProxyCapabilities {
   ip_filter: boolean;
   rate_limit: boolean;
   central_tls: boolean;
+  /** Absent on agents that predate per-domain logging control. */
+  access_log?: boolean;
+  error_log_level?: boolean;
 }
 
 export interface Agent {
@@ -373,6 +376,10 @@ export interface ProxyConfig {
   // tls_policy selects how the public-listener cert is provisioned:
   // "central" (DNS-01 provided cert, the default), "self-acme", or "off".
   tls_policy?: string;
+  /** "off" writes no access log for the domain; unset keeps the host-wide log. */
+  access_log?: string;
+  /** Minimum error log level (e.g. "crit"); unset keeps the host default. */
+  error_log_level?: string;
 }
 
 export interface AuditLogEntry {
@@ -473,6 +480,8 @@ export interface ProxyRoute {
   IPBlocklist?: string[];
   RateLimit?: { RequestsPerSecond?: number };
   TLS?: { Policy?: string; Wildcard?: boolean };
+  AccessLog?: string;
+  ErrorLogLevel?: string;
 }
 
 /**

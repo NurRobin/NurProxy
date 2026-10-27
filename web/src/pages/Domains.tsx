@@ -42,6 +42,8 @@ function proxiedValue(c: ProxiedChoice): boolean | null {
   return null;
 }
 const STATUS_FILTERS = ['all', 'active', 'pending', 'error', 'deleting'];
+// Mirrors proxymodel.ErrorLogLevels, most to least verbose.
+const ERROR_LOG_LEVELS = ['info', 'notice', 'warn', 'error', 'crit', 'alert', 'emerg'];
 
 export default function Domains() {
   const { t } = useTranslation();
@@ -83,6 +85,8 @@ export default function Domains() {
   const [editForceHttps, setEditForceHttps] = useState(true);
   const [editMaxBody, setEditMaxBody] = useState('');
   const [editProxied, setEditProxied] = useState<ProxiedChoice>('keep');
+  const [editAccessLog, setEditAccessLog] = useState('');
+  const [editErrorLogLevel, setEditErrorLogLevel] = useState('');
   const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
   const [editRawConfig, setEditRawConfig] = useState('');
   const [editConfigBackend, setEditConfigBackend] = useState('caddy');
@@ -194,6 +198,8 @@ export default function Domains() {
     setEditForceHttps(d.force_https || d.proxy_config?.force_https || false);
     setEditMaxBody(d.proxy_config?.max_body_size ?? '');
     setEditProxied(proxiedChoice(d.proxied));
+    setEditAccessLog(d.proxy_config?.access_log ?? '');
+    setEditErrorLogLevel(d.proxy_config?.error_log_level ?? '');
     setEditHeaders(d.proxy_config?.custom_request_headers
       ? Object.entries(d.proxy_config.custom_request_headers).map(([key, value]) => ({ key, value }))
       : []);
@@ -215,6 +221,7 @@ export default function Domains() {
         proxy_config: proxyConfigChanges(detailDomain.proxy_config, {
           websocket: editWebsocket, force_https: editForceHttps,
           max_body_size: editMaxBody, custom_request_headers: editHeaders,
+          access_log: editAccessLog, error_log_level: editErrorLogLevel,
         }),
       });
       toast.success(t('domains.updated'));
@@ -556,6 +563,22 @@ export default function Domains() {
                 <Field label={t('domains.maxBodySize')} help="max-body-size" hint={supports('reverse_proxy') ? t('domains.maxBodyHint') : unsupportedHint('reverse_proxy')}>
                   <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder={t('domains.maxBodyPh')} />
                 </Field>
+                {/* An unsupported option stays editable while it is set, so a
+                    value saved for another backend can still be reset. */}
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label={t('domains.accessLog')} hint={supports('access_log') ? t('domains.accessLogHint') : t('domains.logUnsupported', { backend: backendName })}>
+                    <Select value={editAccessLog} disabled={!supports('access_log') && editAccessLog === ''} onChange={(e) => setEditAccessLog(e.target.value)}>
+                      <option value="">{t('domains.logDefault')}</option>
+                      <option value="off">{t('domains.accessLogOff')}</option>
+                    </Select>
+                  </Field>
+                  <Field label={t('domains.errorLogLevel')} hint={supports('error_log_level') ? t('domains.errorLogLevelHint') : t('domains.logUnsupported', { backend: backendName })}>
+                    <Select value={editErrorLogLevel} disabled={!supports('error_log_level') && editErrorLogLevel === ''} onChange={(e) => setEditErrorLogLevel(e.target.value)}>
+                      <option value="">{t('domains.logDefault')}</option>
+                      {ERROR_LOG_LEVELS.map((level) => <option key={level} value={level}>{level}</option>)}
+                    </Select>
+                  </Field>
+                </div>
                 <div className="flex justify-end gap-3 pt-1">
                   <Button variant="danger-ghost" onClick={() => removeDomain(liveDomain)}>{t('common.delete')}</Button>
                   <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>

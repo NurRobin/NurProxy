@@ -11,6 +11,10 @@ export interface ProxyConfigFormEdits {
   websocket: boolean;
   force_https: boolean;
   max_body_size: string;
+  /** "" keeps the host-wide access log, "off" turns it off. */
+  access_log: string;
+  /** "" keeps the host default level. */
+  error_log_level: string;
   custom_request_headers: { key: string; value: string }[];
 }
 
@@ -30,6 +34,8 @@ export function proxyConfigChanges(stored: ProxyConfig | undefined, edits: Proxy
   if (edits.websocket !== (stored?.websocket ?? false)) changes.websocket = edits.websocket;
   if (edits.force_https !== (stored?.force_https ?? false)) changes.force_https = edits.force_https;
   if (edits.max_body_size !== (stored?.max_body_size ?? '')) changes.max_body_size = edits.max_body_size || null;
+  if (edits.access_log !== (stored?.access_log ?? '')) changes.access_log = edits.access_log || null;
+  if (edits.error_log_level !== (stored?.error_log_level ?? '')) changes.error_log_level = edits.error_log_level || null;
 
   const headers: Record<string, string> = {};
   for (const h of edits.custom_request_headers) if (h.key.trim()) headers[h.key.trim()] = h.value;

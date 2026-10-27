@@ -17,6 +17,8 @@ const unchanged: ProxyConfigFormEdits = {
   websocket: true,
   force_https: false,
   max_body_size: '10m',
+  access_log: '',
+  error_log_level: '',
   custom_request_headers: [{ key: 'X-B', value: '2' }, { key: 'X-A', value: '1' }],
 };
 
@@ -42,8 +44,15 @@ test('fields emptied by the user are sent as null', () => {
   assert.deepEqual(body, { websocket: false, max_body_size: null, custom_request_headers: null });
 });
 
+test('logging settings are sent when changed and cleared back to the host default with null (#150)', () => {
+  assert.deepEqual(proxyConfigChanges(stored, { ...unchanged, access_log: 'off', error_log_level: 'crit' }), { access_log: 'off', error_log_level: 'crit' });
+  const quiet = { ...stored, access_log: 'off', error_log_level: 'crit' } as ProxyConfig;
+  assert.equal(proxyConfigChanges(quiet, { ...unchanged, access_log: 'off', error_log_level: 'crit' }), undefined);
+  assert.deepEqual(proxyConfigChanges(quiet, unchanged), { access_log: null, error_log_level: null });
+});
+
 test('works without a stored config', () => {
-  const empty: ProxyConfigFormEdits = { websocket: false, force_https: false, max_body_size: '', custom_request_headers: [] };
+  const empty: ProxyConfigFormEdits = { websocket: false, force_https: false, max_body_size: '', access_log: '', error_log_level: '', custom_request_headers: [] };
   assert.equal(proxyConfigChanges(undefined, empty), undefined);
   assert.deepEqual(proxyConfigChanges(undefined, { ...empty, websocket: true }), { websocket: true });
 });
