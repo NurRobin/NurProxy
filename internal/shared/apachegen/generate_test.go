@@ -139,9 +139,9 @@ func TestRender_structured_intentToConfig(t *testing.T) {
 				return Input{Route: r}
 			}(),
 			wantVHost: []string{
-				"RequestHeader set A-Req two",
-				"RequestHeader set X-Req one",
-				"Header always set X-Resp yes",
+				`RequestHeader set A-Req "two"`,
+				`RequestHeader set X-Req "one"`,
+				`Header always set X-Resp "yes"`,
 			},
 			wantNoWarns: true,
 		},

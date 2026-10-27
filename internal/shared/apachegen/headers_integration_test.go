@@ -67,6 +67,25 @@ func TestRenderedHeaderValuesAreLiteralInRealApache(t *testing.T) {
 	// Control: an unescaped format sequence is expanded, so the check above
 	// would notice missing escapes.
 	vhost = strings.Replace(vhost, "    ProxyPreserveHost On", "    Header always set X-Control %{HTTPD_PREFIX}e\n    ProxyPreserveHost On", 1)
+	// Values proxymodel refuses, written with headerValue directly: the
+	// quoting alone must already make Apache set them literally.
+	unvalidated := map[string]string{
+		"X-Single-Expr": "'expr=%{file:/etc/passwd}'",
+		"X-Double-Expr": `"expr=%{file:/etc/passwd}"`,
+		"X-Inner-Expr":  "x expr=%{file:/etc/passwd}",
+		"X-Backslash":   `a\b\`,
+		"X-Escape":      `\n%{HOME}e`,
+		"X-Quotes":      `say "hi" 'now'`,
+	}
+	var extra strings.Builder
+	for name, value := range unvalidated {
+		extra.WriteString("    Header always set " + name + " " + headerValue(value) + "\n")
+		values[name] = value
+	}
+	// Control: a single-quoted word loses its quotes in Apache's tokenizer,
+	// so mod_headers evaluates it as an expression.
+	extra.WriteString("    Header always set X-Expr-Control 'expr=%{toupper:abc}'\n")
+	vhost = strings.Replace(vhost, "    ProxyPreserveHost On", extra.String()+"    ProxyPreserveHost On", 1)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "app.conf"), []byte(vhost), 0o644); err != nil {
 		t.Fatal(err)
@@ -86,6 +105,9 @@ cat /tmp/h`
 	}
 	if strings.Contains(string(out), "X-Control: %{HTTPD_PREFIX}e") || !strings.Contains(string(out), "X-Control: ") {
 		t.Fatalf("control header was not expanded by mod_headers:\n%s", out)
+	}
+	if !strings.Contains(string(out), "X-Expr-Control: ABC\n") {
+		t.Fatalf("control expression was not evaluated by mod_headers:\n%s", out)
 	}
 	for name, want := range values {
 		if !strings.Contains(string(out), name+": "+want+"\n") {

@@ -283,8 +283,8 @@ func (r Route) ValidateOptions() error {
 			if len(value)+strings.Count(value, `"`) > MaxHeaderValueBytes {
 				return fmt.Errorf("%s header %s has a value longer than %d bytes", kind, name, MaxHeaderValueBytes)
 			}
-			if len(value) >= 5 && strings.EqualFold(value[:5], "expr=") {
-				return fmt.Errorf("%s header %s must not start with \"expr=\" (Apache would evaluate it as an expression)", kind, name)
+			if err := checkHeaderValueStart(value); err != nil {
+				return fmt.Errorf("%s header %s %w", kind, name, err)
 			}
 		}
 	}
@@ -355,6 +355,23 @@ func validIPOrCIDR(entry string) bool {
 	}
 	_, _, err := net.ParseCIDR(entry)
 	return err == nil
+}
+
+// checkHeaderValueStart refuses a header value whose first non-space
+// character is a quote, and one that starts with "expr=" once leading spaces
+// and quotes are removed (case-insensitive). A config tokenizer strips a
+// leading quote pair, and Apache's mod_headers evaluates a value starting
+// with "expr=" as an expression, which can read files.
+func checkHeaderValueStart(v string) error {
+	trimmed := strings.TrimLeft(v, " ")
+	if strings.HasPrefix(trimmed, `"`) || strings.HasPrefix(trimmed, "'") {
+		return fmt.Errorf("must not start with a quote")
+	}
+	trimmed = strings.TrimLeft(v, ` "'`)
+	if len(trimmed) >= 5 && strings.EqualFold(trimmed[:5], "expr=") {
+		return fmt.Errorf("must not start with \"expr=\" (Apache would evaluate it as an expression)")
+	}
+	return nil
 }
 
 // validHeaderValue refuses control characters (CR, LF, NUL, ...) and

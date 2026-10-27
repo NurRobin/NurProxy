@@ -395,26 +395,25 @@ func parseSizeToBytes(s string) (int64, bool) {
 func basicAuthRealm(host string) string { return "Restricted: " + host }
 
 // headerValue renders a Header or RequestHeader value so mod_headers sets it
-// literally. mod_headers reads the value as a format string, where "%"
-// starts a format specifier such as %{NAME}e (an environment variable), so
-// every "%" is doubled. proxymodel refuses values starting with "expr=",
-// which mod_headers would evaluate as an expression.
+// literally. mod_headers reads the value as a format string: "%" starts a
+// format specifier such as %{NAME}e (an environment variable) and "\"
+// starts an escape such as \n, so both are doubled. The result is then
+// written as one quoted word. proxymodel refuses values that start with
+// "expr=" (also behind leading quotes or spaces), which mod_headers would
+// evaluate as an expression.
 func headerValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
 	return quoteValue(strings.ReplaceAll(v, "%", "%%"))
 }
 
-// quoteValue wraps an Apache directive argument in double quotes when it
-// contains whitespace, which Apache would otherwise tokenize into multiple
-// arguments. Embedded double quotes are backslash-escaped. An empty value is
-// rendered as an explicit empty-string token.
+// quoteValue renders v as one double-quoted Apache directive argument, so
+// the word Apache's config tokenizer (ap_getword_conf) hands to the
+// directive is exactly v. Inside double quotes that tokenizer turns `\\`
+// into `\` and `\"` into `"` and keeps every other character as is, so
+// backslashes are escaped before double quotes.
 func quoteValue(v string) string {
-	if v == "" {
-		return `""`
-	}
-	if strings.ContainsAny(v, " \t\"") {
-		return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
-	}
-	return v
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
 }
 
 // regexpEscape escapes the regex metacharacters that can appear in a URL path

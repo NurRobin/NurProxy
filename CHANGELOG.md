@@ -52,8 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses to write one that fails.
 - **Proxy settings are validated before they reach a config.** Header names
   may only contain letters, digits, `-` and `_`. Header values may not contain
-  control characters or backslashes, may not start with `expr=`, and are
-  limited to 3900 bytes. Hosts and upstream addresses must be DNS names or IP
+  control characters or backslashes, may not start with a quote or with
+  `expr=` (also after leading spaces or quotes), and are limited to 3900
+  bytes. Hosts and upstream addresses must be DNS names or IP
   addresses, IP lists must hold IPs or CIDR ranges, body sizes must be whole
   sizes like `10m`, `1GB`, `0` or `unlimited`, path rules may not contain
   whitespace, quotes, braces, `#`, `;` or backslashes, and basic-auth user
@@ -62,8 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values. Header values that contain `'`, `#` or braces are now rendered in
   double quotes, so nginx reads them as one value; the nginx renderer also
   escapes backslashes inside quotes as a second safeguard. Apache header
-  values are rendered with `%` doubled, so mod_headers sets them literally
-  instead of expanding format sequences such as `%{NAME}e`.
+  values and the basic-auth realm are always rendered as one double-quoted
+  word with backslashes and quotes escaped, and header values have `%` and
+  `\` doubled, so mod_headers sets them literally instead of expanding
+  format sequences such as `%{NAME}e`.
 - **A domain with invalid stored settings no longer blocks its agent.** The
   reconciler holds back only that domain, keeps its current config and
   certificate on the agent, and marks the domain as failed with the reason,

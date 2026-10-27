@@ -41,6 +41,14 @@ func TestRoute_Validate_values(t *testing.T) {
 		{"header value expr", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": "expr=%{file:/etc/shadow}"} }, false},
 		{"header value EXPR", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": "EXPR=1"} }, false},
 		{"header value containing expr", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": "a expr=1"} }, true},
+		{"single-quoted expr", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": "'expr=%{file:/etc/passwd}'"} }, false},
+		{"double-quoted expr", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": `"expr=1"`} }, false},
+		{"spaced expr", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": "   Expr=1"} }, false},
+		{"spaced quoted expr", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": ` '"expr=1`} }, false},
+		{"leading single quote", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": "'abc'"} }, false},
+		{"leading double quote", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": `"abc`} }, false},
+		{"spaced leading quote", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": ` "abc`} }, false},
+		{"inner quotes", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": `default-src 'self' "x"`} }, true},
 		{"long header value", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": strings.Repeat("a", MaxHeaderValueBytes)} }, true},
 		{"too long header value", func(r *Route) {
 			r.ResponseHeaders = map[string]string{"X-A": strings.Repeat("a", MaxHeaderValueBytes+1)}

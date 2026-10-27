@@ -35,6 +35,15 @@ func TestRender_hostileValuesRefused(t *testing.T) {
 			r.ResponseHeaders = map[string]string{"X-A": "expr=%{file:/etc/shadow}"}
 		},
 		"request header expression": func(r *proxymodel.Route) { r.RequestHeaders = map[string]string{"X-A": "Expr=1"} },
+		"single-quoted expression": func(r *proxymodel.Route) {
+			r.ResponseHeaders = map[string]string{"X-A": "'expr=%{file:/etc/passwd}'"}
+		},
+		"double-quoted expression": func(r *proxymodel.Route) {
+			r.ResponseHeaders = map[string]string{"X-A": `"expr=%{file:/etc/passwd}"`}
+		},
+		"spaced expression":    func(r *proxymodel.Route) { r.RequestHeaders = map[string]string{"X-A": "  expr=1"} },
+		"leading quote":        func(r *proxymodel.Route) { r.ResponseHeaders = map[string]string{"X-A": "'a b'"} },
+		"spaced leading quote": func(r *proxymodel.Route) { r.ResponseHeaders = map[string]string{"X-A": ` "a`} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -60,10 +69,10 @@ func TestRender_headerValuesAreLiteral(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Header always set X-Env %%{HOME}e\n",
-		"Header always set X-Pct 100%%\n",
+		`Header always set X-Env "%%{HOME}e"` + "\n",
+		`Header always set X-Pct "100%%"` + "\n",
 		`Header always set X-Spaced "a %%{SSL_PROTOCOL}s b"` + "\n",
-		"RequestHeader set X-Req %%D\n",
+		`RequestHeader set X-Req "%%D"` + "\n",
 	} {
 		if !strings.Contains(res.VHost, want) {
 			t.Errorf("vhost lacks %q:\n%s", want, res.VHost)
