@@ -399,6 +399,9 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "create", dom.Subdomain)
+	if err := d.ClaimDomainRoute(dom); err != nil {
+		return nil, fmt.Errorf("domain created, but colliding route tombstones could not be dropped: %w", err)
+	}
 	return dom, nil
 }
 
@@ -421,6 +424,7 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("domain not found")
 	}
+	before := *dom
 	if in.ServerID != nil {
 		if _, err := d.GetServer(*in.ServerID); err != nil {
 			return nil, fmt.Errorf("server not found")
@@ -443,10 +447,29 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		dom.SSLMode = models.SSLMode(*in.SSLMode)
 	}
 	dom.Status = models.DomainStatusPending // re-queue for reconciliation
+	// Same move handling as the REST API: tombstone the old host on the old
+	// agent before the row changes, drop the stale artifact afterwards (#148).
+	// The reconciler's next tick pushes both agents.
+	var move *db.DomainMove
+	if before.ServerID != dom.ServerID {
+		move, err = d.BeginDomainMove(&before, dom.ServerID, time.Now().UTC())
+		if err != nil {
+			return nil, fmt.Errorf("failed to persist managed deletion identity for the old agent: %w", err)
+		}
+	}
 	if err := d.UpdateDomain(dom); err != nil {
+		d.AbortDomainMove(move)
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "update", dom.Subdomain)
+	if removed, err := d.CompleteDomainMove(move); err != nil {
+		return nil, fmt.Errorf("domain moved, but its stale artifact could not be removed: %w", err)
+	} else if removed {
+		auditMCP(d, "config_artifact", move.ArtifactID, "remove", "domain moved to another agent")
+	}
+	if err := d.ClaimDomainRoute(dom); err != nil {
+		return nil, fmt.Errorf("domain updated, but colliding route tombstones could not be dropped: %w", err)
+	}
 	return dom, nil
 }
 

@@ -123,6 +123,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "create", dom.Subdomain)
+	if err := s.db.ClaimDomainRoute(dom); err != nil {
+		log.Printf("create: cannot drop colliding route tombstones for domain %d: %v", dom.ID, err)
+	}
 	s.triggerAgentPush(dom.ServerID)
 	s.triggerCertIssuance(dom)
 
@@ -186,6 +189,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
 	}
+	// Snapshot the stored domain before any requested field is applied: a move
+	// must tombstone the OLD host on the OLD agent even when the same request
+	// also renames the domain.
+	before := *dom
 
 	var req struct {
 		Subdomain   *string             `json:"subdomain"`
@@ -216,10 +223,6 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 		dom.ZoneID = *req.ZoneID
 	}
-	// Capture the prior server so a move can clean up the artifact on the old
-	// agent (no ghost vhosts, §3).
-	oldServerID := dom.ServerID
-	before := *dom
 	if req.ServerID != nil {
 		if _, err := s.db.GetServer(*req.ServerID); err != nil {
 			writeError(w, http.StatusBadRequest, "server not found")
@@ -246,13 +249,13 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	// Mark as pending for reconciler to pick up
 	dom.Status = models.DomainStatusPending
 
-	// A move to another agent must leave a route tombstone on the old agent
-	// before any push stops retaining the route's certificate there; otherwise
-	// the old vhost survives while its certificate is pruned (#148).
-	var moveTombstoneAgentID string
-	var moveTombstone *helperprotocol.ManagedDeletion
-	if req.ServerID != nil && oldServerID != dom.ServerID {
-		moveTombstoneAgentID, moveTombstone, err = s.persistMoveTombstone(&before, dom.ServerID)
+	// A move to another agent must leave a route tombstone for the old host on
+	// the old agent before any push stops retaining the route's certificate
+	// there; otherwise the old vhost survives while its certificate is pruned
+	// (#148).
+	var move *db.DomainMove
+	if req.ServerID != nil && before.ServerID != dom.ServerID {
+		move, err = s.db.BeginDomainMove(&before, dom.ServerID, time.Now().UTC())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to persist managed deletion identity for the old agent")
 			return
@@ -260,128 +263,31 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.UpdateDomain(dom); err != nil {
-		if moveTombstone != nil {
-			_ = s.db.DeleteManagedRouteTombstones(moveTombstoneAgentID, []helperprotocol.ManagedDeletion{*moveTombstone})
-		}
+		s.db.AbortDomainMove(move)
 		writeError(w, http.StatusInternalServerError, "failed to update domain")
 		return
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "update", dom.Subdomain)
 
-	// Domain lifecycle: a server move (to a server on a different agent) must
-	// remove the artifact on the OLD agent and (re-)render the intent on the new
-	// one — no ghost vhosts (§3). The artifact row is keyed by agent_id, so we drop
-	// the stale row; the old agent's next full-sync push (below) no longer lists
-	// this domain, so it clears the route, and the new agent renders + reports a
-	// fresh artifact in its apply-ACK.
-	if req.ServerID != nil && oldServerID != dom.ServerID {
-		s.handleArtifactServerMove(r, dom.ID, oldServerID, dom.ServerID)
+	// The artifact row is keyed to the old agent, so a cross-agent move drops
+	// it; the new agent renders and reports a fresh one in its apply-ACK (§3).
+	if removed, err := s.db.CompleteDomainMove(move); err != nil {
+		log.Printf("move: failed to delete stale artifact for domain %d: %v", dom.ID, err)
+	} else if removed {
+		s.audit(r, "config_artifact", move.ArtifactID, "remove", "domain moved to another agent")
+	}
+	if err := s.db.ClaimDomainRoute(dom); err != nil {
+		log.Printf("update: cannot drop colliding route tombstones for domain %d: %v", dom.ID, err)
+	}
+	if move != nil {
+		// Push the old agent so it removes the route at once.
+		s.pushAgent(move.OldAgentID)
 	}
 
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, dom)
-}
-
-// handleArtifactServerMove cleans up a domain's config artifact after it moves
-// from one server to another (§3). When the move crosses agents, it deletes the
-// stale artifact row (keyed to the old agent) so no orphaned/ghost artifact
-// lingers, and pushes the old agent's now-shrunk intent set so it drops the
-// route on disk. The new agent re-renders the intent and round-trips a fresh
-// artifact on its next apply-ACK. A move within the same agent is a no-op here
-// (the artifact stays valid; the agent just re-applies it).
-func (s *Server) handleArtifactServerMove(r *http.Request, domainID int64, oldServerID, newServerID string) {
-	oldAgentID := s.agentIDForServer(oldServerID)
-	newAgentID := s.agentIDForServer(newServerID)
-	if oldAgentID == "" || oldAgentID == newAgentID {
-		return // same agent (or unresolvable old server) — nothing to clean up.
-	}
-
-	artifactID := artifactIDForDomainID(domainID)
-	if _, err := s.db.GetConfigArtifact(artifactID); err == nil {
-		if dErr := s.db.DeleteConfigArtifact(artifactID); dErr != nil {
-			log.Printf("move: failed to delete stale artifact %s: %v", artifactID, dErr)
-		} else {
-			s.audit(r, "config_artifact", artifactID, "remove", "domain moved to another agent")
-		}
-	}
-
-	// A tombstone left on the new agent by an earlier move away from it would
-	// now contradict the route it is about to render again.
-	s.dropPendingTombstones(newAgentID, artifactID)
-
-	// Push the old agent so it drops the now-unmanaged route (no ghost vhost).
-	s.pushAgent(oldAgentID)
-}
-
-// persistMoveTombstone records a managed route deletion for the domain's old
-// host on its old agent when a server change moves it to a different agent and
-// the old agent renders through a file backend (nginx/apache). Same-agent moves,
-// cert-only domains and Caddy agents need none and return a nil deletion.
-func (s *Server) persistMoveTombstone(old *models.Domain, newServerID string) (string, *helperprotocol.ManagedDeletion, error) {
-	if old.CertOnly {
-		return "", nil, nil
-	}
-	oldSrv, err := s.db.GetServer(old.ServerID)
-	if err != nil {
-		return "", nil, nil // unresolvable old server: nothing to clean up on it
-	}
-	if oldSrv.AgentID == s.agentIDForServer(newServerID) {
-		return "", nil, nil
-	}
-	backend := s.backendForDomain(oldSrv)
-	if backend != "nginx" && backend != "apache" {
-		return "", nil, nil
-	}
-	zone, err := s.db.GetZone(old.ZoneID)
-	if err != nil {
-		return "", nil, err
-	}
-	deletion := helperprotocol.ManagedDeletion{
-		ResourceID: artifactIDForDomainID(old.ID),
-		Host:       old.FQDN(zone.Name),
-		Backend:    backend,
-	}
-	if err := s.db.UpsertManagedRouteTombstone(oldSrv.AgentID, deletion, time.Now().UTC()); err != nil {
-		return "", nil, err
-	}
-	return oldSrv.AgentID, &deletion, nil
-}
-
-// dropPendingTombstones removes any not-yet-applied route tombstone for
-// resourceID on agentID. Best-effort: the reconciler also ignores tombstones
-// for resources that are part of the agent's desired routes.
-func (s *Server) dropPendingTombstones(agentID, resourceID string) {
-	if agentID == "" {
-		return
-	}
-	pending, err := s.db.ListManagedRouteTombstones(agentID)
-	if err != nil {
-		log.Printf("move: cannot list route tombstones for agent %s: %v", agentID, err)
-		return
-	}
-	stale := make([]helperprotocol.ManagedDeletion, 0, 1)
-	for _, deletion := range pending {
-		if deletion.ResourceID == resourceID {
-			stale = append(stale, deletion)
-		}
-	}
-	if err := s.db.DeleteManagedRouteTombstones(agentID, stale); err != nil {
-		log.Printf("move: cannot drop stale route tombstone %s on agent %s: %v", resourceID, agentID, err)
-	}
-}
-
-// agentIDForServer resolves a server ID to its owning agent ID, or "" on error.
-func (s *Server) agentIDForServer(serverID string) string {
-	if serverID == "" {
-		return ""
-	}
-	srv, err := s.db.GetServer(serverID)
-	if err != nil {
-		return ""
-	}
-	return srv.AgentID
 }
 
 // artifactIDForDomainID derives the stable artifact identity for a generated

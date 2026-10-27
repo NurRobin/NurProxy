@@ -201,20 +201,28 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 	return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed})
 }
 
-// deletionsOutsideDesired drops tombstones whose resource is rendered again on
-// this agent (for example a domain moved away and straight back before the
-// deletion was applied). A signed intent must never retain and delete the same
-// resource, so such a tombstone would otherwise block every apply.
+// deletionsOutsideDesired drops tombstones that collide with the agent's
+// desired routes or with each other. A tombstone whose resource or host is
+// rendered again (a domain moved away and back, or a new domain reusing a
+// deleted host) and a second tombstone for an already listed host would put
+// the same vhost file into one signed apply twice; the helper rejects that,
+// and every apply on the agent would stay blocked.
 func deletionsOutsideDesired(deletions []helperprotocol.ManagedDeletion, intents []proxymodel.RouteIntent) []helperprotocol.ManagedDeletion {
-	desired := make(map[string]struct{}, len(intents))
+	resources := make(map[string]struct{}, len(intents))
+	hosts := make(map[string]struct{}, len(intents)+len(deletions))
 	for _, intent := range intents {
-		desired[intent.ArtifactID] = struct{}{}
+		resources[intent.ArtifactID] = struct{}{}
+		hosts[strings.ToLower(intent.Route.Host)] = struct{}{}
 	}
 	kept := make([]helperprotocol.ManagedDeletion, 0, len(deletions))
 	for _, deletion := range deletions {
-		if _, rendered := desired[deletion.ResourceID]; rendered {
+		if _, rendered := resources[deletion.ResourceID]; rendered {
 			continue
 		}
+		if _, taken := hosts[strings.ToLower(deletion.Host)]; taken {
+			continue
+		}
+		hosts[strings.ToLower(deletion.Host)] = struct{}{}
 		kept = append(kept, deletion)
 	}
 	return kept

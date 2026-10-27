@@ -44,12 +44,14 @@ func TestUpdateDomainServerMoveTombstones(t *testing.T) {
 	cases := []struct {
 		name       string
 		manual     bool
+		rename     string   // subdomain sent together with each move
 		moves      []string // server IDs, applied in order
 		wantAgent1 bool     // tombstone for the domain expected on agent-1
 		wantAgent2 bool     // tombstone for the domain expected on agent-2
 	}{
 		{name: "move to another agent", moves: []string{"srv-2"}, wantAgent1: true},
 		{name: "manual config move to another agent", manual: true, moves: []string{"srv-2"}, wantAgent1: true},
+		{name: "rename and move in one request tombstones the old host", rename: "renamed", moves: []string{"srv-2"}, wantAgent1: true},
 		{name: "move within the same agent", moves: []string{"srv-1b"}},
 		{name: "move away and back again", moves: []string{"srv-2", "srv-1"}, wantAgent2: true},
 	}
@@ -72,8 +74,11 @@ func TestUpdateDomainServerMoveTombstones(t *testing.T) {
 				}
 			}
 			for _, serverID := range tc.moves {
-				w := doRequest(t, handler, http.MethodPut, "/api/v1/domains/"+strconv.FormatInt(domainID, 10),
-					map[string]any{"server_id": serverID}, cookie)
+				body := map[string]any{"server_id": serverID}
+				if tc.rename != "" {
+					body["subdomain"] = tc.rename
+				}
+				w := doRequest(t, handler, http.MethodPut, "/api/v1/domains/"+strconv.FormatInt(domainID, 10), body, cookie)
 				if w.Code != http.StatusOK {
 					t.Fatalf("move to %s: %d: %s", serverID, w.Code, w.Body.String())
 				}
@@ -98,5 +103,33 @@ func TestUpdateDomainServerMoveTombstones(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A new domain that reuses a host with a pending tombstone on the same agent
+// claims that host: the tombstone is dropped instead of colliding with the new
+// route in one signed apply.
+func TestCreateDomainClaimsPendingTombstoneForItsHost(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+	domainID, fqdn := seedDomainTopology(t, srv, cookie)
+	seedMoveTargets(t, srv)
+	w := doRequest(t, handler, http.MethodPut, "/api/v1/domains/"+strconv.FormatInt(domainID, 10),
+		map[string]any{"server_id": "srv-2", "subdomain": "renamed"}, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("rename and move: %d: %s", w.Code, w.Body.String())
+	}
+	if deletions, err := database.ListManagedRouteTombstones("agent-1"); err != nil || len(deletions) != 1 || deletions[0].Host != fqdn {
+		t.Fatalf("tombstones before reuse = %#v, err=%v", deletions, err)
+	}
+	w = doRequest(t, handler, http.MethodPost, "/api/v1/domains", map[string]any{
+		"subdomain": "health", "zone_id": "zone-1", "server_id": "srv-1", "port": 8081,
+	}, cookie)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create reusing host: %d: %s", w.Code, w.Body.String())
+	}
+	if deletions, err := database.ListManagedRouteTombstones("agent-1"); err != nil || len(deletions) != 0 {
+		t.Fatalf("tombstones after reuse = %#v, err=%v, want none", deletions, err)
 	}
 }
