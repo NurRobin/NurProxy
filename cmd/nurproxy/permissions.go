@@ -15,7 +15,9 @@ func cmdPermissions(args []string) {
 	dataDir := fs.String("data-dir", "", "Data directory (default: $NP_DATA_DIR or ./data)")
 	dropIn := fs.String("systemd-drop-in", "", "Write an exact ReadWritePaths systemd drop-in")
 	envFile := fs.String("environment-file", "", "Read NP_DATA_DIR from a systemd EnvironmentFile when present")
-	_ = fs.Parse(args)
+	if _, err := parseArgs(fs, args, ""); err != nil {
+		fatalf("permissions: %v", err)
+	}
 	resolved := resolveDataDir(*dataDir)
 	if *envFile != "" {
 		f, err := os.Open(*envFile)

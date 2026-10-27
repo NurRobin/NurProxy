@@ -17,24 +17,67 @@ import (
 
 // parseClient builds a FlagSet pre-seeded with the shared auth/output flags,
 // lets the caller add command-specific flags via setup, parses args, and
-// returns a ready client plus the parsed FlagSet (for positional args).
-func parseClient(name string, args []string, setup func(*flag.FlagSet)) (*client, *flag.FlagSet) {
+// returns a ready client plus the parsed FlagSet (for fs.Visit). Flags may
+// appear before or after positional arguments. positional names the single
+// positional argument the command expects (e.g. "domain id"), or is empty
+// when it takes none; a missing or unexpected positional is a fatal error, so
+// a mistyped invocation never runs with half its flags silently ignored.
+func parseClient(name string, args []string, positional string, setup func(*flag.FlagSet)) (*client, *flag.FlagSet, string) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	u, k, p, j := registerClientFlags(fs)
 	if setup != nil {
 		setup(fs)
 	}
-	_ = fs.Parse(args)
-	return newClient(*u, *k, *p, *j), fs
+	arg, err := parseArgs(fs, args, positional)
+	if err != nil {
+		fatalf("%s: %v", name, err)
+	}
+	return newClient(*u, *k, *p, *j), fs, arg
 }
 
-// requireArg returns the first positional argument or exits with usage help.
-func requireArg(fs *flag.FlagSet, what string) string {
-	v := fs.Arg(0)
-	if v == "" {
-		fatalf("missing %s", what)
+// parseArgs parses args with interspersed flags and checks that exactly the
+// expected positional argument (or none, when positional is empty) remains.
+func parseArgs(fs *flag.FlagSet, args []string, positional string) (string, error) {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return "", err
 	}
-	return v
+	if positional == "" {
+		if len(pos) > 0 {
+			return "", fmt.Errorf("unexpected argument %q", pos[0])
+		}
+		return "", nil
+	}
+	if len(pos) == 0 || pos[0] == "" {
+		return "", fmt.Errorf("missing %s", positional)
+	}
+	if len(pos) > 1 {
+		return "", fmt.Errorf("unexpected argument %q (only one %s expected)", pos[1], positional)
+	}
+	return pos[0], nil
+}
+
+// parseInterspersed parses flags that may appear anywhere among positional
+// arguments. The standard flag package stops at the first non-flag argument,
+// so parsing is resumed after each positional. A "--" ends flag parsing and
+// everything after it is positional.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positionals []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		consumed := len(args) - len(rest)
+		if consumed > 0 && args[consumed-1] == "--" {
+			return append(positionals, rest...), nil
+		}
+		if len(rest) == 0 {
+			return positionals, nil
+		}
+		positionals = append(positionals, rest[0])
+		args = rest[1:]
+	}
 }
 
 // --- provider ------------------------------------------------------------
@@ -43,7 +86,7 @@ func cmdProvider(args []string) {
 	action, rest := shift(args)
 	switch action {
 	case "list":
-		c, _ := parseClient("provider list", rest, nil)
+		c, _, _ := parseClient("provider list", rest, "", nil)
 		var provs []models.Provider
 		if err := c.getInto("/api/v1/providers", &provs); err != nil {
 			fatalf("%v", err)
@@ -60,7 +103,7 @@ func cmdProvider(args []string) {
 
 	case "add":
 		var typ, name, config, configFile string
-		c, _ := parseClient("provider add", rest, func(fs *flag.FlagSet) {
+		c, _, _ := parseClient("provider add", rest, "", func(fs *flag.FlagSet) {
 			fs.StringVar(&typ, "type", "", "Provider type (e.g. cloudflare)")
 			fs.StringVar(&name, "name", "", "Display name")
 			fs.StringVar(&config, "config", "", "Provider config as JSON")
@@ -79,8 +122,7 @@ func cmdProvider(args []string) {
 		c.emit(raw, "provider created: "+gjson(raw, "id"))
 
 	case "delete":
-		c, fs := parseClient("provider delete", rest, nil)
-		id := requireArg(fs, "provider id")
+		c, _, id := parseClient("provider delete", rest, "provider id", nil)
 		raw, err := c.del("/api/v1/providers/" + id)
 		if err != nil {
 			fatalf("%v", err)
@@ -88,8 +130,7 @@ func cmdProvider(args []string) {
 		c.emit(raw, "provider deleted: "+id)
 
 	case "zones":
-		c, fs := parseClient("provider zones", rest, nil)
-		id := requireArg(fs, "provider id")
+		c, _, id := parseClient("provider zones", rest, "provider id", nil)
 		var zones []models.Zone
 		if err := c.getInto("/api/v1/providers/"+id+"/zones", &zones); err != nil {
 			fatalf("%v", err)
@@ -107,7 +148,7 @@ func cmdZone(args []string) {
 	action, rest := shift(args)
 	switch action {
 	case "list":
-		c, _ := parseClient("zone list", rest, nil)
+		c, _, _ := parseClient("zone list", rest, "", nil)
 		var zones []models.Zone
 		if err := c.getInto("/api/v1/zones", &zones); err != nil {
 			fatalf("%v", err)
@@ -116,7 +157,7 @@ func cmdZone(args []string) {
 
 	case "add":
 		var provider, name, externalID string
-		c, _ := parseClient("zone add", rest, func(fs *flag.FlagSet) {
+		c, _, _ := parseClient("zone add", rest, "", func(fs *flag.FlagSet) {
 			fs.StringVar(&provider, "provider", "", "Provider ID")
 			fs.StringVar(&name, "name", "", "Zone name (e.g. example.com)")
 			fs.StringVar(&externalID, "external-id", "", "Provider-side zone ID (optional)")
@@ -134,10 +175,9 @@ func cmdZone(args []string) {
 
 	case "delete":
 		var cascade *bool
-		c, fs := parseClient("zone delete", rest, func(fs *flag.FlagSet) {
+		c, _, id := parseClient("zone delete", rest, "zone id", func(fs *flag.FlagSet) {
 			cascade = fs.Bool("cascade", false, "also delete dependent domains (torn down through the reconciler; the zone is removed once their teardown finishes)")
 		})
-		id := requireArg(fs, "zone id")
 		url := "/api/v1/zones/" + id
 		if *cascade {
 			url += "?cascade=true"
@@ -159,7 +199,7 @@ func cmdAgent(args []string) {
 	action, rest := shift(args)
 	switch action {
 	case "list":
-		c, _ := parseClient("agent list", rest, nil)
+		c, _, _ := parseClient("agent list", rest, "", nil)
 		var agents []models.Agent
 		if err := c.getInto("/api/v1/agents", &agents); err != nil {
 			fatalf("%v", err)
@@ -175,8 +215,7 @@ func cmdAgent(args []string) {
 		printTable([]string{"ID", "NAME", "FQDN", "STATUS", "VERSION", "PROXY"}, rows)
 
 	case "status":
-		c, fs := parseClient("agent status", rest, nil)
-		id := requireArg(fs, "agent id")
+		c, _, id := parseClient("agent status", rest, "agent id", nil)
 		raw, err := c.get("/api/v1/agents/" + id + "/status")
 		if err != nil {
 			fatalf("%v", err)
@@ -186,14 +225,13 @@ func cmdAgent(args []string) {
 	case "adopt":
 		var name, fqdn, zones, dnsMode string
 		var ddns int
-		c, fs := parseClient("agent adopt", rest, func(fs *flag.FlagSet) {
+		c, _, id := parseClient("agent adopt", rest, "agent id", func(fs *flag.FlagSet) {
 			fs.StringVar(&name, "name", "", "Friendly name")
 			fs.StringVar(&fqdn, "fqdn", "", "Anchor FQDN override")
 			fs.StringVar(&zones, "zones", "", "Comma-separated zone IDs")
 			fs.StringVar(&dnsMode, "dns-mode", "", "DNS mode")
 			fs.IntVar(&ddns, "ddns-interval", 0, "DDNS interval (seconds)")
 		})
-		id := requireArg(fs, "agent id")
 		body := map[string]interface{}{}
 		putStr(body, "name", name)
 		putStr(body, "fqdn", fqdn)
@@ -213,14 +251,13 @@ func cmdAgent(args []string) {
 	case "update":
 		var name, fqdn, zones, dnsMode string
 		var ddns int
-		c, fs := parseClient("agent update", rest, func(fs *flag.FlagSet) {
+		c, _, id := parseClient("agent update", rest, "agent id", func(fs *flag.FlagSet) {
 			fs.StringVar(&name, "name", "", "Friendly name")
 			fs.StringVar(&fqdn, "fqdn", "", "Anchor FQDN")
 			fs.StringVar(&zones, "zones", "", "Comma-separated zone IDs")
 			fs.StringVar(&dnsMode, "dns-mode", "", "DNS mode")
 			fs.IntVar(&ddns, "ddns-interval", 0, "DDNS interval (seconds)")
 		})
-		id := requireArg(fs, "agent id")
 		body := map[string]interface{}{}
 		putStr(body, "name", name)
 		putStr(body, "fqdn", fqdn)
@@ -238,8 +275,7 @@ func cmdAgent(args []string) {
 		c.emit(raw, "agent updated: "+id)
 
 	case "reject":
-		c, fs := parseClient("agent reject", rest, nil)
-		id := requireArg(fs, "agent id")
+		c, _, id := parseClient("agent reject", rest, "agent id", nil)
 		raw, err := c.do(http.MethodPut, "/api/v1/agents/"+id+"/reject", nil)
 		if err != nil {
 			fatalf("%v", err)
@@ -248,10 +284,9 @@ func cmdAgent(args []string) {
 
 	case "delete":
 		var cascade *bool
-		c, fs := parseClient("agent delete", rest, func(fs *flag.FlagSet) {
+		c, _, id := parseClient("agent delete", rest, "agent id", func(fs *flag.FlagSet) {
 			cascade = fs.Bool("cascade", false, "also delete dependent domains (torn down through the reconciler; the agent is removed once their teardown finishes)")
 		})
-		id := requireArg(fs, "agent id")
 		url := "/api/v1/agents/" + id
 		if *cascade {
 			url += "?cascade=true"
@@ -273,8 +308,7 @@ func cmdServer(args []string) {
 	action, rest := shift(args)
 	switch action {
 	case "list":
-		c, fs := parseClient("server list", rest, nil)
-		agentID := requireArg(fs, "agent id")
+		c, _, agentID := parseClient("server list", rest, "agent id", nil)
 		var servers []models.Server
 		if err := c.getInto("/api/v1/agents/"+agentID+"/servers", &servers); err != nil {
 			fatalf("%v", err)
@@ -291,12 +325,11 @@ func cmdServer(args []string) {
 
 	case "add":
 		var name, address, notes string
-		c, fs := parseClient("server add", rest, func(fs *flag.FlagSet) {
+		c, _, agentID := parseClient("server add", rest, "agent id", func(fs *flag.FlagSet) {
 			fs.StringVar(&name, "name", "", "Server name")
 			fs.StringVar(&address, "address", "", "Backend address (host:port from the agent's view)")
 			fs.StringVar(&notes, "notes", "", "Notes (optional)")
 		})
-		agentID := requireArg(fs, "agent id")
 		if name == "" || address == "" {
 			fatalf("--name and --address are required")
 		}
@@ -310,12 +343,11 @@ func cmdServer(args []string) {
 
 	case "update":
 		var name, address, notes string
-		c, fs := parseClient("server update", rest, func(fs *flag.FlagSet) {
+		c, _, id := parseClient("server update", rest, "server id", func(fs *flag.FlagSet) {
 			fs.StringVar(&name, "name", "", "Server name")
 			fs.StringVar(&address, "address", "", "Backend address")
 			fs.StringVar(&notes, "notes", "", "Notes")
 		})
-		id := requireArg(fs, "server id")
 		body := map[string]interface{}{}
 		putStr(body, "name", name)
 		putStr(body, "address", address)
@@ -328,10 +360,9 @@ func cmdServer(args []string) {
 
 	case "delete":
 		var cascade *bool
-		c, fs := parseClient("server delete", rest, func(fs *flag.FlagSet) {
+		c, _, id := parseClient("server delete", rest, "server id", func(fs *flag.FlagSet) {
 			cascade = fs.Bool("cascade", false, "also delete dependent domains (torn down through the reconciler; the server is removed once their teardown finishes)")
 		})
-		id := requireArg(fs, "server id")
 		url := "/api/v1/servers/" + id
 		if *cascade {
 			url += "?cascade=true"
@@ -354,7 +385,7 @@ func cmdDomain(args []string) {
 	switch action {
 	case "list":
 		var agentID, serverID, status string
-		c, _ := parseClient("domain list", rest, func(fs *flag.FlagSet) {
+		c, _, _ := parseClient("domain list", rest, "", func(fs *flag.FlagSet) {
 			fs.StringVar(&agentID, "agent", "", "Filter by agent ID")
 			fs.StringVar(&serverID, "server", "", "Filter by server ID")
 			fs.StringVar(&status, "status", "", "Filter by status")
@@ -388,7 +419,7 @@ func cmdDomain(args []string) {
 		var subdomain, zone, server, sslMode, proxyFile string
 		var port int
 		var ws, forceHTTPS bool
-		c, _ := parseClient("domain add", rest, func(fs *flag.FlagSet) {
+		c, _, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -419,7 +450,7 @@ func cmdDomain(args []string) {
 		var subdomain, zone, server, sslMode string
 		var port int
 		var ws, forceHTTPS bool
-		c, fs := parseClient("domain update", rest, func(fs *flag.FlagSet) {
+		c, fs, id := parseClient("domain update", rest, "domain id", func(fs *flag.FlagSet) {
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -428,7 +459,6 @@ func cmdDomain(args []string) {
 			fs.BoolVar(&forceHTTPS, "force-https", false, "Force HTTPS redirect")
 			fs.StringVar(&sslMode, "ssl-mode", "", "SSL mode")
 		})
-		id := requireArg(fs, "domain id")
 		body := map[string]interface{}{}
 		putStr(body, "subdomain", subdomain)
 		putStr(body, "zone_id", zone)
@@ -454,8 +484,7 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain updated: "+id)
 
 	case "delete":
-		c, fs := parseClient("domain delete", rest, nil)
-		id := requireArg(fs, "domain id")
+		c, _, id := parseClient("domain delete", rest, "domain id", nil)
 		raw, err := c.del("/api/v1/domains/" + id)
 		if err != nil {
 			fatalf("%v", err)
@@ -463,8 +492,7 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain marked for deletion: "+id)
 
 	case "dns-takeover":
-		c, fs := parseClient("domain dns-takeover", rest, nil)
-		id := requireArg(fs, "domain id")
+		c, _, id := parseClient("domain dns-takeover", rest, "domain id", nil)
 		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/dns/takeover", nil)
 		if err != nil {
 			fatalf("%v", err)
@@ -482,7 +510,7 @@ func cmdAPIKey(args []string) {
 	action, rest := shift(args)
 	switch action {
 	case "show":
-		c, _ := parseClient("apikey show", rest, nil)
+		c, _, _ := parseClient("apikey show", rest, "", nil)
 		raw, err := c.get("/api/v1/api-key")
 		if err != nil {
 			fatalf("%v", err)
@@ -490,7 +518,7 @@ func cmdAPIKey(args []string) {
 		c.emit(raw, prettyJSON(raw))
 
 	case "create":
-		c, _ := parseClient("apikey create", rest, nil)
+		c, _, _ := parseClient("apikey create", rest, "", nil)
 		raw, err := c.do(http.MethodPost, "/api/v1/api-key", nil)
 		if err != nil {
 			fatalf("%v", err)
@@ -498,7 +526,7 @@ func cmdAPIKey(args []string) {
 		c.emit(raw, "API key (shown once): "+gjson(raw, "api_key"))
 
 	case "revoke":
-		c, _ := parseClient("apikey revoke", rest, nil)
+		c, _, _ := parseClient("apikey revoke", rest, "", nil)
 		raw, err := c.del("/api/v1/api-key")
 		if err != nil {
 			fatalf("%v", err)
@@ -519,7 +547,7 @@ func cmdAuth(args []string) {
 		// Bootstrap: sets the admin password on a fresh install. Needs no
 		// credentials, so it bypasses the client's auth flow. The password comes
 		// from the shared --password / NP_API_PASSWORD flag.
-		c, _ := parseClient("auth setup", rest, nil)
+		c, _, _ := parseClient("auth setup", rest, "", nil)
 		if c.password == "" {
 			fatalf("--password (or NP_API_PASSWORD) is required")
 		}
@@ -530,7 +558,7 @@ func cmdAuth(args []string) {
 		c.emit(raw, "admin password configured — now run: nurproxy apikey create --password <pw>")
 
 	case "status":
-		c, _ := parseClient("auth status", rest, nil)
+		c, _, _ := parseClient("auth status", rest, "", nil)
 		raw, err := c.postNoAuthGet("/api/v1/auth/status")
 		if err != nil {
 			fatalf("%v", err)

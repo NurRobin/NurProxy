@@ -34,7 +34,9 @@ func cmdInstall(args []string) {
 	dataDir := fs.String("data-dir", "/var/lib/nurproxy", "Data directory")
 	user := fs.String("user", "root", "System user to run the service as")
 	bin := fs.String("bin", selfPath(), "Path to the nurproxy binary the service runs")
-	_ = fs.Parse(args)
+	if _, err := parseArgs(fs, args, ""); err != nil {
+		fatalf("install: %v", err)
+	}
 
 	if err := install.Install(orchestratorService(*bin, *dataDir, *port, *user), os.Stdout); err != nil {
 		log.Fatalf("install failed: %v", err)
@@ -47,7 +49,9 @@ func cmdUninstall(args []string) {
 	dataDir := fs.String("data-dir", "/var/lib/nurproxy", "Data directory (only removed with --purge)")
 	purge := fs.Bool("purge", false, "Also remove data dir, config, and env file")
 	yes := fs.Bool("yes", false, "Skip the confirmation prompt")
-	_ = fs.Parse(args)
+	if _, err := parseArgs(fs, args, ""); err != nil {
+		fatalf("uninstall: %v", err)
+	}
 
 	if *purge && !*yes && !confirm(fmt.Sprintf("Remove the nurproxy service AND its data at %s? [y/N] ", *dataDir)) {
 		fmt.Println("aborted")
