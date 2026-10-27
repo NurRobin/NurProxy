@@ -870,6 +870,12 @@ type HelperReceipt struct {
 
 const MaxManagedReceiptContentBytes = MaxFrameBytes / 8
 
+// ManagedLeftoverVhostsNote introduces, inside a managed apply receipt's
+// sanitized_result, the list of NurProxy-named vhost files the apply left on
+// disk without a desired route. The orchestrator looks for it to surface the
+// leftovers; the list runs to the next "; " or the end of the message.
+const ManagedLeftoverVhostsNote = "vhost file(s) without a desired route left in place, remove manually: "
+
 type ManagedArtifactReceipt struct {
 	ArtifactID string   `json:"artifact_id"`
 	Backend    string   `json:"backend"`

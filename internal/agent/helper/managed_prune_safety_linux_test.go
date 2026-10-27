@@ -19,21 +19,57 @@ import (
 // it. Pruning it anyway broke native validation after the commit and latched
 // the helper breaker permanently.
 func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) {
+	const leftoverName = "nurproxy-gone.example.com.conf"
 	cases := []struct {
 		name          string
-		orphanVhost   bool // a stamped vhost for gone.example.com stays on disk
-		operatorRef   bool // an operator file references the certificate
-		unmarked      bool // the orphaned vhost is a preserved raw config without marker
+		orphanVhost   bool // a vhost for gone.example.com stays on disk
+		unmarked      bool // that vhost is a preserved raw config without marker
 		deleteVhost   bool // the intent tombstones gone.example.com
+		setup         func(t *testing.T, action *managedApplyAction, certPath string)
 		wantPruned    bool
-		wantRetention bool
 		wantVhostGone bool
+		wantNote      []string // substrings the receipt message must carry
 	}{
 		{name: "unreferenced certificate is pruned", wantPruned: true},
-		{name: "orphaned managed vhost keeps its certificate", orphanVhost: true, wantRetention: true},
-		{name: "operator config keeps a referenced certificate", operatorRef: true, wantRetention: true},
+		{name: "orphaned managed vhost keeps its certificate and is reported", orphanVhost: true,
+			wantNote: []string{"kept 1 unretained certificate(s) still referenced by proxy config: gone.example.com", helperprotocol.ManagedLeftoverVhostsNote + leftoverName}},
+		{name: "operator config keeps a referenced certificate",
+			setup: func(t *testing.T, action *managedApplyAction, certPath string) {
+				writeTestFile(t, filepath.Join(action.layout.AvailableDir, "operator.conf"), "ssl_certificate "+certPath+";\n")
+			},
+			wantNote: []string{"kept 1 unretained certificate(s)"}},
+		{name: "differently spelled path still counts as a reference",
+			setup: func(t *testing.T, action *managedApplyAction, _ string) {
+				writeTestFile(t, filepath.Join(action.layout.AvailableDir, "operator.conf"), "ssl_certificate /var/lib//nurproxy-agent/certs/gone.example.com.crt;\n")
+			},
+			wantNote: []string{"kept 1 unretained certificate(s)"}},
+		{name: "enabled symlink to a config outside the available dir is followed",
+			setup: func(t *testing.T, action *managedApplyAction, certPath string) {
+				outside := filepath.Join(t.TempDir(), "elsewhere.conf")
+				writeTestFile(t, outside, "ssl_certificate "+certPath+";\n")
+				if err := os.Symlink(outside, filepath.Join(action.layout.EnabledDir, "elsewhere.conf")); err != nil {
+					t.Fatal(err)
+				}
+				action.agentUID = uint32(os.Getuid()) + 1 // target is not agent-owned
+			},
+			wantNote: []string{"kept 1 unretained certificate(s)"}},
+		{name: "symlink target owned by the agent is not trusted",
+			setup: func(t *testing.T, action *managedApplyAction, certPath string) {
+				outside := filepath.Join(t.TempDir(), "agent-owned.conf")
+				writeTestFile(t, outside, "ssl_certificate "+certPath+";\n")
+				if err := os.Symlink(outside, filepath.Join(action.layout.EnabledDir, "agent-owned.conf")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantPruned: true},
+		{name: "oversized config skips pruning instead of failing the plan",
+			setup: func(t *testing.T, action *managedApplyAction, _ string) {
+				writeTestFile(t, filepath.Join(action.layout.AvailableDir, "huge.conf"), strings.Repeat("#", int(maxConfigFileBytes)+1))
+			},
+			wantNote: []string{"certificate prune skipped, 1 config file(s) too large to scan for references: huge.conf"}},
 		{name: "tombstoned vhost is removed together with its certificate", orphanVhost: true, deleteVhost: true, wantPruned: true, wantVhostGone: true},
-		{name: "tombstoned unmarked raw vhost stays and keeps its certificate", orphanVhost: true, unmarked: true, deleteVhost: true, wantRetention: true},
+		{name: "tombstoned unmarked raw vhost stays, keeps its certificate and is reported", orphanVhost: true, unmarked: true, deleteVhost: true,
+			wantNote: []string{"kept 1 unretained certificate(s)", helperprotocol.ManagedLeftoverVhostsNote + leftoverName}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -42,29 +78,21 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 			intent.PruneCertificates = true
 			certPath := filepath.Join(action.layout.CertificateDir, "gone.example.com.crt")
 			keyPath := filepath.Join(action.layout.CertificateDir, "gone.example.com.key.plain")
-			for path, content := range map[string]string{certPath: "cert", keyPath: "key"} {
-				if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			vhostPath := filepath.Join(action.layout.AvailableDir, "nurproxy-gone.example.com.conf")
-			linkPath := filepath.Join(action.layout.EnabledDir, "nurproxy-gone.example.com.conf")
+			writeTestFile(t, certPath, "cert")
+			writeTestFile(t, keyPath, "key")
+			vhostPath := filepath.Join(action.layout.AvailableDir, leftoverName)
 			if tc.orphanVhost {
 				content := "server {\n  listen 443 ssl;\n  server_name gone.example.com;\n  ssl_certificate " + certPath + ";\n  ssl_certificate_key " + keyPath + ";\n}\n"
 				if !tc.unmarked {
 					content = proxy.StampManagedArtifact(content)
 				}
-				if err := os.WriteFile(vhostPath, []byte(content), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(vhostPath, linkPath); err != nil {
+				writeTestFile(t, vhostPath, content)
+				if err := os.Symlink(vhostPath, filepath.Join(action.layout.EnabledDir, leftoverName)); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if tc.operatorRef {
-				if err := os.WriteFile(filepath.Join(action.layout.AvailableDir, "operator.conf"), []byte("ssl_certificate "+certPath+";\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
+			if tc.setup != nil {
+				tc.setup(t, action, certPath)
 			}
 			if tc.deleteVhost {
 				intent.DeletionSet = []helperprotocol.ManagedDeletion{{ResourceID: "dom-59", Host: "gone.example.com", Backend: "nginx"}}
@@ -90,8 +118,13 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 					t.Fatalf("%s pruned = %v, want %v (stat: %v)", filepath.Base(path), pruned, tc.wantPruned, statErr)
 				}
 			}
-			if retained := strings.Contains(result.SanitizedResult, "gone.example.com"); retained != tc.wantRetention {
-				t.Fatalf("receipt retention note = %q, want mention %v", result.SanitizedResult, tc.wantRetention)
+			for _, note := range tc.wantNote {
+				if !strings.Contains(result.SanitizedResult, note) {
+					t.Fatalf("receipt message = %q, want it to contain %q", result.SanitizedResult, note)
+				}
+			}
+			if len(tc.wantNote) == 0 && strings.Contains(result.SanitizedResult, ";") {
+				t.Fatalf("receipt message = %q, want no notes", result.SanitizedResult)
 			}
 			if tc.orphanVhost {
 				_, statErr := os.Lstat(vhostPath)
@@ -100,6 +133,13 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -67,9 +67,12 @@ type managedCompilation struct {
 	// RetainedCertificates names unretained certificate bases that were kept
 	// because surviving proxy config still references them.
 	RetainedCertificates []string `json:"retained_certificates,omitempty"`
-	// UnmarkedDeletions names tombstoned hosts whose vhost carries no NurProxy
-	// marker (a preserved raw config); the helper never deletes those files.
-	UnmarkedDeletions []string `json:"unmarked_deletions,omitempty"`
+	// UnscannedConfigs names surviving config files too large to scan; while
+	// any exist, no certificate is pruned.
+	UnscannedConfigs []string `json:"unscanned_configs,omitempty"`
+	// LeftoverVhosts names NurProxy-named vhost files this apply neither
+	// writes nor deletes (see leftoverManagedVhosts).
+	LeftoverVhosts []string `json:"leftover_vhosts,omitempty"`
 }
 
 type managedFileSnapshot struct {
@@ -419,7 +422,8 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			return managedCompilation{}, err
 		}
 		if unmarked {
-			compilation.UnmarkedDeletions = append(compilation.UnmarkedDeletions, deletion.Host)
+			// Never delete a vhost without NurProxy provenance; it is reported
+			// as a leftover in this and every later receipt instead.
 			continue
 		}
 		compilation.Files = append(compilation.Files, managedCompiledFile{Path: available, Class: "vhost", Delete: true})
@@ -467,15 +471,16 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 				candidateBases = append(candidateBases, base)
 			}
 		}
-		referenced, err := a.referencedCertificateBases(compilation, candidateBases)
+		references, err := a.referencedCertificateBases(compilation, candidateBases)
 		if err != nil {
 			return managedCompilation{}, err
 		}
-		stillReferenced := make(map[string]struct{}, len(referenced))
-		for _, base := range referenced {
+		stillReferenced := make(map[string]struct{}, len(references.referenced))
+		for _, base := range references.referenced {
 			stillReferenced[base] = struct{}{}
 		}
-		compilation.RetainedCertificates = referenced
+		compilation.RetainedCertificates = references.referenced
+		compilation.UnscannedConfigs = references.unscanned
 		for _, candidate := range candidates {
 			if _, inUse := stillReferenced[candidate.base]; inUse {
 				continue
@@ -495,6 +500,11 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			compilation.Files = append(compilation.Files, managedCompiledFile{Path: path, Class: "auth", Delete: true})
 		}
 	}
+	leftovers, err := a.leftoverManagedVhosts(compilation)
+	if err != nil {
+		return managedCompilation{}, err
+	}
+	compilation.LeftoverVhosts = leftovers
 	sort.Slice(compilation.Files, func(i, j int) bool {
 		if compilation.Files[i].Class != compilation.Files[j].Class {
 			return managedClassOrder(compilation.Files[i].Class) < managedClassOrder(compilation.Files[j].Class)
