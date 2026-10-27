@@ -48,14 +48,16 @@ func TestValidateManagedAgreesWithRealNginx(t *testing.T) {
 		admitted bool
 		validate func(string, ManagedPolicy) error
 	}
+	// nginx -t resolves upstream host names, and the container has no DNS
+	// (musl's hosts lookup also does not match a trailing-dot name), so
+	// upstream names become 127.0.0.1 to keep the check offline.
+	offline := strings.NewReplacer("backend.internal", "127.0.0.1", "ai.lan.", "127.0.0.1")
 	var cases []nginxCase
 	for name, content := range policyTestAccepted {
-		cases = append(cases, nginxCase{name: "accepted/" + name, content: content, admitted: true, validate: ValidateManaged})
+		cases = append(cases, nginxCase{name: "accepted/" + name, content: offline.Replace(content), admitted: true, validate: ValidateManaged})
 	}
 	for name, generated := range policyTestGeneratedConfigs(t) {
-		// nginx -t resolves upstream host names; keep the check offline.
-		content := strings.ReplaceAll(generated.full, "backend.internal", "127.0.0.1")
-		cases = append(cases, nginxCase{name: "generated/" + name, content: content, admitted: true, validate: ValidateRendered})
+		cases = append(cases, nginxCase{name: "generated/" + name, content: offline.Replace(generated.full), admitted: true, validate: ValidateRendered})
 	}
 	for _, tt := range policyTestRefused {
 		cases = append(cases, nginxCase{name: "refused/" + tt.name, content: tt.content, validate: ValidateManaged})

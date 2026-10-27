@@ -21,6 +21,8 @@ func TestDomainProxyOptionsAreValidatedOnSave(t *testing.T) {
 		"header value with newline":   {"custom_request_headers": map[string]string{"X-A": "a\nb"}},
 		"header name with space":      {"custom_response_headers": map[string]string{"X-A b": "v"}},
 		"body size":                   {"max_body_size": "10m;include /etc/x"},
+		"decimal body size":           {"max_body_size": "1.5GB"},
+		"header expression":           {"custom_response_headers": map[string]string{"X-A": "expr=%{file:/etc/shadow}"}},
 		"path rewrite":                {"path_rewrite": "/x break; include /etc/x"},
 		"ip list":                     {"ip_allowlist": []string{"10.0.0.0/8;"}},
 		"username":                    {"basic_auth": map[string]string{"username": "a:b", "password": "$2y$10$x"}},
@@ -40,6 +42,24 @@ func TestDomainProxyOptionsAreValidatedOnSave(t *testing.T) {
 		}, cookie)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("create with hostile header: got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("merged result", func(t *testing.T) {
+		stored, err := srv.db.GetDomain(domainID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored.ProxyConfig.CustomRequestHeaders = map[string]string{"X-Stored": "a\nb"}
+		if err := srv.db.UpdateDomain(stored); err != nil {
+			t.Fatal(err)
+		}
+		w := doRequest(t, handler, http.MethodPut, path, map[string]interface{}{"proxy_config": map[string]interface{}{"max_body_size": "10m"}}, cookie)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("patch over an invalid stored value: got %d: %s", w.Code, w.Body.String())
+		}
+		w = doRequest(t, handler, http.MethodPut, path, map[string]interface{}{"proxy_config": map[string]interface{}{"custom_request_headers": nil}}, cookie)
+		if w.Code != http.StatusOK {
+			t.Fatalf("patch clearing the invalid stored value: got %d: %s", w.Code, w.Body.String())
 		}
 	})
 	t.Run("ordinary values", func(t *testing.T) {

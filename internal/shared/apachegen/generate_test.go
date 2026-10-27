@@ -278,7 +278,7 @@ func TestRender_structured_intentToConfig(t *testing.T) {
 			name: "max_body_size_unparseable_dropped",
 			input: func() Input {
 				r := baseRoute()
-				r.MaxBodySize = "1.5g"
+				r.MaxBodySize = "99999999999999999999g" // passes validation, overflows int64
 				return Input{Route: r}
 			}(),
 			notVHost: []string{"LimitRequestBody"},

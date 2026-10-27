@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -250,9 +251,18 @@ func (r Route) Validate() error {
 var (
 	hostLabelRe   = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$`)
 	headerNameRe  = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	bodySizeRe    = regexp.MustCompile(`^\s*(?i:unlimited|[0-9]+(\.[0-9]+)?\s*[kmg]?b?)\s*$`)
+	bodySizeRe    = regexp.MustCompile(`^\s*(?i:unlimited|[0-9]+\s*[kmg]?b?)\s*$`)
 	pathUnsafeSet = " \t\"'\\{};#"
 )
+
+// MaxHeaderValueBytes bounds a header value as rendered: its bytes plus one
+// escape per double quote. nginx fails `nginx -t` on a word longer than its
+// 4096-byte read buffer, and the raw/rendered nginx policy refuses words over
+// 4000 bytes, so a value within this bound always fits once quoted.
+const MaxHeaderValueBytes = 3900
+
+// maxPathBytes bounds the path strip prefix and rewrite target.
+const maxPathBytes = 1024
 
 // ValidateOptions checks the option values that renderers interpolate into
 // native proxy configs: header names and values, body size, path rules, IP
@@ -264,15 +274,27 @@ func (r Route) ValidateOptions() error {
 			if !headerNameRe.MatchString(name) {
 				return fmt.Errorf("%s header name %q may only contain letters, digits, '-' and '_'", kind, name)
 			}
+			if len(name) > 256 {
+				return fmt.Errorf("%s header name %q is longer than 256 bytes", kind, name)
+			}
 			if !validHeaderValue(value) {
 				return fmt.Errorf("%s header %s has a value with control characters or a backslash", kind, name)
+			}
+			if len(value)+strings.Count(value, `"`) > MaxHeaderValueBytes {
+				return fmt.Errorf("%s header %s has a value longer than %d bytes", kind, name, MaxHeaderValueBytes)
+			}
+			if len(value) >= 5 && strings.EqualFold(value[:5], "expr=") {
+				return fmt.Errorf("%s header %s must not start with \"expr=\" (Apache would evaluate it as an expression)", kind, name)
 			}
 		}
 	}
 	if r.MaxBodySize != "" && !bodySizeRe.MatchString(r.MaxBodySize) {
-		return fmt.Errorf("max body size %q is not a size like 10m, 1GB or unlimited", r.MaxBodySize)
+		return fmt.Errorf("max body size %q is not a whole size like 10m, 1GB, 0 or unlimited", r.MaxBodySize)
 	}
 	for _, p := range []struct{ name, value string }{{"path strip prefix", r.Path.StripPrefix}, {"path rewrite", r.Path.Rewrite}} {
+		if len(p.value) > maxPathBytes {
+			return fmt.Errorf("%s is longer than %d bytes", p.name, maxPathBytes)
+		}
 		if p.value != "" && (hasControl(p.value) || strings.ContainsAny(p.value, pathUnsafeSet)) {
 			return fmt.Errorf("%s %q contains whitespace, quotes, braces, '#', ';' or a backslash", p.name, p.value)
 		}
@@ -311,13 +333,20 @@ func validHost(host string) bool {
 	return true
 }
 
-// validUpstreamAddr accepts a DNS name or an IP address (IPv6 with or without
+// validUpstreamAddr accepts a DNS name (a fully qualified one may end in a
+// dot, as nginx and Apache accept) or an IP address (IPv6 with or without
 // brackets).
 func validUpstreamAddr(addr string) bool {
 	if net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]")) != nil {
 		return true
 	}
-	return !strings.HasPrefix(addr, "*") && validHost(addr)
+	return !strings.HasPrefix(addr, "*") && validHost(strings.TrimSuffix(addr, "."))
+}
+
+// UpstreamHostPort formats an upstream address and port for a proxy URL,
+// bracketing an IPv6 address ("[fd00::5]:8080").
+func UpstreamHostPort(addr string, port int) string {
+	return net.JoinHostPort(strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), strconv.Itoa(port))
 }
 
 func validIPOrCIDR(entry string) bool {

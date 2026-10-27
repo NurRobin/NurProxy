@@ -50,6 +50,10 @@ var policyTestAccepted = map[string]string{
 	"redirect after proxied":    policyTestValid + "\n" + policyTestRedirect,
 	"redirect to literal host":  strings.Replace(policyTestRedirect, "https://$host", "https://app.example.test", 1) + policyTestValid,
 	"old nginx http2 listen":    strings.Replace(policyTestValid, "listen 443 ssl;", "listen 443 ssl http2;", 1),
+	"long quoted value":         strings.Replace(policyTestValid, "DENY always", "\""+strings.Repeat("a b", 1300)+"\" always", 1),
+	"long comment":              "#" + strings.Repeat("a", 3900) + "\n" + policyTestValid,
+	"bracketed ipv6 upstream":   strings.Replace(policyTestValid, "http://127.0.0.1:3000", "http://[fd00::5]:3000", 1),
+	"fully qualified upstream":  strings.Replace(policyTestValid, "http://127.0.0.1:3000", "http://ai.lan.:3000", 1),
 	"compact location":          strings.Replace(policyTestValid, "location / {\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n    }", "location / { proxy_pass http://127.0.0.1:3000; }", 1),
 	"escaped rewrite":           strings.Replace(policyTestValid, "proxy_pass", `rewrite ^/api\.v1/?(.*)$ /$1 break;`+"\n        proxy_pass", 1),
 	"header without always":     strings.Replace(policyTestValid, "DENY always", "DENY", 1),
@@ -181,8 +185,7 @@ type policyTestGenerated struct {
 	// full is the file the helper writes: the http preamble, then the server.
 	full string
 	// raw reports whether the server passes as a raw config. Basic auth and
-	// rate limits are generator-only, and the mask parser does not read a
-	// bracketed IPv6 upstream, so those are refused as raw.
+	// rate limits are generator-only.
 	raw bool
 }
 
@@ -195,10 +198,16 @@ func policyTestGeneratedConfigs(t *testing.T) map[string]policyTestGenerated {
 		"https upstream": func(r *proxymodel.Route) {
 			r.Upstream = proxymodel.Upstream{Addr: "backend.internal", Port: 8443, Scheme: proxymodel.SchemeHTTPS}
 		},
-		"ipv6 upstream": func(r *proxymodel.Route) { r.Upstream.Addr = "[::1]" },
-		"websocket":     func(r *proxymodel.Route) { r.WebSocket = true },
-		"body size":     func(r *proxymodel.Route) { r.MaxBodySize = "10MB" },
-		"unlimited":     func(r *proxymodel.Route) { r.MaxBodySize = "unlimited" },
+		"ipv6 upstream":            func(r *proxymodel.Route) { r.Upstream.Addr = "[::1]" },
+		"unbracketed ipv6":         func(r *proxymodel.Route) { r.Upstream.Addr = "fd00::5" },
+		"fully qualified upstream": func(r *proxymodel.Route) { r.Upstream.Addr = "ai.lan." },
+		"long header value": func(r *proxymodel.Route) {
+			r.ResponseHeaders = map[string]string{"Content-Security-Policy": "default-src 'self'; " + strings.Repeat("img-src https://a.example.test; ", 100)}
+		},
+		"percent header value": func(r *proxymodel.Route) { r.ResponseHeaders = map[string]string{"X-P": "100%{HOME}e"} },
+		"websocket":            func(r *proxymodel.Route) { r.WebSocket = true },
+		"body size":            func(r *proxymodel.Route) { r.MaxBodySize = "10MB" },
+		"unlimited":            func(r *proxymodel.Route) { r.MaxBodySize = "unlimited" },
 		"access list": func(r *proxymodel.Route) {
 			r.IPAllowlist = []string{"10.0.0.0/8", "2001:db8::/32"}
 			r.IPBlocklist = []string{"1.2.3.4/32"}
@@ -262,7 +271,7 @@ func policyTestGeneratedConfigs(t *testing.T) map[string]policyTestGenerated {
 			configs[fmt.Sprintf("%s/%s", variantName, mode.name)] = policyTestGenerated{
 				server: rendered.Server,
 				full:   full,
-				raw:    route.BasicAuth == nil && route.RateLimit.RequestsPerSecond == 0 && !strings.HasPrefix(route.Upstream.Addr, "["),
+				raw:    route.BasicAuth == nil && route.RateLimit.RequestsPerSecond == 0,
 			}
 		}
 	}

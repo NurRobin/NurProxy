@@ -64,21 +64,17 @@ func parsePolicyConfig(content string, policy ManagedPolicy) ([]block, []directi
 	if strings.TrimSpace(policy.Host) == "" || strings.ContainsAny(policy.Host, " \t\r\n;/$") || !plainArgument(policy.Host) {
 		return nil, nil, fmt.Errorf("managed nginx policy has no exact host")
 	}
-	lineStart := 0
 	for i := 0; i < len(content); i++ {
-		c := content[i]
-		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7f {
+		if c := content[i]; (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7f {
 			return nil, nil, fmt.Errorf("nginx configuration contains control characters")
-		}
-		if c == '\n' {
-			lineStart = i + 1
-		} else if i-lineStart >= maxPolicyLine {
-			return nil, nil, fmt.Errorf("nginx configuration has a line longer than %d bytes", maxPolicyLine)
 		}
 	}
 	blocks, directives, err := parseConfig(content)
 	if err != nil {
 		return nil, nil, fmt.Errorf("nginx configuration is not valid nginx syntax")
+	}
+	if longestWordOrComment(content) > MaxWordBytes {
+		return nil, nil, fmt.Errorf("nginx configuration has a word or comment longer than %d bytes", MaxWordBytes)
 	}
 	if len(blocks) == 0 || len(blocks) > 2 {
 		return nil, nil, fmt.Errorf("nginx configuration has unsupported top-level scope")
@@ -112,12 +108,32 @@ func validateServers(blocks []block, policy ManagedPolicy, zone string) error {
 	return nil
 }
 
-// maxPolicyLine bounds every line, and with it every word and comment, well
-// below the 4096-byte buffer nginx's tokenizer reads a word or comment into;
-// a longer one fails `nginx -t` with "too long parameter". Quoted values may
-// not span lines (headerValue refuses control characters), so no word is
-// longer than its line.
-const maxPolicyLine = 2048
+// MaxWordBytes bounds every word (including its quotes) and every comment
+// (from "#" to the end of the line). nginx's tokenizer reads a word or a
+// comment into a 4096-byte buffer and fails `nginx -t` with "too long
+// parameter" when one does not fit; the margin keeps admitted configs clear
+// of that limit. Lines may be longer.
+const MaxWordBytes = 4000
+
+// longestWordOrComment returns the byte length of the longest word source or
+// comment in a config that parseConfig accepted.
+func longestWordOrComment(content string) int {
+	longest := 0
+	for i := 0; ; {
+		st, err := readStatement(content, i)
+		if err != nil {
+			return longest
+		}
+		longest = max(longest, st.longestComment)
+		for _, t := range st.tokens {
+			longest = max(longest, len(t.source))
+		}
+		if st.end == endFile {
+			return longest
+		}
+		i = st.next
+	}
+}
 
 // policyScope is what argument rules may compare against.
 type policyScope struct {

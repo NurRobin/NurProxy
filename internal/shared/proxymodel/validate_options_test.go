@@ -1,6 +1,9 @@
 package proxymodel
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRoute_Validate_values(t *testing.T) {
 	tests := []struct {
@@ -31,7 +34,21 @@ func TestRoute_Validate_values(t *testing.T) {
 		{"header value with NUL", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": "a\x00"} }, false},
 		{"header value with tab", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": "a\tb"} }, false},
 		{"body sizes", func(r *Route) { r.MaxBodySize = "10MB" }, true},
-		{"body size decimal", func(r *Route) { r.MaxBodySize = "1.5g" }, true},
+		{"body size decimal", func(r *Route) { r.MaxBodySize = "1.5g" }, false},
+		{"body size zero", func(r *Route) { r.MaxBodySize = "0" }, true},
+		{"fully qualified upstream", func(r *Route) { r.Upstream.Addr = "ai.lan." }, true},
+		{"upstream with two trailing dots", func(r *Route) { r.Upstream.Addr = "ai.lan.." }, false},
+		{"header value expr", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": "expr=%{file:/etc/shadow}"} }, false},
+		{"header value EXPR", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": "EXPR=1"} }, false},
+		{"header value containing expr", func(r *Route) { r.RequestHeaders = map[string]string{"X-A": "a expr=1"} }, true},
+		{"long header value", func(r *Route) { r.ResponseHeaders = map[string]string{"X-A": strings.Repeat("a", MaxHeaderValueBytes)} }, true},
+		{"too long header value", func(r *Route) {
+			r.ResponseHeaders = map[string]string{"X-A": strings.Repeat("a", MaxHeaderValueBytes+1)}
+		}, false},
+		{"too long quoted header value", func(r *Route) {
+			r.ResponseHeaders = map[string]string{"X-A": strings.Repeat(`"`, MaxHeaderValueBytes/2+1)}
+		}, false},
+		{"too long path", func(r *Route) { r.Path.Rewrite = "/" + strings.Repeat("a", 1024) }, false},
 		{"body size unlimited", func(r *Route) { r.MaxBodySize = "Unlimited" }, true},
 		{"body size with directive", func(r *Route) { r.MaxBodySize = "10m;include /etc/x" }, false},
 		{"strip prefix", func(r *Route) { r.Path.StripPrefix = "/api.v1/" }, true},

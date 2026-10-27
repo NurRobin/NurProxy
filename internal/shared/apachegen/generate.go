@@ -190,7 +190,7 @@ func Render(in Input) (Result, error) {
 	if len(route.ResponseHeaders) > 0 {
 		b.WriteString("\n")
 		for _, k := range sortedKeys(route.ResponseHeaders) {
-			fmt.Fprintf(&b, "    Header always set %s %s\n", k, quoteValue(route.ResponseHeaders[k]))
+			fmt.Fprintf(&b, "    Header always set %s %s\n", k, headerValue(route.ResponseHeaders[k]))
 		}
 	}
 
@@ -199,7 +199,7 @@ func Render(in Input) (Result, error) {
 	if len(route.RequestHeaders) > 0 {
 		b.WriteString("\n")
 		for _, k := range sortedKeys(route.RequestHeaders) {
-			fmt.Fprintf(&b, "    RequestHeader set %s %s\n", k, quoteValue(route.RequestHeaders[k]))
+			fmt.Fprintf(&b, "    RequestHeader set %s %s\n", k, headerValue(route.RequestHeaders[k]))
 		}
 	}
 
@@ -221,7 +221,7 @@ func Render(in Input) (Result, error) {
 	if route.EffectiveScheme() == proxymodel.SchemeHTTPS {
 		upstreamScheme = "https"
 	}
-	upstreamBase := fmt.Sprintf("%s://%s:%d", upstreamScheme, route.Upstream.Addr, route.Upstream.Port)
+	upstreamBase := upstreamScheme + "://" + proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port)
 
 	// Path handling. Apache expresses prefix strip / rewrite via mod_rewrite;
 	// otherwise a plain ProxyPass at "/" forwards everything.
@@ -250,7 +250,7 @@ func Render(in Input) (Result, error) {
 			}
 			b.WriteString("    RewriteEngine On\n")
 			b.WriteString("    RewriteCond %{HTTP:Upgrade} =websocket [NC]\n")
-			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s:%d/$1 [P,L]\n", wsScheme, route.Upstream.Addr, route.Upstream.Port)
+			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s/$1 [P,L]\n", wsScheme, proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port))
 		}
 		fmt.Fprintf(&b, "    ProxyPass / %s/", upstreamBase)
 		// Upstream timeouts map onto ProxyPass connectiontimeout/timeout key=value
@@ -393,6 +393,15 @@ func parseSizeToBytes(s string) (int64, bool) {
 
 // basicAuthRealm builds the AuthName realm string for a host.
 func basicAuthRealm(host string) string { return "Restricted: " + host }
+
+// headerValue renders a Header or RequestHeader value so mod_headers sets it
+// literally. mod_headers reads the value as a format string, where "%"
+// starts a format specifier such as %{NAME}e (an environment variable), so
+// every "%" is doubled. proxymodel refuses values starting with "expr=",
+// which mod_headers would evaluate as an expression.
+func headerValue(v string) string {
+	return quoteValue(strings.ReplaceAll(v, "%", "%%"))
+}
 
 // quoteValue wraps an Apache directive argument in double quotes when it
 // contains whitespace, which Apache would otherwise tokenize into multiple

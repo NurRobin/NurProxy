@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<VirtualHost>`, which Apache rejects, so the agent could not apply the
   domain. They now go in a `<Location />` block. When a domain has both IP
   rules and basic auth, a request has to pass both, the same as on nginx.
+- **IPv6 upstreams are rendered with brackets** (`http://[fd00::5]:8080`) in
+  nginx and Apache configs, and upstream names may end in a dot (`ai.lan.`).
 
 ### Security
 
@@ -36,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for that block, and directive names must be plain words. A raw config that
   uses quoted directive names, single-quoted values, backslashes outside a
   `rewrite` pattern, `#` or braces inside a word, comments in the middle of a
-  directive, lines over 2048 bytes, or a redirect server with anything other
+  directive, a word or comment over 4000 bytes (nginx fails above 4096), or
+  a redirect server with anything other
   than `listen 80`, one `server_name` for the domain and one `return 301
   https://$host$request_uri` is refused. Listeners must match what NurProxy
   renders: no options on port 80, and `ssl` (plus `http2` on older nginx) on
@@ -49,16 +52,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses to write one that fails.
 - **Proxy settings are validated before they reach a config.** Header names
   may only contain letters, digits, `-` and `_`. Header values may not contain
-  control characters or backslashes. Hosts and upstream addresses must be DNS
-  names or IP addresses, IP lists must hold IPs or CIDR ranges, body sizes
-  must look like `10m`, `1GB` or `unlimited`, path rules may not contain
+  control characters or backslashes, may not start with `expr=`, and are
+  limited to 3900 bytes. Hosts and upstream addresses must be DNS names or IP
+  addresses, IP lists must hold IPs or CIDR ranges, body sizes must be whole
+  sizes like `10m`, `1GB`, `0` or `unlimited`, path rules may not contain
   whitespace, quotes, braces, `#`, `;` or backslashes, and basic-auth user
-  names may not contain `:`. The API rejects such values when a domain is
-  saved, and the nginx and Apache renderers and the helper refuse them. Header
-  values that contain `'`, `#` or braces are now rendered in double quotes,
-  so nginx reads them as one value; the nginx renderer also escapes
-  backslashes inside quotes as a second safeguard. A domain that already has
-  such a value stored must be corrected before its agent applies again.
+  names may not contain `:`. The API checks the merged settings when a domain
+  is saved, and the nginx and Apache renderers and the helper refuse such
+  values. Header values that contain `'`, `#` or braces are now rendered in
+  double quotes, so nginx reads them as one value; the nginx renderer also
+  escapes backslashes inside quotes as a second safeguard. Apache header
+  values are rendered with `%` doubled, so mod_headers sets them literally
+  instead of expanding format sequences such as `%{NAME}e`.
+- **A domain with invalid stored settings no longer blocks its agent.** The
+  reconciler holds back only that domain, keeps its current config and
+  certificate on the agent, and marks the domain as failed with the reason,
+  until the settings are corrected.
 
 ## [0.5.0] - 2026-10-27
 

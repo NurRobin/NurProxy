@@ -288,7 +288,7 @@ func Render(in Input) (Result, error) {
 	if route.EffectiveScheme() == proxymodel.SchemeHTTPS {
 		scheme = "https"
 	}
-	fmt.Fprintf(&b, "        proxy_pass %s://%s:%d;\n", scheme, route.Upstream.Addr, route.Upstream.Port)
+	fmt.Fprintf(&b, "        proxy_pass %s://%s;\n", scheme, proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port))
 
 	// Standard forwarding headers (mirrors caddy's defaults).
 	fmt.Fprintf(&b, "        proxy_set_header Host $host;\n")

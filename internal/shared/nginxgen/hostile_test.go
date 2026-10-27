@@ -1,6 +1,7 @@
 package nginxgen
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -37,5 +38,21 @@ func TestRender_hostileValuesRefused(t *testing.T) {
 				t.Fatalf("hostile route rendered:\n%s", res.Server)
 			}
 		})
+	}
+}
+
+// TestRender_ipv6UpstreamIsBracketed checks proxy_pass for IPv6 upstreams,
+// with or without brackets in the stored address.
+func TestRender_ipv6UpstreamIsBracketed(t *testing.T) {
+	for _, addr := range []string{"fd00::5", "[fd00::5]"} {
+		r := baseRoute()
+		r.Upstream.Addr = addr
+		res, err := Render(Input{Route: r})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "proxy_pass http://[fd00::5]:8080;"; !strings.Contains(res.Server, want) {
+			t.Errorf("%s: server lacks %q:\n%s", addr, want, res.Server)
+		}
 	}
 }

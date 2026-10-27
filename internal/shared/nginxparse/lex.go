@@ -98,23 +98,33 @@ type statement struct {
 	next int
 	// comment reports a comment between the statement's words.
 	comment bool
+	// longestComment is the byte length of the longest comment read with
+	// this statement, from its "#" to the end of the line.
+	longestComment int
 }
 
 // readStatement reads the next statement starting at offset i, following
 // ngx_conf_read_token.
 func readStatement(s string, i int) (statement, error) {
 	var (
-		st        = statement{start: -1}
-		lastSpace = true
-		needSpace bool
-		dQuoted   bool
-		sQuoted   bool
-		quoted    bool
-		sharp     bool
-		variable  bool
-		wordStart int // first byte of the word's value
-		srcStart  int // first byte of the word's source (the quote, if any)
+		st           = statement{start: -1}
+		lastSpace    = true
+		needSpace    bool
+		dQuoted      bool
+		sQuoted      bool
+		quoted       bool
+		sharp        bool
+		variable     bool
+		wordStart    int // first byte of the word's value
+		srcStart     int // first byte of the word's source (the quote, if any)
+		commentStart int
 	)
+	endComment := func(at int) {
+		if sharp && at-commentStart > st.longestComment {
+			st.longestComment = at - commentStart
+		}
+		sharp = false
+	}
 	finish := func(end statementEnd, at int) (statement, error) {
 		st.end = end
 		st.stop = at
@@ -127,7 +137,7 @@ func readStatement(s string, i int) (statement, error) {
 	for ; i < len(s); i++ {
 		ch := s[i]
 		if ch == '\n' {
-			sharp = false
+			endComment(i)
 		}
 		if sharp {
 			continue
@@ -175,6 +185,7 @@ func readStatement(s string, i int) (statement, error) {
 				return finish(endBlockDone, i)
 			case '#':
 				sharp = true
+				commentStart = i
 				if len(st.tokens) != 0 {
 					st.comment = true
 				}
@@ -242,6 +253,7 @@ func readStatement(s string, i int) (statement, error) {
 			return finish(endBlockStart, i)
 		}
 	}
+	endComment(len(s))
 	if len(st.tokens) != 0 || !lastSpace {
 		return st, errSyntax
 	}

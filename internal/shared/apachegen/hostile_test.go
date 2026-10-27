@@ -1,6 +1,7 @@
 package apachegen
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
@@ -30,6 +31,10 @@ func TestRender_hostileValuesRefused(t *testing.T) {
 		"hash with newline": func(r *proxymodel.Route) {
 			r.BasicAuth = &proxymodel.BasicAuth{Username: "a", PasswordHash: "$2y$x\nb:c"}
 		},
+		"response header expression": func(r *proxymodel.Route) {
+			r.ResponseHeaders = map[string]string{"X-A": "expr=%{file:/etc/shadow}"}
+		},
+		"request header expression": func(r *proxymodel.Route) { r.RequestHeaders = map[string]string{"X-A": "Expr=1"} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -40,5 +45,47 @@ func TestRender_hostileValuesRefused(t *testing.T) {
 				t.Fatalf("hostile route rendered:\n%s", res.VHost)
 			}
 		})
+	}
+}
+
+// TestRender_headerValuesAreLiteral checks that mod_headers format
+// specifiers in header values are escaped, so Apache sets the value as
+// written instead of expanding it.
+func TestRender_headerValuesAreLiteral(t *testing.T) {
+	r := baseRoute()
+	r.ResponseHeaders = map[string]string{"X-Env": "%{HOME}e", "X-Pct": "100%", "X-Spaced": "a %{SSL_PROTOCOL}s b"}
+	r.RequestHeaders = map[string]string{"X-Req": "%D"}
+	res, err := Render(Input{Route: r})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Header always set X-Env %%{HOME}e\n",
+		"Header always set X-Pct 100%%\n",
+		`Header always set X-Spaced "a %%{SSL_PROTOCOL}s b"` + "\n",
+		"RequestHeader set X-Req %%D\n",
+	} {
+		if !strings.Contains(res.VHost, want) {
+			t.Errorf("vhost lacks %q:\n%s", want, res.VHost)
+		}
+	}
+}
+
+// TestRender_ipv6UpstreamIsBracketed checks the proxy targets for IPv6
+// upstreams, with or without brackets in the stored address.
+func TestRender_ipv6UpstreamIsBracketed(t *testing.T) {
+	for _, addr := range []string{"fd00::5", "[fd00::5]"} {
+		r := baseRoute()
+		r.Upstream.Addr = addr
+		r.WebSocket = true
+		res, err := Render(Input{Route: r})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"ProxyPass / http://[fd00::5]:8080/", "ws://[fd00::5]:8080/$1"} {
+			if !strings.Contains(res.VHost, want) {
+				t.Errorf("%s: vhost lacks %q:\n%s", addr, want, res.VHost)
+			}
+		}
 	}
 }
