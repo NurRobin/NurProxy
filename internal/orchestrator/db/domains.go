@@ -122,7 +122,7 @@ func (d *DB) GetDomain(id int64) (*models.Domain, error) {
 
 	dom, err := scanDomain(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("domain not found: %d", id)
+		return nil, fmt.Errorf("%w: %d", ErrDomainNotFound, id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("querying domain: %w", err)
@@ -183,6 +183,13 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 }
 
 // UpdateDomain updates all mutable fields of a domain.
+//
+// When the update changes the domain's name (subdomain or zone), the DNS record
+// stored for the old name is released in the same transaction: it is queued in
+// domain_dns_cleanups (snapshotting the old zone's provider) and the domain's
+// dns_record_id / dns_managed are cleared, so the reconciler resolves the new
+// name from scratch and deletes the old record only if NurProxy created it
+// (#151). dom is updated to match what was stored.
 func (d *DB) UpdateDomain(dom *models.Domain) error {
 	dom.UpdatedAt = time.Now().UTC()
 
@@ -204,7 +211,21 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 		return 0
 	}
 
-	res, err := d.sql.Exec(`
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning domain update: %w", err)
+	}
+	defer tx.Rollback()
+	released, err := releaseRenamedDomainRecordTx(tx, dom)
+	if err != nil {
+		return err
+	}
+	recordID, managed := dom.DNSRecordID, dom.DNSManaged
+	if released {
+		recordID, managed = "", false
+	}
+
+	res, err := tx.Exec(`
 		UPDATE domains
 		SET subdomain = ?, zone_id = ?, server_id = ?, port = ?, proxy_config = ?,
 			manual_config = ?, websocket = ?, force_https = ?, ssl_mode = ?,
@@ -213,8 +234,8 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 		WHERE id = ?`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
-		string(dom.SSLMode), dom.DNSRecordID, string(dom.Status), dom.ErrorMsg,
-		lastSynced, dom.UpdatedAt.Format(time.RFC3339), boolToInt(dom.DNSManaged),
+		string(dom.SSLMode), recordID, string(dom.Status), dom.ErrorMsg,
+		lastSynced, dom.UpdatedAt.Format(time.RFC3339), boolToInt(managed),
 		nullableBool(dom.Proxied), dom.ID,
 	)
 	if err != nil {
@@ -225,6 +246,10 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 	if n == 0 {
 		return fmt.Errorf("domain not found: %d", dom.ID)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing domain update: %w", err)
+	}
+	dom.DNSRecordID, dom.DNSManaged = recordID, managed
 	return nil
 }
 

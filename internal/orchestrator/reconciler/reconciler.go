@@ -67,6 +67,13 @@ type Reconciler struct {
 	anchorRenameGrace time.Duration
 	// anchorWarnAt rate-limits the warning about failing anchor cleanups.
 	anchorWarnAt time.Time
+	// domainDNSCleanupMaxWait bounds how long an old domain record released by
+	// a rename waits for the record at the new name.
+	domainDNSCleanupMaxWait time.Duration
+	// dnsMu serializes the domain DNS phases, which the periodic cycle and an
+	// API-triggered pass (ReconcileDNSNow) may otherwise run at the same time
+	// and both create a record for one name.
+	dnsMu sync.Mutex
 
 	applyAuthority interface {
 		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
@@ -86,6 +93,8 @@ func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reco
 		agentClient:       agentClient,
 		interval:          interval,
 		anchorRenameGrace: defaultAnchorRenameGrace,
+
+		domainDNSCleanupMaxWait: defaultDomainDNSCleanupMaxWait,
 	}
 }
 
@@ -612,9 +621,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 		}
 	}
 
-	if err := r.reconcileDNS(ctx); err != nil {
-		log.Printf("reconciler: DNS phase failed: %v", err)
-	}
+	r.runDomainDNSPhases(ctx)
 
 	if err := r.reconcileAgentDNS(ctx); err != nil {
 		log.Printf("reconciler: agent DNS phase failed: %v", err)
@@ -1103,12 +1110,44 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		return
 	}
 
+	// A CNAME NurProxy created for this name and released by a rename (the
+	// domain is back at its old name) is taken back whatever it points at; the
+	// content check on the next pass retargets it. Without this it would count as
+	// a foreign conflict while its own cleanup waits for the name to be free.
+	for i := range existing {
+		if !strings.EqualFold(existing[i].Type, "CNAME") {
+			continue
+		}
+		owned, queued, qErr := r.db.QueuedDomainDNSRecord(existing[i].ID, dom.ZoneID)
+		if qErr != nil {
+			log.Printf("reconciler: cannot check the DNS cleanup queue for %s, retrying next cycle: %v", fqdn, qErr)
+			return
+		}
+		if !queued || !owned {
+			continue
+		}
+		if _, dErr := r.db.AdoptDomainDNSRecord(dom.ID, dom.Subdomain, existing[i].ID, dom.ZoneID); dErr != nil {
+			log.Printf("reconciler: did not take back DNS record %s for domain %d: %v", existing[i].ID, dom.ID, dErr)
+			return
+		}
+		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+			log.Printf("reconciler: failed to clear domain status: %v", dErr)
+		}
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_reclaimed",
+			fmt.Sprintf("took back queued CNAME %s -> %s (created by NurProxy)", fqdn, existing[i].Content))
+		return
+	}
+
 	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
 		// Identical record already exists — adopt it instead of creating a duplicate
 		// ("it's the record we'd set anyway, just skip"). managed=false: we did NOT
-		// create this record, so teardown must never delete it (§79).
-		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, false); dErr != nil {
-			log.Printf("reconciler: failed to store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
+		// create this record, so teardown must never delete it (§79). An adopted
+		// record still queued after a rename leaves the queue here.
+		if _, dErr := r.db.AdoptDomainDNSRecord(dom.ID, dom.Subdomain, adopt.ID, dom.ZoneID); dErr != nil {
+			// ErrDomainRenamed included: the record belongs to a name the
+			// domain left, and nothing was written.
+			log.Printf("reconciler: did not store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
+			return
 		}
 		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s (%s)", fqdn, target, proxiedWord(adopt.Proxied)))
 		// The adopted record keeps its proxy state unless the operator set one.
@@ -1139,8 +1178,15 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 	}
 
 	// Nothing exists — create it. With no operator setting a new record starts
-	// DNS-only, as before #126.
-	proxied := desiredProxied(dom, false)
+	// DNS-only, as before #126, unless it replaces a record released by a
+	// rename or zone move: then it keeps that record's proxy state (#151).
+	proxied, wait := r.newRecordProxied(dom, dnsProvider)
+	if wait != "" {
+		// Not an error on the domain: the old record's state is read by the
+		// cleanup phase, whose failures show up in health and the log.
+		log.Printf("reconciler: not creating the DNS record for %s yet: %s", fqdn, wait)
+		return
+	}
 	recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: proxied})
 	if cErr != nil {
 		log.Printf("reconciler: failed to create DNS record for %s: %v", fqdn, cErr)
@@ -1150,11 +1196,33 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
 		return
 	}
-	// managed=true: NurProxy created this record, so teardown may delete it (§79).
-	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
-		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
-	}
 	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s (%s)", fqdn, target, proxiedWord(proxied)))
+	// managed=true: NurProxy created this record, so teardown may delete it (§79).
+	// Stored only while the domain still has this name; a rename that landed
+	// meanwhile makes the new record stale at once, so it is queued instead.
+	sErr := r.db.SetDomainDNSRecordIfNamed(dom.ID, dom.Subdomain, dom.ZoneID, recordID, true)
+	switch {
+	case errors.Is(sErr, db.ErrDomainRenamed):
+		r.queueStaleCreatedRecord(dom, fqdn, target, recordID, proxied)
+	case sErr != nil:
+		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, sErr)
+	}
+}
+
+// queueStaleCreatedRecord queues a record created for a name the domain left
+// while the record was being created, so it is cleaned up like any other
+// released record instead of being forgotten at the provider.
+func (r *Reconciler) queueStaleCreatedRecord(dom *models.Domain, fqdn, target, recordID string, proxied bool) {
+	log.Printf("reconciler: domain %d was renamed while its record %s for %s was created; queueing it for cleanup", dom.ID, recordID, fqdn)
+	if err := r.db.QueueDomainDNSRecord(db.DomainDNSCleanup{
+		DomainID: dom.ID, FQDN: fqdn, RecordID: recordID, Owned: true,
+		Content: target, Proxied: &proxied, ZoneID: dom.ZoneID,
+	}); err != nil {
+		log.Printf("reconciler: cannot queue stale record %s for %s, it stays at the provider: %v", recordID, fqdn, err)
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", fmt.Sprintf("record %s at %s created during a rename could not be queued: %v", recordID, fqdn, err))
+		return
+	}
+	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_cleanup_queued", fmt.Sprintf("record %s at %s was created while the domain was renamed", recordID, fqdn))
 }
 
 // desiredProxied is the Cloudflare proxy bit a domain's record should carry:
@@ -1722,7 +1790,7 @@ func (r *Reconciler) cleanupCertForDomain(dom *models.Domain) {
 		}
 		return
 	}
-	served, err := r.hostStillServed(host)
+	served, err := r.db.HostServed(host)
 	if err != nil {
 		log.Printf("reconciler: cannot check remaining domains for host %s, keeping its certificate: %v", host, err)
 		return
@@ -1738,40 +1806,6 @@ func (r *Reconciler) cleanupCertForDomain(dom *models.Domain) {
 		return
 	}
 	r.audit("certificate", host, "deleted", "removed with domain teardown; no remaining domain serves this host")
-}
-
-// hostStillServed reports whether any domain NOT being torn down currently
-// resolves to host, using the same host→domain matching as agentServingHost
-// (the domain's computed FQDN). Domains in "deleting" do not count — they are on
-// their way out and must not keep a dead host's certificate alive.
-func (r *Reconciler) hostStillServed(host string) (bool, error) {
-	domains, err := r.db.ListDomains(db.DomainFilter{})
-	if err != nil {
-		return false, fmt.Errorf("listing domains to resolve host %q: %w", host, err)
-	}
-	zoneNames := make(map[string]string)
-	for i := range domains {
-		dom := &domains[i]
-		if dom.Status == models.DomainStatusDeleting {
-			continue
-		}
-		zoneName, ok := zoneNames[dom.ZoneID]
-		if !ok {
-			zone, zErr := r.db.GetZone(dom.ZoneID)
-			if zErr != nil {
-				// Skipping this domain could return a false "not served" and let the
-				// caller delete a certificate the domain still needs. Fail the check
-				// instead — the caller keeps the cert and retries next cycle.
-				return false, fmt.Errorf("resolving zone %s for domain %d: %w", dom.ZoneID, dom.ID, zErr)
-			}
-			zoneName = zone.Name
-			zoneNames[dom.ZoneID] = zoneName
-		}
-		if dom.FQDN(zoneName) == host {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // resolveDNS resolves a zone ID to its zone, provider, and DNS provider plugin.

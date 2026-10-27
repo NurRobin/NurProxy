@@ -809,6 +809,40 @@ var migrations = []string{
 	ALTER TABLE certificates ADD COLUMN source TEXT NOT NULL DEFAULT 'acme'
 		CHECK (source IN ('acme', 'imported'));
 	`,
+
+	// Migration 35: domain CNAME records released by a rename or zone move
+	// (#151). Same contract as agent_anchor_cleanups: a row stays until the
+	// provider delete succeeds or the record is already gone, and provider_id /
+	// zone_external_id snapshot the ORIGINAL provider and zone so a
+	// cross-provider move still deletes through the old one. Adopted rows
+	// (owned=0) are never deleted; they stay until the new record exists so
+	// their proxied snapshot can still be inherited. content is the target the
+	// record had when it was released, proxied the record's Cloudflare proxy
+	// state read once from the provider (NULL until read). deleted=1 marks an
+	// owned record already deleted by the wait bound while the domain still has
+	// no new record; the row then only keeps the proxied snapshot. No FK to
+	// domains: the domain may be deleted before the cleanup runs.
+	`
+	CREATE TABLE domain_dns_cleanups (
+		id               INTEGER PRIMARY KEY AUTOINCREMENT,
+		domain_id        INTEGER NOT NULL,
+		fqdn             TEXT NOT NULL,
+		record_id        TEXT NOT NULL,
+		owned            INTEGER NOT NULL DEFAULT 0 CHECK (owned IN (0, 1)),
+		content          TEXT NOT NULL DEFAULT '',
+		proxied          INTEGER CHECK (proxied IS NULL OR proxied IN (0, 1)),
+		deleted          INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+		zone_id          TEXT NOT NULL DEFAULT '',
+		provider_id      TEXT NOT NULL DEFAULT '',
+		zone_external_id TEXT NOT NULL DEFAULT '',
+		attempts         INTEGER NOT NULL DEFAULT 0,
+		last_error       TEXT NOT NULL DEFAULT '',
+		created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE (zone_id, record_id)
+	);
+	CREATE INDEX idx_domain_dns_cleanups_record
+		ON domain_dns_cleanups(zone_external_id, record_id);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

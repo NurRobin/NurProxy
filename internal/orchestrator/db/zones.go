@@ -34,7 +34,7 @@ func (d *DB) GetZone(id string) (*models.Zone, error) {
 		FROM zones WHERE id = ?`, id,
 	).Scan(&z.ID, &z.ProviderID, &z.ExternalID, &z.Name, &createdAt)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("zone not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrZoneNotFound, id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("querying zone: %w", err)

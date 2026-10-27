@@ -1,7 +1,9 @@
 package db
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -102,6 +104,155 @@ func (d *DB) CompleteDomainMove(move *DomainMove) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// DomainRename is an update that changes a domain's host (subdomain or zone).
+// The REST API and the MCP tools both route it through BeginDomainRename /
+// FinishDomainRename (#151). The old DNS record is released by UpdateDomain
+// itself.
+type DomainRename struct {
+	OldHost string
+	NewHost string
+	// AgentID / Tombstone: the deletion persisted for the old vhost when the
+	// domain stays on an nginx/apache agent. A rename that also moves to another
+	// agent is covered by the DomainMove tombstone instead.
+	AgentID   string
+	Tombstone *helperprotocol.ManagedDeletion
+}
+
+// renamedRouteResourceID names the tombstone of a vhost a domain left behind by
+// a rename on the same agent. The domain's own "dom-<id>" stays in the signed
+// apply as a retained resource, and one resource cannot be both retained and
+// deleted; the helper deletes by host, so the tombstone gets its own identity
+// derived from the old host.
+func renamedRouteResourceID(domainID int64, oldHost string) string {
+	sum := sha256.Sum256([]byte(oldHost))
+	return domainArtifactID(domainID) + "-was-" + hex.EncodeToString(sum[:8])
+}
+
+// BeginDomainRename prepares an update from before (the stored domain) to after.
+// It returns nil when the host does not change or cannot be resolved. When the
+// domain stays on the same agent and that agent renders nginx/apache, it
+// persists a route tombstone for the old host, so the next signed apply removes
+// the old vhost file in the same transaction that writes the new one. Call it
+// before the domain row is updated.
+func (d *DB) BeginDomainRename(before, after *models.Domain, at time.Time) (*DomainRename, error) {
+	if before.Subdomain == after.Subdomain && before.ZoneID == after.ZoneID {
+		return nil, nil
+	}
+	oldZone, err := d.GetZone(before.ZoneID)
+	if errors.Is(err, ErrZoneNotFound) {
+		return nil, nil // the old host cannot be named; nothing to tombstone
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve old zone: %w", err)
+	}
+	newZone, err := d.GetZone(after.ZoneID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve new zone: %w", err)
+	}
+	rename := &DomainRename{OldHost: before.FQDN(oldZone.Name), NewHost: after.FQDN(newZone.Name)}
+	if rename.OldHost == rename.NewHost || before.CertOnly ||
+		helperprotocol.ManagedVhostKey(rename.OldHost) == helperprotocol.ManagedVhostKey(rename.NewHost) {
+		return rename, nil
+	}
+	oldSrv, err := d.GetServer(before.ServerID)
+	if err != nil {
+		return rename, nil
+	}
+	newSrv, err := d.GetServer(after.ServerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve target server: %w", err)
+	}
+	if oldSrv.AgentID != newSrv.AgentID {
+		return rename, nil // BeginDomainMove tombstones the old host on the old agent
+	}
+	agent, err := d.GetAgent(oldSrv.AgentID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve agent: %w", err)
+	}
+	backend := managedBackendForAgent(agent)
+	if backend != "nginx" && backend != "apache" {
+		return rename, nil
+	}
+	deletion := helperprotocol.ManagedDeletion{
+		ResourceID: renamedRouteResourceID(before.ID, rename.OldHost),
+		Host:       rename.OldHost, Backend: backend,
+	}
+	if err := d.UpsertManagedRouteTombstone(agent.ID, deletion, at); err != nil {
+		return nil, err
+	}
+	rename.AgentID, rename.Tombstone = agent.ID, &deletion
+	return rename, nil
+}
+
+// AbortDomainRename removes the tombstone BeginDomainRename persisted, for when
+// the domain row update itself failed. Best-effort.
+func (d *DB) AbortDomainRename(rename *DomainRename) {
+	if rename == nil || rename.Tombstone == nil {
+		return
+	}
+	_ = d.DeleteManagedRouteTombstones(rename.AgentID, []helperprotocol.ManagedDeletion{*rename.Tombstone})
+}
+
+// FinishDomainRename runs after the renamed row is stored. It deletes the
+// central certificate of the old host unless another domain still serves that
+// host (certificates are keyed by host and can be shared). It reports whether
+// a certificate was deleted.
+func (d *DB) FinishDomainRename(rename *DomainRename) (bool, error) {
+	if rename == nil || rename.OldHost == rename.NewHost {
+		return false, nil
+	}
+	cert, err := d.GetCertificate(rename.OldHost)
+	if err != nil {
+		if errors.Is(err, ErrCertNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("look up certificate for %s: %w", rename.OldHost, err)
+	}
+	if cert.IsWildcard || cert.Source == models.CertSourceImported {
+		// A wildcard covers more than the one host, and an imported bundle is
+		// the operator's to remove; NurProxy could not issue it again.
+		return false, nil
+	}
+	served, err := d.HostServed(rename.OldHost)
+	if err != nil || served {
+		return false, err
+	}
+	if err := d.DeleteCertificate(rename.OldHost); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// HostServed reports whether any domain that is not being deleted resolves to
+// host. A zone that cannot be resolved fails the check, so a caller never
+// deletes a certificate on a false "not served".
+func (d *DB) HostServed(host string) (bool, error) {
+	domains, err := d.ListDomains(DomainFilter{})
+	if err != nil {
+		return false, fmt.Errorf("listing domains to resolve host %q: %w", host, err)
+	}
+	zoneNames := make(map[string]string)
+	for i := range domains {
+		dom := &domains[i]
+		if dom.Status == models.DomainStatusDeleting {
+			continue
+		}
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok {
+			zone, zErr := d.GetZone(dom.ZoneID)
+			if zErr != nil {
+				return false, fmt.Errorf("resolving zone %s for domain %d: %w", dom.ZoneID, dom.ID, zErr)
+			}
+			zoneName = zone.Name
+			zoneNames[dom.ZoneID] = zoneName
+		}
+		if dom.FQDN(zoneName) == host {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ClaimDomainRoute drops any pending route tombstone on dom's agent that the

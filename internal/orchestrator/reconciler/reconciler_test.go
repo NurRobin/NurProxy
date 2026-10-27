@@ -220,6 +220,13 @@ type mockDNSProvider struct {
 	// getErr, when set, is returned by GetRecord instead of the stored record —
 	// used to simulate a transient read failure vs. a genuine ErrRecordNotFound.
 	getErr error
+	// createErr, when set, is returned by CreateRecord instead of creating.
+	createErr error
+	// deleteConfigs records the provider config of every DeleteRecord call, so
+	// a test can tell which provider/zone a delete went through.
+	deleteConfigs []string
+	// id overrides the registry id ("mock"), e.g. to stand in for cloudflare.
+	id string
 }
 
 func newMockDNSProvider() *mockDNSProvider {
@@ -229,11 +236,17 @@ func newMockDNSProvider() *mockDNSProvider {
 }
 
 func (p *mockDNSProvider) Info() provider.ProviderInfo {
+	id := "mock"
+	if p.id != "" {
+		id = p.id
+	}
 	return provider.ProviderInfo{
-		ID:          "mock",
+		ID:          id,
 		Name:        "Mock Provider",
 		Description: "In-memory mock for testing",
 		RecordTypes: []string{"A", "AAAA", "CNAME"},
+		// Standing in for cloudflare, the mock can proxy records too.
+		SupportsProxied: id == "cloudflare",
 	}
 }
 
@@ -252,6 +265,9 @@ func (p *mockDNSProvider) ListZones(_ context.Context, _ json.RawMessage) ([]pro
 func (p *mockDNSProvider) CreateRecord(_ context.Context, _ json.RawMessage, rec provider.Record) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.createErr != nil {
+		return "", p.createErr
+	}
 	p.nextID++
 	id := fmt.Sprintf("rec-%d", p.nextID)
 	p.records[id] = rec
@@ -268,9 +284,10 @@ func (p *mockDNSProvider) UpdateRecord(_ context.Context, _ json.RawMessage, rec
 	return nil
 }
 
-func (p *mockDNSProvider) DeleteRecord(_ context.Context, _ json.RawMessage, recordID string) error {
+func (p *mockDNSProvider) DeleteRecord(_ context.Context, config json.RawMessage, recordID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.deleteConfigs = append(p.deleteConfigs, string(config))
 	if p.deleteErr != nil {
 		return p.deleteErr
 	}

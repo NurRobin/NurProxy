@@ -168,6 +168,29 @@ func (s *Server) triggerCertIssuance(dom *models.Domain) {
 	}()
 }
 
+// dnsReconciler is implemented by the reconciler wired in as DNS takeover: it
+// runs the domain DNS phases on demand.
+type dnsReconciler interface {
+	ReconcileDNSNow(ctx context.Context)
+}
+
+// triggerDNSReconcile runs a DNS pass in the background after a rename or zone
+// move, so the new name gets its record (and the old one its cleanup) right
+// away instead of up to a reconcile interval later, while the agent has
+// already dropped the old vhost. Best-effort; the periodic cycle is the
+// backstop.
+func (s *Server) triggerDNSReconcile() {
+	rec, ok := s.takeover.(dnsReconciler)
+	if !ok {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		rec.ReconcileDNSNow(ctx)
+	}()
+}
+
 // GET /api/v1/domains/{id}
 func (s *Server) handleGetDomain(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
@@ -274,17 +297,27 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	// the old agent before any push stops retaining the route's certificate
 	// there; otherwise the old vhost survives while its certificate is pruned
 	// (#148).
+	now := time.Now().UTC()
 	var move *db.DomainMove
 	if req.ServerID != nil && before.ServerID != dom.ServerID {
-		move, err = s.db.BeginDomainMove(&before, dom.ServerID, time.Now().UTC())
+		move, err = s.db.BeginDomainMove(&before, dom.ServerID, now)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to persist managed deletion identity for the old agent")
 			return
 		}
 	}
+	// A rename on the same agent leaves the old vhost file behind unless it
+	// gets its own tombstone; UpdateDomain releases the old DNS record (#151).
+	rename, err := s.db.BeginDomainRename(&before, dom, now)
+	if err != nil {
+		s.db.AbortDomainMove(move)
+		writeError(w, http.StatusInternalServerError, "failed to persist managed deletion identity for the renamed host")
+		return
+	}
 
 	if err := s.db.UpdateDomain(dom); err != nil {
 		s.db.AbortDomainMove(move)
+		s.db.AbortDomainRename(rename)
 		writeError(w, http.StatusInternalServerError, "failed to update domain")
 		return
 	}
@@ -305,12 +338,21 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.ClaimDomainRoute(dom); err != nil {
 		log.Printf("update: cannot drop colliding route tombstones for domain %d: %v", dom.ID, err)
 	}
+	if dropped, err := s.db.FinishDomainRename(rename); err != nil {
+		log.Printf("update: cannot remove the old certificate of renamed domain %d: %v", dom.ID, err)
+	} else if dropped {
+		s.audit(r, "certificate", rename.OldHost, "deleted", "domain renamed to "+rename.NewHost+"; no remaining domain serves this host")
+	}
 	if move != nil {
 		// Push the old agent so it removes the route at once.
 		s.pushAgent(move.OldAgentID)
 	}
 
 	s.triggerAgentPush(dom.ServerID)
+	if rename != nil {
+		s.triggerCertIssuance(dom)
+		s.triggerDNSReconcile()
+	}
 
 	writeJSON(w, http.StatusOK, dom)
 }

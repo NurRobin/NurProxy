@@ -326,6 +326,68 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Fatalf("resolved stale-temp diagnostic %q disappeared from history", staleDiagnosticID)
 	}
 
+	// Rename the apex domain to www (#151): the new name gets its own record
+	// and certificate, the old record (NurProxy-created) is deleted once the new
+	// one exists, and the old vhost file leaves the agent.
+	var apexBefore struct {
+		DNSRecordID string `json:"dns_record_id"`
+	}
+	api.get(fmt.Sprintf("/api/v1/domains/%d", apex.ID), &apexBefore)
+	oldVhost := filepath.Join(proxyConfigDir, "nurproxy-sandbox.test.conf")
+	if _, err := os.Stat(oldVhost); err != nil {
+		t.Fatalf("apex vhost missing before rename: %v", err)
+	}
+	api.put(fmt.Sprintf("/api/v1/domains/%d", apex.ID), map[string]any{"subdomain": "www"}, nil)
+	newVhost := filepath.Join(proxyConfigDir, "nurproxy-www.sandbox.test.conf")
+	var renamedRecord string
+	waitFor(t, 30*time.Second, func() bool {
+		var d struct {
+			Status      string `json:"status"`
+			DNSManaged  bool   `json:"dns_managed"`
+			DNSRecordID string `json:"dns_record_id"`
+		}
+		api.get(fmt.Sprintf("/api/v1/domains/%d", apex.ID), &d)
+		renamedRecord = d.DNSRecordID
+		if d.Status != "active" || !d.DNSManaged || d.DNSRecordID == "" || d.DNSRecordID == apexBefore.DNSRecordID {
+			return false
+		}
+		var h struct {
+			Checks map[string]string `json:"checks"`
+		}
+		mustGetJSON(t, &http.Client{}, base+"/api/v1/health", &h)
+		if _, queued := h.Checks["domain_dns_cleanup"]; queued {
+			return false
+		}
+		_, oldErr := os.Stat(oldVhost)
+		_, newErr := os.Stat(newVhost)
+		return os.IsNotExist(oldErr) && newErr == nil
+	})
+	var renameAudit struct {
+		Entries []struct {
+			EntityType string `json:"entity_type"`
+			EntityID   string `json:"entity_id"`
+			Action     string `json:"action"`
+			Source     string `json:"source"`
+		} `json:"entries"`
+	}
+	var sawOldDeleted, sawRenamedIssued, sawOldCertDropped bool
+	waitFor(t, 30*time.Second, func() bool {
+		renameAudit.Entries = nil
+		api.get("/api/v1/audit-log?limit=200", &renameAudit)
+		for _, e := range renameAudit.Entries {
+			switch {
+			case e.Source == "dryrun" && e.Action == "dns_deleted" && e.EntityType == "domain" && e.EntityID == fmt.Sprint(apex.ID):
+				sawOldDeleted = true
+			case e.Source == "dryrun" && e.Action == "renewed" && e.EntityID == "www.sandbox.test":
+				sawRenamedIssued = true
+			case e.Action == "deleted" && e.EntityType == "certificate" && e.EntityID == "sandbox.test":
+				sawOldCertDropped = true
+			}
+		}
+		return sawOldDeleted && sawRenamedIssued && sawOldCertDropped
+	})
+	t.Logf("renamed apex to www: record %s -> %s", apexBefore.DNSRecordID, renamedRecord)
+
 	managedPath := filepath.Join(proxyConfigDir, "nurproxy-app.sandbox.test.conf")
 	managedBefore, err := os.ReadFile(managedPath)
 	if err != nil {
@@ -359,9 +421,14 @@ func TestSandboxEndToEnd(t *testing.T) {
 	if unknown == nil || unknown.Ownership != recoverymodel.OwnershipUnknown || unknown.ProposedAction != "" || unknown.AutoRepairEligible || unknown.HardChange {
 		t.Fatalf("unknown validation error was not diagnosis-only: %#v", unknown)
 	}
+	// The rename above runs automatic repairs of its own (orphan vhost prune,
+	// cert bundle rematerialize), possibly still landing now; only a repair for
+	// the unknown failure's diagnostic is wrong.
 	api.get("/api/v1/agents/"+agentID+"/repairs", &repairs)
-	if len(repairs) != 1 {
-		t.Fatalf("unknown validation error created a repair operation: %#v", repairs)
+	for _, repair := range repairs {
+		if repair.DiagnosticID == unknown.ID {
+			t.Fatalf("unknown validation error created a repair operation: %#v", repair)
+		}
 	}
 	if got, err := os.ReadFile(operatorPath); err != nil || !bytes.Equal(got, operatorBytes) {
 		t.Fatalf("unknown validation failure changed operator config: got=%q err=%v", got, err)
@@ -392,9 +459,15 @@ func TestSandboxEndToEnd(t *testing.T) {
 		}
 		return out
 	}
+	// Two creations: the apex itself and, after the rename above, www.
 	created := auditFor(apex.ID, "dns_created")
-	if len(created) != 1 || !strings.Contains(created[0], "(proxied)") {
-		t.Fatalf("apex CNAME was not created proxied; dns_created audit = %q", created)
+	if len(created) != 2 {
+		t.Fatalf("apex domain dns_created audit = %q, want the apex and the renamed www record", created)
+	}
+	for _, c := range created {
+		if !strings.Contains(c, "(proxied)") {
+			t.Fatalf("apex domain CNAME was not created proxied; dns_created audit = %q", created)
+		}
 	}
 	api.put(fmt.Sprintf("/api/v1/domains/%d", apex.ID), map[string]any{"proxied": false}, nil)
 	api.post(fmt.Sprintf("/api/v1/domains/%d/dns/takeover", apex.ID), map[string]any{}, nil)

@@ -5,6 +5,27 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Renaming a domain or moving it to another zone cleans up the old name
+  (#151).** The DNS record of the old name is queued and deleted through the
+  provider and zone it was created in, once the record for the new name exists;
+  records NurProxy only adopted are left alone, and failed deletes are retried.
+  A record that a domain still uses, a name a domain still serves, or a record
+  whose name or target changed since is never deleted. The new name gets its
+  record right after the update instead of on the next reconcile cycle.
+  Between Cloudflare zones the new record keeps the old one's proxy (orange
+  cloud) state unless the domain has its own `proxied` setting.
+  The old host's certificate is removed when no other domain uses it (wildcard
+  and imported certificates are kept), and the new central-TLS host is issued
+  right away.
+  A rename on the same nginx/apache agent now removes the old vhost file in the
+  same apply that writes the new one. The MCP `update_domain` tool accepts
+  `subdomain` and `zone_id`. `/api/v1/health` reports queued deletions as
+  `domain_dns_cleanup`. Migration 35 runs on start.
+
 ## [0.5.0] - 2026-10-27
 
 First stable release of the 0.5 line. It contains everything from

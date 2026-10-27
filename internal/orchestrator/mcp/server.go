@@ -222,7 +222,7 @@ var tools = func() map[string]tool {
 		{
 			name:        "update_domain",
 			description: "Update fields of an existing domain by id. Re-queues it for reconciliation.",
-			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit to leave unchanged, null to go back to keeping the existing record state; true/false is enforced. true only for Cloudflare zones."}},"required":["id"],"additionalProperties":false}`,
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit to leave unchanged, null to go back to keeping the existing record state; true/false is enforced. true only for Cloudflare zones."}},"required":["id"],"additionalProperties":false}`,
 			run:         toolUpdateDomain,
 		},
 		{
@@ -414,6 +414,8 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	var in struct {
 		ID         int64               `json:"id"`
+		Subdomain  *string             `json:"subdomain"`
+		ZoneID     *string             `json:"zone_id"`
 		ServerID   *string             `json:"server_id"`
 		Port       *int                `json:"port"`
 		WebSocket  *bool               `json:"websocket"`
@@ -432,6 +434,18 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("domain not found")
 	}
 	before := *dom
+	if in.Subdomain != nil {
+		if err := dnsname.ValidateSubdomainOrApex(*in.Subdomain); err != nil {
+			return nil, err
+		}
+		dom.Subdomain = *in.Subdomain
+	}
+	if in.ZoneID != nil {
+		if _, err := d.GetZone(*in.ZoneID); err != nil {
+			return nil, fmt.Errorf("zone not found")
+		}
+		dom.ZoneID = *in.ZoneID
+	}
 	if in.ServerID != nil {
 		if _, err := d.GetServer(*in.ServerID); err != nil {
 			return nil, fmt.Errorf("server not found")
@@ -463,15 +477,25 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	// Same move handling as the REST API: tombstone the old host on the old
 	// agent before the row changes, drop the stale artifact afterwards (#148).
 	// The reconciler's next tick pushes both agents.
+	// A rename gets the same treatment (#151): a tombstone for the old vhost on
+	// the same agent, the old DNS record released by UpdateDomain, and the old
+	// certificate dropped afterwards. The renewal scan issues the new host's.
+	now := time.Now().UTC()
 	var move *db.DomainMove
 	if before.ServerID != dom.ServerID {
-		move, err = d.BeginDomainMove(&before, dom.ServerID, time.Now().UTC())
+		move, err = d.BeginDomainMove(&before, dom.ServerID, now)
 		if err != nil {
 			return nil, fmt.Errorf("failed to persist managed deletion identity for the old agent: %w", err)
 		}
 	}
+	rename, err := d.BeginDomainRename(&before, dom, now)
+	if err != nil {
+		d.AbortDomainMove(move)
+		return nil, fmt.Errorf("failed to persist managed deletion identity for the renamed host: %w", err)
+	}
 	if err := d.UpdateDomain(dom); err != nil {
 		d.AbortDomainMove(move)
+		d.AbortDomainRename(rename)
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "update", dom.Subdomain)
@@ -489,6 +513,11 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	}
 	if err := d.ClaimDomainRoute(dom); err != nil {
 		warnings = append(warnings, "colliding route tombstones could not be dropped: "+err.Error())
+	}
+	if dropped, err := d.FinishDomainRename(rename); err != nil {
+		warnings = append(warnings, "old certificate could not be removed: "+err.Error())
+	} else if dropped {
+		auditMCP(d, "certificate", rename.OldHost, "deleted", "domain renamed to "+rename.NewHost+"; no remaining domain serves this host")
 	}
 	return domainWithWarnings(dom, warnings), nil
 }
