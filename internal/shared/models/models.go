@@ -244,10 +244,20 @@ type Agent struct {
 	// DNSRecordID6 is the provider record ID of the agent's AAAA record, tracked
 	// separately from the A record's DNSRecordID so DDNS can update each address
 	// family independently. Empty until an AAAA record is created/adopted.
-	DNSRecordID6 string      `json:"dns_record_id6,omitempty"`
-	Status       AgentStatus `json:"status"`
-	LastSeen     *time.Time  `json:"last_seen,omitempty"`
-	Version      string      `json:"version,omitempty"`
+	DNSRecordID6 string `json:"dns_record_id6,omitempty"`
+	// DNSRecordOwned / DNSRecordOwned6 report whether NurProxy created the A /
+	// AAAA anchor record (true) or adopted an existing one (false). Only owned
+	// anchors are deleted at the provider when the agent is renamed or deleted.
+	// DNSRecordZoneID / DNSRecordZoneID6 name the zone each record lives in.
+	// These are owned by the DB layer: UpdateAgent never writes them from the
+	// struct (see db.SetAgentAnchorRecord).
+	DNSRecordOwned   bool        `json:"dns_record_owned"`
+	DNSRecordOwned6  bool        `json:"dns_record_owned6"`
+	DNSRecordZoneID  string      `json:"dns_record_zone_id,omitempty"`
+	DNSRecordZoneID6 string      `json:"dns_record_zone_id6,omitempty"`
+	Status           AgentStatus `json:"status"`
+	LastSeen         *time.Time  `json:"last_seen,omitempty"`
+	Version          string      `json:"version,omitempty"`
 	// VersionStatus is a COMPUTED, non-persisted comparison of the agent's version
 	// against the orchestrator's, set by the API when listing/showing an agent so
 	// the dashboard can flag skew: "current" | "outdated" | "ahead" | "unknown"

@@ -60,7 +60,14 @@ type Reconciler struct {
 	// audit entries to "dryrun" so simulated record changes are unmistakable —
 	// while non-DNS reconciler events (route push, drift, agent status) stay
 	// "system", since those are not simulated by DNS sandbox mode.
-	dnsDryRun      bool
+	dnsDryRun bool
+
+	// anchorRenameGrace is how long an old anchor record released by a rename
+	// is kept before it may be deleted, for CNAMEs NurProxy does not track.
+	anchorRenameGrace time.Duration
+	// anchorWarnAt rate-limits the warning about failing anchor cleanups.
+	anchorWarnAt time.Time
+
 	applyAuthority interface {
 		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
 	}
@@ -75,9 +82,10 @@ func (r *Reconciler) SetApplyAuthority(authority interface {
 // New creates a Reconciler.
 func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reconciler {
 	return &Reconciler{
-		db:          database,
-		agentClient: agentClient,
-		interval:    interval,
+		db:                database,
+		agentClient:       agentClient,
+		interval:          interval,
+		anchorRenameGrace: defaultAnchorRenameGrace,
 	}
 }
 
@@ -578,6 +586,13 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 
 	if err := r.reconcileAgentDNS(ctx); err != nil {
 		log.Printf("reconciler: agent DNS phase failed: %v", err)
+	}
+
+	// Delete anchor records released by agent renames/deletions (#152). Runs
+	// after reconcileAgentDNS so a record an agent re-adopted this cycle has
+	// already been taken back out of the queue.
+	if err := r.reconcileAgentAnchorCleanups(ctx); err != nil {
+		log.Printf("reconciler: anchor cleanup phase failed: %v", err)
 	}
 
 	log.Println("reconciler: cycle complete")
@@ -1288,17 +1303,15 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 		// agent reported a routable IPv6 — both families coexist on the same FQDN,
 		// each tracked by its own provider record ID so DDNS updates them
 		// independently.
-		r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "A", a.PublicIP, a.DNSRecordID, func(id string) {
-			a.DNSRecordID = id
-			if uErr := r.db.UpdateAgentDNSRecord(a.ID, id); uErr != nil {
-				log.Printf("reconciler: failed to persist A record id for agent %s: %v", a.ID, uErr)
+		r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "A", a.PublicIP, a.DNSRecordID, func(id string, owned bool) {
+			if stored, ok := r.persistAgentAnchor(a, "A", id, zone.ID, owned); ok {
+				a.DNSRecordID, a.DNSRecordOwned, a.DNSRecordZoneID = id, stored, zone.ID
 			}
 		})
 		if a.PublicIP6 != "" {
-			r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "AAAA", a.PublicIP6, a.DNSRecordID6, func(id string) {
-				a.DNSRecordID6 = id
-				if uErr := r.db.UpdateAgentDNSRecord6(a.ID, id); uErr != nil {
-					log.Printf("reconciler: failed to persist AAAA record id for agent %s: %v", a.ID, uErr)
+			r.ensureAgentAddressRecord(ctx, a, dnsProvider, provConfig, "AAAA", a.PublicIP6, a.DNSRecordID6, func(id string, owned bool) {
+				if stored, ok := r.persistAgentAnchor(a, "AAAA", id, zone.ID, owned); ok {
+					a.DNSRecordID6, a.DNSRecordOwned6, a.DNSRecordZoneID6 = id, stored, zone.ID
 				}
 			})
 		}
@@ -1311,9 +1324,10 @@ func (r *Reconciler) reconcileAgentDNS(ctx context.Context) error {
 // address record — A or AAAA — for the agent's anchor FQDN. A and AAAA legitimately
 // coexist on the same name, so the only hard conflict is a CNAME already sitting
 // there. persist stores the resolved provider record ID (in memory + DB) for the
-// family; recordID is the currently stored ID ("" if none yet). All failures are
-// logged + audited and never abort the surrounding reconcile loop.
-func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Agent, dnsProvider provider.Provider, provConfig json.RawMessage, recordType, ip, recordID string, persist func(string)) {
+// family, with owned=true only when this call created the record; recordID is
+// the currently stored ID ("" if none yet). All failures are logged + audited
+// and never abort the surrounding reconcile loop.
+func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Agent, dnsProvider provider.Provider, provConfig json.RawMessage, recordType, ip, recordID string, persist func(id string, owned bool)) {
 	action := strings.ToLower(recordType) + "_record" // "a_record" | "aaaa_record"
 	rec := provider.Record{Type: recordType, Name: a.FQDN, Content: ip, TTL: 0}
 
@@ -1340,7 +1354,7 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 				return
 			}
 			// Content matches what we'd set: adopt it (record its ID).
-			persist(adopt.ID)
+			persist(adopt.ID, false)
 			r.auditDNS("agent", a.ID, action+"_adopted", fmt.Sprintf("adopted existing %s %s -> %s", recordType, a.FQDN, ip))
 			return
 		}
@@ -1358,7 +1372,7 @@ func (r *Reconciler) ensureAgentAddressRecord(ctx context.Context, a *models.Age
 			r.auditDNS("agent", a.ID, action+"_create_failed", cErr.Error())
 			return
 		}
-		persist(newID)
+		persist(newID, true)
 		r.auditDNS("agent", a.ID, action+"_created", fmt.Sprintf("created %s %s -> %s", recordType, a.FQDN, ip))
 		return
 	}

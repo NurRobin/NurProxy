@@ -391,9 +391,10 @@ func (e *fqdnError) Error() string { return e.msg }
 
 // applyFQDNChange validates and applies an FQDN (anchor hostname) override onto
 // the agent in place. A blank fqdn or one equal to the current value is a no-op.
-// When the anchor actually moves, it clears the stored A- and AAAA-record ids
-// (so the reconciler recreates both at the new name and the old records don't
-// leak at the prior name) and any stale last_error.
+// When the anchor actually moves, it clears the A- and AAAA-record ids on the
+// struct (so the reconciler recreates both at the new name) and any stale
+// dns_error. The old records themselves are released by db.UpdateAgent, which
+// queues them for the reconciler to delete if NurProxy created them.
 func (s *Server) applyFQDNChange(agent *models.Agent, fqdn string) *fqdnError {
 	fqdn = strings.TrimSpace(strings.ToLower(fqdn))
 	if fqdn == "" || fqdn == agent.FQDN {
@@ -407,7 +408,7 @@ func (s *Server) applyFQDNChange(agent *models.Agent, fqdn string) *fqdnError {
 	}
 	agent.FQDN = fqdn
 	agent.DNSRecordID = ""  // anchor moved — recreate the A record at the new name
-	agent.DNSRecordID6 = "" // and the AAAA record, else the old one leaks at the prior name
+	agent.DNSRecordID6 = "" // and the AAAA record
 	agent.DNSError = ""     // clear any stale "FQDN outside zone" error
 	return nil
 }
@@ -573,10 +574,11 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update version if it changed.
+	// Update version if it changed. A narrow write: a full-row UpdateAgent from
+	// this snapshot could revert a rename made concurrently through the API.
 	if req.Version != "" && agent.Version != req.Version {
 		agent.Version = req.Version
-		if uerr := s.db.UpdateAgent(agent); uerr != nil {
+		if uerr := s.db.UpdateAgentVersion(id, req.Version); uerr != nil {
 			log.Printf("failed to update agent version: %v", uerr)
 		}
 	}

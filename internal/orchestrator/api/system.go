@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -29,6 +30,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			} else {
 				checks["acme_ca"] = st.Detail
 			}
+		}
+	}
+	// Old agent anchor records queued for deletion (#152). Counts only: the
+	// endpoint is unauthenticated, so the provider errors stay in the log.
+	if pending, failing, err := s.db.AgentAnchorCleanupCounts(ctx); err == nil && pending > 0 {
+		if failing > 0 {
+			checks["agent_dns_cleanup"] = fmt.Sprintf("%d old agent DNS record(s) queued for deletion, %d failing (see orchestrator log)", pending, failing)
+		} else {
+			checks["agent_dns_cleanup"] = fmt.Sprintf("ok (%d old agent DNS record(s) queued for deletion)", pending)
 		}
 	}
 	resp := map[string]any{

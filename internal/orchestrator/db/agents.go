@@ -38,6 +38,7 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 	_, err = d.sql.Exec(`
 		INSERT INTO agents (id, name, fqdn, api_url, token_hash, dns_mode,
 			ddns_interval, public_ip, public_ip6, dns_record_id, dns_record_id6,
+			dns_record_owned, dns_record_owned6, dns_record_zone_id, dns_record_zone_id6,
 			status, last_seen, version,
 			caddy_running, last_error, dns_error,
 			detected_proxy_kind, detected_proxy_version, detected_binary_path,
@@ -46,9 +47,10 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 			detected_installed, detected_at, detected_capabilities,
 			auto_reconcile_config, safe_auto_repair_override, recovery_capability,
 			created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.PublicIP6, a.DNSRecordID, a.DNSRecordID6,
+		boolToInt(a.DNSRecordOwned), boolToInt(a.DNSRecordOwned6), a.DNSRecordZoneID, a.DNSRecordZoneID6,
 		string(a.Status), lastSeen, a.Version,
 		boolToInt(a.CaddyRunning), a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
@@ -260,10 +262,12 @@ func scanAgent(sc interface {
 	var permissions sql.NullString
 	var safeAutoRepairOverride sql.NullInt64
 	var recoveryCapability sql.NullString
+	var owned, owned6 int
 
 	err := sc.Scan(
 		&a.ID, &a.Name, &a.FQDN, &a.APIURL, &a.TokenHash,
 		&a.DNSMode, &a.DDNSInterval, &a.PublicIP, &a.PublicIP6, &a.DNSRecordID, &a.DNSRecordID6,
+		&owned, &owned6, &a.DNSRecordZoneID, &a.DNSRecordZoneID6,
 		&a.Status, &lastSeen, &a.Version, &caddyRunning, &a.LastError,
 		&a.DNSError,
 		&det.kind, &det.version, &det.binaryPath, &det.configDir,
@@ -278,6 +282,8 @@ func scanAgent(sc interface {
 		return nil, err
 	}
 	a.CaddyRunning = caddyRunning != 0
+	a.DNSRecordOwned = owned != 0
+	a.DNSRecordOwned6 = owned6 != 0
 	a.AutoReconcileConfig = autoReconcile != 0
 	a.ProxyDetection, a.ProxyDetectedAt = decodeDetection(det, detectedAt)
 	a.ProxyCapabilities = decodeCapabilities(capabilities)
@@ -306,7 +312,9 @@ func scanAgent(sc interface {
 }
 
 const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
-	ddns_interval, public_ip, public_ip6, dns_record_id, dns_record_id6, status, last_seen, version,
+	ddns_interval, public_ip, public_ip6, dns_record_id, dns_record_id6,
+	dns_record_owned, dns_record_owned6, dns_record_zone_id, dns_record_zone_id6,
+	status, last_seen, version,
 	caddy_running, last_error, dns_error,
 	detected_proxy_kind, detected_proxy_version, detected_binary_path,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
@@ -390,6 +398,15 @@ func (d *DB) ListAgents() ([]models.Agent, error) {
 }
 
 // UpdateAgent updates all mutable fields of an existing agent.
+//
+// The anchor DNS columns (record ids, ownership, zone) are NOT written from the
+// struct: the reconciler owns them through SetAgentAnchorRecord, and a full-row
+// write from a stale snapshot would silently drop a record id it just stored.
+// When the FQDN changes, the anchors at the old name are released into
+// agent_anchor_cleanups (owned ones get deleted at the provider by the
+// reconciler, adopted ones are left alone) and the anchor columns are cleared so
+// the reconciler builds fresh records at the new name. Both happen in the same
+// transaction as the FQDN change.
 func (d *DB) UpdateAgent(a *models.Agent) error {
 	a.UpdatedAt = time.Now().UTC()
 
@@ -406,11 +423,31 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		detectedAt = &s
 	}
 	caps := encodeCapabilities(a.ProxyCapabilities)
-	res, err := d.sql.Exec(`
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning agent update: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentFQDN string
+	if err := tx.QueryRow(`SELECT fqdn FROM agents WHERE id = ?`, a.ID).Scan(&currentFQDN); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("agent not found: %s", a.ID)
+		}
+		return fmt.Errorf("reading agent fqdn: %w", err)
+	}
+	renamed := currentFQDN != a.FQDN
+	if renamed {
+		if err := releaseAgentAnchorsTx(tx, a.ID, "rename"); err != nil {
+			return err
+		}
+	}
+
+	res, err := tx.Exec(`
 		UPDATE agents
 		SET name = ?, fqdn = ?, api_url = ?, token_hash = ?,
 			dns_mode = ?, ddns_interval = ?, public_ip = ?, public_ip6 = ?,
-			dns_record_id = ?, dns_record_id6 = ?,
 			status = ?, last_seen = ?, version = ?, caddy_running = ?,
 			last_error = ?, dns_error = ?,
 			detected_proxy_kind = ?, detected_proxy_version = ?,
@@ -422,7 +459,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 			updated_at = ?
 		WHERE id = ?`,
 		a.Name, a.FQDN, a.APIURL, a.TokenHash,
-		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.PublicIP6, a.DNSRecordID, a.DNSRecordID6,
+		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.PublicIP6,
 		string(a.Status), lastSeen, a.Version, boolToInt(a.CaddyRunning),
 		a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
@@ -439,10 +476,24 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 	if n == 0 {
 		return fmt.Errorf("agent not found: %s", a.ID)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing agent update: %w", err)
+	}
+
+	// Reflect what is now stored, so a caller that keeps using the struct does
+	// not carry anchor ids the database no longer has.
+	if renamed {
+		a.DNSRecordID, a.DNSRecordID6 = "", ""
+		a.DNSRecordOwned, a.DNSRecordOwned6 = false, false
+		a.DNSRecordZoneID, a.DNSRecordZoneID6 = "", ""
+	}
 	return nil
 }
 
 // DeleteAgent removes an agent by ID. Cascades to servers and their domains.
+// The agent's anchor records are released into agent_anchor_cleanups in the
+// same transaction, so the reconciler deletes the owned ones at the provider
+// after the row is gone.
 func (d *DB) DeleteAgent(id string) error {
 	tx, err := d.sql.Begin()
 	if err != nil {
@@ -454,6 +505,9 @@ func (d *DB) DeleteAgent(id string) error {
 	}
 	if _, err := tx.Exec("DELETE FROM recovery_diagnostics WHERE agent_id = ?", id); err != nil {
 		return fmt.Errorf("deleting agent recovery diagnostics: %w", err)
+	}
+	if err := releaseAgentAnchorsTx(tx, id, "delete"); err != nil {
+		return err
 	}
 	res, err := tx.Exec("DELETE FROM agents WHERE id = ?", id)
 	if err != nil {
@@ -479,46 +533,6 @@ func (d *DB) UpdateAgentStatus(id string, status models.AgentStatus) error {
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent status: %w", err)
-	}
-
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("agent not found: %s", id)
-	}
-	return nil
-}
-
-// UpdateAgentDNSRecord sets only the dns_record_id for an agent. Using a narrow
-// update (rather than a full-row UpdateAgent) avoids clobbering fields like
-// public_ip/last_seen that concurrent heartbeats write.
-func (d *DB) UpdateAgentDNSRecord(id string, recordID string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	res, err := d.sql.Exec(`
-		UPDATE agents SET dns_record_id = ?, updated_at = ? WHERE id = ?`,
-		recordID, now, id,
-	)
-	if err != nil {
-		return fmt.Errorf("updating agent DNS record: %w", err)
-	}
-
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("agent not found: %s", id)
-	}
-	return nil
-}
-
-// UpdateAgentDNSRecord6 sets only the dns_record_id6 (AAAA) for an agent. Like
-// UpdateAgentDNSRecord, it is a narrow update so it doesn't clobber fields that
-// concurrent heartbeats write (public_ip/public_ip6/last_seen).
-func (d *DB) UpdateAgentDNSRecord6(id string, recordID string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	res, err := d.sql.Exec(`
-		UPDATE agents SET dns_record_id6 = ?, updated_at = ? WHERE id = ?`,
-		recordID, now, id,
-	)
-	if err != nil {
-		return fmt.Errorf("updating agent AAAA record: %w", err)
 	}
 
 	n, _ := res.RowsAffected()
@@ -736,6 +750,21 @@ func (d *DB) safeAutoRepairSetting() (string, error) {
 		return "", fmt.Errorf("reading safe auto-repair setting: %w", err)
 	}
 	return value, nil
+}
+
+// UpdateAgentVersion sets only the reported agent version, so the heartbeat
+// never writes back a stale copy of the rest of the row (which could revert a
+// concurrent FQDN change).
+func (d *DB) UpdateAgentVersion(id, version string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.sql.Exec(`UPDATE agents SET version = ?, updated_at = ? WHERE id = ?`, version, now, id)
+	if err != nil {
+		return fmt.Errorf("updating agent version: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	return nil
 }
 
 // SetAgentDNSError records an orchestrator-side DNS/config error about an agent
