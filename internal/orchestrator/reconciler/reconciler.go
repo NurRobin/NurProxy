@@ -163,6 +163,7 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 		log.Printf("reconciler: cannot load managed route tombstones for agent %s: %v", agentID, err)
 		return false
 	}
+	deletions = deletionsOutsideDesired(deletions, set.Intents)
 	now := time.Now().UTC()
 	revision, err := helperprotocol.Digest(set)
 	if err != nil {
@@ -198,6 +199,25 @@ func (r *Reconciler) publishIntentSet(agentID string, set proxymodel.IntentSet) 
 		return false
 	}
 	return managedHub.PublishManagedIntentSet(agentID, helperprotocol.ManagedIntentSetEnvelope{IntentSet: set, Intent: signed})
+}
+
+// deletionsOutsideDesired drops tombstones whose resource is rendered again on
+// this agent (for example a domain moved away and straight back before the
+// deletion was applied). A signed intent must never retain and delete the same
+// resource, so such a tombstone would otherwise block every apply.
+func deletionsOutsideDesired(deletions []helperprotocol.ManagedDeletion, intents []proxymodel.RouteIntent) []helperprotocol.ManagedDeletion {
+	desired := make(map[string]struct{}, len(intents))
+	for _, intent := range intents {
+		desired[intent.ArtifactID] = struct{}{}
+	}
+	kept := make([]helperprotocol.ManagedDeletion, 0, len(deletions))
+	for _, deletion := range deletions {
+		if _, rendered := desired[deletion.ResourceID]; rendered {
+			continue
+		}
+		kept = append(kept, deletion)
+	}
+	return kept
 }
 
 func buildApplyIntent(agentID, helperInstanceID string, set proxymodel.IntentSet, issued time.Time) (helperprotocol.ApplyIntent, error) {
