@@ -25,6 +25,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain. They now go in a `<Location />` block. When a domain has both IP
   rules and basic auth, a request has to pass both, the same as on nginx.
 
+### Security
+
+- **Raw nginx configs are checked the way nginx reads them.** The helper's
+  raw config check now splits a config into directives with nginx's own
+  tokenizer rules: quotes and `#` only count at the start of a word, and
+  backslashes escape the next character. Before, the check could read some
+  configs differently from nginx. Every directive in the proxied server, its
+  `location /` and the port-80 redirect server must now be on a fixed list
+  for that block, and directive names must be plain words. A raw config that
+  uses quoted directive names, single-quoted values, backslashes outside a
+  `rewrite` pattern, `#` or braces inside a word, comments in the middle of a
+  directive, or anything besides `listen`, `server_name` and `return 301
+  https://...` in the redirect server is refused. As before, it is kept only
+  if the exact bytes are already installed. Configs rendered from the
+  dashboard form still pass. Header values that contain `'`, `#` or braces
+  are now rendered in double quotes, so nginx reads them as one value.
+
 ## [0.5.0] - 2026-10-27
 
 First stable release of the 0.5 line. It contains everything from

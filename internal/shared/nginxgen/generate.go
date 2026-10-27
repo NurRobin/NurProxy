@@ -396,13 +396,14 @@ func normalizeBodySize(s string) string {
 func basicAuthRealm(host string) string { return "Restricted: " + host }
 
 // quoteHeaderValue wraps a header value in double quotes when it contains
-// whitespace or a semicolon, which nginx would otherwise mis-tokenize. Embedded
-// double quotes are backslash-escaped.
+// whitespace, a semicolon, a quote, "#" or a brace, which nginx would otherwise
+// tokenize differently (or which the raw config check refuses in an unquoted
+// word). Embedded double quotes are backslash-escaped.
 func quoteHeaderValue(v string) string {
 	if v == "" {
 		return `""`
 	}
-	if strings.ContainsAny(v, " \t;\"") {
+	if strings.ContainsAny(v, " \t;\"'#{}") {
 		return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
 	}
 	return v
