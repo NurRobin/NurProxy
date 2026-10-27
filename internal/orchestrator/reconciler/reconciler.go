@@ -968,127 +968,130 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 	}
 
 	for i := range domains {
-		dom := &domains[i]
+		r.reconcileDomainDNS(ctx, &domains[i])
+	}
+	return nil
+}
 
-		// Skip domains not in an actionable state.
-		if dom.Status == models.DomainStatusDeleting {
-			continue
-		}
-
-		// Cert-only domains: NurProxy issues the cert (DNS-01 challenge records are
-		// handled by the issuer) but does NOT manage the public record — the
-		// operator owns DNS for their own hand-written vhost (§7).
-		if dom.CertOnly {
-			continue
-		}
-
-		// Resolve zone -> provider chain.
-		zone, zErr := r.db.GetZone(dom.ZoneID)
-		if zErr != nil {
-			log.Printf("reconciler: cannot get zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
-			continue
-		}
-
-		prov, pErr := r.db.GetProvider(zone.ProviderID)
-		if pErr != nil {
-			log.Printf("reconciler: cannot get provider %s for zone %s: %v", zone.ProviderID, zone.ID, pErr)
-			continue
-		}
-
-		dnsProvider, pErr := provider.Get(prov.Type)
-		if pErr != nil {
-			log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, pErr)
-			continue
-		}
-		dnsProvider = r.wrapDNS(dnsProvider)
-
-		// Merge zone's external ID into provider config for DNS API calls.
-		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
-
-		fqdn := dom.FQDN(zone.Name)
-
-		// Resolve: domain -> server -> agent -> agent.FQDN for CNAME target.
-		srv, sErr := r.db.GetServer(dom.ServerID)
-		if sErr != nil {
-			log.Printf("reconciler: cannot get server %s for domain %d: %v", dom.ServerID, dom.ID, sErr)
-			continue
-		}
-
-		agent, aErr := r.db.GetAgent(srv.AgentID)
-		if aErr != nil {
-			log.Printf("reconciler: cannot get agent %s for domain %d: %v", srv.AgentID, dom.ID, aErr)
-			continue
-		}
-
-		expectedTarget := agent.FQDN
-
-		if dom.DNSRecordID == "" {
-			// No record ID on file — resolve by name (adopt an identical existing
-			// record, flag a conflict, or create) instead of blind-creating.
-			r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
-			continue
-		}
-
-		// Record exists — verify content.
-		rec, gErr := dnsProvider.GetRecord(ctx, provConfig, dom.DNSRecordID)
-		if gErr != nil {
-			// Only a genuine not-found (the record was deleted at the provider) means
-			// we should re-resolve by name — adopt the live record if it still exists,
-			// else create — never blind-create into "already exists". A transient read
-			// error (network/auth/rate-limit) is NOT a miss: re-resolving would adopt a
-			// still-managed record as managed=false, flipping it to "adopted" and
-			// defeating teardown cleanup (#66/§79). Preserve the stored dns_managed flag
-			// and the record id, and retry next cycle.
-			if !errors.Is(gErr, provider.ErrRecordNotFound) {
-				log.Printf("reconciler: transient read of DNS record %s for domain %d, preserving managed state and retrying next cycle: %v", dom.DNSRecordID, dom.ID, gErr)
-				continue
-			}
-			log.Printf("reconciler: DNS record %s for domain %d no longer exists, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
-			r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
-			continue
-		}
-
-		// Record exists and was retrieved — check content and proxy state. The
-		// proxy bit only counts as drift when the operator set it explicitly;
-		// otherwise whatever the record has is kept (#126).
-		wantProxied := desiredProxied(dom, rec.Proxied)
-		contentDrift := rec.Content != expectedTarget
-		proxiedDrift := rec.Proxied != wantProxied
-		if contentDrift || proxiedDrift {
-			log.Printf("reconciler: DNS drift for %s: have %s (proxied=%t), want %s (proxied=%t)", fqdn, rec.Content, rec.Proxied, expectedTarget, wantProxied)
-			// Patch only the fields that drifted, so a provider that supports it
-			// keeps the record's comment, tags and settings.
-			var patch provider.RecordPatch
-			if contentDrift {
-				patch.Content = &expectedTarget
-			}
-			if proxiedDrift {
-				patch.Proxied = &wantProxied
-			}
-			if uErr := provider.PatchOrUpdate(ctx, dnsProvider, provConfig, dom.DNSRecordID, patch, provider.Record{
-				Type:    "CNAME",
-				Name:    fqdn,
-				Content: expectedTarget,
-				TTL:     0,
-				Proxied: wantProxied,
-			}); uErr != nil {
-				log.Printf("reconciler: failed to update DNS record for %s: %v", fqdn, uErr)
-				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", uErr)); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", uErr.Error())
-				continue
-			}
-			if contentDrift {
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_updated", fmt.Sprintf("updated CNAME %s: %s -> %s", fqdn, rec.Content, expectedTarget))
-			}
-			if proxiedDrift {
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_proxied_updated", proxiedChangeDetail(fqdn, rec.Proxied, wantProxied))
-			}
-		}
+// reconcileDomainDNS converges one domain's CNAME: create or adopt it when the
+// domain has none, otherwise fix content and proxy drift.
+func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain) {
+	// Skip domains not in an actionable state.
+	if dom.Status == models.DomainStatusDeleting {
+		return
 	}
 
-	return nil
+	// Cert-only domains: NurProxy issues the cert (DNS-01 challenge records are
+	// handled by the issuer) but does NOT manage the public record — the
+	// operator owns DNS for their own hand-written vhost (§7).
+	if dom.CertOnly {
+		return
+	}
+
+	// Resolve zone -> provider chain.
+	zone, zErr := r.db.GetZone(dom.ZoneID)
+	if zErr != nil {
+		log.Printf("reconciler: cannot get zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
+		return
+	}
+
+	prov, pErr := r.db.GetProvider(zone.ProviderID)
+	if pErr != nil {
+		log.Printf("reconciler: cannot get provider %s for zone %s: %v", zone.ProviderID, zone.ID, pErr)
+		return
+	}
+
+	dnsProvider, pErr := provider.Get(prov.Type)
+	if pErr != nil {
+		log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, pErr)
+		return
+	}
+	dnsProvider = r.wrapDNS(dnsProvider)
+
+	// Merge zone's external ID into provider config for DNS API calls.
+	provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
+
+	fqdn := dom.FQDN(zone.Name)
+
+	// Resolve: domain -> server -> agent -> agent.FQDN for CNAME target.
+	srv, sErr := r.db.GetServer(dom.ServerID)
+	if sErr != nil {
+		log.Printf("reconciler: cannot get server %s for domain %d: %v", dom.ServerID, dom.ID, sErr)
+		return
+	}
+
+	agent, aErr := r.db.GetAgent(srv.AgentID)
+	if aErr != nil {
+		log.Printf("reconciler: cannot get agent %s for domain %d: %v", srv.AgentID, dom.ID, aErr)
+		return
+	}
+
+	expectedTarget := agent.FQDN
+
+	if dom.DNSRecordID == "" {
+		// No record ID on file — resolve by name (adopt an identical existing
+		// record, flag a conflict, or create) instead of blind-creating.
+		r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
+		return
+	}
+
+	// Record exists — verify content.
+	rec, gErr := dnsProvider.GetRecord(ctx, provConfig, dom.DNSRecordID)
+	if gErr != nil {
+		// Only a genuine not-found (the record was deleted at the provider) means
+		// we should re-resolve by name — adopt the live record if it still exists,
+		// else create — never blind-create into "already exists". A transient read
+		// error (network/auth/rate-limit) is NOT a miss: re-resolving would adopt a
+		// still-managed record as managed=false, flipping it to "adopted" and
+		// defeating teardown cleanup (#66/§79). Preserve the stored dns_managed flag
+		// and the record id, and retry next cycle.
+		if !errors.Is(gErr, provider.ErrRecordNotFound) {
+			log.Printf("reconciler: transient read of DNS record %s for domain %d, preserving managed state and retrying next cycle: %v", dom.DNSRecordID, dom.ID, gErr)
+			return
+		}
+		log.Printf("reconciler: DNS record %s for domain %d no longer exists, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
+		r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
+		return
+	}
+
+	// Record exists and was retrieved — check content and proxy state. The
+	// proxy bit only counts as drift when the operator set it explicitly;
+	// otherwise whatever the record has is kept (#126).
+	wantProxied := desiredProxied(dom, rec.Proxied)
+	contentDrift := rec.Content != expectedTarget
+	proxiedDrift := rec.Proxied != wantProxied
+	if contentDrift || proxiedDrift {
+		log.Printf("reconciler: DNS drift for %s: have %s (proxied=%t), want %s (proxied=%t)", fqdn, rec.Content, rec.Proxied, expectedTarget, wantProxied)
+		// Patch only the fields that drifted, so a provider that supports it
+		// keeps the record's comment, tags and settings.
+		var patch provider.RecordPatch
+		if contentDrift {
+			patch.Content = &expectedTarget
+		}
+		if proxiedDrift {
+			patch.Proxied = &wantProxied
+		}
+		if uErr := provider.PatchOrUpdate(ctx, dnsProvider, provConfig, dom.DNSRecordID, patch, provider.Record{
+			Type:    "CNAME",
+			Name:    fqdn,
+			Content: expectedTarget,
+			TTL:     0,
+			Proxied: wantProxied,
+		}); uErr != nil {
+			log.Printf("reconciler: failed to update DNS record for %s: %v", fqdn, uErr)
+			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", uErr)); dErr != nil {
+				log.Printf("reconciler: failed to update domain status: %v", dErr)
+			}
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", uErr.Error())
+			return
+		}
+		if contentDrift {
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_updated", fmt.Sprintf("updated CNAME %s: %s -> %s", fqdn, rec.Content, expectedTarget))
+		}
+		if proxiedDrift {
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_proxied_updated", proxiedChangeDetail(fqdn, rec.Proxied, wantProxied))
+		}
+	}
 }
 
 // ensureDomainCNAME makes the domain's CNAME exist and point at target WITHOUT

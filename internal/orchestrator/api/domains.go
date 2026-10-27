@@ -169,26 +169,22 @@ func (s *Server) triggerCertIssuance(dom *models.Domain) {
 }
 
 // dnsReconciler is implemented by the reconciler wired in as DNS takeover: it
-// runs the domain DNS phases on demand.
+// runs the domain DNS phases for one domain on demand.
 type dnsReconciler interface {
-	ReconcileDNSNow(ctx context.Context)
+	ReconcileDomainDNSNow(domainID int64)
 }
 
-// triggerDNSReconcile runs a DNS pass in the background after a rename or zone
-// move, so the new name gets its record (and the old one its cleanup) right
-// away instead of up to a reconcile interval later, while the agent has
-// already dropped the old vhost. Best-effort; the periodic cycle is the
-// backstop.
-func (s *Server) triggerDNSReconcile() {
+// triggerDNSReconcile runs a DNS pass for the domain in the background after a
+// rename or zone move, so the new name gets its record (and the old one its
+// cleanup) right away instead of up to a reconcile interval later, while the
+// agent has already dropped the old vhost. Best-effort: the pass is skipped
+// while a cycle runs, and the periodic cycle is the backstop.
+func (s *Server) triggerDNSReconcile(domainID int64) {
 	rec, ok := s.takeover.(dnsReconciler)
 	if !ok {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		rec.ReconcileDNSNow(ctx)
-	}()
+	go rec.ReconcileDomainDNSNow(domainID)
 }
 
 // GET /api/v1/domains/{id}
@@ -351,7 +347,7 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	s.triggerAgentPush(dom.ServerID)
 	if rename != nil {
 		s.triggerCertIssuance(dom)
-		s.triggerDNSReconcile()
+		s.triggerDNSReconcile(dom.ID)
 	}
 
 	writeJSON(w, http.StatusOK, dom)

@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider and zone it was created in, once the record for the new name exists;
   records NurProxy only adopted are left alone, and failed deletes are retried.
   A record that a domain still uses, a name a domain still serves, or a record
-  whose name or target changed since is never deleted. The new name gets its
+  whose name or target changed since is never deleted. So moving a domain to a
+  zone at another DNS provider under the same name (a provider migration)
+  leaves the record at the old provider in place; the audit log shows it as
+  `dns_left_in_use`, and it can be deleted there by hand. The new name gets its
   record right after the update instead of on the next reconcile cycle.
   Between Cloudflare zones the new record keeps the old one's proxy (orange
   cloud) state unless the domain has its own `proxied` setting.

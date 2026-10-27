@@ -26,28 +26,50 @@ const defaultDomainDNSCleanupMaxWait = time.Hour
 func (r *Reconciler) runDomainDNSPhases(ctx context.Context) {
 	r.dnsMu.Lock()
 	defer r.dnsMu.Unlock()
-	r.snapshotDomainDNSCleanups(ctx)
+	r.snapshotDomainDNSCleanups(ctx, 0)
 	if err := r.reconcileDNS(ctx); err != nil {
 		log.Printf("reconciler: DNS phase failed: %v", err)
 	}
-	if err := r.reconcileDomainDNSCleanups(ctx); err != nil {
+	if err := r.cleanupDomainDNS(ctx, 0); err != nil {
 		log.Printf("reconciler: domain DNS cleanup phase failed: %v", err)
 	}
 }
 
-// ReconcileDNSNow runs the domain DNS phases at once. The API calls it after a
-// rename or zone move, so the new name gets its record without waiting up to a
-// full cycle while the old vhost is already gone.
-func (r *Reconciler) ReconcileDNSNow(ctx context.Context) {
-	r.runDomainDNSPhases(ctx)
+// immediateDNSPassTimeout bounds an API-triggered DNS pass. It starts once the
+// pass holds the DNS lock, so time spent waiting never expires it.
+const immediateDNSPassTimeout = 2 * time.Minute
+
+// ReconcileDomainDNSNow runs the domain DNS phases for one domain at once. The
+// API calls it after a rename or zone move, so the new name gets its record
+// without waiting up to a full cycle while the old vhost is already gone. When
+// a cycle (or another immediate pass) holds the DNS lock it does nothing: the
+// cycle covers every domain, and the next one picks this domain up anyway.
+func (r *Reconciler) ReconcileDomainDNSNow(domainID int64) {
+	if !r.dnsMu.TryLock() {
+		return
+	}
+	defer r.dnsMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), immediateDNSPassTimeout)
+	defer cancel()
+	dom, err := r.db.GetDomain(domainID)
+	if err != nil {
+		log.Printf("reconciler: immediate DNS pass for domain %d: %v", domainID, err)
+		return
+	}
+	r.snapshotDomainDNSCleanups(ctx, domainID)
+	r.reconcileDomainDNS(ctx, dom)
+	if err := r.cleanupDomainDNS(ctx, domainID); err != nil {
+		log.Printf("reconciler: immediate DNS cleanup for domain %d failed: %v", domainID, err)
+	}
 }
 
 // snapshotDomainDNSCleanups reads, once per queued record, the proxy state the
 // record at the new name inherits. Only providers that can proxy are asked; a
 // record that is gone, or whose provider is gone, counts as not proxied. A
 // read error leaves the snapshot empty for the next cycle and is recorded on
-// the row, so it shows in health.
-func (r *Reconciler) snapshotDomainDNSCleanups(ctx context.Context) {
+// the row, so it shows in health. domainID limits it to one domain's rows (0:
+// all).
+func (r *Reconciler) snapshotDomainDNSCleanups(ctx context.Context, domainID int64) {
 	cleanups, err := r.db.ListDomainDNSCleanups()
 	if err != nil {
 		log.Printf("reconciler: cannot list domain DNS cleanups: %v", err)
@@ -55,7 +77,7 @@ func (r *Reconciler) snapshotDomainDNSCleanups(ctx context.Context) {
 	}
 	for i := range cleanups {
 		c := &cleanups[i]
-		if c.Proxied != nil {
+		if c.Proxied != nil || (domainID != 0 && c.DomainID != domainID) {
 			continue
 		}
 		proxied, rErr := r.readReleasedProxied(ctx, c)
@@ -206,8 +228,16 @@ func (s *cleanupScope) decide(c *db.DomainDNSCleanup, maxWait time.Duration) (cl
 		if d.Status == models.DomainStatusDeleting || !ok || !sameRecordContent(d.FQDN(z.Name), c.FQDN) {
 			continue
 		}
+		if d.CertOnly {
+			// NurProxy manages no public record for it, so it will never take
+			// the record back; the operator owns DNS at this name.
+			return cleanupDrop, fmt.Sprintf("cert-only domain %d serves %s; old record %s left in place for the operator", d.ID, c.FQDN, c.RecordID)
+		}
 		if d.DNSRecordID == "" {
-			return cleanupWait, fmt.Sprintf("domain %d uses %s again and may take the record back", d.ID, c.FQDN)
+			if s.now.Before(c.CreatedAt.Add(maxWait)) {
+				return cleanupWait, fmt.Sprintf("domain %d uses %s again and may take the record back", d.ID, c.FQDN)
+			}
+			return cleanupDrop, fmt.Sprintf("domain %d serves %s but has had no DNS record for %s; old record %s left in place, delete it at the provider if it is no longer needed", d.ID, c.FQDN, maxWait, c.RecordID)
 		}
 		return cleanupDrop, fmt.Sprintf("domain %d serves %s again (record %s); old record %s left in place, delete it at the provider if it is no longer needed", d.ID, c.FQDN, d.DNSRecordID, c.RecordID)
 	}
@@ -228,6 +258,12 @@ func (s *cleanupScope) decide(c *db.DomainDNSCleanup, maxWait time.Duration) (cl
 // failure is retried next cycle. Right before deleting, the record is read
 // back and left alone if its name or target is no longer what was released.
 func (r *Reconciler) reconcileDomainDNSCleanups(ctx context.Context) error {
+	return r.cleanupDomainDNS(ctx, 0)
+}
+
+// cleanupDomainDNS is reconcileDomainDNSCleanups limited to one domain's rows
+// (domainID 0: all rows).
+func (r *Reconciler) cleanupDomainDNS(ctx context.Context, domainID int64) error {
 	cleanups, err := r.db.ListDomainDNSCleanups()
 	if err != nil {
 		return fmt.Errorf("listing domain DNS cleanups: %w", err)
@@ -242,6 +278,9 @@ func (r *Reconciler) reconcileDomainDNSCleanups(ctx context.Context) error {
 	failing := 0
 	for i := range cleanups {
 		c := &cleanups[i]
+		if domainID != 0 && c.DomainID != domainID {
+			continue
+		}
 		entityID := fmt.Sprintf("%d", c.DomainID)
 		action, why := scope.decide(c, r.domainDNSCleanupMaxWait)
 		switch action {
