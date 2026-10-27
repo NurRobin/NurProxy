@@ -757,6 +757,41 @@ var migrations = []string{
 	CREATE INDEX idx_managed_route_tombstones_agent_created
 		ON managed_route_tombstones(agent_id, created_at, resource_id);
 	`,
+
+	// Migration 32: ownership of the agent anchor records (#152). The *_owned
+	// columns say whether NurProxy CREATED the A / AAAA record (1) or adopted one
+	// that already existed (0); the *_zone_id columns name the zone it was made
+	// in. Existing rows default to 0 — provenance unknown means "adopted", so a
+	// pre-existing anchor is never auto-deleted (fail closed).
+	//
+	// agent_anchor_cleanups holds anchor records released by an agent rename or
+	// delete. A row stays until the provider delete succeeds (or the record is
+	// already gone), so a failed delete is retried by the next reconcile cycle.
+	// provider_id / zone_external_id snapshot the ORIGINAL provider and zone, so
+	// later zone reassignment cannot redirect the delete. No FK to agents: the
+	// agent row may already be gone.
+	`
+	ALTER TABLE agents ADD COLUMN dns_record_owned    INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE agents ADD COLUMN dns_record_owned6   INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE agents ADD COLUMN dns_record_zone_id  TEXT NOT NULL DEFAULT '';
+	ALTER TABLE agents ADD COLUMN dns_record_zone_id6 TEXT NOT NULL DEFAULT '';
+	CREATE TABLE agent_anchor_cleanups (
+		id               INTEGER PRIMARY KEY AUTOINCREMENT,
+		agent_id         TEXT NOT NULL,
+		fqdn             TEXT NOT NULL,
+		record_type      TEXT NOT NULL CHECK (record_type IN ('A', 'AAAA')),
+		record_id        TEXT NOT NULL,
+		owned            INTEGER NOT NULL DEFAULT 0 CHECK (owned IN (0, 1)),
+		zone_id          TEXT NOT NULL DEFAULT '',
+		provider_id      TEXT NOT NULL DEFAULT '',
+		zone_external_id TEXT NOT NULL DEFAULT '',
+		reason           TEXT NOT NULL DEFAULT '',
+		attempts         INTEGER NOT NULL DEFAULT 0,
+		last_error       TEXT NOT NULL DEFAULT '',
+		created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE (zone_id, record_id)
+	);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
