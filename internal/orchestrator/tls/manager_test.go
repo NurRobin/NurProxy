@@ -39,12 +39,12 @@ func (s *fakeStore) TargetForHost(_ context.Context, host string) (*RenewTarget,
 	}
 	return s.forHost[host], nil
 }
-func (s *fakeStore) SaveRenewed(_ context.Context, res *CertResult, isWildcard bool) error {
+func (s *fakeStore) SaveRenewed(_ context.Context, res *CertResult, t RenewTarget) error {
 	if s.saveErr != nil {
 		return s.saveErr
 	}
 	s.saved = append(s.saved, res)
-	s.savedWC = append(s.savedWC, isWildcard)
+	s.savedWC = append(s.savedWC, t.IsWildcard)
 	return nil
 }
 func (s *fakeStore) MarkRateLimited(_ context.Context, host, detail string, retryAfter *time.Time) (time.Time, error) {
@@ -333,7 +333,7 @@ func (s *lockStore) TargetForHost(_ context.Context, host string) (*RenewTarget,
 	return &RenewTarget{Host: host, Names: []string{host}, Provider: s.provider}, nil
 }
 
-func (s *lockStore) SaveRenewed(_ context.Context, res *CertResult, _ bool) error {
+func (s *lockStore) SaveRenewed(_ context.Context, res *CertResult, _ RenewTarget) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hasCert[res.Host] = true
@@ -592,6 +592,65 @@ func containsEvent(events []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestRenewer_supersededSaveKeepsStoredCert covers the import race (#80): when
+// the store reports that the cert changed while the order ran, the renewer
+// keeps the stored cert, audits the skip, and neither pushes nor fails.
+func TestRenewer_supersededSaveKeepsStoredCert(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(r *Renewer) error
+	}{
+		{name: "renewal scan", run: func(r *Renewer) error { return r.RunOnce(context.Background()) }},
+		{name: "on-demand issuance", run: func(r *Renewer) error { return r.EnsureCertForHost(context.Background(), "a.example.com") }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := newFakeProvider("TXT")
+			target := RenewTarget{Host: "a.example.com", Names: []string{"a.example.com"}, Provider: fp, PriorCertPEM: "OLD"}
+			store := &fakeStore{
+				due:     []RenewTarget{target},
+				forHost: map[string]*RenewTarget{"a.example.com": &target},
+				saveErr: ErrCertSuperseded,
+			}
+			rl := &fakeReloader{}
+			audit := &fakeAudit{}
+			r := newRenewer(store, &fakeACME{result: &CertResult{CertPEM: []byte("NEW"), KeyPEM: []byte("K")}}, rl, audit)
+
+			if err := tc.run(r); err != nil {
+				t.Fatalf("superseded save must not fail the run: %v", err)
+			}
+			if len(rl.hosts) != 0 {
+				t.Errorf("repushed %v after a superseded save, want nothing", rl.hosts)
+			}
+			if !containsEvent(audit.events, "renew_superseded:a.example.com") || containsEvent(audit.events, "renewed:a.example.com") {
+				t.Errorf("audit events = %v, want renew_superseded and no renewed", audit.events)
+			}
+		})
+	}
+}
+
+func TestRenewer_TryLockHost(t *testing.T) {
+	r := newRenewer(&fakeStore{}, &fakeACME{}, nil, nil)
+	unlock, ok := r.TryLockHost("a.example.com")
+	if !ok {
+		t.Fatal("first TryLockHost failed on an idle host")
+	}
+	if _, again := r.TryLockHost("a.example.com"); again {
+		t.Error("TryLockHost succeeded while the host lock was held")
+	}
+	if u2, other := r.TryLockHost("b.example.com"); !other {
+		t.Error("lock on one host blocked another host")
+	} else {
+		u2()
+	}
+	unlock()
+	if u3, ok := r.TryLockHost("a.example.com"); !ok {
+		t.Error("TryLockHost failed after unlock")
+	} else {
+		u3()
+	}
 }
 
 // flakyACME fails its first failBefore Obtain calls with err, then returns result.

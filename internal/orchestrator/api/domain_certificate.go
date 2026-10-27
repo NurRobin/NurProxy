@@ -1,16 +1,24 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
+
+// certHostLocker is implemented by the TLS renewer: it exposes the per-host
+// issuance lock so an import never races an ACME order for the same host.
+type certHostLocker interface {
+	TryLockHost(host string) (unlock func(), ok bool)
+}
 
 // PUT /api/v1/domains/{id}/certificate imports an operator-provided certificate
 // for the domain's host (#80). It is the migration path for a host that already
@@ -60,6 +68,18 @@ func (s *Server) handleImportDomainCertificate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Hold the renewer's per-host lock while writing, so an ACME order for the
+	// same host cannot finish in between and overwrite the import. Refuse rather
+	// than wait: an order can take minutes.
+	if locker, ok := s.issuer.(certHostLocker); ok {
+		unlock, locked := locker.TryLockHost(host)
+		if !locked {
+			writeError(w, http.StatusConflict, "certificate issuance for "+host+" is in progress; retry in a minute")
+			return
+		}
+		defer unlock()
+	}
+
 	now := time.Now().UTC()
 	cert := &models.Certificate{
 		ID:        host, // host-keyed like issued certs; the upsert replaces any existing one
@@ -67,11 +87,15 @@ func (s *Server) handleImportDomainCertificate(w http.ResponseWriter, r *http.Re
 		Names:     bundle.Names,
 		CertPEM:   bundle.CertPEM,
 		KeyPEM:    bundle.KeyPEM,
-		IssuedAt:  now,
+		IssuedAt:  bundle.NotBefore,
 		ExpiresAt: bundle.NotAfter,
 		Source:    models.CertSourceImported,
 	}
-	if err := s.db.UpsertCertificate(cert); err != nil {
+	if err := s.db.ImportCertificateForDomain(dom.ID, cert); err != nil {
+		if errors.Is(err, db.ErrDomainDeleting) {
+			writeError(w, http.StatusConflict, "domain is being deleted")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to store certificate")
 		return
 	}

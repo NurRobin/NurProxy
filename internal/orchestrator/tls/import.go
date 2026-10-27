@@ -29,7 +29,7 @@ type ImportedBundle struct {
 // ValidateImportedBundle checks an operator-provided certificate and key for
 // host. The key must match the leaf, the leaf must cover host (wildcard SANs
 // count, one label deep), be valid at now and usable for TLS servers, and any
-// chain certificates must follow in signing order.
+// chain certificates must follow in signing order and must not be expired.
 //
 // The chain is deliberately NOT verified against a trusted root: import exists
 // for certificates NurProxy did not issue (certbot or acme.sh migrations,
@@ -69,6 +69,11 @@ func ValidateImportedBundle(certPEM, keyPEM []byte, host string, now time.Time) 
 	}
 	if !now.Before(leaf.NotAfter) {
 		return nil, fmt.Errorf("certificate expired %s", leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	for i, c := range chain[1:] {
+		if !now.Before(c.NotAfter) {
+			return nil, fmt.Errorf("chain certificate %d (%s) expired %s; remove it from the bundle", i+2, c.Subject.CommonName, c.NotAfter.UTC().Format(time.RFC3339))
+		}
 	}
 	if !serverAuthAllowed(leaf) {
 		return nil, errors.New("certificate is not valid for TLS server authentication (extended key usage)")

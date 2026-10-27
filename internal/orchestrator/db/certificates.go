@@ -16,11 +16,81 @@ import (
 // decryption failure via errors.Is.
 var ErrCertNotFound = errors.New("certificate not found")
 
+// ErrDomainDeleting rejects writing a certificate for a domain that is gone or
+// being torn down; the teardown would never clean the new row up.
+var ErrDomainDeleting = errors.New("domain is missing or being deleted")
+
 // UpsertCertificate inserts or replaces the certificate for a host. The private
 // key (KeyPEM) is encrypted with the existing AES-256-GCM key before storage;
 // the leaf certificate is public and stored as-is. One certificate per host
 // (UNIQUE(host)); re-issuance overwrites in place and bumps updated_at.
 func (d *DB) UpsertCertificate(c *models.Certificate) error {
+	return d.upsertCertificate(d.sql, c)
+}
+
+// ReplaceCertificateIfUnchanged writes c only while the host's stored cert_pem
+// still equals prior ("" meaning no row). It reports false and writes nothing
+// when the row changed in between, e.g. an operator import (#80) landed while an
+// ACME order for the same host was running.
+func (d *DB) ReplaceCertificateIfUnchanged(c *models.Certificate, prior string) (bool, error) {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return false, fmt.Errorf("beginning certificate replace: %w", err)
+	}
+	defer tx.Rollback()
+	var current string
+	switch err := tx.QueryRow("SELECT cert_pem FROM certificates WHERE host = ?", c.Host).Scan(&current); {
+	case errors.Is(err, sql.ErrNoRows):
+		current = ""
+	case err != nil:
+		return false, fmt.Errorf("reading stored certificate: %w", err)
+	}
+	if current != prior {
+		return false, nil
+	}
+	if err := d.upsertCertificate(tx, c); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("committing certificate replace: %w", err)
+	}
+	return true, nil
+}
+
+// ImportCertificateForDomain stores c for domainID, checking in the same
+// transaction that the domain still exists and is not being deleted. A separate
+// check-then-write could store the cert just after teardown cleaned up the host,
+// leaving an orphan row that nothing removes.
+func (d *DB) ImportCertificateForDomain(domainID int64, c *models.Certificate) error {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning certificate import: %w", err)
+	}
+	defer tx.Rollback()
+	var status string
+	switch err := tx.QueryRow("SELECT status FROM domains WHERE id = ?", domainID).Scan(&status); {
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrDomainDeleting
+	case err != nil:
+		return fmt.Errorf("reading domain status: %w", err)
+	}
+	if status == string(models.DomainStatusDeleting) {
+		return ErrDomainDeleting
+	}
+	if err := d.upsertCertificate(tx, c); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing certificate import: %w", err)
+	}
+	return nil
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func (d *DB) upsertCertificate(exec sqlExecer, c *models.Certificate) error {
 	encKey, err := crypto.EncryptString(d.cryptoKey, c.KeyPEM)
 	if err != nil {
 		return fmt.Errorf("encrypting certificate key: %w", err)
@@ -50,7 +120,7 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 		expires = c.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 
-	_, err = d.sql.Exec(`
+	_, err = exec.Exec(`
 		INSERT INTO certificates (id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(host) DO UPDATE SET

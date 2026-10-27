@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
@@ -45,6 +46,23 @@ func selfSignedPEM(t *testing.T, notAfter time.Time, names ...string) (certPEM, 
 		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 }
 
+// lockingIssuer stands in for the TLS renewer: busy simulates an ACME order
+// holding the host lock.
+type lockingIssuer struct {
+	busy             bool
+	locked, unlocked int
+}
+
+func (f *lockingIssuer) EnsureCertForHost(context.Context, string) error { return nil }
+
+func (f *lockingIssuer) TryLockHost(string) (func(), bool) {
+	if f.busy {
+		return nil, false
+	}
+	f.locked++
+	return func() { f.unlocked++ }, true
+}
+
 func TestImportDomainCertificate(t *testing.T) {
 	inTwoMonths := time.Now().Add(60 * 24 * time.Hour)
 	appCert, appKey := selfSignedPEM(t, inTwoMonths, "app.example.com")
@@ -58,6 +76,10 @@ func TestImportDomainCertificate(t *testing.T) {
 		sslMode     models.SSLMode
 		tlsPolicy   string
 		cert, key   string
+		noAuth      bool
+		deleting    bool
+		orderBusy   bool
+		oversized   bool
 		wantStatus  int
 		wantWarning bool
 	}{
@@ -72,10 +94,16 @@ func TestImportDomainCertificate(t *testing.T) {
 		{name: "self-acme", tlsPolicy: "self-acme", cert: appCert, key: appKey, wantStatus: http.StatusConflict},
 		{name: "unknown domain", domainID: "999", cert: appCert, key: appKey, wantStatus: http.StatusNotFound},
 		{name: "bad id", domainID: "abc", cert: appCert, key: appKey, wantStatus: http.StatusBadRequest},
+		{name: "unauthenticated", noAuth: true, cert: appCert, key: appKey, wantStatus: http.StatusUnauthorized},
+		{name: "domain being deleted", deleting: true, cert: appCert, key: appKey, wantStatus: http.StatusConflict},
+		{name: "acme order in flight", orderBusy: true, cert: appCert, key: appKey, wantStatus: http.StatusConflict},
+		{name: "oversized body", oversized: true, key: appKey, wantStatus: http.StatusBadRequest},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, database := testServer(t)
+			issuer := &lockingIssuer{busy: tc.orderBusy}
+			srv.SetCertIssuer(issuer)
 			handler := srv.Handler()
 			cookie := setupAdmin(t, handler)
 
@@ -92,13 +120,26 @@ func TestImportDomainCertificate(t *testing.T) {
 			if err := database.CreateDomain(dom); err != nil {
 				t.Fatalf("CreateDomain: %v", err)
 			}
+			if tc.deleting {
+				if err := database.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
 			id := tc.domainID
 			if id == "" {
 				id = strconv.FormatInt(dom.ID, 10)
 			}
+			cert := tc.cert
+			if tc.oversized {
+				cert = strings.Repeat("A", 5<<20)
+			}
+			var cookies []*http.Cookie
+			if !tc.noAuth {
+				cookies = append(cookies, cookie)
+			}
 
 			w := doRequest(t, handler, "PUT", "/api/v1/domains/"+id+"/certificate",
-				map[string]string{"cert_pem": tc.cert, "key_pem": tc.key}, cookie)
+				map[string]string{"cert_pem": cert, "key_pem": tc.key}, cookies...)
 			if w.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d: %s", w.Code, tc.wantStatus, w.Body.String())
 			}
@@ -118,6 +159,13 @@ func TestImportDomainCertificate(t *testing.T) {
 			}
 			if stored.Source != models.CertSourceImported || stored.ExpiresAt.IsZero() {
 				t.Errorf("stored cert: source=%q expires=%v, want imported with expiry", stored.Source, stored.ExpiresAt)
+			}
+			// selfSignedPEM backdates NotBefore by an hour; issued_at must be that.
+			if !stored.IssuedAt.Before(time.Now().Add(-30 * time.Minute)) {
+				t.Errorf("issued_at = %v, want the leaf's NotBefore", stored.IssuedAt)
+			}
+			if issuer.locked != 1 || issuer.unlocked != 1 {
+				t.Errorf("host lock taken %d / released %d times, want 1 / 1", issuer.locked, issuer.unlocked)
 			}
 			if strings.Contains(stored.CertPEM, "PRIVATE KEY") {
 				t.Error("stored cert_pem contains private key material")

@@ -3,6 +3,7 @@ package tls
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -26,7 +27,8 @@ type leafOpts struct {
 	notBefore time.Time
 	notAfter  time.Time
 	extUsage  []x509.ExtKeyUsage
-	rsaKey    bool
+	keyType   string // "" (ECDSA P-256), "rsa" or "ed25519"
+	caExpired bool
 }
 
 func newImportFixture(t *testing.T, opts leafOpts) importFixture {
@@ -44,6 +46,10 @@ func newImportFixture(t *testing.T, opts leafOpts) importFixture {
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
+	if opts.caExpired {
+		caTmpl.NotBefore = time.Now().Add(-400 * 24 * time.Hour)
+		caTmpl.NotAfter = time.Now().Add(-time.Hour)
+	}
 	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
 	if err != nil {
 		t.Fatal(err)
@@ -57,14 +63,26 @@ func newImportFixture(t *testing.T, opts leafOpts) importFixture {
 		leafPub any
 		keyPEM  []byte
 	)
-	if opts.rsaKey {
+	switch opts.keyType {
+	case "rsa":
 		k, err := rsa.GenerateKey(rand.Reader, 2048)
 		if err != nil {
 			t.Fatal(err)
 		}
 		leafPub = &k.PublicKey
 		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
-	} else {
+	case "ed25519":
+		pub, k, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leafPub = pub
+		der, err := x509.MarshalPKCS8PrivateKey(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	default:
 		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
 			t.Fatal(err)
@@ -120,7 +138,12 @@ func join(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 func TestValidateImportedBundle(t *testing.T) {
 	now := time.Now()
 	plain := newImportFixture(t, leafOpts{names: []string{"app.example.com", "www.example.com"}})
-	wildcard := newImportFixture(t, leafOpts{names: []string{"*.example.com"}, rsaKey: true})
+	wildcard := newImportFixture(t, leafOpts{names: []string{"*.example.com"}, keyType: "rsa"})
+	edLeaf := newImportFixture(t, leafOpts{names: []string{"app.example.com"}, keyType: "ed25519"})
+	staleChain := newImportFixture(t, leafOpts{names: []string{"app.example.com"}, caExpired: true})
+	legacyEncrypted := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Headers: map[string]string{
+		"Proc-Type": "4,ENCRYPTED", "DEK-Info": "AES-128-CBC,00112233445566778899AABBCCDDEEFF",
+	}, Bytes: []byte{1, 2, 3}})
 	expired := newImportFixture(t, leafOpts{names: []string{"app.example.com"}, notBefore: now.Add(-90 * 24 * time.Hour), notAfter: now.Add(-time.Hour)})
 	future := newImportFixture(t, leafOpts{names: []string{"app.example.com"}, notBefore: now.Add(48 * time.Hour), notAfter: now.Add(90 * 24 * time.Hour)})
 	clientOnly := newImportFixture(t, leafOpts{names: []string{"app.example.com"}, extUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
@@ -137,6 +160,10 @@ func TestValidateImportedBundle(t *testing.T) {
 		{name: "leaf only", cert: plain.leafPEM, key: plain.keyPEM, host: "app.example.com", wantNames: []string{"app.example.com", "www.example.com"}, wantCerts: 1},
 		{name: "leaf plus chain", cert: join(plain.leafPEM, plain.caPEM), key: plain.keyPEM, host: "www.example.com", wantNames: []string{"app.example.com", "www.example.com"}, wantCerts: 2},
 		{name: "wildcard covers one label", cert: join(wildcard.leafPEM, wildcard.caPEM), key: wildcard.keyPEM, host: "app.example.com", wantNames: []string{"*.example.com"}, wantCerts: 2},
+		{name: "rsa leaf key", cert: join(wildcard.leafPEM, wildcard.caPEM), key: wildcard.keyPEM, host: "www.example.com", wantNames: []string{"*.example.com"}, wantCerts: 2},
+		{name: "ed25519 leaf key", cert: join(edLeaf.leafPEM, edLeaf.caPEM), key: edLeaf.keyPEM, host: "app.example.com", wantNames: []string{"app.example.com"}, wantCerts: 2},
+		{name: "expired chain certificate", cert: join(staleChain.leafPEM, staleChain.caPEM), key: staleChain.keyPEM, host: "app.example.com", wantErr: "chain certificate 2"},
+		{name: "legacy encrypted key (Proc-Type)", cert: plain.leafPEM, key: legacyEncrypted, host: "app.example.com", wantErr: "encrypted"},
 		{name: "combined pem: key in cert file is dropped", cert: join(plain.leafPEM, plain.keyPEM, plain.caPEM), key: plain.keyPEM, host: "app.example.com", wantNames: []string{"app.example.com", "www.example.com"}, wantCerts: 2},
 		{name: "wildcard does not cover apex", cert: wildcard.leafPEM, key: wildcard.keyPEM, host: "example.com", wantErr: "does not cover example.com"},
 		{name: "wildcard does not cover two labels", cert: wildcard.leafPEM, key: wildcard.keyPEM, host: "a.b.example.com", wantErr: "does not cover"},
