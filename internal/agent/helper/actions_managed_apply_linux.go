@@ -70,6 +70,9 @@ type managedCompilation struct {
 	// UnscannedConfigs names surviving config files too large to scan; while
 	// any exist, no certificate is pruned.
 	UnscannedConfigs []string `json:"unscanned_configs,omitempty"`
+	// RetainedAuthFiles names basic-auth files of unrouted hosts that were kept
+	// because surviving proxy config still references them.
+	RetainedAuthFiles []string `json:"retained_auth_files,omitempty"`
 	// LeftoverVhosts names NurProxy-named vhost files this apply neither
 	// writes nor deletes (see leftoverManagedVhosts).
 	LeftoverVhosts []string `json:"leftover_vhosts,omitempty"`
@@ -447,6 +450,7 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		type pruneCandidate struct{ base, name string }
 		var candidates []pruneCandidate
 		var candidateBases []string
+		var authCandidates []managedCompiledFile
 		seenBases := make(map[string]struct{})
 		for _, entry := range entries {
 			name := entry.Name()
@@ -454,7 +458,7 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 				// Legacy certs/ auth files of hosts this push does not route.
 				path := filepath.Join(a.layout.CertificateDir, name)
 				if _, routed := routeHosts[host]; !routed && !compilation.hasTarget(path) {
-					compilation.Files = append(compilation.Files, managedCompiledFile{Path: path, Class: "secret", Delete: true})
+					authCandidates = append(authCandidates, managedCompiledFile{Path: path, Class: "secret", Delete: true})
 				}
 				continue
 			}
@@ -471,22 +475,6 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 				candidateBases = append(candidateBases, base)
 			}
 		}
-		references, err := a.referencedCertificateBases(compilation, candidateBases)
-		if err != nil {
-			return managedCompilation{}, err
-		}
-		stillReferenced := make(map[string]struct{}, len(references.referenced))
-		for _, base := range references.referenced {
-			stillReferenced[base] = struct{}{}
-		}
-		compilation.RetainedCertificates = references.referenced
-		compilation.UnscannedConfigs = references.unscanned
-		for _, candidate := range candidates {
-			if _, inUse := stillReferenced[candidate.base]; inUse {
-				continue
-			}
-			compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, candidate.name), Class: "secret", Delete: true})
-		}
 		authEntries, err := os.ReadDir(authDir)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return managedCompilation{}, fmt.Errorf("read managed auth directory: %w", err)
@@ -497,8 +485,41 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			if _, routed := routeHosts[host]; !ok || routed || compilation.hasTarget(path) {
 				continue
 			}
-			compilation.Files = append(compilation.Files, managedCompiledFile{Path: path, Class: "auth", Delete: true})
+			authCandidates = append(authCandidates, managedCompiledFile{Path: path, Class: "auth", Delete: true})
 		}
+		// Nothing that surviving config still references is pruned: not a
+		// certificate, and not the auth file of an unrouted host whose vhost
+		// stays on disk (an unmarked leftover, or a route omitted this push).
+		var config survivingConfig
+		if len(candidateBases) > 0 || len(authCandidates) > 0 {
+			config, err = a.loadSurvivingConfig(compilation)
+			if err != nil {
+				return managedCompilation{}, err
+			}
+		}
+		compilation.UnscannedConfigs = config.unscanned
+		stillReferenced := make(map[string]struct{})
+		for _, base := range candidateBases {
+			if config.referencesCertificate(base) {
+				stillReferenced[base] = struct{}{}
+				compilation.RetainedCertificates = append(compilation.RetainedCertificates, base)
+			}
+		}
+		sort.Strings(compilation.RetainedCertificates)
+		for _, candidate := range candidates {
+			if _, inUse := stillReferenced[candidate.base]; inUse {
+				continue
+			}
+			compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, candidate.name), Class: "secret", Delete: true})
+		}
+		for _, candidate := range authCandidates {
+			if config.references(filepath.Base(candidate.Path)) {
+				compilation.RetainedAuthFiles = append(compilation.RetainedAuthFiles, candidate.Path)
+				continue
+			}
+			compilation.Files = append(compilation.Files, candidate)
+		}
+		sort.Strings(compilation.RetainedAuthFiles)
 	}
 	leftovers, err := a.leftoverManagedVhosts(compilation)
 	if err != nil {

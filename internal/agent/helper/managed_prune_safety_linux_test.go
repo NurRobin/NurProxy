@@ -35,18 +35,18 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 			wantNote: []string{"kept 1 unretained certificate(s) still referenced by proxy config: gone.example.com", helperprotocol.ManagedLeftoverVhostsNote + leftoverName}},
 		{name: "operator config keeps a referenced certificate",
 			setup: func(t *testing.T, action *managedApplyAction, certPath string) {
-				writeTestFile(t, filepath.Join(action.layout.AvailableDir, "operator.conf"), "ssl_certificate "+certPath+";\n")
+				writeConfigFixture(t, filepath.Join(action.layout.AvailableDir, "operator.conf"), "ssl_certificate "+certPath+";\n")
 			},
 			wantNote: []string{"kept 1 unretained certificate(s)"}},
 		{name: "differently spelled path still counts as a reference",
 			setup: func(t *testing.T, action *managedApplyAction, _ string) {
-				writeTestFile(t, filepath.Join(action.layout.AvailableDir, "operator.conf"), "ssl_certificate /var/lib//nurproxy-agent/certs/gone.example.com.crt;\n")
+				writeConfigFixture(t, filepath.Join(action.layout.AvailableDir, "operator.conf"), "ssl_certificate /var/lib//nurproxy-agent/certs/gone.example.com.crt;\n")
 			},
 			wantNote: []string{"kept 1 unretained certificate(s)"}},
 		{name: "enabled symlink to a config outside the available dir is followed",
 			setup: func(t *testing.T, action *managedApplyAction, certPath string) {
 				outside := filepath.Join(t.TempDir(), "elsewhere.conf")
-				writeTestFile(t, outside, "ssl_certificate "+certPath+";\n")
+				writeConfigFixture(t, outside, "ssl_certificate "+certPath+";\n")
 				if err := os.Symlink(outside, filepath.Join(action.layout.EnabledDir, "elsewhere.conf")); err != nil {
 					t.Fatal(err)
 				}
@@ -56,7 +56,7 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 		{name: "symlink target owned by the agent is not trusted",
 			setup: func(t *testing.T, action *managedApplyAction, certPath string) {
 				outside := filepath.Join(t.TempDir(), "agent-owned.conf")
-				writeTestFile(t, outside, "ssl_certificate "+certPath+";\n")
+				writeConfigFixture(t, outside, "ssl_certificate "+certPath+";\n")
 				if err := os.Symlink(outside, filepath.Join(action.layout.EnabledDir, "agent-owned.conf")); err != nil {
 					t.Fatal(err)
 				}
@@ -64,9 +64,9 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 			wantPruned: true},
 		{name: "oversized config skips pruning instead of failing the plan",
 			setup: func(t *testing.T, action *managedApplyAction, _ string) {
-				writeTestFile(t, filepath.Join(action.layout.AvailableDir, "huge.conf"), strings.Repeat("#", int(maxConfigFileBytes)+1))
+				writeConfigFixture(t, filepath.Join(action.layout.AvailableDir, "huge.conf"), strings.Repeat("#", int(maxConfigFileBytes)+1))
 			},
-			wantNote: []string{"certificate prune skipped, 1 config file(s) too large to scan for references: huge.conf"}},
+			wantNote: []string{"prune skipped, 1 config file(s) too large to scan for references: huge.conf"}},
 		{name: "tombstoned vhost is removed together with its certificate", orphanVhost: true, deleteVhost: true, wantPruned: true, wantVhostGone: true},
 		{name: "tombstoned unmarked raw vhost stays, keeps its certificate and is reported", orphanVhost: true, unmarked: true, deleteVhost: true,
 			wantNote: []string{"kept 1 unretained certificate(s)", helperprotocol.ManagedLeftoverVhostsNote + leftoverName}},
@@ -78,15 +78,15 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 			intent.PruneCertificates = true
 			certPath := filepath.Join(action.layout.CertificateDir, "gone.example.com.crt")
 			keyPath := filepath.Join(action.layout.CertificateDir, "gone.example.com.key.plain")
-			writeTestFile(t, certPath, "cert")
-			writeTestFile(t, keyPath, "key")
+			writeConfigFixture(t, certPath, "cert")
+			writeConfigFixture(t, keyPath, "key")
 			vhostPath := filepath.Join(action.layout.AvailableDir, leftoverName)
 			if tc.orphanVhost {
 				content := "server {\n  listen 443 ssl;\n  server_name gone.example.com;\n  ssl_certificate " + certPath + ";\n  ssl_certificate_key " + keyPath + ";\n}\n"
 				if !tc.unmarked {
 					content = proxy.StampManagedArtifact(content)
 				}
-				writeTestFile(t, vhostPath, content)
+				writeConfigFixture(t, vhostPath, content)
 				if err := os.Symlink(vhostPath, filepath.Join(action.layout.EnabledDir, leftoverName)); err != nil {
 					t.Fatal(err)
 				}
@@ -136,7 +136,7 @@ func TestManagedApplyKeepsCertificatesReferencedBySurvivingConfig(t *testing.T) 
 	}
 }
 
-func writeTestFile(t *testing.T, path, content string) {
+func writeConfigFixture(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)

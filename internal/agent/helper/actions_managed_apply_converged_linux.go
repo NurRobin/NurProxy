@@ -80,7 +80,7 @@ func (a *managedApplyAction) Converged(ctx context.Context, plan helperprotocol.
 	if err != nil {
 		return ActionResult{}, false, fmt.Errorf("managed proxy artifact attestation failed: %w", err)
 	}
-	return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged", ManagedArtifacts: artifacts}, true, nil
+	return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged" + compilation.retentionNote(), ManagedArtifacts: artifacts}, true, nil
 }
 
 // managedFileChangePending is the one decision for a compiled file: whether

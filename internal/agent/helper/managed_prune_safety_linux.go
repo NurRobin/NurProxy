@@ -20,35 +20,31 @@ import (
 // entry can have. A config that references any of them keeps the whole entry.
 var managedCertificateSuffixes = []string{".crt", ".key", ".key.plain", ".key.enc"}
 
-// certificateReferences is the outcome of scanning the config that survives an
-// apply for certificate references.
-type certificateReferences struct {
-	referenced []string // candidate bases some surviving config references
+// survivingConfig is the proxy config that is still on disk after an apply,
+// loaded so prune decisions can ask whether something still references a
+// certificate or basic-auth file.
+type survivingConfig struct {
+	contents [][]byte
 	// unscanned names surviving config files that could not be read in full
-	// (larger than maxConfigFileBytes). While any exist, no certificate is
-	// pruned, because a reference in them cannot be ruled out.
+	// (larger than maxConfigFileBytes). While any exist, nothing is pruned,
+	// because a reference in them cannot be ruled out.
 	unscanned []string
 }
 
-// referencedCertificateBases scans the config that survives this apply for
-// references to the candidate certificate bases.
-//
-// Surviving config is every vhost the compilation writes or preserves, plus
-// every regular file in the available/enabled directories that the compilation
-// neither writes nor deletes. Symlinks in those directories are followed to
-// regular files outside the already scanned set, as long as the target is not
-// owned by the unprivileged agent (the same trust rule as the fingerprint).
-func (a *managedApplyAction) referencedCertificateBases(compilation managedCompilation, candidates []string) (certificateReferences, error) {
-	var result certificateReferences
-	if len(candidates) == 0 {
-		return result, nil
-	}
+// loadSurvivingConfig reads every vhost the compilation writes or preserves,
+// plus every regular file in the available/enabled directories that the
+// compilation neither writes nor deletes. Symlinks in those directories are
+// followed to regular files outside the already scanned set, as long as the
+// target is not owned by the unprivileged agent (the fingerprint's trust
+// rule). The auth and certificate directories are never scanned: they hold
+// referenced files, not config.
+func (a *managedApplyAction) loadSurvivingConfig(compilation managedCompilation) (survivingConfig, error) {
+	var config survivingConfig
 	touched := make(map[string]struct{}, len(compilation.Files))
-	var contents [][]byte
 	for _, file := range compilation.Files {
 		touched[file.Path] = struct{}{}
 		if file.Class == "vhost" && !file.Delete {
-			contents = append(contents, file.Content)
+			config.contents = append(config.contents, file.Content)
 		}
 	}
 	scanned := make(map[string]struct{})
@@ -59,20 +55,20 @@ func (a *managedApplyAction) referencedCertificateBases(compilation managedCompi
 		scanned[path] = struct{}{}
 		info, err := os.Lstat(path)
 		if err != nil {
-			return fmt.Errorf("inspect config file for certificate references: %w", err)
+			return fmt.Errorf("inspect config file for prune references: %w", err)
 		}
 		if !info.Mode().IsRegular() {
 			return nil
 		}
 		if info.Size() > maxConfigFileBytes {
-			result.unscanned = append(result.unscanned, display)
+			config.unscanned = append(config.unscanned, display)
 			return nil
 		}
 		content, err := readNoFollowFile(path, info.Size())
 		if err != nil {
-			return fmt.Errorf("read config file for certificate references: %w", err)
+			return fmt.Errorf("read config file for prune references: %w", err)
 		}
-		contents = append(contents, content)
+		config.contents = append(config.contents, content)
 		return nil
 	}
 	var links []string
@@ -85,7 +81,7 @@ func (a *managedApplyAction) referencedCertificateBases(compilation managedCompi
 			continue
 		}
 		if err != nil {
-			return result, fmt.Errorf("read managed config directory for certificate references: %w", err)
+			return config, fmt.Errorf("read managed config directory for prune references: %w", err)
 		}
 		for _, entry := range entries {
 			path := filepath.Join(dir, entry.Name())
@@ -97,7 +93,7 @@ func (a *managedApplyAction) referencedCertificateBases(compilation managedCompi
 				continue
 			}
 			if err := scan(path, entry.Name()); err != nil {
-				return result, err
+				return config, err
 			}
 		}
 	}
@@ -117,31 +113,37 @@ func (a *managedApplyAction) referencedCertificateBases(compilation managedCompi
 			continue
 		}
 		if err := scan(target, filepath.Base(link)+" -> "+target); err != nil {
-			return result, err
+			return config, err
 		}
 	}
-	for _, base := range candidates {
-		if len(result.unscanned) > 0 || certificateBaseReferenced(base, contents) {
-			result.referenced = append(result.referenced, base)
-		}
-	}
-	sort.Strings(result.referenced)
-	sort.Strings(result.unscanned)
-	return result, nil
+	sort.Strings(config.unscanned)
+	return config, nil
 }
 
-// certificateBaseReferenced matches "/<base><suffix>" so any absolute or
-// differently spelled path to the store file (double slashes, symlinked
-// store directory) still counts as a reference. A false positive keeps the
-// certificate for as long as the matching config file exists; it never
-// deletes anything.
-func certificateBaseReferenced(base string, contents [][]byte) bool {
+// references reports whether surviving config may still use a file with the
+// given base name. It matches "/<name>" so any absolute or differently spelled
+// path (double slashes, symlinked directories, the pre-#147 certs/ location of
+// an auth file) still counts. A false positive keeps the file for as long as
+// the matching config exists; it never deletes anything. With unscanned files
+// every name counts as referenced.
+func (c survivingConfig) references(name string) bool {
+	if len(c.unscanned) > 0 {
+		return true
+	}
+	needle := []byte("/" + name)
+	for _, content := range c.contents {
+		if bytes.Contains(content, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// referencesCertificate reports whether any store file of base is referenced.
+func (c survivingConfig) referencesCertificate(base string) bool {
 	for _, suffix := range managedCertificateSuffixes {
-		needle := []byte("/" + base + suffix)
-		for _, content := range contents {
-			if bytes.Contains(content, needle) {
-				return true
-			}
+		if c.references(base + suffix) {
+			return true
 		}
 	}
 	return false
@@ -149,9 +151,10 @@ func certificateBaseReferenced(base string, contents [][]byte) bool {
 
 // leftoverManagedVhosts lists NurProxy-named vhost files in the available
 // directory that are neither written nor deleted by this apply: routes the
-// orchestrator no longer sends, and tombstoned vhosts the helper refused to
-// delete because they carry no NurProxy marker. They are reported in every
-// receipt until someone removes them.
+// orchestrator did not send this time, and tombstoned vhosts the helper
+// refused to delete because they carry no NurProxy marker. They are reported
+// in every receipt while they exist. Auth and certificate files are never
+// listed; they live in other directories.
 func (a *managedApplyAction) leftoverManagedVhosts(compilation managedCompilation) ([]string, error) {
 	entries, err := os.ReadDir(a.layout.AvailableDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -168,7 +171,7 @@ func (a *managedApplyAction) leftoverManagedVhosts(compilation managedCompilatio
 	var leftovers []string
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".conf") {
+		if !entry.Type().IsRegular() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".conf") {
 			continue
 		}
 		if _, ok := touched[filepath.Join(a.layout.AvailableDir, name)]; ok {
@@ -181,15 +184,22 @@ func (a *managedApplyAction) leftoverManagedVhosts(compilation managedCompilatio
 }
 
 // retentionNote is appended to the receipt message so the operator can see
-// what the helper deliberately left in place, and why.
+// what the helper deliberately left in place, and why. Execute and Converged
+// both use it, so a converged receipt carries the same notes.
 func (c managedCompilation) retentionNote() string {
 	note := ""
 	if len(c.UnscannedConfigs) > 0 {
-		note += fmt.Sprintf("; certificate prune skipped, %d config file(s) too large to scan for references: %s",
+		note += fmt.Sprintf("; prune skipped, %d config file(s) too large to scan for references: %s",
 			len(c.UnscannedConfigs), boundedList(c.UnscannedConfigs))
-	} else if len(c.RetainedCertificates) > 0 {
-		note += fmt.Sprintf("; kept %d unretained certificate(s) still referenced by proxy config: %s",
-			len(c.RetainedCertificates), boundedList(c.RetainedCertificates))
+	} else {
+		if len(c.RetainedCertificates) > 0 {
+			note += fmt.Sprintf("; kept %d unretained certificate(s) still referenced by proxy config: %s",
+				len(c.RetainedCertificates), boundedList(c.RetainedCertificates))
+		}
+		if len(c.RetainedAuthFiles) > 0 {
+			note += fmt.Sprintf("; kept %d unrouted basic-auth file(s) still referenced by proxy config: %s",
+				len(c.RetainedAuthFiles), boundedList(c.RetainedAuthFiles))
+		}
 	}
 	if len(c.LeftoverVhosts) > 0 {
 		note += fmt.Sprintf("; %s%s", helperprotocol.ManagedLeftoverVhostsNote, boundedList(c.LeftoverVhosts))
