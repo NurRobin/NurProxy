@@ -5,7 +5,7 @@ import { usePolling } from '../lib/usePolling';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Domain, Agent, Server, Zone, ProxyCapabilities } from '../lib/types';
+import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities } from '../lib/types';
 import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
@@ -27,6 +27,19 @@ interface ServerWithAgent extends Server {
 }
 
 type EditTab = 'general' | 'headers' | 'advanced';
+type ProxiedChoice = 'keep' | 'on' | 'off';
+
+function proxiedChoice(p: boolean | null | undefined): ProxiedChoice {
+  if (p === true) return 'on';
+  if (p === false) return 'off';
+  return 'keep';
+}
+
+function proxiedValue(c: ProxiedChoice): boolean | null {
+  if (c === 'on') return true;
+  if (c === 'off') return false;
+  return null;
+}
 const STATUS_FILTERS = ['all', 'active', 'pending', 'error', 'deleting'];
 
 export default function Domains() {
@@ -35,6 +48,7 @@ export default function Domains() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
+  const [providers, setProviders] = useState<Provider[]>([]);
   const [acmeConfigured, setAcmeConfigured] = useState(true);
   const [allServers, setAllServers] = useState<ServerWithAgent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -51,6 +65,7 @@ export default function Domains() {
   const [createWebsocket, setCreateWebsocket] = useState(false);
   const [createForceHttps, setCreateForceHttps] = useState(true);
   const [createCertOnly, setCreateCertOnly] = useState(false);
+  const [createProxied, setCreateProxied] = useState<ProxiedChoice>('keep');
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState('');
 
@@ -66,6 +81,7 @@ export default function Domains() {
   const [editWebsocket, setEditWebsocket] = useState(false);
   const [editForceHttps, setEditForceHttps] = useState(true);
   const [editMaxBody, setEditMaxBody] = useState('');
+  const [editProxied, setEditProxied] = useState<ProxiedChoice>('keep');
   const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
   const [editRawConfig, setEditRawConfig] = useState('');
   const [editConfigBackend, setEditConfigBackend] = useState('caddy');
@@ -79,8 +95,8 @@ export default function Domains() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [d, a, z, s] = await Promise.all([api.listDomains(), api.listAgents(), api.listAllZones(), api.getSettings()]);
-      setDomains(d); setAgents(a); setZones(z);
+      const [d, a, z, s, p] = await Promise.all([api.listDomains(), api.listAgents(), api.listAllZones(), api.getSettings(), api.listProviders()]);
+      setDomains(d); setAgents(a); setZones(z); setProviders(p);
       setAcmeConfigured(!!s.find((st) => st.key === 'acme_email')?.value?.trim());
       const adopted = a.filter((ag) => ag.status === 'adopted' || ag.status === 'offline');
       const serverResults = await Promise.all(
@@ -106,6 +122,11 @@ export default function Domains() {
 
   const getZoneName = (zoneId: string) => zones.find((z) => z.id === zoneId)?.name ?? '';
   const getServerInfo = (serverId: string) => allServers.find((s) => s.id === serverId);
+  // The proxy setting only means something on Cloudflare zones (#126).
+  const zoneSupportsProxy = (zoneId: string) => {
+    const zone = zones.find((z) => z.id === zoneId);
+    return !!zone && providers.find((p) => p.id === zone.provider_id)?.type === 'cloudflare';
+  };
 
   // Resolve the agent that will serve a domain (via its server) so the edit form
   // can grey out options the agent's selected backend can't honor (§8). Returns
@@ -149,11 +170,14 @@ export default function Domains() {
         subdomain: createSub, zone_id: createZone, server_id: createServer,
         port: createCertOnly ? 0 : parseInt(createPort, 10),
         websocket: createWebsocket, force_https: createForceHttps, cert_only: createCertOnly,
+        ...(!createCertOnly && zoneSupportsProxy(createZone) && createProxied !== 'keep'
+          ? { proxied: proxiedValue(createProxied) }
+          : {}),
       });
       toast.success(t('domains.created', { fqdn: domainFqdn(createSub, getZoneName(createZone)) }));
       setShowCreate(false);
       setCreateSub(''); setCreateZone(''); setCreateServer(''); setCreatePort('80');
-      setCreateWebsocket(false); setCreateForceHttps(true); setCreateCertOnly(false);
+      setCreateWebsocket(false); setCreateForceHttps(true); setCreateCertOnly(false); setCreateProxied('keep');
       fetchData();
     } catch (err) {
       setCreateError(errMessage(err, t('domains.createFailed')));
@@ -168,6 +192,7 @@ export default function Domains() {
     setEditWebsocket(d.websocket || d.proxy_config?.websocket || false);
     setEditForceHttps(d.force_https || d.proxy_config?.force_https || false);
     setEditMaxBody(d.proxy_config?.max_body_size ?? '');
+    setEditProxied(proxiedChoice(d.proxied));
     setEditHeaders(d.proxy_config?.custom_request_headers
       ? Object.entries(d.proxy_config.custom_request_headers).map(([key, value]) => ({ key, value }))
       : []);
@@ -183,7 +208,10 @@ export default function Domains() {
     try {
       const customHeaders: Record<string, string> = {};
       for (const h of editHeaders) if (h.key.trim()) customHeaders[h.key.trim()] = h.value;
+      const proxiedChanged = !detailDomain.cert_only && zoneSupportsProxy(detailDomain.zone_id) &&
+        editProxied !== proxiedChoice(detailDomain.proxied);
       await api.updateDomain(detailDomain.id, {
+        ...(proxiedChanged ? { proxied: proxiedValue(editProxied) } : {}),
         websocket: editWebsocket, force_https: editForceHttps,
         proxy_config: {
           websocket: editWebsocket, force_https: editForceHttps,
@@ -399,7 +427,14 @@ export default function Domains() {
                         onChange={() => toggleSelected(d.id)}
                       />
                     </td>
-                    <td className="px-4 py-3 font-medium text-fg">{zone ? domainFqdn(d.subdomain, zone) : d.subdomain}</td>
+                    <td className="px-4 py-3 font-medium text-fg">
+                      {zone ? domainFqdn(d.subdomain, zone) : d.subdomain}
+                      {d.proxied === true && (
+                        <span title={t('domains.proxiedBadgeTitle')} className="ml-2 inline-flex items-center rounded-full bg-warning-soft px-2 py-0.5 align-middle text-[11px] font-medium text-warning-fg">
+                          {t('domains.proxiedBadge')}
+                        </span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 font-mono text-xs text-fg-muted">{srv ? `${srv.address}:${d.port}` : `:${d.port}`}</td>
                     <td className="px-4 py-3 text-fg-muted">{srv?.agentName ?? '—'}</td>
                     <td className="px-4 py-3"><StatusBadge status={d.status} /></td>
@@ -451,6 +486,18 @@ export default function Domains() {
             {!createCertOnly && <span className="flex items-center gap-1.5"><Checkbox label={t('domains.forceHttps')} checked={createForceHttps} onChange={(e) => setCreateForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>}
             <span className="flex items-center gap-1.5"><Checkbox label={t('domains.certOnly')} checked={createCertOnly} onChange={(e) => setCreateCertOnly(e.target.checked)} /></span>
           </div>
+          {!createCertOnly && zoneSupportsProxy(createZone) && (
+            <Field label={t('domains.proxied')} hint={t('domains.proxiedHint')}>
+              <Select value={createProxied} onChange={(e) => setCreateProxied(e.target.value as ProxiedChoice)}>
+                <option value="keep">{t('domains.proxiedKeep')}</option>
+                <option value="on">{t('domains.proxiedOn')}</option>
+                <option value="off">{t('domains.proxiedOff')}</option>
+              </Select>
+            </Field>
+          )}
+          {!createCertOnly && zoneSupportsProxy(createZone) && createProxied === 'on' && (
+            <Callout tone="info">{t('domains.proxiedHelp')}</Callout>
+          )}
           {createCertOnly && (
             <Callout tone="info">
               {t('domains.certOnlyHelp')}
@@ -496,6 +543,18 @@ export default function Domains() {
                   <span className="flex items-center gap-1.5" title={unsupportedHint('websocket')}><Checkbox label={t('domains.websocket')} checked={editWebsocket} disabled={!supports('websocket')} onChange={(e) => setEditWebsocket(e.target.checked)} /><HelpTip term="websocket" /></span>
                   <span className="flex items-center gap-1.5" title={unsupportedHint('force_https')}><Checkbox label={t('domains.forceHttps')} checked={editForceHttps} disabled={!supports('force_https')} onChange={(e) => setEditForceHttps(e.target.checked)} /><HelpTip term="force-https" /></span>
                 </div>
+                {!liveDomain.cert_only && zoneSupportsProxy(liveDomain.zone_id) && (
+                  <>
+                    <Field label={t('domains.proxied')} hint={t('domains.proxiedHint')}>
+                      <Select value={editProxied} onChange={(e) => setEditProxied(e.target.value as ProxiedChoice)}>
+                        <option value="keep">{t('domains.proxiedKeep')}</option>
+                        <option value="on">{t('domains.proxiedOn')}</option>
+                        <option value="off">{t('domains.proxiedOff')}</option>
+                      </Select>
+                    </Field>
+                    {editProxied === 'on' && <Callout tone="info">{t('domains.proxiedHelp')}</Callout>}
+                  </>
+                )}
                 <Field label={t('domains.maxBodySize')} help="max-body-size" hint={supports('reverse_proxy') ? t('domains.maxBodyHint') : unsupportedHint('reverse_proxy')}>
                   <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder={t('domains.maxBodyPh')} />
                 </Field>
