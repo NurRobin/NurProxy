@@ -61,7 +61,7 @@ for entry in /var/lib/nurproxy-agent/* /var/lib/nurproxy-agent/.[!.]* /var/lib/n
   fi
   name=${entry##*/}
   case "$name" in
-    state|helper|helper-staging|certs) continue ;;
+    state|helper|helper-staging|certs|auth) continue ;;
   esac
   if [ -e "/var/lib/nurproxy-agent/state/$name" ] || [ -L "/var/lib/nurproxy-agent/state/$name" ]; then
     echo "NurProxy agent state migration collision: $name" >&2

@@ -37,6 +37,9 @@ type managedApplyAction struct {
 	layout         ManagedApplyTargetConfig
 	journal        *Journal
 	host           proxyServiceHost
+	// workerGroup resolves the GID of the proxy worker that reads basic-auth
+	// files per request.
+	workerGroup func() (uint32, error)
 }
 
 type managedCompiledFile struct {
@@ -44,6 +47,7 @@ type managedCompiledFile struct {
 	Path       string `json:"path"`
 	SHA256     string `json:"sha256"`
 	Mode       uint32 `json:"mode"`
+	GID        uint32 `json:"gid,omitempty"`
 	Class      string `json:"class"`
 	Delete     bool   `json:"delete"`
 	Preserve   bool   `json:"preserve"`
@@ -80,7 +84,10 @@ func newManagedApplyAction(agentUID uint32, target ProxyTargetConfig, layout Man
 	if agentUID == 0 || target.Validate() != nil || layout.Validate(target.Kind) != nil || journal == nil || host == nil {
 		return nil, fmt.Errorf("managed apply action is not safely configured")
 	}
-	return &managedApplyAction{agentUID: agentUID, ownerUID: 0, stagingRootUID: 0, target: target, layout: layout, journal: journal, host: host}, nil
+	workerGroup := func() (uint32, error) {
+		return resolveProxyWorkerGroup(target.Kind, layout.AvailableDir, readTrustedProxyMainConfig, lookupGroupID)
+	}
+	return &managedApplyAction{agentUID: agentUID, ownerUID: 0, stagingRootUID: 0, target: target, layout: layout, journal: journal, host: host, workerGroup: workerGroup}, nil
 }
 
 func (a *managedApplyAction) Plan(ctx context.Context, intent helperprotocol.ApplyIntent) (ManagedApplyMaterial, error) {
@@ -132,7 +139,7 @@ func (a *managedApplyAction) Prepare(ctx context.Context, operationID string, pl
 	if err != nil || fingerprint != plan.ResourceFingerprint {
 		return PreparedAction{}, fmt.Errorf("managed targets changed before snapshot")
 	}
-	snapshot, err := captureManagedSnapshot(compilation, a.ownerUID)
+	snapshot, err := captureManagedSnapshot(compilation, a.ownerUID, a.layout)
 	if err != nil {
 		return PreparedAction{}, err
 	}
@@ -176,7 +183,7 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		mutated = mutated || removed
 	}
 	for _, file := range compilation.Files {
-		if !file.Delete {
+		if !file.Delete || isManagedAuthDeletion(file) {
 			continue
 		}
 		removed, err := removeManagedFile(file, a.ownerUID)
@@ -189,7 +196,7 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		if file.Delete || file.Preserve {
 			continue
 		}
-		changed, err := installManagedFile(file, a.ownerUID)
+		changed, err := installManagedFile(file, a.ownerUID, a.layout)
 		if err != nil {
 			return ActionResult{Mutated: mutated}, err
 		}
@@ -205,25 +212,40 @@ func (a *managedApplyAction) Execute(ctx context.Context, operationID string, pl
 		}
 		mutated = mutated || changed
 	}
+	if mutated {
+		if err := a.host.Validate(ctx, a.target); err != nil {
+			return ActionResult{Mutated: true}, fmt.Errorf("native proxy validation failed after managed commit: %w", err)
+		}
+		if err := a.host.Mutate(ctx, a.target, proxyServiceReload); err != nil {
+			return ActionResult{Mutated: true}, fmt.Errorf("proxy reload failed after managed commit: %w", err)
+		}
+		if err := a.host.Validate(ctx, a.target); err != nil {
+			return ActionResult{Mutated: true}, fmt.Errorf("native proxy validation failed after managed reload: %w", err)
+		}
+		post, err := a.host.Inspect(ctx, a.target)
+		if err != nil || !post.Active || post.Kind != a.target.Kind || post.Unit != a.target.Unit {
+			return ActionResult{Mutated: true}, fmt.Errorf("managed proxy postcondition could not be proven")
+		}
+	}
+	// Auth files go only after the reload, so the running workers never point
+	// at a missing user file (which nginx answers with 500, not 401). Nothing
+	// references them any more, so removing them needs no further reload.
+	for _, file := range compilation.Files {
+		if !file.Delete || !isManagedAuthDeletion(file) {
+			continue
+		}
+		removed, err := removeManagedFile(file, a.ownerUID)
+		if err != nil {
+			return ActionResult{Mutated: mutated}, err
+		}
+		mutated = mutated || removed
+	}
 	if !mutated {
 		artifacts, err := a.attestManagedArtifacts(compilation)
 		if err != nil {
 			return ActionResult{}, fmt.Errorf("managed proxy artifact attestation failed: %w", err)
 		}
 		return ActionResult{Mutated: false, Validated: true, SanitizedResult: "managed proxy state already converged", ManagedArtifacts: artifacts}, nil
-	}
-	if err := a.host.Validate(ctx, a.target); err != nil {
-		return ActionResult{Mutated: true}, fmt.Errorf("native proxy validation failed after managed commit: %w", err)
-	}
-	if err := a.host.Mutate(ctx, a.target, proxyServiceReload); err != nil {
-		return ActionResult{Mutated: true}, fmt.Errorf("proxy reload failed after managed commit: %w", err)
-	}
-	if err := a.host.Validate(ctx, a.target); err != nil {
-		return ActionResult{Mutated: true}, fmt.Errorf("native proxy validation failed after managed reload: %w", err)
-	}
-	post, err := a.host.Inspect(ctx, a.target)
-	if err != nil || !post.Active || post.Kind != a.target.Kind || post.Unit != a.target.Unit {
-		return ActionResult{Mutated: true}, fmt.Errorf("managed proxy postcondition could not be proven")
 	}
 	artifacts, err := a.attestManagedArtifacts(compilation)
 	if err != nil {
@@ -275,6 +297,20 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		return managedCompilation{}, err
 	}
 	compilation := managedCompilation{Files: []managedCompiledFile{}, Links: []managedCompiledLink{}}
+	authDir := a.layout.AuthDir()
+	authGID, authGIDErr, authGIDResolved := uint32(0), error(nil), false
+	resolveAuthGID := func() (uint32, error) {
+		if !authGIDResolved {
+			authGIDResolved = true
+			if a.workerGroup == nil {
+				authGIDErr = fmt.Errorf("no worker group resolver")
+			} else {
+				authGID, authGIDErr = a.workerGroup()
+			}
+		}
+		return authGID, authGIDErr
+	}
+	routeHosts := make(map[string]struct{}, len(intent.Routes))
 	for host, pair := range certificates {
 		base := certstore.SanitizeHost(host)
 		compilation.Files = append(compilation.Files,
@@ -293,23 +329,16 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			certPath = filepath.Join(a.layout.CertificateDir, base+".crt")
 			keyPath = filepath.Join(a.layout.CertificateDir, base+".key.plain")
 		}
+		routeHosts[certstore.SanitizeHost(route.Host)] = struct{}{}
 		authPath := ""
 		if route.BasicAuth != nil || route.IsRaw() {
-			authPath = filepath.Join(a.layout.CertificateDir, "auth-"+certstore.SanitizeHost(route.Host)+".htpasswd")
-		}
-		if route.BasicAuth != nil {
-			compilation.Files = append(compilation.Files, compiledFile(authPath, []byte(route.BasicAuth.Username+":"+route.BasicAuth.PasswordHash+"\n"), 0o600, "secret"))
+			authPath = managedAuthFilePath(authDir, route.Host)
 		}
 		available := filepath.Join(a.layout.AvailableDir, managedFileName(a.target.Kind, route.Host))
 		var content string
 		preserve := false
 		if route.IsRaw() {
-			if a.target.Kind != "nginx" || nginxparse.ValidateManaged(route.Raw.Content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}) != nil {
-				content = route.Raw.Content
-				preserve = true
-			} else {
-				content = route.Raw.Content
-			}
+			content, preserve, err = a.admitRawRoute(route, certPath, keyPath, authPath)
 		} else {
 			content, err = a.renderRoute(route, certPath, keyPath, authPath)
 		}
@@ -344,6 +373,32 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		file.ResourceID = routeIntent.ArtifactID
 		file.Preserve = preserve
 		compilation.Files = append(compilation.Files, file)
+		// The auth/ file is only written when the vhost actually uses it, so a
+		// preserved legacy vhost with its own sidecar needs no worker group.
+		needsAuthFile := route.BasicAuth != nil && authPath != "" && bytes.Contains(compiledContent, []byte(authPath))
+		if needsAuthFile {
+			gid, err := resolveAuthGID()
+			if err != nil {
+				return managedCompilation{}, fmt.Errorf("basic auth for %s: cannot write %s because the %s worker group is unknown (fix the proxy's user/Group setting, or remove basic auth from this route): %w", route.Host, authPath, a.target.Kind, err)
+			}
+			authFile := compiledFile(authPath, []byte(route.BasicAuth.Username+":"+route.BasicAuth.PasswordHash+"\n"), 0o640, "auth")
+			authFile.GID = gid
+			compilation.Files = append(compilation.Files, authFile)
+		}
+		// Auth files the vhost does not reference are removed: the pre-#147
+		// certs/ location, and the auth/ file once basic auth is switched off.
+		stale := []managedCompiledFile{{Path: legacyManagedAuthFilePath(a.layout.CertificateDir, route.Host), Class: "secret", Delete: true}}
+		if !needsAuthFile {
+			stale = append(stale, managedCompiledFile{Path: managedAuthFilePath(authDir, route.Host), Class: "auth", Delete: true})
+		}
+		for _, deletion := range stale {
+			if bytes.Contains(compiledContent, []byte(deletion.Path)) {
+				continue
+			}
+			if err := appendExistingDeletion(&compilation, deletion); err != nil {
+				return managedCompilation{}, err
+			}
+		}
 		if a.layout.EnabledDir != "" {
 			compilation.Links = append(compilation.Links, managedCompiledLink{Path: filepath.Join(a.layout.EnabledDir, filepath.Base(available)), Target: available, Preserve: preserve})
 		}
@@ -354,7 +409,10 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		}
 		available := filepath.Join(a.layout.AvailableDir, managedFileName(a.target.Kind, deletion.Host))
 		compilation.Files = append(compilation.Files, managedCompiledFile{Path: available, Class: "vhost", Delete: true})
-		compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, "auth-"+certstore.SanitizeHost(deletion.Host)+".htpasswd"), Class: "secret", Delete: true})
+		compilation.Files = append(compilation.Files,
+			managedCompiledFile{Path: managedAuthFilePath(authDir, deletion.Host), Class: "auth", Delete: true},
+			managedCompiledFile{Path: legacyManagedAuthFilePath(a.layout.CertificateDir, deletion.Host), Class: "secret", Delete: true},
+		)
 		if a.layout.EnabledDir != "" {
 			compilation.Links = append(compilation.Links, managedCompiledLink{Path: filepath.Join(a.layout.EnabledDir, filepath.Base(available)), Target: available, Delete: true})
 		}
@@ -370,6 +428,14 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		}
 		for _, entry := range entries {
 			name := entry.Name()
+			if host, ok := managedAuthFileHost(name); ok {
+				// Legacy certs/ auth files of hosts this push does not route.
+				path := filepath.Join(a.layout.CertificateDir, name)
+				if _, routed := routeHosts[host]; !routed && !compilation.hasTarget(path) {
+					compilation.Files = append(compilation.Files, managedCompiledFile{Path: path, Class: "secret", Delete: true})
+				}
+				continue
+			}
 			base, recognized := managedCertificateBase(name)
 			if !recognized {
 				continue
@@ -379,10 +445,22 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			}
 			compilation.Files = append(compilation.Files, managedCompiledFile{Path: filepath.Join(a.layout.CertificateDir, name), Class: "secret", Delete: true})
 		}
+		authEntries, err := os.ReadDir(authDir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return managedCompilation{}, fmt.Errorf("read managed auth directory: %w", err)
+		}
+		for _, entry := range authEntries {
+			host, ok := managedAuthFileHost(entry.Name())
+			path := filepath.Join(authDir, entry.Name())
+			if _, routed := routeHosts[host]; !ok || routed || compilation.hasTarget(path) {
+				continue
+			}
+			compilation.Files = append(compilation.Files, managedCompiledFile{Path: path, Class: "auth", Delete: true})
+		}
 	}
 	sort.Slice(compilation.Files, func(i, j int) bool {
 		if compilation.Files[i].Class != compilation.Files[j].Class {
-			return compilation.Files[i].Class == "secret"
+			return managedClassOrder(compilation.Files[i].Class) < managedClassOrder(compilation.Files[j].Class)
 		}
 		return compilation.Files[i].Path < compilation.Files[j].Path
 	})
@@ -395,6 +473,41 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		targets[file.Path] = struct{}{}
 	}
 	return compilation, nil
+}
+
+// admitRawRoute decides whether a raw route is written or kept as an exact
+// policy-foreign file. nginxparse never admits a raw config that carries
+// auth_basic, so raw basic-auth routes are policy-foreign. Those saved from a
+// pre-#147 artifact point auth_basic_user_file at certs/, which the worker
+// cannot read. When such a raw config is exactly what the generator rendered
+// for this route with the old path, it is re-rendered with the auth/ path;
+// any other raw config still on the old path is refused with an error that
+// names both paths.
+func (a *managedApplyAction) admitRawRoute(route proxymodel.Route, certPath, keyPath, authPath string) (string, bool, error) {
+	content := route.Raw.Content
+	if a.target.Kind != "nginx" {
+		return content, true, nil
+	}
+	if nginxparse.ValidateManaged(content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}) == nil {
+		return content, false, nil
+	}
+	legacy := legacyManagedAuthFilePath(a.layout.CertificateDir, route.Host)
+	if !strings.Contains(content, legacy) {
+		return content, true, nil
+	}
+	if route.BasicAuth != nil {
+		structured := route
+		structured.Raw = proxymodel.RawConfig{}
+		legacyRender, err := a.renderRoute(structured, certPath, keyPath, legacy)
+		if err != nil {
+			return "", false, err
+		}
+		if proxy.StampManagedArtifact(content) == proxy.StampManagedArtifact(legacyRender) {
+			current, err := a.renderRoute(structured, certPath, keyPath, authPath)
+			return current, false, err
+		}
+	}
+	return "", false, fmt.Errorf("raw nginx config for %s uses auth_basic_user_file %s, which the %s worker cannot read; change it to %s", route.Host, legacy, a.target.Kind, authPath)
 }
 
 func exactUnmarkedManagedFile(path string, desired []byte, ownerUID uint32) (bool, error) {
@@ -495,6 +608,43 @@ func managedFileName(kind, host string) string {
 	return nginx.ManagedFileName(host)
 }
 
+// readTrustedProxyMainConfig reads a root-owned proxy main config that only
+// root can modify, so a worker group taken from it is operator intent.
+func readTrustedProxyMainConfig(path string) ([]byte, error) {
+	return readTrustedConfigOwnedBy(path, 0)
+}
+
+// readTrustedConfigOwnedBy opens path without following symlinks and checks
+// type, owner and mode on the opened descriptor, so a swap after the check
+// cannot substitute another file.
+func readTrustedConfigOwnedBy(path string, ownerUID uint32) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("invalid config descriptor")
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return nil, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != ownerUID || stat.Mode&0o022 != 0 || stat.Size < 0 || stat.Size > maxConfigFileBytes {
+		return nil, fmt.Errorf("%s is not a regular file owned by uid %d and writable only by its owner", path, ownerUID)
+	}
+	payload, err := io.ReadAll(io.LimitReader(file, maxConfigFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxConfigFileBytes {
+		return nil, fmt.Errorf("%s exceeds the config size limit", path)
+	}
+	return payload, nil
+}
+
 func managedCertificateBase(name string) (string, bool) {
 	for _, suffix := range []string{".key.plain", ".key.enc", ".crt", ".key"} {
 		if base := strings.TrimSuffix(name, suffix); base != name && base != "" && certstore.SanitizeHost(base) == base {
@@ -502,6 +652,65 @@ func managedCertificateBase(name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func managedAuthFilePath(authDir, host string) string {
+	return filepath.Join(authDir, "auth-"+certstore.SanitizeHost(host)+".htpasswd")
+}
+
+// legacyManagedAuthFilePath is where helpers before #147 wrote auth files. The
+// proxy worker cannot read it, so it is only ever deleted.
+func legacyManagedAuthFilePath(certificateDir, host string) string {
+	return filepath.Join(certificateDir, "auth-"+certstore.SanitizeHost(host)+".htpasswd")
+}
+
+// managedAuthFileHost returns the sanitized host of an auth-<host>.htpasswd name.
+func managedAuthFileHost(name string) (string, bool) {
+	host, ok := strings.CutPrefix(name, "auth-")
+	if !ok {
+		return "", false
+	}
+	host, ok = strings.CutSuffix(host, ".htpasswd")
+	if !ok || host == "" || certstore.SanitizeHost(host) != host {
+		return "", false
+	}
+	return host, true
+}
+
+func managedClassOrder(class string) int {
+	switch class {
+	case "secret":
+		return 0
+	case "auth":
+		return 1
+	default:
+		return 2
+	}
+}
+
+// appendExistingDeletion schedules a deletion only when the target exists, so
+// converged hosts keep a deletion-free plan (and pre-mutation validation).
+func appendExistingDeletion(compilation *managedCompilation, deletion managedCompiledFile) error {
+	if compilation.hasTarget(deletion.Path) {
+		return nil
+	}
+	if _, err := os.Lstat(deletion.Path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("inspect stale managed auth file: %w", err)
+	}
+	compilation.Files = append(compilation.Files, deletion)
+	return nil
+}
+
+func (c managedCompilation) hasTarget(path string) bool {
+	for _, file := range c.Files {
+		if file.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func compiledFile(path string, content []byte, mode os.FileMode, class string) managedCompiledFile {
@@ -528,7 +737,7 @@ func (c managedCompilation) hasDeletions() bool {
 }
 
 func (a *managedApplyAction) fingerprint(ctx context.Context, compilation managedCompilation) (string, error) {
-	if err := validateManagedCompilationTargets(compilation); err != nil {
+	if err := validateManagedCompilationTargets(compilation, a.layout); err != nil {
 		return "", err
 	}
 	facts, err := a.host.Inspect(ctx, a.target)
@@ -565,22 +774,30 @@ func (a *managedApplyAction) fingerprint(ctx context.Context, compilation manage
 	}{Proxy: facts, Targets: current})
 }
 
-func validateManagedCompilationTargets(compilation managedCompilation) error {
+// validateManagedCompilationTargets also pins each secret-bearing class to its
+// directory: secrets to CertificateDir, auth files to the auth directory.
+func validateManagedCompilationTargets(compilation managedCompilation, layout ManagedApplyTargetConfig) error {
 	if compilation.Files == nil || compilation.Links == nil {
 		return fmt.Errorf("managed compilation has noncanonical collections")
 	}
 	totalReceiptContent := 0
 	for _, file := range compilation.Files {
-		if validatePrivatePath(file.Path) != nil || (file.Class != "vhost" && file.Class != "secret") {
+		if validatePrivatePath(file.Path) != nil || !validManagedFileClass(file.Class) {
 			return fmt.Errorf("managed compilation contains an invalid file")
 		}
+		if _, ok := managedAuthFileHost(filepath.Base(file.Path)); file.Class == "auth" && (!ok || filepath.Dir(file.Path) != layout.AuthDir()) {
+			return fmt.Errorf("managed auth file is outside the auth directory or has an unexpected name")
+		}
+		if file.Class == "secret" && filepath.Dir(file.Path) != layout.CertificateDir {
+			return fmt.Errorf("managed secret is outside the certificate directory")
+		}
 		if file.Delete {
-			if file.ResourceID != "" || file.Preserve || file.SHA256 != "" || file.Mode != 0 || len(file.Content) != 0 {
+			if file.ResourceID != "" || file.Preserve || file.SHA256 != "" || file.Mode != 0 || file.GID != 0 || len(file.Content) != 0 {
 				return fmt.Errorf("managed compilation contains an invalid file deletion")
 			}
 			continue
 		}
-		if !validDigest(file.SHA256) || (file.Mode != 0o600 && file.Mode != 0o644) {
+		if !validDigest(file.SHA256) || !validManagedFileMode(file.Class, file.Mode) || (file.Class != "auth" && file.GID != 0) {
 			return fmt.Errorf("managed compilation contains invalid file content")
 		}
 		if file.Preserve && file.Class != "vhost" {
@@ -613,8 +830,31 @@ func validateManagedCompilationTargets(compilation managedCompilation) error {
 	return nil
 }
 
+// isManagedAuthDeletion reports deletions of basic-auth user files, in auth/
+// or in the pre-#147 certs/ location. Execute removes them after the reload.
+func isManagedAuthDeletion(file managedCompiledFile) bool {
+	if !file.Delete {
+		return false
+	}
+	_, named := managedAuthFileHost(filepath.Base(file.Path))
+	return file.Class == "auth" || (file.Class == "secret" && named)
+}
+
+func validManagedFileClass(class string) bool {
+	return class == "vhost" || class == "secret" || class == "auth"
+}
+
+// validManagedFileMode pins each class to its modes. Auth files are the only
+// group-readable class: root:<worker group> 0640.
+func validManagedFileMode(class string, mode uint32) bool {
+	if class == "auth" {
+		return mode == 0o640
+	}
+	return mode == 0o600 || mode == 0o644
+}
+
 func (a *managedApplyAction) attestManagedArtifacts(compilation managedCompilation) ([]helperprotocol.ManagedArtifactReceipt, error) {
-	if err := validateManagedCompilationTargets(compilation); err != nil {
+	if err := validateManagedCompilationTargets(compilation, a.layout); err != nil {
 		return nil, err
 	}
 	enabledByTarget := make(map[string]bool, len(compilation.Links))
@@ -691,7 +931,7 @@ func inspectPreservedManagedFile(file managedCompiledFile, ownerUID uint32) (man
 }
 
 func removeManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error) {
-	if !file.Delete || (file.Class != "vhost" && file.Class != "secret") {
+	if !file.Delete || !validManagedFileClass(file.Class) {
 		return false, fmt.Errorf("invalid managed file deletion")
 	}
 	pending, err := managedFileChangePending(file, ownerUID)
@@ -793,8 +1033,8 @@ func openManagedComponentAtWith(
 	return openat(dirFD, component, flags|unix.O_NOFOLLOW, 0)
 }
 
-func captureManagedSnapshot(compilation managedCompilation, ownerUID uint32) (managedApplySnapshot, error) {
-	if err := validateManagedCompilationTargets(compilation); err != nil {
+func captureManagedSnapshot(compilation managedCompilation, ownerUID uint32, layout ManagedApplyTargetConfig) (managedApplySnapshot, error) {
+	if err := validateManagedCompilationTargets(compilation, layout); err != nil {
 		return managedApplySnapshot{}, err
 	}
 	snapshot := managedApplySnapshot{Files: make([]managedFileSnapshot, 0, len(compilation.Files)+len(compilation.Links))}
@@ -847,7 +1087,7 @@ func inspectManagedPath(path, class, expectedLinkTarget string, ownerUID uint32)
 		if err != nil || item.LinkTarget != expectedLinkTarget {
 			return item, fmt.Errorf("activation symlink is not exact NurProxy provenance")
 		}
-	case "vhost", "secret":
+	case "vhost", "secret", "auth":
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return item, fmt.Errorf("managed target is not a regular file")
 		}
@@ -870,8 +1110,8 @@ func inspectManagedPath(path, class, expectedLinkTarget string, ownerUID uint32)
 	return item, nil
 }
 
-func installManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error) {
-	if err := validateManagedCompilationTargets(managedCompilation{Files: []managedCompiledFile{file}, Links: []managedCompiledLink{}}); err != nil {
+func installManagedFile(file managedCompiledFile, ownerUID uint32, layout ManagedApplyTargetConfig) (bool, error) {
+	if err := validateManagedCompilationTargets(managedCompilation{Files: []managedCompiledFile{file}, Links: []managedCompiledLink{}}, layout); err != nil {
 		return false, err
 	}
 	pending, err := managedFileChangePending(file, ownerUID)
@@ -879,6 +1119,22 @@ func installManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error)
 		return false, err
 	}
 	dir := filepath.Dir(file.Path)
+	if file.Class == "auth" {
+		if err := ensureManagedAuthDirectory(dir, layout, ownerUID, file.GID); err != nil {
+			return false, err
+		}
+		if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
+			return false, err
+		}
+		current, err := inspectManagedPath(file.Path, file.Class, "", ownerUID)
+		if err != nil {
+			return false, err
+		}
+		if managedFileConverged(current, file) {
+			// Only the directory's group or mode needed repair.
+			return true, nil
+		}
+	}
 	tmp, err := os.CreateTemp(dir, ".nurproxy-helper-*")
 	if err != nil {
 		return false, err
@@ -891,6 +1147,11 @@ func installManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error)
 	tmpInfo, err := tmp.Stat()
 	if err != nil || fileOwnerUID(tmpInfo) != ownerUID {
 		return false, fmt.Errorf("managed temporary file owner is not the privileged identity")
+	}
+	if file.Class == "auth" {
+		if err := tmp.Chown(int(ownerUID), int(file.GID)); err != nil {
+			return false, err
+		}
 	}
 	if err := tmp.Chmod(os.FileMode(file.Mode)); err != nil {
 		return false, err
@@ -938,6 +1199,13 @@ func installManagedLink(link managedCompiledLink, ownerUID uint32) (bool, error)
 
 func restoreManagedSnapshot(snapshot managedFileSnapshot, ownerUID uint32) error {
 	dir := filepath.Dir(snapshot.Path)
+	if !snapshot.Exists {
+		// Nothing to undo while the target is still absent; its directory (for
+		// example a freshly created auth/) may not exist either.
+		if _, err := os.Lstat(snapshot.Path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
 	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
 		return err
 	}
@@ -990,6 +1258,48 @@ func restoreManagedSnapshot(snapshot managedFileSnapshot, ownerUID uint32) error
 		return err
 	}
 	return syncDirectory(dir)
+}
+
+// ensureManagedAuthDirectory creates or repairs the auth directory as
+// owner:<worker gid> 0750. Only that directory is opened to the worker group;
+// its parent must stay privileged.
+func ensureManagedAuthDirectory(dir string, layout ManagedApplyTargetConfig, ownerUID, gid uint32) error {
+	if dir != layout.AuthDir() || validatePrivatePath(dir) != nil {
+		return fmt.Errorf("refusing to manage %s as the auth directory", dir)
+	}
+	parent := filepath.Dir(dir)
+	if err := validatePrivilegedManagedDirectory(parent, ownerUID); err != nil {
+		return err
+	}
+	created := false
+	if err := os.Mkdir(dir, 0o700); err == nil {
+		created = true
+	} else if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create managed auth directory: %w", err)
+	}
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open managed auth directory: %w", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != ownerUID {
+		return fmt.Errorf("managed auth directory is not owned by the configured privileged identity")
+	}
+	if stat.Gid != gid {
+		if err := unix.Fchown(fd, int(ownerUID), int(gid)); err != nil {
+			return fmt.Errorf("set managed auth directory group: %w", err)
+		}
+	}
+	if stat.Mode&0o7777 != 0o750 {
+		if err := unix.Fchmod(fd, 0o750); err != nil {
+			return fmt.Errorf("set managed auth directory mode: %w", err)
+		}
+	}
+	if created {
+		return syncDirectory(parent)
+	}
+	return nil
 }
 
 func validatePrivilegedManagedDirectory(path string, ownerUID uint32) error {
