@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,28 @@ var (
 )
 
 const maxStoredPlans = 128
+
+// Retention for finished operations. Every terminal record per action is kept
+// while it is younger than operationRetentionAge, and the newest
+// operationRetentionPerAction are kept regardless of age. maxRetainedOperations
+// is a backstop that may cut into the age window, but never below the per-action
+// floor and never for records younger than operationRetentionMinAge, which is far
+// longer than any grant lifetime, so a pruned grant can no longer be replayed.
+const (
+	operationRetentionPerAction = 50
+	operationRetentionAge       = 14 * 24 * time.Hour
+	operationRetentionMinAge    = time.Hour
+	maxRetainedOperations       = 1000
+	journalPruneInterval        = time.Hour
+	pruneBatchSize              = 256
+)
+
+// PruneResult counts the journal files one prune pass removed.
+type PruneResult struct {
+	Operations int
+	Grants     int
+	Snapshots  int
+}
 
 type OperationRecord struct {
 	OperationID            string                        `json:"operation_id"`
@@ -124,6 +147,8 @@ type Journal struct {
 	snapshotsDir    string
 	breakerPath     string
 	breakerIsOpen   bool
+	lastPrune       time.Time
+	pruneMu         sync.Mutex
 }
 
 func NewJournal(root string, ownerUID uint32) (*Journal, error) {
@@ -574,6 +599,190 @@ func (j *Journal) Recover() error {
 		}
 	}
 	return nil
+}
+
+// Prune removes finished operations, with their grant claim and snapshot, that
+// fall outside the retention window. Non-terminal records, records Recover turns
+// into incidents (rollback_failed, outcome_indeterminate) and anything unreadable
+// are never touched. A snapshot or grant that is already gone is not an error.
+//
+// The directory scan runs without the journal lock; removal happens in batches
+// of pruneBatchSize, each under the lock and each re-reading the record first,
+// so a large backlog never blocks a request for more than one batch. A failed
+// removal is skipped and reported in the joined error; the pass goes on. Only
+// one pass runs at a time; a concurrent call returns immediately.
+func (j *Journal) Prune(now time.Time) (PruneResult, error) {
+	if !j.pruneMu.TryLock() {
+		return PruneResult{}, nil
+	}
+	defer j.pruneMu.Unlock()
+	j.mu.Lock()
+	j.lastPrune = now
+	j.mu.Unlock()
+	return j.prune(now)
+}
+
+// PruneIfDue runs Prune at most once per journalPruneInterval.
+func (j *Journal) PruneIfDue(now time.Time) (PruneResult, bool, error) {
+	j.mu.Lock()
+	due := j.lastPrune.IsZero() || now.Sub(j.lastPrune) >= journalPruneInterval
+	j.mu.Unlock()
+	if !due {
+		return PruneResult{}, false, nil
+	}
+	result, err := j.Prune(now)
+	return result, true, err
+}
+
+type pruneCandidate struct {
+	record  OperationRecord
+	updated time.Time
+}
+
+func (j *Journal) prune(now time.Time) (PruneResult, error) {
+	expired, err := j.pruneCandidates(now)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	var result PruneResult
+	var errs []error
+	for start := 0; start < len(expired); start += pruneBatchSize {
+		end := min(start+pruneBatchSize, len(expired))
+		errs = append(errs, j.removeOperationBatch(expired[start:end], &result)...)
+	}
+	return result, errors.Join(errs...)
+}
+
+// pruneCandidates reads the operation directory without holding the journal
+// lock. Terminal records never change state again, and removal re-checks each
+// record under the lock, so a stale read can only make a pass skip a record.
+func (j *Journal) pruneCandidates(now time.Time) ([]pruneCandidate, error) {
+	entries, err := os.ReadDir(j.operationsDir)
+	if err != nil {
+		return nil, err
+	}
+	byAction := make(map[helperprotocol.Action][]pruneCandidate)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		operationID := strings.TrimSuffix(name, ".json")
+		record, loadErr := j.loadOperationLocked(operationID)
+		if loadErr != nil || record.OperationID != operationID || !prunableJournalState(record.State) {
+			continue
+		}
+		updated, parseErr := time.Parse(time.RFC3339Nano, record.UpdatedAt)
+		if parseErr != nil {
+			continue
+		}
+		byAction[record.Action] = append(byAction[record.Action], pruneCandidate{record: record, updated: updated})
+	}
+	var expired, overflow []pruneCandidate
+	retained := 0
+	for _, candidates := range byAction {
+		sortCandidatesNewestFirst(candidates)
+		for index, candidate := range candidates {
+			switch {
+			case index < operationRetentionPerAction:
+				retained++
+			case now.Sub(candidate.updated) > operationRetentionAge:
+				expired = append(expired, candidate)
+			default:
+				retained++
+				overflow = append(overflow, candidate)
+			}
+		}
+	}
+	if retained > maxRetainedOperations {
+		sortCandidatesNewestFirst(overflow)
+		for index := len(overflow) - 1; index >= 0 && retained > maxRetainedOperations; index-- {
+			if now.Sub(overflow[index].updated) < operationRetentionMinAge {
+				break
+			}
+			expired = append(expired, overflow[index])
+			retained--
+		}
+	}
+	return expired, nil
+}
+
+// removeOperationBatch deletes and fsyncs every snapshot and grant of the batch
+// before it deletes any operation record. After a crash an operation record may
+// outlive its snapshot or grant (the next pass finishes it), but a grant claim
+// never outlives the record that consumed it.
+func (j *Journal) removeOperationBatch(batch []pruneCandidate, result *PruneResult) []error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var errs []error
+	removable := make([]OperationRecord, 0, len(batch))
+	for _, candidate := range batch {
+		current, err := j.loadOperationLocked(candidate.record.OperationID)
+		if err != nil || current.State != candidate.record.State || current.UpdatedAt != candidate.record.UpdatedAt ||
+			current.GrantID != candidate.record.GrantID || !validConfigID(current.GrantID) {
+			continue
+		}
+		if err := removeIfPresent(filepath.Join(j.snapshotsDir, current.OperationID+".json"), &result.Snapshots); err != nil {
+			errs = append(errs, fmt.Errorf("prune snapshot %s: %w", current.OperationID, err))
+			continue
+		}
+		// A grant claim that is missing, unreadable or bound to another operation
+		// is left alone; only the claim this operation consumed is removed.
+		if claim, err := j.loadGrantLocked(current.GrantID); err == nil && claim.OperationID == current.OperationID {
+			if err := removeIfPresent(filepath.Join(j.grantsDir, current.GrantID+".json"), &result.Grants); err != nil {
+				errs = append(errs, fmt.Errorf("prune grant %s: %w", current.GrantID, err))
+				continue
+			}
+		}
+		removable = append(removable, current)
+	}
+	if len(removable) == 0 {
+		return errs
+	}
+	for _, dir := range []string{j.snapshotsDir, j.grantsDir} {
+		if err := syncDirectory(dir); err != nil {
+			return append(errs, err)
+		}
+	}
+	for _, record := range removable {
+		if err := removeIfPresent(filepath.Join(j.operationsDir, record.OperationID+".json"), &result.Operations); err != nil {
+			errs = append(errs, fmt.Errorf("prune operation %s: %w", record.OperationID, err))
+		}
+	}
+	if err := syncDirectory(j.operationsDir); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
+}
+
+func removeIfPresent(path string, removed *int) error {
+	err := os.Remove(path)
+	if err == nil {
+		*removed++
+		return nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func sortCandidatesNewestFirst(candidates []pruneCandidate) {
+	sort.Slice(candidates, func(a, b int) bool {
+		if !candidates[a].updated.Equal(candidates[b].updated) {
+			return candidates[a].updated.After(candidates[b].updated)
+		}
+		return candidates[a].record.OperationID > candidates[b].record.OperationID
+	})
+}
+
+func prunableJournalState(state helperprotocol.JournalState) bool {
+	switch state {
+	case helperprotocol.JournalSucceeded, helperprotocol.JournalFailedBeforeMutation, helperprotocol.JournalRolledBack:
+		return true
+	default:
+		return false
+	}
 }
 
 func (j *Journal) BreakerOpen() bool {

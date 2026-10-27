@@ -5,8 +5,10 @@ package helper
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/user"
 	"strconv"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 )
@@ -37,6 +39,17 @@ func RunRootHelper(ctx context.Context, buildID string) error {
 	if err := journal.Recover(); err != nil {
 		return fmt.Errorf("recover helper journal: %w", err)
 	}
+	// The first pass after an upgrade can face tens of thousands of records, so
+	// it runs beside the server; it takes the journal lock only per batch.
+	go func() {
+		result, err := journal.Prune(time.Now().UTC())
+		if err != nil {
+			slog.Warn("helper journal retention failed at startup", "error", err)
+		}
+		if result.Operations > 0 {
+			slog.Info("helper journal retention pruned finished operations", "operations", result.Operations, "grants", result.Grants, "snapshots", result.Snapshots)
+		}
+	}()
 	proxyHost := systemProxyServiceHost{agentUID: config.AgentUID}
 	actions, err := compiledRootActions(config, journal, proxyHost)
 	if err != nil {

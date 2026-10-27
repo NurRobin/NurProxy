@@ -268,8 +268,19 @@ func (r *Reconciler) intentSetFor(agent *models.Agent, desired map[string]desire
 		certKeep = append(certKeep, host)
 	}
 	sort.Strings(certKeep)
+	// desired is a map, so both slices come out in random order. The managed
+	// apply revision is a digest of this set; without a stable order an unchanged
+	// desired state gets a new revision, and a new signed intent, on every tick.
+	sort.SliceStable(certs, func(i, j int) bool { return certs[i].Host < certs[j].Host })
+	intents := intentsFromDesired(desired, backendForAgent(agent))
+	sort.Slice(intents, func(i, j int) bool {
+		if intents[i].ArtifactID != intents[j].ArtifactID {
+			return intents[i].ArtifactID < intents[j].ArtifactID
+		}
+		return intents[i].Route.Host < intents[j].Route.Host
+	})
 	return proxymodel.IntentSet{
-		Intents: intentsFromDesired(desired, backendForAgent(agent)),
+		Intents: intents,
 		Certs:   certs, Keep: keepExtra,
 		PruneCerts: true, CertKeep: certKeep,
 	}
