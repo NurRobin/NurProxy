@@ -2,8 +2,11 @@ package models
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
@@ -96,6 +99,11 @@ type ProxyCapabilities struct {
 	IPFilter      bool `json:"ip_filter"`
 	RateLimit     bool `json:"rate_limit"`
 	CentralTLS    bool `json:"central_tls"`
+	// AccessLog reports that the backend can turn a domain's access log off.
+	AccessLog bool `json:"access_log"`
+	// ErrorLogLevel reports that the backend can set a per-domain error log
+	// level.
+	ErrorLogLevel bool `json:"error_log_level"`
 }
 
 // ProxyDetection is the agent's read-only Phase-0 detection result (§13.0, §2.1,
@@ -376,6 +384,51 @@ type ProxyConfig struct {
 	// or for orchestrator-down resilience; "off" disables TLS. Empty is treated as
 	// "central" by the renderer.
 	TLSPolicy string `json:"tls_policy,omitempty"`
+	// AccessLog is "off" to write no access log for this domain. Empty (or
+	// "default", normalized to empty on save) keeps the proxy's host-wide log.
+	AccessLog string `json:"access_log,omitempty"`
+	// ErrorLogLevel raises the domain's error log threshold to one of
+	// proxymodel.ErrorLogLevels (e.g. "crit"). Empty keeps the host default.
+	ErrorLogLevel string `json:"error_log_level,omitempty"`
+}
+
+// NormalizeLogging canonicalizes the logging settings ("default" becomes
+// empty) and rejects unknown values.
+func (pc *ProxyConfig) NormalizeLogging() error {
+	switch pc.AccessLog {
+	case "", "default":
+		pc.AccessLog = ""
+	case string(proxymodel.AccessLogOff):
+	default:
+		return fmt.Errorf("access_log must be \"default\" or \"off\", got %q", pc.AccessLog)
+	}
+	if pc.ErrorLogLevel == "default" {
+		pc.ErrorLogLevel = ""
+	}
+	if !proxymodel.ValidErrorLogLevel(pc.ErrorLogLevel) {
+		return fmt.Errorf("error_log_level must be empty or one of %s, got %q", strings.Join(proxymodel.ErrorLogLevels, ", "), pc.ErrorLogLevel)
+	}
+	return nil
+}
+
+// CheckLoggingSupported refuses logging settings the serving agent's backend
+// cannot render. A nil matrix (agent never reported one) is not checked.
+// Agents from before these capabilities existed report them as false, which
+// is correct: their renderers would silently ignore the settings.
+func (pc ProxyConfig) CheckLoggingSupported(caps *ProxyCapabilities, backend string) error {
+	if caps == nil {
+		return nil
+	}
+	if backend == "" {
+		backend = "the agent's proxy"
+	}
+	if pc.AccessLog != "" && !caps.AccessLog {
+		return fmt.Errorf("%s cannot turn off the access log for a domain", backend)
+	}
+	if pc.ErrorLogLevel != "" && !caps.ErrorLogLevel {
+		return fmt.Errorf("%s cannot set a per-domain error log level", backend)
+	}
+	return nil
 }
 
 // Domain represents a proxied subdomain.

@@ -589,6 +589,27 @@ func TestConfigFromDomain(t *testing.T) {
 	}
 }
 
+func TestConfigFromDomain_Logging(t *testing.T) {
+	tests := []struct {
+		name       string
+		pc         models.ProxyConfig
+		wantAccess proxymodel.AccessLogMode
+		wantLevel  string
+	}{
+		{"unset", models.ProxyConfig{}, proxymodel.AccessLogDefault, ""},
+		{"explicit default", models.ProxyConfig{AccessLog: "default", ErrorLogLevel: "default"}, proxymodel.AccessLogDefault, ""},
+		{"off and crit", models.ProxyConfig{AccessLog: "off", ErrorLogLevel: "crit"}, proxymodel.AccessLogOff, "crit"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			route := ConfigFromDomain(models.Domain{Port: 80, ProxyConfig: tt.pc}, "x.example.com", "10.0.0.9")
+			if route.AccessLog != tt.wantAccess || route.ErrorLogLevel != tt.wantLevel {
+				t.Fatalf("got access=%q level=%q, want %q %q", route.AccessLog, route.ErrorLogLevel, tt.wantAccess, tt.wantLevel)
+			}
+		})
+	}
+}
+
 func TestConfigFromDomain_RawConfig(t *testing.T) {
 	d := models.Domain{
 		Port: 80,

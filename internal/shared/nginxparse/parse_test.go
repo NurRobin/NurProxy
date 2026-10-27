@@ -70,6 +70,25 @@ func TestParse_roundTrip_render_then_parse_recoversRoute(t *testing.T) {
 			},
 		},
 		{
+			name: "logging_overrides_with_force_https",
+			route: proxymodel.Route{
+				Host:          "private.example.com",
+				Upstream:      proxymodel.Upstream{Addr: "10.0.0.9", Port: 3000},
+				ForceHTTPS:    true,
+				AccessLog:     proxymodel.AccessLogOff,
+				ErrorLogLevel: "crit",
+				TLS:           proxymodel.TLSConfig{Policy: proxymodel.TLSPolicyCentral},
+			},
+			want: proxymodel.Route{
+				Host:          "private.example.com",
+				Upstream:      proxymodel.Upstream{Addr: "10.0.0.9", Port: 3000, Scheme: proxymodel.SchemeHTTP},
+				ForceHTTPS:    true,
+				AccessLog:     proxymodel.AccessLogOff,
+				ErrorLogLevel: "crit",
+				TLS:           proxymodel.TLSConfig{Policy: proxymodel.TLSPolicyCentral},
+			},
+		},
+		{
 			name: "websocket",
 			route: proxymodel.Route{
 				Host:      "ws.example.com",

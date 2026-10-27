@@ -802,6 +802,10 @@ func declaredCapsFromNames(names []string) *proxy.Capabilities {
 			c.RateLimit = true
 		case "central_tls", "centraltls":
 			c.CentralTLS = true
+		case "access_log", "accesslog":
+			c.AccessLog = true
+		case "error_log_level", "errorloglevel":
+			c.ErrorLogLevel = true
 		}
 	}
 	return &c

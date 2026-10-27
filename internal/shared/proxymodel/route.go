@@ -127,6 +127,35 @@ func (r RawConfig) IsZero() bool {
 	return r.Backend == "" && r.Content == ""
 }
 
+// AccessLogMode selects how a route's access log is written.
+type AccessLogMode string
+
+const (
+	// AccessLogDefault inherits the proxy's host-wide access log.
+	AccessLogDefault AccessLogMode = ""
+	// AccessLogOff writes no access log for the route.
+	AccessLogOff AccessLogMode = "off"
+)
+
+// ErrorLogLevels are the accepted per-route error log levels, from most to
+// least verbose. nginx and Apache both understand every one of them; "debug" is
+// left out because nginx only honors it in debug builds.
+var ErrorLogLevels = []string{"info", "notice", "warn", "error", "crit", "alert", "emerg"}
+
+// ValidErrorLogLevel reports whether level is empty (host default) or one of
+// ErrorLogLevels.
+func ValidErrorLogLevel(level string) bool {
+	if level == "" {
+		return true
+	}
+	for _, l := range ErrorLogLevels {
+		if l == level {
+			return true
+		}
+	}
+	return false
+}
+
 // Route is the backend-neutral intent for proxying one host to one upstream.
 //
 // It is consumed by every backend renderer and is deliberately free of any
@@ -175,6 +204,15 @@ type Route struct {
 
 	// TLS selects the public-listener TLS policy for the route.
 	TLS TLSConfig
+
+	// AccessLog controls the per-host access log. The zero value keeps the
+	// proxy's host-wide default, so routes without the setting render exactly as
+	// before. The JSON tag drops the zero value, keeping the helper intent digest
+	// of existing routes unchanged.
+	AccessLog AccessLogMode `json:",omitempty"`
+	// ErrorLogLevel sets the minimum severity of the per-host error log (one of
+	// ErrorLogLevels). Empty keeps the proxy's host-wide default.
+	ErrorLogLevel string `json:",omitempty"`
 
 	// Raw is the per-backend escape hatch. When non-zero, renderers for the
 	// matching backend use Raw.Content verbatim and ignore the structured
@@ -287,6 +325,14 @@ func (r Route) ValidateOptions() error {
 				return fmt.Errorf("%s header %s %w", kind, name, err)
 			}
 		}
+	}
+	switch r.AccessLog {
+	case AccessLogDefault, AccessLogOff:
+	default:
+		return fmt.Errorf("access log mode %q must be empty (host default) or %q", r.AccessLog, AccessLogOff)
+	}
+	if !ValidErrorLogLevel(r.ErrorLogLevel) {
+		return fmt.Errorf("error log level %q must be empty (host default) or one of %s", r.ErrorLogLevel, strings.Join(ErrorLogLevels, ", "))
 	}
 	if r.MaxBodySize != "" && !bodySizeRe.MatchString(r.MaxBodySize) {
 		return fmt.Errorf("max body size %q is not a whole size like 10m, 1GB, 0 or unlimited", r.MaxBodySize)

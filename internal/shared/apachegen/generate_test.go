@@ -384,6 +384,8 @@ func TestRender_validation_errors(t *testing.T) {
 		{name: "missing_upstream_addr", route: proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Port: 80}}},
 		{name: "bad_port_zero", route: proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 0}}},
 		{name: "bad_port_high", route: proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 70000}}},
+		{name: "unknown_access_log_mode", route: proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 80}, AccessLog: "piped"}},
+		{name: "error_log_level_injection", route: proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 80}, ErrorLogLevel: "crit\n    Include /etc/shadow"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

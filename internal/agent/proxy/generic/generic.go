@@ -79,6 +79,12 @@ type RouteContext struct {
 	// ForceHTTPS / WebSocket mirror the route options for convenience.
 	ForceHTTPS bool
 	WebSocket  bool
+	// AccessLogOff is true when the route asks for no access log.
+	// ErrorLogLevel is the requested error log level, empty for the host
+	// default. A template honors them only if the operator declared the
+	// access_log / error_log_level capabilities.
+	AccessLogOff  bool
+	ErrorLogLevel string
 	// Route is the complete backend-neutral intent, for anything the flat fields
 	// above don't cover (headers, path rules, timeouts, IP rules, rate limit).
 	Route proxymodel.Route
@@ -218,16 +224,18 @@ func (b *Backend) Render(_ context.Context, route proxymodel.Route) (proxy.Artif
 		policy = proxymodel.TLSPolicyCentral
 	}
 	ctx := RouteContext{
-		Host:         route.Host,
-		TLS:          policy != proxymodel.TLSPolicyOff,
-		Policy:       string(policy),
-		Scheme:       string(route.EffectiveScheme()),
-		UpstreamHost: route.Upstream.Addr,
-		UpstreamPort: route.Upstream.Port,
-		UpstreamAddr: upstreamAddr(route.Upstream),
-		ForceHTTPS:   route.ForceHTTPS,
-		WebSocket:    route.WebSocket,
-		Route:        route,
+		Host:          route.Host,
+		TLS:           policy != proxymodel.TLSPolicyOff,
+		Policy:        string(policy),
+		Scheme:        string(route.EffectiveScheme()),
+		UpstreamHost:  route.Upstream.Addr,
+		UpstreamPort:  route.Upstream.Port,
+		UpstreamAddr:  upstreamAddr(route.Upstream),
+		ForceHTTPS:    route.ForceHTTPS,
+		WebSocket:     route.WebSocket,
+		AccessLogOff:  route.AccessLog == proxymodel.AccessLogOff,
+		ErrorLogLevel: route.ErrorLogLevel,
+		Route:         route,
 	}
 	// Resolve provided-cert paths for a central-TLS route; a missing store or
 	// cert leaves them empty and the template guards with {{ if .CertPath }}.

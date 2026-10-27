@@ -1,0 +1,45 @@
+----
+<VirtualHost *:80>
+    ServerName app.example.com
+    CustomLog /dev/null common
+    LogLevel crit
+    Redirect permanent / https://app.example.com/
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName app.example.com
+
+    SSLEngine on
+    SSLCertificateFile /var/lib/nurproxy-agent/certs/app.example.com.crt
+    SSLCertificateKeyFile /var/lib/nurproxy-agent/certs/app.example.com.key.plain
+
+    CustomLog /dev/null common
+    LogLevel crit
+
+    LimitRequestBody 50000000
+
+    <RequireAll>
+        Require ip 10.0.0.0/8
+        Require not ip 10.6.6.6/32
+    </RequireAll>
+
+    <Location />
+        AuthType Basic
+        AuthName "Restricted: app.example.com"
+        AuthUserFile /etc/apache2/nurproxy-auth/app.example.com.htpasswd
+        Require valid-user
+    </Location>
+
+    Header always set X-Frame-Options DENY
+
+    RequestHeader set X-Team edge
+
+    RequestHeader set X-Forwarded-Proto https
+    ProxyPreserveHost On
+
+    RewriteEngine On
+    RewriteCond %{HTTP:Upgrade} =websocket [NC]
+    RewriteRule ^/?(.*)$ ws://10.0.0.4:8080/$1 [P,L]
+    ProxyPass / http://10.0.0.4:8080/ connectiontimeout=30 timeout=60
+    ProxyPassReverse / http://10.0.0.4:8080/
+</VirtualHost>

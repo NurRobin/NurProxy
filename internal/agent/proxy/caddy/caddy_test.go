@@ -237,6 +237,49 @@ func TestBackend_Render_matchesCaddygen(t *testing.T) {
 	}
 }
 
+// TestBackend_Render_logging pins the built-in Caddy's logging behavior: the
+// route JSON never changes (Caddy logs no access lines without a logs block,
+// which NurProxy never configures), and a per-domain error level is dropped
+// with a warning because Caddy's error log is process-wide.
+func TestBackend_Render_logging(t *testing.T) {
+	b := New(agentcaddy.NewMockClient())
+	plain, err := b.Render(context.Background(), sampleRoute())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		mode     proxymodel.AccessLogMode
+		level    string
+		wantWarn bool
+	}{
+		{"default", proxymodel.AccessLogDefault, "", false},
+		{"access off", proxymodel.AccessLogOff, "", false},
+		{"error level", proxymodel.AccessLogDefault, "crit", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := sampleRoute()
+			r.AccessLog = tt.mode
+			r.ErrorLogLevel = tt.level
+			art, err := b.Render(context.Background(), r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if art.Content != plain.Content {
+				t.Fatalf("logging changed the caddy route:\n got: %s\nwant: %s", art.Content, plain.Content)
+			}
+			if got := len(art.Warnings) > 0; got != tt.wantWarn {
+				t.Fatalf("warnings = %v, want warning %v", art.Warnings, tt.wantWarn)
+			}
+		})
+	}
+	caps := b.Capabilities()
+	if !caps.AccessLog || caps.ErrorLogLevel {
+		t.Fatalf("caddy logging capabilities = access %v, level %v; want true, false", caps.AccessLog, caps.ErrorLogLevel)
+	}
+}
+
 func TestBackend_Render_targetCarriesRouteID(t *testing.T) {
 	b := New(agentcaddy.NewMockClient())
 	art, err := b.Render(context.Background(), sampleRoute())

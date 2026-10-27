@@ -107,3 +107,13 @@ func TestWatchSignals(t *testing.T) {
 		})
 	}
 }
+
+func TestDeclaredCapsFromNamesLogging(t *testing.T) {
+	caps := declaredCapsFromNames([]string{"access_log", "error_log_level"})
+	if !caps.AccessLog || !caps.ErrorLogLevel {
+		t.Fatalf("declared logging capabilities not mapped: %+v", caps)
+	}
+	if defaults := declaredCapsFromNames(nil); defaults.AccessLog || defaults.ErrorLogLevel {
+		t.Fatalf("logging must not be advertised by default: %+v", defaults)
+	}
+}

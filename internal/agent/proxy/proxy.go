@@ -196,6 +196,11 @@ type Capabilities struct {
 	// CentralTLS reports support for orchestrator-provisioned (DNS-01) certs
 	// installed via InstallCerts (§7).
 	CentralTLS bool `json:"central_tls"`
+	// AccessLog reports that the backend can turn a route's access log off.
+	AccessLog bool `json:"access_log"`
+	// ErrorLogLevel reports that the backend can set a per-route error log
+	// level.
+	ErrorLogLevel bool `json:"error_log_level"`
 }
 
 // ToModel converts the agent-side Capabilities into the shared wire/storage
@@ -213,6 +218,8 @@ func (c Capabilities) ToModel() *models.ProxyCapabilities {
 		IPFilter:      c.IPFilter,
 		RateLimit:     c.RateLimit,
 		CentralTLS:    c.CentralTLS,
+		AccessLog:     c.AccessLog,
+		ErrorLogLevel: c.ErrorLogLevel,
 	}
 }
 

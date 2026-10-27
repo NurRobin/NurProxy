@@ -143,6 +143,7 @@ func Render(in Input) (Result, error) {
 		if tlsEnabled {
 			fmt.Fprintf(&b, "<VirtualHost *:80>\n")
 			fmt.Fprintf(&b, "    ServerName %s\n", route.Host)
+			writeLogDirectives(&b, route)
 			fmt.Fprintf(&b, "    Redirect permanent / https://%s/\n", route.Host)
 			fmt.Fprintf(&b, "</VirtualHost>\n\n")
 		} else {
@@ -163,6 +164,11 @@ func Render(in Input) (Result, error) {
 		fmt.Fprintf(&b, "    SSLEngine on\n")
 		fmt.Fprintf(&b, "    SSLCertificateFile %s\n", in.CertPath)
 		fmt.Fprintf(&b, "    SSLCertificateKeyFile %s\n", in.KeyPath)
+	}
+
+	if route.AccessLog != proxymodel.AccessLogDefault || route.ErrorLogLevel != "" {
+		b.WriteString("\n")
+		writeLogDirectives(&b, route)
 	}
 
 	// Max body size (Apache uses bytes for LimitRequestBody; "0" = unlimited).
@@ -312,6 +318,24 @@ func writeAccessControl(b *strings.Builder, route proxymodel.Route, authFile str
 	}
 	b.WriteString("        </RequireAll>\n")
 	b.WriteString("    </Location>\n")
+}
+
+// accessLogSink is where a vhost with the access log turned off sends its
+// access log. Apache has no "CustomLog off", but a vhost with its own CustomLog
+// stops writing to the server-wide one, so pointing it at /dev/null drops the
+// lines without creating any file.
+const accessLogSink = "/dev/null"
+
+// writeLogDirectives emits the per-route logging overrides. It writes nothing
+// for a route on the host defaults, which keeps those configs byte-identical to
+// what earlier versions rendered.
+func writeLogDirectives(b *strings.Builder, route proxymodel.Route) {
+	if route.AccessLog == proxymodel.AccessLogOff {
+		fmt.Fprintf(b, "    CustomLog %s common\n", accessLogSink)
+	}
+	if route.ErrorLogLevel != "" {
+		fmt.Fprintf(b, "    LogLevel %s\n", route.ErrorLogLevel)
+	}
 }
 
 // resolveTLS decides whether the VirtualHost gets a TLS listener (:443 +

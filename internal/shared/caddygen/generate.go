@@ -78,6 +78,15 @@ func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Rou
 		RateLimit:   proxymodel.RateLimit{RequestsPerSecond: d.ProxyConfig.RateLimit},
 		TLS:         proxymodel.TLSConfig{Policy: tlsPolicyFromDomain(d)},
 	}
+	// Stored values are normalized on save; "default" is mapped here too so a
+	// row written by hand still renders the host default. Anything else is
+	// passed through so Route.ValidateOptions refuses it.
+	if d.ProxyConfig.AccessLog != "default" {
+		route.AccessLog = proxymodel.AccessLogMode(d.ProxyConfig.AccessLog)
+	}
+	if d.ProxyConfig.ErrorLogLevel != "default" {
+		route.ErrorLogLevel = d.ProxyConfig.ErrorLogLevel
+	}
 	if d.ProxyConfig.BasicAuth != nil {
 		route.BasicAuth = &proxymodel.BasicAuth{
 			Username:     d.ProxyConfig.BasicAuth.Username,

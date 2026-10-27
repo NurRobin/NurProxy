@@ -22,6 +22,12 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
+// DefaultErrorLogPath is the error log a per-route error_log directive writes
+// to. It is the error log path nginx is built with on Debian, Ubuntu, RHEL,
+// Alpine and Arch, so the directive only changes the level and never makes
+// nginx create a log file outside the host's existing log directory.
+const DefaultErrorLogPath = "/var/log/nginx/error.log"
+
 // backendNginx is the backend tag the nginx renderer recognizes on a raw
 // escape-hatch payload (proxymodel.RawConfig.Backend).
 const backendNginx = "nginx"
@@ -192,6 +198,7 @@ func Render(in Input) (Result, error) {
 			fmt.Fprintf(&b, "    listen 80;\n")
 			fmt.Fprintf(&b, "    listen [::]:80;\n")
 			fmt.Fprintf(&b, "    server_name %s;\n", route.Host)
+			writeLogDirectives(&b, route)
 			fmt.Fprintf(&b, "    return 301 https://$host$request_uri;\n")
 			fmt.Fprintf(&b, "}\n\n")
 		} else {
@@ -222,6 +229,11 @@ func Render(in Input) (Result, error) {
 		fmt.Fprintf(&b, "\n")
 		fmt.Fprintf(&b, "    ssl_certificate %s;\n", in.CertPath)
 		fmt.Fprintf(&b, "    ssl_certificate_key %s;\n", in.KeyPath)
+	}
+
+	if route.AccessLog != proxymodel.AccessLogDefault || route.ErrorLogLevel != "" {
+		b.WriteString("\n")
+		writeLogDirectives(&b, route)
 	}
 
 	// Max body size.
@@ -326,6 +338,18 @@ func Render(in Input) (Result, error) {
 		Server:       b.String(),
 		Warnings:     warnings,
 	}, nil
+}
+
+// writeLogDirectives emits the per-route logging overrides. It writes nothing
+// for a route on the host defaults, which keeps those configs byte-identical to
+// what earlier versions rendered.
+func writeLogDirectives(b *strings.Builder, route proxymodel.Route) {
+	if route.AccessLog == proxymodel.AccessLogOff {
+		b.WriteString("    access_log off;\n")
+	}
+	if route.ErrorLogLevel != "" {
+		fmt.Fprintf(b, "    error_log %s %s;\n", DefaultErrorLogPath, route.ErrorLogLevel)
+	}
 }
 
 // resolveTLS decides whether the main server gets a TLS listener and returns any

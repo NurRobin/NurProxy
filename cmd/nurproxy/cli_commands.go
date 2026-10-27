@@ -380,6 +380,13 @@ func cmdServer(args []string) {
 
 // --- domain --------------------------------------------------------------
 
+// addLoggingFlags registers the per-domain logging flags shared by
+// `domain add` and `domain update`. The orchestrator validates the values.
+func addLoggingFlags(fs *flag.FlagSet, accessLog, errorLogLevel *string) {
+	fs.StringVar(accessLog, "access-log", "", `Access log for this domain: "off" or "default" (host-wide log)`)
+	fs.StringVar(errorLogLevel, "error-log-level", "", `Minimum error log level for this domain (info, notice, warn, error, crit, alert, emerg) or "default"`)
+}
+
 func cmdDomain(args []string) {
 	action, rest := shift(args)
 	switch action {
@@ -416,10 +423,11 @@ func cmdDomain(args []string) {
 		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "PROXIED", "STATUS"}, rows)
 
 	case "add":
-		var subdomain, zone, server, sslMode, proxyFile, proxied string
+		var subdomain, zone, server, sslMode, proxyFile, proxied, accessLog, errorLogLevel string
 		var port int
 		var ws, forceHTTPS bool
 		c, _, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
+			addLoggingFlags(fs, &accessLog, &errorLogLevel)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -441,6 +449,8 @@ func cmdDomain(args []string) {
 		if proxied != "" {
 			body["proxied"] = parseProxiedFlag(proxied)
 		}
+		putStr(body, "access_log", accessLog)
+		putStr(body, "error_log_level", errorLogLevel)
 		if proxyFile != "" {
 			body["proxy_config"] = json.RawMessage(readFileArg(proxyFile))
 		}
@@ -451,10 +461,11 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain created: "+gjson(raw, "id"))
 
 	case "update":
-		var subdomain, zone, server, sslMode, proxied string
+		var subdomain, zone, server, sslMode, proxied, accessLog, errorLogLevel string
 		var port int
 		var ws, forceHTTPS bool
 		c, fs, id := parseClient("domain update", rest, "domain id", func(fs *flag.FlagSet) {
+			addLoggingFlags(fs, &accessLog, &errorLogLevel)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -482,6 +493,10 @@ func cmdDomain(args []string) {
 				body["force_https"] = forceHTTPS
 			case "proxied":
 				body["proxied"] = parseProxiedFlag(proxied)
+			case "access-log":
+				body["access_log"] = accessLog
+			case "error-log-level":
+				body["error_log_level"] = errorLogLevel
 			}
 		})
 		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id, body)

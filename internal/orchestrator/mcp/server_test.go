@@ -244,6 +244,24 @@ func TestCreateListUpdateDeleteDomain(t *testing.T) {
 		t.Errorf("update_domain port = %d, want 9090", updated.Port)
 	}
 
+	// update_domain: per-domain logging, checked against the agent's reported
+	// capability matrix.
+	callTool(t, h, "update_domain", map[string]any{"id": created.ID, "access_log": "off", "error_log_level": "crit"}, &updated)
+	if updated.ProxyConfig.AccessLog != "off" || updated.ProxyConfig.ErrorLogLevel != "crit" {
+		t.Errorf("update_domain logging = %+v, want off/crit", updated.ProxyConfig)
+	}
+	if isErr := callTool(t, h, "update_domain", map[string]any{"id": created.ID, "error_log_level": "verbose"}, nil); !isErr {
+		t.Error("unknown error_log_level should report isError")
+	}
+	if err := d.UpdateAgentCapabilities(agentID, &models.ProxyCapabilities{ReverseProxy: true, AccessLog: true}); err != nil {
+		t.Fatal(err)
+	}
+	if isErr := callTool(t, h, "create_domain", map[string]any{
+		"subdomain": "quiet", "zone_id": zoneID, "server_id": serverID, "port": 8080, "error_log_level": "crit",
+	}, nil); !isErr {
+		t.Error("error_log_level on a backend without the capability should report isError")
+	}
+
 	// delete_domain
 	var del map[string]any
 	if isErr := callTool(t, h, "delete_domain", map[string]any{"id": created.ID}, &del); isErr {

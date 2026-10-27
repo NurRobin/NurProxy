@@ -66,6 +66,7 @@ Each route is rendered with:
 | `.Policy` | `central` / `self-acme` / `off` |
 | `.CertPath`, `.KeyPath` | on-disk cert + key for a central-TLS route (empty until installed — guard with `{{ if .CertPath }}`) |
 | `.ForceHTTPS`, `.WebSocket` | route options |
+| `.AccessLogOff`, `.ErrorLogLevel` | per-domain logging: no access log / error log level (`crit`, …; empty = host default). Declare `access_log` / `error_log_level` in `proxy_caps` if your template honors them |
 | `.Route` | the full backend-neutral intent (headers, path rules, timeouts, IP rules, rate limit) |
 
 ## What NurProxy manages vs. what you own

@@ -259,6 +259,40 @@ func TestSandboxEndToEnd(t *testing.T) {
 		return agentCertPath != ""
 	})
 	t.Logf("imported certificate installed on the agent at %s", agentCertPath)
+	// Per-domain logging (#150): the nginx agent advertises both logging
+	// capabilities, and turning them on for one domain re-renders only that
+	// domain's vhost with the directives.
+	waitFor(t, 30*time.Second, func() bool {
+		var agents []struct {
+			ID   string `json:"id"`
+			Caps struct {
+				AccessLog     bool `json:"access_log"`
+				ErrorLogLevel bool `json:"error_log_level"`
+			} `json:"proxy_capabilities"`
+		}
+		api.get("/api/v1/agents", &agents)
+		for _, a := range agents {
+			if a.ID == agentID {
+				return a.Caps.AccessLog && a.Caps.ErrorLogLevel
+			}
+		}
+		return false
+	})
+	apexVhostPath := filepath.Join(proxyConfigDir, "nurproxy-sandbox.test.conf")
+	apexVhostBefore, err := os.ReadFile(apexVhostPath)
+	if err != nil {
+		t.Fatalf("read apex vhost: %v", err)
+	}
+	api.put(fmt.Sprintf("/api/v1/domains/%d", domain.ID), map[string]any{"access_log": "off", "error_log_level": "crit"}, nil)
+	appPath := filepath.Join(proxyConfigDir, "nurproxy-app.sandbox.test.conf")
+	waitFor(t, 75*time.Second, func() bool {
+		content, err := os.ReadFile(appPath)
+		return err == nil && bytes.Contains(content, []byte("    access_log off;\n")) &&
+			bytes.Contains(content, []byte("    error_log /var/log/nginx/error.log crit;\n"))
+	})
+	if got, err := os.ReadFile(apexVhostPath); err != nil || !bytes.Equal(got, apexVhostBefore) {
+		t.Fatalf("logging change on one domain rewrote another domain's vhost: err=%v", err)
+	}
 
 	stalePath := filepath.Join(proxyConfigDir, "nurproxy-stale.sandbox.test.conf.nurproxy-tmp")
 	if err := os.WriteFile(stalePath, []byte(agentproxy.ManagedArtifactMarker+"\n# stale sandbox temp\n"), 0o644); err != nil {

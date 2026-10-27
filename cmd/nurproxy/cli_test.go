@@ -257,3 +257,41 @@ func TestParseArgsVisitSeesTrailingFlag(t *testing.T) {
 		t.Fatal("force-https after the ID was not visited")
 	}
 }
+
+// TestDomainLoggingFlags checks that the logging flags reach the API as the
+// top-level access_log / error_log_level fields, and that `domain update`
+// sends them only when given, so an unrelated update never resets them.
+func TestDomainLoggingFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want map[string]any // expected logging fields; absent keys must not be sent
+	}{
+		{"update both", []string{"update", "7", "--access-log", "off", "--error-log-level", "crit"}, map[string]any{"access_log": "off", "error_log_level": "crit"}},
+		{"update back to default", []string{"update", "7", "--access-log=default"}, map[string]any{"access_log": "default"}},
+		{"update unrelated", []string{"update", "7", "--port", "9000"}, map[string]any{}},
+		{"add with logging", []string{"add", "--subdomain", "p", "--zone", "z", "--server", "s", "--port", "80", "--access-log", "off"}, map[string]any{"access_log": "off"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, reqs := newTestServer(t, func(w http.ResponseWriter, r *http.Request, rec *capturedReq) {
+				_, _ = io.WriteString(w, `{"id":7}`)
+			})
+			cmdDomain(append(tt.args, "--url", srv.URL, "--key", "k"))
+			if len(*reqs) != 1 {
+				t.Fatalf("requests = %d, want 1", len(*reqs))
+			}
+			var body map[string]any
+			if err := json.Unmarshal([]byte((*reqs)[0].body), &body); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"access_log", "error_log_level"} {
+				want, expected := tt.want[key]
+				got, sent := body[key]
+				if sent != expected || got != want {
+					t.Errorf("%s = %v (sent %v), want %v (sent %v)", key, got, sent, want, expected)
+				}
+			}
+		})
+	}
+}
