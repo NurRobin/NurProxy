@@ -259,21 +259,23 @@ func TestSandboxEndToEnd(t *testing.T) {
 		return agentCertPath != ""
 	})
 	t.Logf("imported certificate installed on the agent at %s", agentCertPath)
-	// Per-domain logging (#150): the nginx agent advertises both logging
-	// capabilities, and turning them on for one domain re-renders only that
-	// domain's vhost with the directives.
+
+	// Per-domain logging (#150): the nginx agent advertises access log control,
+	// and turning the access log off for one domain re-renders only that
+	// domain's vhost. The error log level is not exercised: the agent offers it
+	// only when the host's nginx error log is /var/log/nginx/error.log, which
+	// depends on the machine, not on the hermetic fixture.
 	waitFor(t, 30*time.Second, func() bool {
 		var agents []struct {
 			ID   string `json:"id"`
 			Caps struct {
-				AccessLog     bool `json:"access_log"`
-				ErrorLogLevel bool `json:"error_log_level"`
+				AccessLog bool `json:"access_log"`
 			} `json:"proxy_capabilities"`
 		}
 		api.get("/api/v1/agents", &agents)
 		for _, a := range agents {
 			if a.ID == agentID {
-				return a.Caps.AccessLog && a.Caps.ErrorLogLevel
+				return a.Caps.AccessLog
 			}
 		}
 		return false
@@ -283,12 +285,11 @@ func TestSandboxEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read apex vhost: %v", err)
 	}
-	api.put(fmt.Sprintf("/api/v1/domains/%d", domain.ID), map[string]any{"access_log": "off", "error_log_level": "crit"}, nil)
+	api.put(fmt.Sprintf("/api/v1/domains/%d", domain.ID), map[string]any{"access_log": "off"}, nil)
 	appPath := filepath.Join(proxyConfigDir, "nurproxy-app.sandbox.test.conf")
 	waitFor(t, 75*time.Second, func() bool {
 		content, err := os.ReadFile(appPath)
-		return err == nil && bytes.Contains(content, []byte("    access_log off;\n")) &&
-			bytes.Contains(content, []byte("    error_log /var/log/nginx/error.log crit;\n"))
+		return err == nil && bytes.Contains(content, []byte("    access_log off;\n"))
 	})
 	if got, err := os.ReadFile(apexVhostPath); err != nil || !bytes.Equal(got, apexVhostBefore) {
 		t.Fatalf("logging change on one domain rewrote another domain's vhost: err=%v", err)

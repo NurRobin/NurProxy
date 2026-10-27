@@ -68,7 +68,7 @@ func (d *DB) CheckDomainLogging(dom *models.Domain) error {
 	}
 	srv, err := d.GetServer(dom.ServerID)
 	if err != nil {
-		return err
+		return fmt.Errorf("logging settings need the domain's server %q, which was not found", dom.ServerID)
 	}
 	agent, err := d.GetAgent(srv.AgentID)
 	if err != nil {

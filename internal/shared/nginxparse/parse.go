@@ -204,8 +204,7 @@ func parseProxiedServer(s block, res *Result) bool {
 			clean = false
 		case "access_log", "error_log":
 			// Only the exact forms nginxgen emits map onto the Route; any other
-			// path or format stays raw, so the policy check never admits a log
-			// file outside the host's default error log.
+			// path or format stays raw and marks the mask unclean.
 			if !parseLogDirective(d.name, d.args, r) {
 				res.Unparsed = append(res.Unparsed, d.raw)
 				res.Notes = append(res.Notes, fmt.Sprintf("unrecognized %s form", d.name))

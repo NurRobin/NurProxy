@@ -119,9 +119,14 @@ nurproxy domain delete <domain-id>          # marks for deletion; reconciler cle
 its visitors don't end up in the host-wide log. `--error-log-level` (`info`,
 `notice`, `warn`, `error`, `crit`, `alert`, `emerg`) raises the domain's error
 log threshold; `crit` keeps routine upstream errors with client IPs out of the
-log. `default` puts either setting back to the host default. nginx and Apache
-support both; the built-in Caddy writes no access log anyway and has no
-per-domain error level, so the orchestrator refuses `--error-log-level` there.
+log. `default` puts either setting back to the host default. Apache supports
+both. nginx supports `--access-log` everywhere, but `--error-log-level` only
+when the host's nginx error log is `/var/log/nginx/error.log` (the stock path
+of distribution packages): the agent checks `nginx -V` and the error_log lines
+of the main nginx.conf, and otherwise doesn't offer it, so source builds and
+OpenResty keep their own log. The built-in Caddy writes no access log anyway
+and has no per-domain error level. The orchestrator refuses a setting the
+domain's agent doesn't offer.
 
 For advanced per-domain proxy options (custom headers, timeouts, basic auth, IP
 allow/block lists, path rewriting), pass a `ProxyConfig` JSON document via
