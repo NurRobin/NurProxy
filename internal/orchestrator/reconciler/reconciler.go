@@ -1041,15 +1041,20 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 			continue
 		}
 
-		// Record exists and was retrieved — check content.
-		if rec.Content != expectedTarget {
-			log.Printf("reconciler: DNS drift for %s: have %s, want %s", fqdn, rec.Content, expectedTarget)
+		// Record exists and was retrieved — check content and proxy state. The
+		// proxy bit only counts as drift when the operator set it explicitly;
+		// otherwise whatever the record has is kept (#126).
+		wantProxied := desiredProxied(dom, rec.Proxied)
+		contentDrift := rec.Content != expectedTarget
+		proxiedDrift := rec.Proxied != wantProxied
+		if contentDrift || proxiedDrift {
+			log.Printf("reconciler: DNS drift for %s: have %s (proxied=%t), want %s (proxied=%t)", fqdn, rec.Content, rec.Proxied, expectedTarget, wantProxied)
 			if uErr := dnsProvider.UpdateRecord(ctx, provConfig, dom.DNSRecordID, provider.Record{
 				Type:    "CNAME",
 				Name:    fqdn,
 				Content: expectedTarget,
 				TTL:     0,
-				Proxied: rec.Proxied,
+				Proxied: wantProxied,
 			}); uErr != nil {
 				log.Printf("reconciler: failed to update DNS record for %s: %v", fqdn, uErr)
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", uErr)); dErr != nil {
@@ -1058,7 +1063,12 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", uErr.Error())
 				continue
 			}
-			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_updated", fmt.Sprintf("updated CNAME %s: %s -> %s", fqdn, rec.Content, expectedTarget))
+			if contentDrift {
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_updated", fmt.Sprintf("updated CNAME %s: %s -> %s", fqdn, rec.Content, expectedTarget))
+			}
+			if proxiedDrift {
+				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_proxied_updated", proxiedChangeDetail(fqdn, rec.Proxied, wantProxied))
+			}
 		}
 	}
 
@@ -1091,11 +1101,19 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, false); dErr != nil {
 			log.Printf("reconciler: failed to store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
 		}
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s (%s)", fqdn, target, proxiedWord(adopt.Proxied)))
+		// The adopted record keeps its proxy state unless the operator set one.
+		if pErr := r.enforceProxied(ctx, dom, fqdn, adopt, dnsProvider, provConfig); pErr != nil {
+			log.Printf("reconciler: failed to set proxy state on adopted record for %s: %v", fqdn, pErr)
+			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", pErr)); dErr != nil {
+				log.Printf("reconciler: failed to update domain status: %v", dErr)
+			}
+			return
+		}
 		// Clear any stale DNS error; the proxy apply sets the real status next.
 		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
 			log.Printf("reconciler: failed to clear domain status: %v", dErr)
 		}
-		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s", fqdn, target))
 		return
 	}
 
@@ -1111,8 +1129,10 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		return
 	}
 
-	// Nothing exists — create it.
-	recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0})
+	// Nothing exists — create it. With no operator setting a new record starts
+	// DNS-only, as before #126.
+	proxied := desiredProxied(dom, false)
+	recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: proxied})
 	if cErr != nil {
 		log.Printf("reconciler: failed to create DNS record for %s: %v", fqdn, cErr)
 		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS create failed: %v", cErr)); dErr != nil {
@@ -1125,7 +1145,50 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 	if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
 		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, dErr)
 	}
-	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s", fqdn, target))
+	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s (%s)", fqdn, target, proxiedWord(proxied)))
+}
+
+// desiredProxied is the Cloudflare proxy bit a domain's record should carry:
+// the operator's explicit setting, or the record's current state when the
+// setting is unset, so an adopted or taken-over record is never flipped
+// without being asked (#126).
+func desiredProxied(dom *models.Domain, current bool) bool {
+	if dom.Proxied != nil {
+		return *dom.Proxied
+	}
+	return current
+}
+
+// enforceProxied sets rec's proxy bit to the domain's explicit setting when
+// they differ, keeping everything else about the record. An unset setting
+// never touches the record. The change is audited.
+func (r *Reconciler) enforceProxied(ctx context.Context, dom *models.Domain, fqdn string, rec *provider.Record, p provider.Provider, cfg json.RawMessage) error {
+	want := desiredProxied(dom, rec.Proxied)
+	if rec.Proxied == want {
+		return nil
+	}
+	upd := *rec
+	upd.Proxied = want
+	if err := p.UpdateRecord(ctx, cfg, rec.ID, upd); err != nil {
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", err.Error())
+		return err
+	}
+	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_proxied_updated", proxiedChangeDetail(fqdn, rec.Proxied, want))
+	rec.Proxied = want
+	return nil
+}
+
+// proxiedWord names a record's proxy state for audit text.
+func proxiedWord(proxied bool) string {
+	if proxied {
+		return "proxied"
+	}
+	return "DNS only"
+}
+
+// proxiedChangeDetail is the audit text for a proxy-state change.
+func proxiedChangeDetail(fqdn string, from, to bool) string {
+	return fmt.Sprintf("set %s from %s to %s (operator setting)", fqdn, proxiedWord(from), proxiedWord(to))
 }
 
 // TakeoverDomainDNS forcibly aligns a domain's public DNS record with NurProxy's
@@ -1183,9 +1246,15 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
 		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, true); dErr != nil {
 			return fmt.Errorf("storing adopted record id: %w", dErr)
 		}
-		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s", fqdn, target))
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s (%s)", fqdn, target, proxiedWord(adopt.Proxied)))
+		if pErr := r.enforceProxied(ctx, dom, fqdn, adopt, dnsProvider, provConfig); pErr != nil {
+			return fmt.Errorf("setting proxy state on %s: %w", fqdn, pErr)
+		}
 	} else {
 		// Delete every conflicting record at this name, then create the CNAME.
+		// The new CNAME inherits the proxy state of what it replaces (any proxied
+		// record at the name means the name was behind Cloudflare), unless the
+		// operator set one explicitly.
 		wasProxied := false
 		for i := range existing {
 			wasProxied = wasProxied || existing[i].Proxied
@@ -1193,14 +1262,15 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
 				return fmt.Errorf("deleting conflicting record %s (%s): %w", existing[i].ID, existing[i].Type, dErr)
 			}
 		}
-		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: wasProxied})
+		proxied := desiredProxied(dom, wasProxied)
+		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: proxied})
 		if cErr != nil {
 			return fmt.Errorf("creating CNAME for %s: %w", fqdn, cErr)
 		}
 		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
 			return fmt.Errorf("storing created record id: %w", dErr)
 		}
-		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took over DNS for %s: replaced %s with CNAME -> %s", fqdn, describeRecords(existing), target))
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took over DNS for %s: replaced %s with CNAME -> %s (%s)", fqdn, describeRecords(existing), target, proxiedWord(proxied)))
 	}
 
 	// Clear the conflict error; the proxy apply sets the real status next.
@@ -1272,7 +1342,11 @@ func normalizeDNSName(s string) string {
 func describeRecords(records []provider.Record) string {
 	parts := make([]string, 0, len(records))
 	for _, rec := range records {
-		parts = append(parts, fmt.Sprintf("%s → %s", rec.Type, rec.Content))
+		part := fmt.Sprintf("%s → %s", rec.Type, rec.Content)
+		if rec.Proxied {
+			part += " (proxied)"
+		}
+		parts = append(parts, part)
 	}
 	return strings.Join(parts, ", ")
 }

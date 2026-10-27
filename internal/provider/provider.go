@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 )
 
 // ErrRecordNotFound signals that a record a caller tried to read or delete does
@@ -38,6 +39,30 @@ type ProviderInfo struct {
 	Description string   `json:"description"`
 	Website     string   `json:"website"`
 	RecordTypes []string `json:"record_types"`
+	// SupportsProxied reports whether Record.Proxied means anything for this
+	// provider (Cloudflare's orange cloud). Providers without it must never be
+	// asked to create a proxied record.
+	SupportsProxied bool `json:"supports_proxied"`
+}
+
+// SupportsProxied reports whether the registered provider with the given ID
+// can proxy records. Unknown providers report false.
+func SupportsProxied(id string) bool {
+	p, err := Get(id)
+	if err != nil {
+		return false
+	}
+	return p.Info().SupportsProxied
+}
+
+// ProxiableType reports whether a record of this type can carry the proxied
+// bit. Cloudflare only proxies address and alias records.
+func ProxiableType(recordType string) bool {
+	switch strings.ToUpper(recordType) {
+	case "A", "AAAA", "CNAME":
+		return true
+	}
+	return false
 }
 
 // SupportsTXT reports whether the provider can create TXT records, which is the

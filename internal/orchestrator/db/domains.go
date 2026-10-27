@@ -45,14 +45,14 @@ func (d *DB) CreateDomain(dom *models.Domain) error {
 		INSERT INTO domains (subdomain, zone_id, server_id, port, proxy_config,
 			manual_config, websocket, force_https, ssl_mode, dns_record_id,
 			status, error_msg, last_synced, created_at, updated_at, dns_managed,
-			cert_only)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			cert_only, proxied)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID,
 		string(dom.Status), dom.ErrorMsg, lastSynced,
 		now.Format(time.RFC3339), now.Format(time.RFC3339), boolToInt(dom.DNSManaged),
-		boolToInt(dom.CertOnly),
+		boolToInt(dom.CertOnly), nullableBool(dom.Proxied),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting domain: %w", err)
@@ -73,6 +73,7 @@ func scanDomain(sc interface {
 	var dom models.Domain
 	var pcJSON string
 	var manualConfig, websocket, forceHTTPS, dnsManaged, certOnly int
+	var proxied sql.NullInt64
 	var lastSynced sql.NullString
 	var createdAt, updatedAt string
 
@@ -80,7 +81,7 @@ func scanDomain(sc interface {
 		&dom.ID, &dom.Subdomain, &dom.ZoneID, &dom.ServerID, &dom.Port,
 		&pcJSON, &manualConfig, &websocket, &forceHTTPS,
 		&dom.SSLMode, &dom.DNSRecordID, &dom.Status, &dom.ErrorMsg,
-		&lastSynced, &createdAt, &updatedAt, &dnsManaged, &certOnly,
+		&lastSynced, &createdAt, &updatedAt, &dnsManaged, &certOnly, &proxied,
 	)
 	if err != nil {
 		return nil, err
@@ -91,6 +92,10 @@ func scanDomain(sc interface {
 	dom.ForceHTTPS = forceHTTPS != 0
 	dom.DNSManaged = dnsManaged != 0
 	dom.CertOnly = certOnly != 0
+	if proxied.Valid {
+		p := proxied.Int64 != 0
+		dom.Proxied = &p
+	}
 	dom.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	dom.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	if lastSynced.Valid {
@@ -107,7 +112,7 @@ func scanDomain(sc interface {
 
 const domainColumns = `id, subdomain, zone_id, server_id, port, proxy_config,
 	manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
-	error_msg, last_synced, created_at, updated_at, dns_managed, cert_only`
+	error_msg, last_synced, created_at, updated_at, dns_managed, cert_only, proxied`
 
 // GetDomain retrieves a domain by its auto-incremented ID.
 func (d *DB) GetDomain(id int64) (*models.Domain, error) {
@@ -204,12 +209,13 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 		SET subdomain = ?, zone_id = ?, server_id = ?, port = ?, proxy_config = ?,
 			manual_config = ?, websocket = ?, force_https = ?, ssl_mode = ?,
 			dns_record_id = ?, status = ?, error_msg = ?, last_synced = ?, updated_at = ?,
-			dns_managed = ?
+			dns_managed = ?, proxied = ?
 		WHERE id = ?`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID, string(dom.Status), dom.ErrorMsg,
-		lastSynced, dom.UpdatedAt.Format(time.RFC3339), boolToInt(dom.DNSManaged), dom.ID,
+		lastSynced, dom.UpdatedAt.Format(time.RFC3339), boolToInt(dom.DNSManaged),
+		nullableBool(dom.Proxied), dom.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("updating domain: %w", err)
@@ -220,6 +226,17 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 		return fmt.Errorf("domain not found: %d", dom.ID)
 	}
 	return nil
+}
+
+// nullableBool maps a tri-state bool to SQL: nil -> NULL, else 0/1.
+func nullableBool(b *bool) any {
+	if b == nil {
+		return nil
+	}
+	if *b {
+		return 1
+	}
+	return 0
 }
 
 // DeleteDomain removes a domain by ID.
@@ -343,7 +360,7 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 	// Qualify all column references with d. to avoid ambiguity with the servers join.
 	qualifiedColumns := `d.id, d.subdomain, d.zone_id, d.server_id, d.port, d.proxy_config,
 		d.manual_config, d.websocket, d.force_https, d.ssl_mode, d.dns_record_id, d.status,
-		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed, d.cert_only`
+		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed, d.cert_only, d.proxied`
 
 	rows, err := d.read.Query(`
 		SELECT `+qualifiedColumns+`

@@ -329,7 +329,7 @@ the same calls regardless of dry/real; only the orchestrator behind it differs.
   REST: `GET /api/v1/domains` with query params `agent_id` / `server_id` / `status`
   (only non-empty ones added, `cli_commands.go:341-348`).
 - **Steps:** `./nurproxy domain list` ; `./nurproxy domain list --status active` ; `-json`
-- **Pass:** table `ID  SUBDOMAIN  SERVER  PORT  STATUS` (`cli_commands.go:364`); ID
+- **Pass:** table `ID  SUBDOMAIN  SERVER  PORT  PROXIED  STATUS` (`cli_commands.go:364`); ID
   is the numeric domain ID; STATUS is `pending`/`active`/`deleting`-etc.
   (`models.go:22-23`). `-json` → `[]models.Domain`.
 - **Coverage:** D

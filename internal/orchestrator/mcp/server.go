@@ -216,13 +216,13 @@ var tools = func() map[string]tool {
 		{
 			name:        "create_domain",
 			description: "Create a proxied domain (subdomain in a zone, pointing at a server+port).",
-			inputSchema: `{"type":"object","properties":{"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]}},"required":["subdomain","zone_id","server_id","port"],"additionalProperties":false}`,
+			inputSchema: `{"type":"object","properties":{"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit or null to keep whatever the existing record has; true/false is enforced. true only for Cloudflare zones."}},"required":["subdomain","zone_id","server_id","port"],"additionalProperties":false}`,
 			run:         toolCreateDomain,
 		},
 		{
 			name:        "update_domain",
 			description: "Update fields of an existing domain by id. Re-queues it for reconciliation.",
-			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]}},"required":["id"],"additionalProperties":false}`,
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit to leave unchanged, null to go back to keeping the existing record state; true/false is enforced. true only for Cloudflare zones."}},"required":["id"],"additionalProperties":false}`,
 			run:         toolUpdateDomain,
 		},
 		{
@@ -356,6 +356,7 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		WebSocket  bool   `json:"websocket"`
 		ForceHTTPS bool   `json:"force_https"`
 		SSLMode    string `json:"ssl_mode"`
+		Proxied    *bool  `json:"proxied"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -375,6 +376,9 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if _, err := d.GetServer(in.ServerID); err != nil {
 		return nil, fmt.Errorf("server not found")
 	}
+	if err := d.ValidateDomainProxied(in.ZoneID, false, in.Proxied); err != nil {
+		return nil, err
+	}
 	existing, _ := d.ListDomains(db.DomainFilter{})
 	for i := range existing {
 		if existing[i].Subdomain == in.Subdomain && existing[i].ZoneID == in.ZoneID {
@@ -393,6 +397,7 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		WebSocket:  in.WebSocket,
 		ForceHTTPS: in.ForceHTTPS,
 		SSLMode:    sslMode,
+		Proxied:    in.Proxied,
 		Status:     models.DomainStatusPending,
 	}
 	if err := d.CreateDomain(dom); err != nil {
@@ -408,12 +413,13 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 
 func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	var in struct {
-		ID         int64   `json:"id"`
-		ServerID   *string `json:"server_id"`
-		Port       *int    `json:"port"`
-		WebSocket  *bool   `json:"websocket"`
-		ForceHTTPS *bool   `json:"force_https"`
-		SSLMode    *string `json:"ssl_mode"`
+		ID         int64               `json:"id"`
+		ServerID   *string             `json:"server_id"`
+		Port       *int                `json:"port"`
+		WebSocket  *bool               `json:"websocket"`
+		ForceHTTPS *bool               `json:"force_https"`
+		SSLMode    *string             `json:"ssl_mode"`
+		Proxied    models.OptionalBool `json:"proxied"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -447,6 +453,12 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if in.SSLMode != nil {
 		dom.SSLMode = models.SSLMode(*in.SSLMode)
 	}
+	if in.Proxied.Set {
+		dom.Proxied = in.Proxied.Value
+	}
+	if err := d.ValidateDomainProxied(dom.ZoneID, dom.CertOnly, dom.Proxied); err != nil {
+		return nil, err
+	}
 	dom.Status = models.DomainStatusPending // re-queue for reconciliation
 	// Same move handling as the REST API: tombstone the old host on the old
 	// agent before the row changes, drop the stale artifact afterwards (#148).
@@ -463,6 +475,10 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "update", dom.Subdomain)
+	if models.ProxiedLabel(before.Proxied) != models.ProxiedLabel(dom.Proxied) {
+		auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "proxied_set",
+			fmt.Sprintf("%s: %s -> %s", dom.Subdomain, models.ProxiedLabel(before.Proxied), models.ProxiedLabel(dom.Proxied)))
+	}
 	// The update is committed from here on, so cleanup failures are reported
 	// as warnings next to the domain rather than as a tool error.
 	var warnings []string

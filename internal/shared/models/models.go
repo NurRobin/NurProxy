@@ -401,12 +401,53 @@ type Domain struct {
 	// (§7). The operator hand-writes the engine config and points it at the stable
 	// cert path; NurProxy keeps the cert fresh. No public DNS record is managed —
 	// the operator owns DNS for their own hand-written vhost.
-	CertOnly   bool         `json:"cert_only"`
+	CertOnly bool `json:"cert_only"`
+	// Proxied is the operator's Cloudflare proxy (orange cloud) setting for the
+	// domain's DNS record (#126). nil means "not set": NurProxy keeps whatever
+	// proxy state the live record already has (a new record starts DNS-only).
+	// true / false are enforced by the reconciler as desired state. Only zones
+	// whose provider supports proxying accept true.
+	Proxied    *bool        `json:"proxied"`
 	Status     DomainStatus `json:"status"`
 	ErrorMsg   string       `json:"error_msg,omitempty"`
 	LastSynced *time.Time   `json:"last_synced,omitempty"`
 	CreatedAt  time.Time    `json:"created_at"`
 	UpdatedAt  time.Time    `json:"updated_at"`
+}
+
+// OptionalBool is a PATCH-style JSON field for a tri-state bool: Set is false
+// when the key is absent, and Value is nil for an explicit null (clear the
+// setting) or points at true / false.
+type OptionalBool struct {
+	Set   bool
+	Value *bool
+}
+
+// UnmarshalJSON records that the key was present and decodes null/true/false.
+func (o *OptionalBool) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var v bool
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// ProxiedLabel renders a tri-state proxied setting for audit text.
+func ProxiedLabel(p *bool) string {
+	switch {
+	case p == nil:
+		return "keep existing"
+	case *p:
+		return "proxied"
+	default:
+		return "DNS only"
+	}
 }
 
 // IsApex reports whether the domain targets the zone apex (root), represented by

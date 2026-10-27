@@ -243,6 +243,11 @@ func validateRecord(r provider.Record) error {
 	if r.TTL < 0 {
 		return fmt.Errorf("dryrun: record TTL must be >= 0")
 	}
+	// Mirror Cloudflare, which rejects the proxy flag on record types it cannot
+	// proxy (TXT, MX, ...). Catches a proxied ACME challenge record in dry-run.
+	if r.Proxied && !provider.ProxiableType(r.Type) {
+		return fmt.Errorf("dryrun: %s records cannot be proxied", r.Type)
+	}
 	return nil
 }
 

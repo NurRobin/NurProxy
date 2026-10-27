@@ -83,6 +83,8 @@ func (p *CloudflareProvider) Info() provider.ProviderInfo {
 		Description: "Cloudflare DNS management via API v4",
 		Website:     "https://www.cloudflare.com",
 		RecordTypes: []string{"A", "AAAA", "CNAME", "TXT"},
+		// Orange-cloud proxying (#126).
+		SupportsProxied: true,
 	}
 }
 
