@@ -519,9 +519,10 @@ func (e *Engine) ExecuteManagedApply(ctx context.Context, request helperprotocol
 }
 
 // convergedManagedReceipt answers an apply whose on-disk state already matches
-// the plan without journaling a grant, operation or snapshot. Nothing was written,
-// so there is nothing to recover or roll back; a retry of the same grant re-runs
-// this check against a fingerprint that still has to match the plan. Any doubt
+// the plan without journaling a grant, operation or snapshot. Nothing was
+// written and no snapshot exists, so the receipt claims no rollback coverage.
+// A retry of the same grant re-runs this check against a fingerprint that still
+// has to match the plan. Any doubt
 // (no checker, an inspection error, a single differing target) falls back to the
 // full journaled transaction, which reports the problem the usual way.
 func (e *Engine) convergedManagedReceipt(ctx context.Context, operationID, requestDigest string, plan helperprotocol.ManagedApplyPlan, intent helperprotocol.ApplyIntent) (helperprotocol.HelperReceipt, bool, error) {
@@ -537,7 +538,7 @@ func (e *Engine) convergedManagedReceipt(ctx context.Context, operationID, reque
 	if strings.TrimSpace(message) == "" {
 		message = "managed proxy state already converged"
 	}
-	receipt := e.newManagedReceipt(operationID, requestDigest, plan, helperprotocol.JournalSucceeded, PreparedAction{RollbackCoverage: plan.RollbackCoverage}, message)
+	receipt := e.newManagedReceipt(operationID, requestDigest, plan, helperprotocol.JournalSucceeded, PreparedAction{RollbackCoverage: helperprotocol.RollbackCoverageNone}, message)
 	receipt.ManagedArtifacts = append([]helperprotocol.ManagedArtifactReceipt(nil), result.ManagedArtifacts...)
 	if err := receipt.Validate(); err != nil {
 		return helperprotocol.HelperReceipt{}, false, err
@@ -552,7 +553,8 @@ func (e *Engine) pruneJournal() {
 	result, ran, err := e.journal.PruneIfDue(e.now().UTC())
 	if err != nil {
 		slog.Warn("helper journal retention failed", "error", err)
-	} else if ran && result.Operations > 0 {
+	}
+	if ran && result.Operations > 0 {
 		slog.Info("helper journal retention pruned finished operations", "operations", result.Operations, "grants", result.Grants, "snapshots", result.Snapshots)
 	}
 }

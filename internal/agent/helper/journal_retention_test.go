@@ -97,6 +97,13 @@ func TestJournalPruneRetention(t *testing.T) {
 			wantCount:  n,
 		},
 		{
+			name:       "backlog larger than several batches is pruned in one pass",
+			ops:        finishedManaged("backlog", n+3*pruneBatchSize+7, 30*day, true),
+			wantKept:   []string{id("backlog", 0), id("backlog", n-1)},
+			wantPruned: []string{id("backlog", n), id("backlog", n+3*pruneBatchSize+6)},
+			wantCount:  n,
+		},
+		{
 			name: "keeps everything inside the age window beyond N",
 			ops: append(finishedManaged("recent", n+5, 2*time.Hour, true),
 				seededOperation{id: "ancient", action: managed, state: helperprotocol.JournalSucceeded, age: 40 * day, snapshot: true}),
@@ -180,6 +187,47 @@ func TestJournalPruneRetention(t *testing.T) {
 				t.Errorf("operations left = %d, want %d", len(entries), tt.wantCount)
 			}
 		})
+	}
+}
+
+// A record whose snapshot cannot be removed is skipped and reported, and its
+// grant and operation record stay; the rest of the pass still runs.
+func TestJournalPruneContinuesPastRemovalErrors(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	journal := testJournal(t)
+	n := operationRetentionPerAction
+	seedOperations(t, journal, now, finishedManaged("old", n+3, 30*24*time.Hour, true))
+	stuck := fmt.Sprintf("old-%04d", n+1)
+	stuckSnapshot := filepath.Join(journal.snapshotsDir, stuck+".json")
+	if err := os.Remove(stuckSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stuckSnapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stuckSnapshot, "blocker"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := journal.Prune(now)
+	if err == nil || !strings.Contains(err.Error(), stuck) {
+		t.Fatalf("prune error = %v, want one naming %s", err, stuck)
+	}
+	if result.Operations != 2 {
+		t.Fatalf("pruned operations = %d, want 2", result.Operations)
+	}
+	for _, path := range []string{
+		filepath.Join(journal.operationsDir, stuck+".json"),
+		filepath.Join(journal.grantsDir, "grant-"+stuck+".json"),
+	} {
+		if !journalFileExists(t, path) {
+			t.Fatalf("%s was removed although its snapshot could not be", path)
+		}
+	}
+	for _, gone := range []string{fmt.Sprintf("old-%04d", n), fmt.Sprintf("old-%04d", n+2)} {
+		if journalFileExists(t, filepath.Join(journal.operationsDir, gone+".json")) {
+			t.Fatalf("%s survived although its removal could succeed", gone)
+		}
 	}
 }
 

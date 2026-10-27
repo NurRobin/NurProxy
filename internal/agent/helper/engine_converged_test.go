@@ -85,6 +85,9 @@ func TestEngineManagedApplySkipsJournalForConvergedState(t *testing.T) {
 				payload.HelperInstanceID != fixture.config.HelperInstanceID || payload.SanitizedResult != tt.wantMessage {
 				t.Fatalf("unexpected receipt: %+v", payload)
 			}
+			if tt.wantOperations == 0 && (payload.RollbackCoverage != helperprotocol.RollbackCoverageNone || payload.SnapshotDigest != "") {
+				t.Fatalf("snapshot-free receipt claims rollback coverage: %s %q", payload.RollbackCoverage, payload.SnapshotDigest)
+			}
 			if handler.checks != tt.wantChecks || handler.executeCount != tt.wantExecutes || handler.prepareCount != tt.wantExecutes {
 				t.Fatalf("checks=%d prepare=%d execute=%d", handler.checks, handler.prepareCount, handler.executeCount)
 			}

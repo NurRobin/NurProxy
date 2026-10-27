@@ -694,17 +694,11 @@ func removeManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error) 
 	if !file.Delete || (file.Class != "vhost" && file.Class != "secret") {
 		return false, fmt.Errorf("invalid managed file deletion")
 	}
-	current, err := inspectManagedPath(file.Path, file.Class, "", ownerUID)
-	if err != nil {
+	pending, err := managedFileChangePending(file, ownerUID)
+	if err != nil || !pending {
 		return false, err
-	}
-	if !current.Exists {
-		return false, nil
 	}
 	dir := filepath.Dir(file.Path)
-	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
-		return false, err
-	}
 	if err := os.Remove(file.Path); err != nil {
 		return false, err
 	}
@@ -715,17 +709,11 @@ func removeManagedLink(link managedCompiledLink, ownerUID uint32) (bool, error) 
 	if !link.Delete {
 		return false, fmt.Errorf("invalid managed activation deletion")
 	}
-	current, err := inspectManagedPath(link.Path, "link", link.Target, ownerUID)
-	if err != nil {
+	pending, err := managedLinkChangePending(link, ownerUID)
+	if err != nil || !pending {
 		return false, err
-	}
-	if !current.Exists {
-		return false, nil
 	}
 	dir := filepath.Dir(link.Path)
-	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
-		return false, err
-	}
 	if err := os.Remove(link.Path); err != nil {
 		return false, err
 	}
@@ -886,17 +874,11 @@ func installManagedFile(file managedCompiledFile, ownerUID uint32) (bool, error)
 	if err := validateManagedCompilationTargets(managedCompilation{Files: []managedCompiledFile{file}, Links: []managedCompiledLink{}}); err != nil {
 		return false, err
 	}
-	current, err := inspectManagedPath(file.Path, file.Class, "", ownerUID)
-	if err != nil {
+	pending, err := managedFileChangePending(file, ownerUID)
+	if err != nil || !pending {
 		return false, err
 	}
 	dir := filepath.Dir(file.Path)
-	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
-		return false, err
-	}
-	if managedFileConverged(current, file) {
-		return false, nil
-	}
 	tmp, err := os.CreateTemp(dir, ".nurproxy-helper-*")
 	if err != nil {
 		return false, err
@@ -935,17 +917,11 @@ func installManagedLink(link managedCompiledLink, ownerUID uint32) (bool, error)
 	if validatePrivatePath(link.Path) != nil || validatePrivatePath(link.Target) != nil {
 		return false, fmt.Errorf("invalid managed activation link")
 	}
-	current, err := inspectManagedPath(link.Path, "link", link.Target, ownerUID)
-	if err != nil {
+	pending, err := managedLinkChangePending(link, ownerUID)
+	if err != nil || !pending {
 		return false, err
 	}
 	dir := filepath.Dir(link.Path)
-	if err := validatePrivilegedManagedDirectory(dir, ownerUID); err != nil {
-		return false, err
-	}
-	if current.Exists {
-		return false, nil
-	}
 	tmp := filepath.Join(dir, fmt.Sprintf(".nurproxy-helper-link-%d", os.Getpid()))
 	if err := os.Symlink(link.Target, tmp); err != nil {
 		return false, err
