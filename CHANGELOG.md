@@ -5,6 +5,25 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-27
+
+First stable release of the 0.5 line. It contains everything from
+`0.5.0-rc.2` and `0.5.0-rc.3` below, unchanged since `rc.3`. `rc.3` ran on the
+production orchestrator and three nginx agents (amd64 and arm64) before this
+tag.
+
+Upgrade notes:
+
+- Install the orchestrator first, then the agents; both directions work during
+  the rollout. Back up with `nurproxy backup` before upgrading the orchestrator
+  (migration 32 runs on start).
+- On agents that ran a `0.4.x` dev build with the root helper, the first start
+  prunes the old helper journal in the background. On our hosts this took
+  several minutes and freed 8 to 12 GB.
+- A helper breaker that was opened by an earlier build stays open after the
+  upgrade. Check `nginx -t`, then move `/var/lib/nurproxy-agent/helper/breaker.json`
+  away and restart `nurproxy-agent-helper` and `nurproxy-agent`.
+
 ## [0.5.0-rc.3] - 2026-10-27
 
 Fixes found while running `rc.2`-era builds in production. No new features.
@@ -290,6 +309,7 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.5.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0
 [0.5.0-rc.3]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.3
 [0.5.0-rc.2]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.2
 [0.3.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.3.0
