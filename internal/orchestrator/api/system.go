@@ -41,6 +41,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			checks["agent_dns_cleanup"] = fmt.Sprintf("ok (%d old agent DNS record(s) queued for deletion)", pending)
 		}
 	}
+	// Old domain records released by renames / zone moves (#151), same rules.
+	if pending, failing, err := s.db.DomainDNSCleanupCounts(ctx); err == nil && pending > 0 {
+		if failing > 0 {
+			checks["domain_dns_cleanup"] = fmt.Sprintf("%d old domain DNS record(s) queued for deletion, %d failing (see orchestrator log)", pending, failing)
+		} else {
+			checks["domain_dns_cleanup"] = fmt.Sprintf("ok (%d old domain DNS record(s) queued for deletion)", pending)
+		}
+	}
 	resp := map[string]any{
 		"status":       "ok",
 		"version":      s.version,
