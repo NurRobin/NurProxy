@@ -5,6 +5,46 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0-rc.3] - 2026-10-27
+
+Fixes found while running `rc.2`-era builds in production. No new features.
+
+### Fixed
+
+- **Moving a domain to another agent cleans up the old agent (#148).** The old
+  agent now gets a tombstone for the vhost, so the vhost and its certificate are
+  removed together. Before, the certificate was pruned while the vhost stayed,
+  `nginx -t` failed after commit, rollback could not be proven and the helper
+  opened a permanent breaker. The helper also keeps any certificate that a
+  remaining config file still references, reports NurProxy-named vhost files
+  that no route covers, and includes the `nginx -t` / `apachectl configtest`
+  output in failed receipts. An open helper breaker (`rollback_failed` or
+  `outcome_indeterminate`) is now shown in the agent's Diagnosis & recovery
+  panel. The REST API and the MCP `update_domain` tool share the same move
+  logic.
+- **Basic auth works on nginx and Apache agents (#147).** htpasswd files moved
+  to `/var/lib/nurproxy-agent/auth/` (`0750 root:<worker group>`, files `0640`),
+  so the proxy worker can read them. The worker group comes from the nginx
+  `user` directive or Apache's `Group` / `APACHE_RUN_GROUP`; if it can't be
+  determined, the apply fails with a message naming the host. Old
+  `certs/auth-*.htpasswd` files are removed once nothing references them.
+- **The helper journal no longer grows without bound (#146).** Finished
+  operations are pruned with their grant and snapshot (newest 50 per action and
+  everything younger than 14 days are kept). Managed applies that would change
+  nothing no longer write to the journal, and the orchestrator no longer
+  produces a new intent every tick because of random map order. On hosts with a
+  large journal, the first pruning pass runs in the background after the
+  upgrade.
+- **Agent rename and deletion clean up the agent's A/AAAA records (#152).**
+  Ownership is now stored per record (migration 32). Only records NurProxy
+  created are deleted, through the provider and zone they were created in;
+  records from before this release count as adopted and are left alone. After a
+  rename, the old record is deleted only after a one-hour grace period, once the
+  new record exists and no domain points at the old name.
+- **CLI flags after a positional argument are no longer ignored (#145).**
+  `nurproxy domain update 83 --force-https` now applies the flag. Unexpected or
+  missing positional arguments are an error.
+
 ## [0.5.0-rc.2] - 2026-08-29
 
 This release candidate introduces NurProxy's privilege-separated agent and its
@@ -250,5 +290,6 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.5.0-rc.3]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.3
 [0.5.0-rc.2]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.2
 [0.3.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.3.0
