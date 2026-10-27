@@ -60,6 +60,10 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		ForceHTTPS  bool                `json:"force_https"`
 		SSLMode     models.SSLMode      `json:"ssl_mode"`
 		ProxyConfig *models.ProxyConfig `json:"proxy_config"`
+		// AccessLog / ErrorLogLevel set the matching proxy_config fields
+		// without sending the whole proxy_config.
+		AccessLog     *string `json:"access_log"`
+		ErrorLogLevel *string `json:"error_log_level"`
 		// CertOnly issues + renews a cert for this host and installs it on the
 		// agent without serving a vhost (§7). No upstream/port is needed.
 		CertOnly bool `json:"cert_only"`
@@ -137,6 +141,11 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
+	if err := s.db.CheckDomainLogging(dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	if err := s.db.CreateDomain(dom); err != nil {
@@ -247,6 +256,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		// Proxied: absent leaves the setting alone, null clears it back to
 		// "keep existing", true/false sets it (#126).
 		Proxied models.OptionalBool `json:"proxied"`
+		// AccessLog / ErrorLogLevel are shortcuts for the matching
+		// proxy_config keys, applied after proxy_config.
+		AccessLog     *string `json:"access_log"`
+		ErrorLogLevel *string `json:"error_log_level"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -306,6 +319,11 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	// Checked against the final zone, so moving a proxied domain into a zone
 	// whose provider cannot proxy is refused too.
 	if err := s.db.ValidateDomainProxied(dom.ZoneID, dom.CertOnly, dom.Proxied); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
+	if err := s.db.CheckDomainLogging(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -424,6 +442,17 @@ func mergeProxyConfig(stored models.ProxyConfig, patch json.RawMessage) (models.
 
 func isJSONNull(raw json.RawMessage) bool {
 	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// applyLoggingPatch copies the top-level logging fields of a create/update
+// request onto the proxy config. Nil leaves the field as it is.
+func applyLoggingPatch(pc *models.ProxyConfig, accessLog, errorLogLevel *string) {
+	if accessLog != nil {
+		pc.AccessLog = *accessLog
+	}
+	if errorLogLevel != nil {
+		pc.ErrorLogLevel = *errorLogLevel
+	}
 }
 
 // artifactIDForDomainID derives the stable artifact identity for a generated

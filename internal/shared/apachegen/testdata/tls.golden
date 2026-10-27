@@ -1,0 +1,14 @@
+----
+<VirtualHost *:443>
+    ServerName app.example.com
+
+    SSLEngine on
+    SSLCertificateFile /var/lib/nurproxy-agent/certs/app.example.com.crt
+    SSLCertificateKeyFile /var/lib/nurproxy-agent/certs/app.example.com.key.plain
+
+    RequestHeader set X-Forwarded-Proto https
+    ProxyPreserveHost On
+
+    ProxyPass / http://10.0.0.4:8080/
+    ProxyPassReverse / http://10.0.0.4:8080/
+</VirtualHost>

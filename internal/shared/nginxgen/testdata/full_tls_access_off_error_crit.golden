@@ -1,0 +1,52 @@
+limit_req_zone $binary_remote_addr zone=nurproxy_app_example_com:10m rate=5r/s;
+----
+server {
+    listen 80;
+    listen [::]:80;
+    server_name app.example.com;
+    access_log off;
+    error_log /var/log/nginx/error.log crit;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name app.example.com;
+
+    ssl_certificate /var/lib/nurproxy-agent/certs/app.example.com.crt;
+    ssl_certificate_key /var/lib/nurproxy-agent/certs/app.example.com.key.plain;
+
+    access_log off;
+    error_log /var/log/nginx/error.log crit;
+
+    client_max_body_size 50m;
+
+    deny 10.6.6.6/32;
+    allow 10.0.0.0/8;
+    deny all;
+
+    auth_basic "Restricted: app.example.com";
+    auth_basic_user_file /etc/nginx/nurproxy-auth/app.example.com.htpasswd;
+
+    limit_req zone=nurproxy_app_example_com burst=5 nodelay;
+
+    add_header X-Frame-Options DENY always;
+
+    location / {
+        rewrite ^/api/?(.*)$ /$1 break;
+        proxy_pass http://10.0.0.4:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Team edge;
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 60s;
+    }
+}

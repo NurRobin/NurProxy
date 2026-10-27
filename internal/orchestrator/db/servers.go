@@ -55,6 +55,33 @@ func (d *DB) GetServer(id string) (*models.Server, error) {
 	return s, nil
 }
 
+// CheckDomainLogging normalizes a domain's per-domain logging settings and
+// refuses them when the agent serving the domain's server reported a backend
+// that cannot render them. Shared by the REST API and the MCP tools so both
+// reject the same requests.
+func (d *DB) CheckDomainLogging(dom *models.Domain) error {
+	if err := dom.ProxyConfig.NormalizeLogging(); err != nil {
+		return err
+	}
+	if dom.ProxyConfig.AccessLog == "" && dom.ProxyConfig.ErrorLogLevel == "" {
+		return nil
+	}
+	srv, err := d.GetServer(dom.ServerID)
+	if err != nil {
+		return fmt.Errorf("logging settings need the domain's server %q, which was not found", dom.ServerID)
+	}
+	agent, err := d.GetAgent(srv.AgentID)
+	if err != nil {
+		// No agent row yet: nothing reported, nothing to check against.
+		return nil
+	}
+	backend := "the built-in Caddy"
+	if agent.ProxyMode == "existing" && agent.ProxyDetection != nil && agent.ProxyDetection.Kind != "" {
+		backend = agent.ProxyDetection.Kind
+	}
+	return dom.ProxyConfig.CheckLoggingSupported(agent.ProxyCapabilities, backend)
+}
+
 // ListServersByAgent returns all servers belonging to the given agent.
 func (d *DB) ListServersByAgent(agentID string) ([]models.Server, error) {
 	rows, err := d.read.Query(`

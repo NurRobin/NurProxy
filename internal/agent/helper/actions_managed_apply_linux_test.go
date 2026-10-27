@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -415,6 +416,100 @@ func TestManagedApplyAdmitsParserBoundedNginxCustomConfiguration(t *testing.T) {
 	if len(compilation.Files) != 1 || !strings.Contains(string(compilation.Files[0].Content), "proxy_pass http://10.0.0.2:8080") ||
 		!proxy.HasManagedArtifactMarker(string(compilation.Files[0].Content)) {
 		t.Fatalf("bounded raw config was not compiled: %+v", compilation)
+	}
+}
+
+func TestManagedApplyRendersPerDomainLogging(t *testing.T) {
+	tests := []struct {
+		name      string
+		kind      string
+		access    proxymodel.AccessLogMode
+		level     string
+		want      []string
+		wantNoLog bool
+	}{
+		{name: "nginx_default", kind: "nginx", wantNoLog: true},
+		{name: "nginx_off_crit", kind: "nginx", access: proxymodel.AccessLogOff, level: "crit", want: []string{"    access_log off;\n", "    error_log /var/log/nginx/error.log crit;\n"}},
+		{name: "apache_off_crit", kind: "apache", access: proxymodel.AccessLogOff, level: "crit", want: []string{"    CustomLog /dev/null common\n", "    LogLevel crit\n"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, intent, _ := newManagedApplyTest(t)
+			action.target.Kind = tt.kind
+			intent.Routes[0].Backend = tt.kind
+			intent.Routes[0].Route.AccessLog = tt.access
+			intent.Routes[0].Route.ErrorLogLevel = tt.level
+			compilation, err := action.compile(intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(compilation.Files) != 1 {
+				t.Fatalf("unexpected compilation: %+v", compilation)
+			}
+			content := string(compilation.Files[0].Content)
+			for _, want := range tt.want {
+				if !strings.Contains(content, want) {
+					t.Errorf("compiled config lacks %q:\n%s", want, content)
+				}
+			}
+			if tt.wantNoLog && (strings.Contains(content, "access_log") || strings.Contains(content, "error_log")) {
+				t.Errorf("default route gained a log directive:\n%s", content)
+			}
+		})
+	}
+}
+
+func TestManagedApplyRefusesInvalidLogLevelInIntent(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	intent.Routes[0].Route.ErrorLogLevel = "crit;\n    include /etc/shadow"
+	if _, err := action.Plan(context.Background(), intent); err == nil {
+		t.Fatal("helper accepted an error log level that smuggles a directive")
+	}
+}
+
+func TestManagedApplyRawNginxLogDirectivesPolicy(t *testing.T) {
+	const base = `server {
+    listen 80;
+    listen [::]:80;
+    server_name app.example.com;
+    %s
+    location / {
+        proxy_pass http://10.0.0.2:8080;
+        proxy_set_header Host $host;
+    }
+}`
+	tests := []struct {
+		name    string
+		logs    string
+		wantErr bool
+	}{
+		{"access_off_and_default_error_log", "access_log off;\n    error_log /var/log/nginx/error.log crit;", false},
+		{"error_log_to_foreign_path", "error_log /etc/cron.d/nurproxy crit;", true},
+		{"access_log_to_file", "access_log /var/log/nginx/app.log;", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, intent, _ := newManagedApplyTest(t)
+			intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: fmt.Sprintf(base, tt.logs)}
+			if tt.wantErr {
+				// Policy-foreign raw config is only ever kept if exactly these
+				// bytes already exist on disk; with nothing there, Plan refuses.
+				if _, err := action.Plan(context.Background(), intent); err == nil {
+					t.Fatal("policy-foreign log directive was admitted")
+				}
+				return
+			}
+			if _, err := action.Plan(context.Background(), intent); err != nil {
+				t.Fatalf("bounded raw config with log directives was refused: %v", err)
+			}
+			compilation, err := action.compile(intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(compilation.Files) != 1 || compilation.Files[0].Preserve || !strings.Contains(string(compilation.Files[0].Content), "access_log off;") {
+				t.Fatalf("raw config with log directives was not compiled: %+v", compilation)
+			}
+		})
 	}
 }
 

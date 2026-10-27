@@ -174,6 +174,8 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		IPFilter:      true,
 		RateLimit:     false,
 		CentralTLS:    b.certs != nil,
+		AccessLog:     true,
+		ErrorLogLevel: true,
 	}
 }
 

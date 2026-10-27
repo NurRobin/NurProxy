@@ -121,6 +121,11 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		IPFilter:      true,
 		RateLimit:     b.hasRateLimitModule(),
 		CentralTLS:    true,
+		// The built-in Caddy has no access log configured at all, so "off" is
+		// what every route already gets. Its error log is process-wide and has
+		// no per-host level.
+		AccessLog:     true,
+		ErrorLogLevel: false,
 	}
 }
 
@@ -194,13 +199,18 @@ func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Art
 	if err != nil {
 		return proxy.Artifact{}, fmt.Errorf("rendering caddy route: %w", err)
 	}
+	var warnings []string
+	if !route.IsRaw() && route.ErrorLogLevel != "" {
+		warnings = append(warnings, "error_log_level: the built-in Caddy has one process-wide error log; per-domain level dropped")
+	}
 	return proxy.Artifact{
 		Target: proxy.Target{
 			Kind: proxy.TargetKindCaddyRoute,
 			Path: routeTarget(raw),
 		},
-		Content: string(raw),
-		Enabled: true,
+		Content:  string(raw),
+		Enabled:  true,
+		Warnings: warnings,
 	}, nil
 }
 

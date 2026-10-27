@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // ManagedPolicy names the values an nginx vhost must use verbatim before the
@@ -177,6 +180,19 @@ var proxiedServerDirectives = map[string]argRule{
 	"limit_req": func(a []token, p policyScope) bool {
 		return p.zone != "" && len(a) == 3 && plainOneOf(a[:1], "zone="+p.zone) && plainMatch(a[1:2], burstRe) && plainOneOf(a[2:], "nodelay")
 	},
+	"access_log": accessLogRule,
+	"error_log":  errorLogRule,
+}
+
+// accessLogRule accepts only `access_log off;`: any other form names a file
+// or syslog target nginx would open.
+func accessLogRule(a []token, _ policyScope) bool { return plainOneOf(a, "off") }
+
+// errorLogRule accepts only `error_log /var/log/nginx/error.log <level>;`,
+// the form nginxgen renders, so nginx opens no file but the host's stock
+// error log.
+func errorLogRule(a []token, _ policyScope) bool {
+	return len(a) == 2 && plainOneOf(a[:1], nginxgen.DefaultErrorLogPath) && plainOneOf(a[1:], proxymodel.ErrorLogLevels...)
 }
 
 // locationDirectives are the only directives allowed in `location / {}`.
@@ -197,9 +213,11 @@ var locationDirectives = map[string]argRule{
 // redirectServerDirectives are the only directives allowed in the port-80
 // force-https companion server, matching what nginxgen renders there:
 // `return 301 https://$host$request_uri;` (or the literal host in place of
-// $host). validateRedirectServer also requires exactly one server_name and
-// exactly one return.
+// $host) and the route's logging overrides. validateRedirectServer also
+// requires exactly one server_name and exactly one return.
 var redirectServerDirectives = map[string]argRule{
+	"access_log":  accessLogRule,
+	"error_log":   errorLogRule,
 	"listen":      func(a []token, _ policyScope) bool { return managedListen(a, true) },
 	"server_name": func(a []token, p policyScope) bool { return plainExact(a, p.Host) },
 	"return": func(a []token, p policyScope) bool {

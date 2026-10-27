@@ -87,6 +87,10 @@ type Backend struct {
 	// directory is configured: TLS routes then render without a cert and nginxgen
 	// drops the TLS listener with a warning (invariant #4).
 	certs *certstore.Store
+	// errorLogLevel reports that a per-route error_log at
+	// nginxgen.DefaultErrorLogPath is safe on this host (see
+	// errorLogPathMatches). Probed once at construction.
+	errorLogLevel bool
 }
 
 // New builds an nginx backend from the agent's per-backend Config (§9). It
@@ -117,6 +121,7 @@ func New(cfg proxy.Config) *Backend {
 	if cfg.CertDir != "" {
 		b.certs = certstore.New(cfg.CertDir, cfg.EncryptKey)
 	}
+	b.errorLogLevel = errorLogPathMatches(binary)
 	return b
 }
 
@@ -170,7 +175,8 @@ func (b *Backend) Detect(ctx context.Context) (bool, error) {
 // options are expressible in the server block nginxgen emits; rate limiting uses
 // the always-compiled-in ngx_http_limit_req_module, so it is advertised. Central
 // TLS (provided certs via InstallCerts) is supported when a cert store is
-// configured.
+// configured. A per-domain error log level is only advertised when the host's
+// error log is the one nginxgen writes to.
 func (b *Backend) Capabilities() proxy.Capabilities {
 	return proxy.Capabilities{
 		ReverseProxy:  true,
@@ -182,6 +188,8 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		IPFilter:      true,
 		RateLimit:     true,
 		CentralTLS:    b.certs != nil,
+		AccessLog:     true,
+		ErrorLogLevel: b.errorLogLevel,
 	}
 }
 

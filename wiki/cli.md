@@ -108,10 +108,25 @@ nurproxy server delete <server-id>
 nurproxy domain list [--agent <id>] [--server <id>] [--status <s>]
 nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port 8080 \
                     [--websocket] [--force-https] [--ssl-mode auto] \
+                    [--access-log off] [--error-log-level crit] \
                     [--proxy-config-file ./proxy.json]
-nurproxy domain update <domain-id> [--subdomain s] [--port n] [--websocket] [--force-https] [--ssl-mode m]
+nurproxy domain update <domain-id> [--subdomain s] [--port n] [--websocket] [--force-https] [--ssl-mode m] \
+                    [--access-log off|default] [--error-log-level <level>|default]
 nurproxy domain delete <domain-id>          # marks for deletion; reconciler cleans up
 ```
+
+`--access-log off` stops writing an access log for the domain, so client IPs of
+its visitors don't end up in the host-wide log. `--error-log-level` (`info`,
+`notice`, `warn`, `error`, `crit`, `alert`, `emerg`) raises the domain's error
+log threshold; `crit` keeps routine upstream errors with client IPs out of the
+log. `default` puts either setting back to the host default. Apache supports
+both. nginx supports `--access-log` everywhere, but `--error-log-level` only
+when the host's nginx error log is `/var/log/nginx/error.log` (the stock path
+of distribution packages): the agent checks `nginx -V` and the error_log lines
+of the main nginx.conf, and otherwise doesn't offer it, so source builds and
+OpenResty keep their own log. The built-in Caddy writes no access log anyway
+and has no per-domain error level. The orchestrator refuses a setting the
+domain's agent doesn't offer.
 
 For advanced per-domain proxy options (custom headers, timeouts, basic auth, IP
 allow/block lists, path rewriting), pass a `ProxyConfig` JSON document via

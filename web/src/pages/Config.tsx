@@ -784,6 +784,8 @@ function MaskForm({ mask, loading }: { mask: ArtifactMask | null; loading: boole
     [t('config.form.websocket'), r.WebSocket ? t('config.form.enabled') : t('config.form.none')],
     [t('config.form.forceHttps'), r.ForceHTTPS ? t('config.form.enabled') : t('config.form.none')],
     [t('config.form.maxBodySize'), r.MaxBodySize || t('config.form.none')],
+    [t('config.form.accessLog'), r.AccessLog === 'off' ? t('config.form.off') : t('config.form.none')],
+    [t('config.form.errorLogLevel'), r.ErrorLogLevel || t('config.form.none')],
     [t('config.form.stripPrefix'), r.Path?.StripPrefix || t('config.form.none')],
     [t('config.form.rewrite'), r.Path?.Rewrite || t('config.form.none')],
     [t('config.form.requestHeaders'), headerList(r.RequestHeaders)],

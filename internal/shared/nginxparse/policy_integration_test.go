@@ -105,9 +105,37 @@ func TestValidateManagedAgreesWithRealNginx(t *testing.T) {
 		}
 	}
 
-	script := `for main in /cases/*.main; do
-  if nginx -q -t -c "$main" >/dev/null 2>&1; then echo "rc $(basename "$main" .conf.main) 0"; else echo "rc $(basename "$main" .conf.main) 1"; fi
-done
+	// The admitted cases run first. The image links the stock logs to
+	// stdout/stderr; as plain paths, a file nginx creates shows up in the scan
+	// that follows. The scan lists every file the admitted cases created
+	// anywhere outside /markers, so a log directive that opens anything but
+	// the stock logs (as the per-domain error_log form could, #150) is caught
+	// even without a marker. Refused cases run after the scan.
+	var admitted, refused []string
+	for i, c := range cases {
+		main := fmt.Sprintf("/cases/case-%03d.conf.main", i)
+		if c.admitted {
+			admitted = append(admitted, main)
+		} else {
+			refused = append(refused, main)
+		}
+	}
+	for name, list := range map[string][]string{"admitted": admitted, "refused": refused} {
+		if err := os.WriteFile(filepath.Join(casesDir, name), []byte(strings.Join(list, "\n")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := `run() {
+  while read -r main; do
+    if nginx -q -t -c "$main" >/dev/null 2>&1; then echo "rc $(basename "$main" .conf.main) 0"; else echo "rc $(basename "$main" .conf.main) 1"; fi
+  done < "$1"
+}
+files() { find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /markers -o -path /tmp/files.before \) -prune -o ! -type d -print | sort; }
+rm -f /var/log/nginx/error.log /var/log/nginx/access.log
+files > /tmp/files.before
+run /cases/admitted
+files | comm -13 /tmp/files.before - | sed 's/^/created /'
+run /cases/refused
 for marker in /markers/*; do [ -e "$marker" ] && echo "marker $marker"; done
 true`
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -122,6 +150,7 @@ true`
 	}
 	accepted := map[string]bool{}
 	opened := map[string]bool{}
+	var created []string
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		switch {
@@ -129,7 +158,23 @@ true`
 			accepted[fields[1]] = fields[2] == "0"
 		case len(fields) == 2 && fields[0] == "marker":
 			opened[fields[1]] = true
+		case len(fields) == 2 && fields[0] == "created":
+			created = append(created, fields[1])
 		}
+	}
+	// Only nginx's own files may appear: the stock logs (the http-level
+	// defaults every config opens, and the error log the per-domain error_log
+	// form names) and the pid file `nginx -t` writes.
+	stockLogs := map[string]bool{"/var/log/nginx/error.log": true, "/var/log/nginx/access.log": true, "/run/nginx.pid": true}
+	sawStockErrorLog := false
+	for _, path := range created {
+		if !stockLogs[path] {
+			t.Errorf("nginx -t created an unexpected file: %s", path)
+		}
+		sawStockErrorLog = sawStockErrorLog || path == "/var/log/nginx/error.log"
+	}
+	if !sawStockErrorLog {
+		t.Errorf("the file scan saw no stock error log, so it is not observing nginx's log opens:\n%s", out)
 	}
 	for i, c := range cases {
 		id := fmt.Sprintf("case-%03d", i)

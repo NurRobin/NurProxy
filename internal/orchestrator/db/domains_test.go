@@ -101,3 +101,16 @@ func TestMarkDomainApplied(t *testing.T) {
 		}
 	})
 }
+
+// A domain whose server is gone gets a plain message, not a database error.
+func TestCheckDomainLoggingMissingServer(t *testing.T) {
+	d := testDB(t)
+	dom := &models.Domain{ServerID: "srv-gone", CertOnly: true, ProxyConfig: models.ProxyConfig{AccessLog: "off"}}
+	err := d.CheckDomainLogging(dom)
+	if err == nil || !strings.Contains(err.Error(), `server "srv-gone", which was not found`) || strings.Contains(err.Error(), "querying") {
+		t.Fatalf("CheckDomainLogging() error = %v", err)
+	}
+	if err := d.CheckDomainLogging(&models.Domain{ServerID: "srv-gone"}); err != nil {
+		t.Fatalf("a domain without logging settings needs no server lookup: %v", err)
+	}
+}

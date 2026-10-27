@@ -25,7 +25,8 @@
 // (nginxgen's force-https pair). Inside the primary server it maps listen/ssl
 // (TLS policy), server_name (Host), client_max_body_size (MaxBodySize),
 // allow/deny (IP allow/block), auth_basic* (BasicAuth presence), limit_req
-// (RateLimit), add_header (ResponseHeaders), and the location / block's
+// (RateLimit), add_header (ResponseHeaders), access_log off / error_log at the
+// default path (AccessLog, ErrorLogLevel), and the location / block's
 // proxy_pass (Upstream), proxy_set_header (RequestHeaders + websocket + the
 // standard forwarded headers), rewrite (Path), and proxy_*_timeout (Timeouts).
 package nginxparse
@@ -36,6 +37,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -200,6 +202,14 @@ func parseProxiedServer(s block, res *Result) bool {
 			// server). We can detect its presence but not the exact rate from here.
 			res.Notes = append(res.Notes, "rate limit detected (rate is defined by the limit_req_zone in http context)")
 			clean = false
+		case "access_log", "error_log":
+			// Only the exact forms nginxgen emits map onto the Route; any other
+			// path or format stays raw and marks the mask unclean.
+			if !parseLogDirective(d.name, d.args, r) {
+				res.Unparsed = append(res.Unparsed, d.raw)
+				res.Notes = append(res.Notes, fmt.Sprintf("unrecognized %s form", d.name))
+				clean = false
+			}
 		case "add_header":
 			k, v, ok := parseAddHeader(d.args)
 			if !ok {
@@ -381,6 +391,27 @@ func parseSeconds(args string) (int, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// parseLogDirective maps the logging directives nginxgen emits back onto the
+// Route: `access_log off;` and `error_log <nginxgen.DefaultErrorLogPath>
+// <level>;` with a level from proxymodel.ErrorLogLevels. Anything else returns
+// false.
+func parseLogDirective(name, args string, r *proxymodel.Route) bool {
+	fields := strings.Fields(args)
+	switch name {
+	case "access_log":
+		if len(fields) == 1 && fields[0] == "off" {
+			r.AccessLog = proxymodel.AccessLogOff
+			return true
+		}
+	case "error_log":
+		if len(fields) == 2 && fields[0] == nginxgen.DefaultErrorLogPath && fields[1] != "" && proxymodel.ValidErrorLogLevel(fields[1]) {
+			r.ErrorLogLevel = fields[1]
+			return true
+		}
+	}
+	return false
 }
 
 // parseAddHeader splits `add_header Name Value [always];` into name + value,
