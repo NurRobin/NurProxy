@@ -108,8 +108,16 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 	//    orphaned (its domain was deleted or switched policy): skip it rather than
 	//    drive ACME forever for a host nobody serves. Skip, never delete — cert
 	//    removal belongs to the teardown path, not the renewer.
+	//
+	//    An imported cert (#80) is the exception: its SANs were chosen by the
+	//    operator's CA and may span zones NurProxy cannot solve DNS-01 for. Central
+	//    renewal takes it over for the one host it is stored under, which is all
+	//    the consuming domain needs; the renewed cert is an ordinary ACME cert.
 	for i := range certs {
 		c := &certs[i]
+		if c.Source == models.CertSourceImported {
+			c = &models.Certificate{Host: c.Host, Names: []string{c.Host}}
+		}
 		if !certHasCentralConsumer(c, centralHosts) {
 			log.Printf("reconciler: renewal: no central-TLS domain consumes cert host %q, skipping renewal", c.Host)
 			continue
@@ -244,6 +252,7 @@ func (s *CertRenewalStore) SaveRenewed(_ context.Context, res *tls.CertResult, i
 		IsWildcard: isWildcard,
 		CertPEM:    string(res.CertPEM),
 		KeyPEM:     string(res.KeyPEM),
+		Source:     models.CertSourceACME,
 	}
 	if notAfter, err := tls.LeafNotAfter(res.CertPEM); err == nil {
 		cert.ExpiresAt = notAfter

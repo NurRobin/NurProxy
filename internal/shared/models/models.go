@@ -637,7 +637,16 @@ type Certificate struct {
 	IssuedAt  time.Time `json:"issued_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Source says where the stored bundle came from: CertSourceACME (central
+	// issuance) or CertSourceImported (operator upload, #80). Empty is treated
+	// as ACME.
+	Source string `json:"source"`
 }
+
+const (
+	CertSourceACME     = "acme"
+	CertSourceImported = "imported"
+)
 
 // AdminOpType names a kind of pending agent admin op (§19). It drives the
 // payload schema and the agent-side handler.

@@ -87,6 +87,40 @@ func TestUpsertCertificate_reissueOverwrites(t *testing.T) {
 	}
 }
 
+// TestUpsertCertificate_source covers the import provenance (#80): an imported
+// bundle keeps its source until a later upsert (an ACME renewal) replaces it,
+// and an unset source is stored as acme.
+func TestUpsertCertificate_source(t *testing.T) {
+	tests := []struct {
+		name   string
+		writes []string
+		want   string
+	}{
+		{name: "unset defaults to acme", writes: []string{""}, want: models.CertSourceACME},
+		{name: "imported", writes: []string{models.CertSourceImported}, want: models.CertSourceImported},
+		{name: "renewal replaces import", writes: []string{models.CertSourceImported, models.CertSourceACME}, want: models.CertSourceACME},
+		{name: "re-import over acme", writes: []string{models.CertSourceACME, models.CertSourceImported}, want: models.CertSourceImported},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			for _, source := range tc.writes {
+				c := &models.Certificate{ID: "h.example.com", Host: "h.example.com", CertPEM: "C", KeyPEM: "K", Source: source}
+				if err := d.UpsertCertificate(c); err != nil {
+					t.Fatalf("UpsertCertificate(%q): %v", source, err)
+				}
+			}
+			got, err := d.GetCertificate("h.example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Source != tc.want {
+				t.Errorf("source = %q, want %q", got.Source, tc.want)
+			}
+		})
+	}
+}
+
 func TestCertificatesDueForRenewal_window(t *testing.T) {
 	d := testDB(t)
 

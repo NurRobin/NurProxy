@@ -16,8 +16,16 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io/fs"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -231,6 +239,26 @@ func TestSandboxEndToEnd(t *testing.T) {
 	if !sawIssuance {
 		t.Error("no audit entry with source=dryrun for certificate issuance")
 	}
+
+	// Operator-imported certificate (#80): it replaces the dry-issued one, is
+	// stored as imported, and reaches the agent's cert store over the same push.
+	importedCert, importedKey := sandboxServerCert(t, "app.sandbox.test")
+	var imported struct {
+		Host   string `json:"host"`
+		Source string `json:"source"`
+	}
+	api.put(fmt.Sprintf("/api/v1/domains/%d/certificate", domain.ID), map[string]string{
+		"cert_pem": importedCert, "key_pem": importedKey,
+	}, &imported)
+	if imported.Host != "app.sandbox.test" || imported.Source != "imported" {
+		t.Fatalf("certificate import response = %+v", imported)
+	}
+	agentCertPath := ""
+	waitFor(t, 20*time.Second, func() bool {
+		agentCertPath = findFileWithContent(agentDataDir, "app.sandbox.test.crt", importedCert)
+		return agentCertPath != ""
+	})
+	t.Logf("imported certificate installed on the agent at %s", agentCertPath)
 
 	stalePath := filepath.Join(proxyConfigDir, "nurproxy-stale.sandbox.test.conf.nurproxy-tmp")
 	if err := os.WriteFile(stalePath, []byte(agentproxy.ManagedArtifactMarker+"\n# stale sandbox temp\n"), 0o644); err != nil {
@@ -587,3 +615,48 @@ func (c *apiClient) do(method, path string, body, out any) {
 func (c *apiClient) get(path string, out any)     { c.do(http.MethodGet, path, nil, out) }
 func (c *apiClient) post(path string, b, out any) { c.do(http.MethodPost, path, b, out) }
 func (c *apiClient) put(path string, b, out any)  { c.do(http.MethodPut, path, b, out) }
+
+// sandboxServerCert mints a self-signed server certificate for host, standing
+// in for an operator's existing bundle.
+func sandboxServerCert(t *testing.T, host string) (certPEM, keyPEM string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(60 * 24 * time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+}
+
+// findFileWithContent returns the path of a file named name below root whose
+// content equals want, or "" when there is none (yet).
+func findFileWithContent(root, name, want string) string {
+	found := ""
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != name {
+			return nil
+		}
+		if got, rErr := os.ReadFile(path); rErr == nil && string(got) == want {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}

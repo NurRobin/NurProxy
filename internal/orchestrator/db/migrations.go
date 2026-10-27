@@ -800,6 +800,15 @@ var migrations = []string{
 	`
 	ALTER TABLE domains ADD COLUMN proxied INTEGER CHECK (proxied IS NULL OR proxied IN (0, 1));
 	`,
+
+	// Migration 34: where a stored certificate came from (#80). 'acme' is a
+	// centrally issued cert; 'imported' is an operator-uploaded bundle. Renewal
+	// re-issues an imported cert for its host only, not for the SAN list the
+	// operator's CA chose. Existing rows were all issued by NurProxy.
+	`
+	ALTER TABLE certificates ADD COLUMN source TEXT NOT NULL DEFAULT 'acme'
+		CHECK (source IN ('acme', 'imported'));
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

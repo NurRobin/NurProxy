@@ -41,14 +41,18 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 	if c.IsWildcard {
 		isWildcard = 1
 	}
+	source := c.Source
+	if source == "" {
+		source = models.CertSourceACME
+	}
 	expires := ""
 	if !c.ExpiresAt.IsZero() {
 		expires = c.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 
 	_, err = d.sql.Exec(`
-		INSERT INTO certificates (id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO certificates (id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(host) DO UPDATE SET
 			names = excluded.names,
 			is_wildcard = excluded.is_wildcard,
@@ -56,9 +60,10 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 			key_pem_enc = excluded.key_pem_enc,
 			issued_at = excluded.issued_at,
 			expires_at = excluded.expires_at,
-			updated_at = excluded.updated_at`,
+			updated_at = excluded.updated_at,
+			source = excluded.source`,
 		c.ID, c.Host, string(names), isWildcard, c.CertPEM, encKey,
-		c.IssuedAt.UTC().Format(time.RFC3339), expires, now.Format(time.RFC3339),
+		c.IssuedAt.UTC().Format(time.RFC3339), expires, now.Format(time.RFC3339), source,
 	)
 	if err != nil {
 		return fmt.Errorf("upserting certificate: %w", err)
@@ -70,7 +75,7 @@ func (d *DB) UpsertCertificate(c *models.Certificate) error {
 // key. Returns an error if not found.
 func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
 	row := d.read.QueryRow(`
-		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
+		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source
 		FROM certificates WHERE host = ?`, host)
 	c, err := d.scanCertificate(row)
 	if err == sql.ErrNoRows {
@@ -85,7 +90,7 @@ func (d *DB) GetCertificate(host string) (*models.Certificate, error) {
 // ListCertificates returns all stored certificates with private keys decrypted.
 func (d *DB) ListCertificates() ([]models.Certificate, error) {
 	rows, err := d.read.Query(`
-		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
+		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source
 		FROM certificates ORDER BY host`)
 	if err != nil {
 		return nil, fmt.Errorf("listing certificates: %w", err)
@@ -109,7 +114,7 @@ func (d *DB) ListCertificates() ([]models.Certificate, error) {
 func (d *DB) CertificatesDueForRenewal(window time.Duration) ([]models.Certificate, error) {
 	cutoff := time.Now().UTC().Add(window).Format(time.RFC3339)
 	rows, err := d.read.Query(`
-		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at
+		SELECT id, host, names, is_wildcard, cert_pem, key_pem_enc, issued_at, expires_at, updated_at, source
 		FROM certificates
 		WHERE expires_at != '' AND expires_at <= ?
 		ORDER BY expires_at`, cutoff)
@@ -157,7 +162,7 @@ func (d *DB) scanCertificate(s scanner) (*models.Certificate, error) {
 		expiresAt  string
 		updatedAt  string
 	)
-	if err := s.Scan(&c.ID, &c.Host, &namesJSON, &isWildcard, &c.CertPEM, &encKey, &issuedAt, &expiresAt, &updatedAt); err != nil {
+	if err := s.Scan(&c.ID, &c.Host, &namesJSON, &isWildcard, &c.CertPEM, &encKey, &issuedAt, &expiresAt, &updatedAt, &c.Source); err != nil {
 		return nil, err
 	}
 
