@@ -1,4 +1,5 @@
 import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
+import type { ProxyConfigUpdate } from './proxy-config';
 
 const BASE = '/api/v1';
 
@@ -175,7 +176,7 @@ export const api = {
   createDomain: (data: Partial<Domain>) =>
     request<Domain>('/domains', { method: 'POST', body: JSON.stringify(data) }),
   getDomain: (id: number) => request<Domain>(`/domains/${id}`),
-  updateDomain: (id: number, data: Partial<Domain>) =>
+  updateDomain: (id: number, data: Partial<Omit<Domain, 'proxy_config'>> & { proxy_config?: ProxyConfigUpdate }) =>
     request<Domain>(`/domains/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteDomain: (id: number) => request<{ message: string }>(`/domains/${id}`, { method: 'DELETE' }),
   getDomainConfig: (id: number) => request<DomainConfig>(`/domains/${id}/config`),

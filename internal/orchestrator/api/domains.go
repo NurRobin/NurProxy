@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -195,14 +196,14 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	before := *dom
 
 	var req struct {
-		Subdomain   *string             `json:"subdomain"`
-		ZoneID      *string             `json:"zone_id"`
-		ServerID    *string             `json:"server_id"`
-		Port        *int                `json:"port"`
-		WebSocket   *bool               `json:"websocket"`
-		ForceHTTPS  *bool               `json:"force_https"`
-		SSLMode     *models.SSLMode     `json:"ssl_mode"`
-		ProxyConfig *models.ProxyConfig `json:"proxy_config"`
+		Subdomain   *string         `json:"subdomain"`
+		ZoneID      *string         `json:"zone_id"`
+		ServerID    *string         `json:"server_id"`
+		Port        *int            `json:"port"`
+		WebSocket   *bool           `json:"websocket"`
+		ForceHTTPS  *bool           `json:"force_https"`
+		SSLMode     *models.SSLMode `json:"ssl_mode"`
+		ProxyConfig json.RawMessage `json:"proxy_config"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -242,8 +243,13 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	if req.SSLMode != nil {
 		dom.SSLMode = *req.SSLMode
 	}
-	if req.ProxyConfig != nil {
-		dom.ProxyConfig = *req.ProxyConfig
+	if len(req.ProxyConfig) > 0 {
+		merged, err := mergeProxyConfig(dom.ProxyConfig, req.ProxyConfig)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		dom.ProxyConfig = merged
 	}
 
 	// Mark as pending for reconciler to pick up
@@ -288,6 +294,55 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	s.triggerAgentPush(dom.ServerID)
 
 	writeJSON(w, http.StatusOK, dom)
+}
+
+// mergeProxyConfig applies a PUT request's proxy_config onto the stored one,
+// key by key: a key the request leaves out keeps its stored value, a key set to
+// null resets that field, and any other value replaces the field as a whole
+// (maps and lists such as custom_request_headers or ip_allowlist are replaced,
+// not merged). A null proxy_config changes nothing. Merging through the JSON
+// form keeps fields added to ProxyConfig later covered without listing them.
+func mergeProxyConfig(stored models.ProxyConfig, patch json.RawMessage) (models.ProxyConfig, error) {
+	if isJSONNull(patch) {
+		return stored, nil
+	}
+	var overlay map[string]json.RawMessage
+	if err := json.Unmarshal(patch, &overlay); err != nil || overlay == nil {
+		return stored, errors.New("proxy_config must be a JSON object")
+	}
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		return stored, fmt.Errorf("encode stored proxy_config: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(storedJSON, &fields); err != nil {
+		return stored, fmt.Errorf("decode stored proxy_config: %w", err)
+	}
+	for key, value := range overlay {
+		// encoding/json matches struct fields case-insensitively, so a stored
+		// key that differs only in case would compete with the request's key.
+		for existing := range fields {
+			if strings.EqualFold(existing, key) {
+				delete(fields, existing)
+			}
+		}
+		if !isJSONNull(value) {
+			fields[key] = value
+		}
+	}
+	mergedJSON, err := json.Marshal(fields)
+	if err != nil {
+		return stored, fmt.Errorf("encode proxy_config: %w", err)
+	}
+	var merged models.ProxyConfig
+	if err := json.Unmarshal(mergedJSON, &merged); err != nil {
+		return stored, fmt.Errorf("invalid proxy_config: %w", err)
+	}
+	return merged, nil
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
 }
 
 // artifactIDForDomainID derives the stable artifact identity for a generated
