@@ -296,7 +296,7 @@ func parseLocation(loc block, res *Result) bool {
 	return clean
 }
 
-var proxyPassRe = regexp.MustCompile(`^(https?)://([^:/\s]+):(\d+)/?$`)
+var proxyPassRe = regexp.MustCompile(`^(https?)://(\[[0-9A-Fa-f:.]+\]|[^:/\s\[\]]+):(\d+)/?$`)
 
 // parseProxyPass maps `proxy_pass http://addr:port;` onto the Upstream. Only the
 // simple scheme://host:port form nginxgen emits is recognized; anything fancier
@@ -310,7 +310,7 @@ func parseProxyPass(arg string, r *proxymodel.Route) bool {
 	if err != nil || port <= 0 || port > 65535 {
 		return false
 	}
-	r.Upstream.Addr = m[2]
+	r.Upstream.Addr = strings.TrimSuffix(strings.TrimPrefix(m[2], "["), "]")
 	r.Upstream.Port = port
 	if m[1] == "https" {
 		r.Upstream.Scheme = proxymodel.SchemeHTTPS

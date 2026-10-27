@@ -386,8 +386,10 @@
   zone/server → 400.
 - **Coverage:** D.
 - **Pitfalls:** every update resets status to `pending` even for a no-op body —
-  expect a reconcile cycle and a re-push after any PUT. Setting `proxy_config` here
-  **replaces** the whole object (it does not deep-merge).
+  expect a reconcile cycle and a re-push after any PUT. `proxy_config` is merged
+  key by key onto the stored object (#163): absent keys keep their value, `null`
+  clears a field (e.g. `{"proxy_config":{"basic_auth":null}}`), any other value
+  replaces that field whole (maps and lists are not merged).
 
 ### Domain delete — `DELETE /domains/{id}` (soft delete)
 

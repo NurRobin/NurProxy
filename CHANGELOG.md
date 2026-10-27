@@ -29,6 +29,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `subdomain` and `zone_id`. `/api/v1/health` reports queued deletions as
   `domain_dns_cleanup`. Migration 35 runs on start.
 
+## [0.5.1] - 2026-10-27
+
+### Fixed
+
+- **Saving a domain in the dashboard no longer drops proxy settings it doesn't
+  show (#163).** The General and Headers tabs sent only their own fields, and
+  the API replaced the whole stored proxy config with them. Basic auth, IP
+  allow/block lists, TLS policy, raw config, response headers, timeouts, rate
+  limit, path rules and upstream scheme set through the API or CLI were
+  silently cleared, so a protected site could become public. The dashboard now
+  sends only the settings you changed, and `PUT /api/v1/domains/{id}`
+  merges `proxy_config` key by key: keys left out keep their stored value,
+  `null` clears a field (for example `"basic_auth": null`), and any other value
+  replaces that field as a whole.
+- **Apache domains with an IP allowlist or blocklist pass `httpd -t` again
+  (#166).** The rules were rendered as a `<RequireAll>` directly inside
+  `<VirtualHost>`, which Apache rejects, so the agent could not apply the
+  domain. They now go in a `<Location />` block. When a domain has both IP
+  rules and basic auth, a request has to pass both, the same as on nginx.
+- **IPv6 upstreams are rendered with brackets** (`http://[fd00::5]:8080`) in
+  nginx and Apache configs, and upstream names may end in a dot (`ai.lan.`).
+
+### Security
+
+- **Raw nginx configs are checked the way nginx reads them.** The helper's
+  raw config check now splits a config into directives with nginx's own
+  tokenizer rules: quotes and `#` only count at the start of a word, and
+  backslashes escape the next character. Before, the check could read some
+  configs differently from nginx. Every directive in the proxied server, its
+  `location /` and the port-80 redirect server must now be on a fixed list
+  for that block, and directive names must be plain words. A raw config that
+  uses quoted directive names, single-quoted values, backslashes outside a
+  `rewrite` pattern, `#` or braces inside a word, comments in the middle of a
+  directive, a word or comment over 4000 bytes (nginx fails above 4096), or
+  a redirect server with anything other
+  than `listen 80`, one `server_name` for the domain and one `return 301
+  https://$host$request_uri` is refused. Listeners must match what NurProxy
+  renders: no options on port 80, and `ssl` (plus `http2` on older nginx) on
+  port 443, because nginx applies listen options to every vhost on that
+  port. As before, a refused config is kept only if the exact bytes are
+  already installed. Configs rendered from the dashboard form still pass.
+- **Rendered vhosts get the same check.** The helper now runs every nginx
+  vhost it renders from a domain's settings through the same check (with
+  basic auth and rate limits allowed in the form NurProxy renders them) and
+  refuses to write one that fails.
+- **Proxy settings are validated before they reach a config.** Header names
+  may only contain letters, digits, `-` and `_`. Header values may not contain
+  control characters or backslashes, may not start with a quote or with
+  `expr=` (also after leading spaces or quotes), and are limited to 3900
+  bytes. Hosts and upstream addresses must be DNS names or IP
+  addresses, IP lists must hold IPs or CIDR ranges, body sizes must be whole
+  sizes like `10m`, `1GB`, `0` or `unlimited`, path rules may not contain
+  whitespace, quotes, braces, `#`, `;` or backslashes, and basic-auth user
+  names may not contain `:`. The API checks the merged settings when a domain
+  is saved, and the nginx and Apache renderers and the helper refuse such
+  values. Header values that contain `'`, `#` or braces are now rendered in
+  double quotes, so nginx reads them as one value; the nginx renderer also
+  escapes backslashes inside quotes as a second safeguard. Apache header
+  values and the basic-auth realm are always rendered as one double-quoted
+  word with backslashes and quotes escaped, and header values have `%` and
+  `\` doubled, so mod_headers sets them literally instead of expanding
+  format sequences such as `%{NAME}e`.
+- **A domain with invalid stored settings no longer blocks its agent.** The
+  reconciler holds back only that domain, keeps its current config and
+  certificate on the agent, and marks the domain as failed with the reason,
+  until the settings are corrected.
+
 ## [0.5.0] - 2026-10-27
 
 First stable release of the 0.5 line. It contains everything from
@@ -333,6 +400,7 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.5.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.1
 [0.5.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0
 [0.5.0-rc.3]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.3
 [0.5.0-rc.2]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.2

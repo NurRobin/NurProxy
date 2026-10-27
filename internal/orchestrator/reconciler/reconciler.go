@@ -801,6 +801,21 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			}
 		} else {
 			intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+			// The agent's helper refuses the whole apply batch when one route
+			// fails validation. Hold back only this route, keep its current
+			// file on the agent (like a drifted artifact) and show the reason
+			// on the domain, so one bad stored value neither blocks the other
+			// domains nor goes unnoticed.
+			if vErr := intent.Validate(); vErr != nil {
+				log.Printf("reconciler: not pushing domain %d (%s): stored proxy settings are invalid: %v", dom.ID, fqdn, vErr)
+				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("proxy settings are invalid, fix them to apply this domain again: %v", vErr)); dErr != nil {
+					log.Printf("reconciler: failed to update domain status: %v", dErr)
+				}
+				if artErr == nil && storedArt.Target.Path != "" {
+					keepExtra = append(keepExtra, storedArt.Target.Path)
+				}
+				continue
+			}
 		}
 
 		// route (Caddy JSON) feeds only the inbound same-host fallback; the stream

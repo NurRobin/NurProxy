@@ -76,6 +76,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Build frontend
         run: cd web && npm ci && npm run build
+      - name: Frontend unit tests
+        run: cd web && npm test
       - name: Build orchestrator
         run: go build -o nurproxy ./cmd/nurproxy
       - name: Build agent

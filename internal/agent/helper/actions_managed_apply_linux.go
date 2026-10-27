@@ -648,6 +648,11 @@ func (a *managedApplyAction) renderRoute(route proxymodel.Route, certPath, keyPa
 			content.WriteByte('\n')
 		}
 		content.WriteString(result.Server)
+		// The rendered file must stay inside the same directive allowlists as
+		// a raw config, so a renderer defect can never become a root write.
+		if err := nginxparse.ValidateRendered(content.String(), nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}); err != nil {
+			return "", fmt.Errorf("rendered nginx config for %s failed the managed policy: %w", route.Host, err)
+		}
 		return content.String(), nil
 	case "apache":
 		result, err := apachegen.Render(apachegen.Input{Route: route, CertPath: certPath, KeyPath: keyPath, AuthFile: authPath})
