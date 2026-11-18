@@ -46,7 +46,7 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 // with the same rules the agent's helper applies, so a value the helper would
 // refuse is rejected when it is saved.
 func validateProxyOptions(dom models.Domain) error {
-	return caddygen.ConfigFromDomain(dom, "", "").ValidateOptions()
+	return caddygen.ConfigFromDomain(dom, "", "", nil).ValidateOptions()
 }
 
 // POST /api/v1/domains
@@ -144,6 +144,10 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
 	if err := s.db.CheckDomainLogging(dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.db.CheckDomainRoutes(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -324,6 +328,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
 	if err := s.db.CheckDomainLogging(dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.db.CheckDomainRoutes(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -641,7 +649,11 @@ func (s *Server) handleGetDomainConfig(w http.ResponseWriter, r *http.Request) {
 // agent's conventional cert-store paths so a TLS route previews its real
 // listener; the operator adjusts them if their agent uses a custom cert dir.
 func (s *Server) renderDomainPreview(dom *models.Domain, srv *models.Server, fqdn string) (backend string, config interface{}, err error) {
-	route := caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+	routeAddrs, err := s.db.PathRouteAddrs(*dom)
+	if err != nil {
+		return s.backendForDomain(srv), nil, err
+	}
+	route := caddygen.ConfigFromDomain(*dom, fqdn, srv.Address, routeAddrs)
 	backend = s.backendForDomain(srv)
 	certPath, keyPath := previewCertPaths(fqdn)
 

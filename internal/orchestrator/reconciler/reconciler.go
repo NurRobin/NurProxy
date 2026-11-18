@@ -800,13 +800,23 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 				Raw:  proxymodel.RawConfig{Backend: backendForAgent(agent), Content: storedArt.Content},
 			}
 		} else {
-			intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+			routeAddrs, rErr := r.db.PathRouteAddrs(*dom)
+			intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address, routeAddrs)
 			// The agent's helper refuses the whole apply batch when one route
 			// fails validation. Hold back only this route, keep its current
 			// file on the agent (like a drifted artifact) and show the reason
 			// on the domain, so one bad stored value neither blocks the other
-			// domains nor goes unnoticed.
-			if vErr := intent.Validate(); vErr != nil {
+			// domains nor goes unnoticed. Path routes the agent's backend
+			// cannot render are held back the same way: an older agent would
+			// drop them without a word.
+			vErr := rErr
+			if vErr == nil {
+				vErr = intent.Validate()
+			}
+			if vErr == nil && len(intent.PathRoutes) > 0 {
+				vErr = dom.ProxyConfig.CheckRoutesSupported(agent.ProxyCapabilities, backendForAgent(agent))
+			}
+			if vErr != nil {
 				log.Printf("reconciler: not pushing domain %d (%s): stored proxy settings are invalid: %v", dom.ID, fqdn, vErr)
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("proxy settings are invalid, fix them to apply this domain again: %v", vErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
@@ -1981,6 +1991,15 @@ func (r *Reconciler) finalizePendingParentDeletions() {
 		}
 		if len(doms) > 0 {
 			continue // teardown still in flight; try again next cycle
+		}
+		if p.EntityType == "server" {
+			// A path route added after the cascade request still needs the
+			// server; it has no foreign key to stop the delete.
+			refs, err := r.db.ListDomains(db.DomainFilter{RouteServerID: p.EntityID})
+			if err != nil || len(refs) > 0 {
+				log.Printf("reconciler: pending delete of server %s waits: %d domain(s) still route paths to it (err=%v)", p.EntityID, len(refs), err)
+				continue
+			}
 		}
 
 		var delErr error

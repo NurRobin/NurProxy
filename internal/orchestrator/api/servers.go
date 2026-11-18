@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -113,9 +114,42 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, srv)
 }
 
+// guardRouteServer refuses to delete a server that other domains still use as
+// a path route upstream. It writes a 409 listing those domains and returns
+// true when deletion must abort. Domains whose own server is this one are
+// left to guardChildDomains and the cascade.
+func (s *Server) guardRouteServer(w http.ResponseWriter, id string) bool {
+	doms, err := s.db.ListDomains(db.DomainFilter{RouteServerID: id})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check for path routes using this server")
+		return true
+	}
+	var names []string
+	for _, d := range doms {
+		if d.ServerID != id {
+			names = append(names, d.Subdomain)
+		}
+	}
+	if len(names) == 0 {
+		return false
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"error":   fmt.Sprintf("server is the upstream of path routes on %d domain(s); remove those routes first", len(names)),
+		"domains": names,
+	})
+	return true
+}
+
 // DELETE /api/v1/servers/{id}
 func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
+
+	// Path routes reference servers inside proxy_config, out of reach of any
+	// foreign key, and are refused even with ?cascade=true: deleting a whole
+	// domain because one of its paths points here would go too far.
+	if s.guardRouteServer(w, id) {
+		return
+	}
 
 	// Refuse while domains still reference this server: the ON DELETE CASCADE would
 	// orphan their DNS records/certs ahead of the reconciler teardown (see
