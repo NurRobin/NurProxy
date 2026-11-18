@@ -34,16 +34,21 @@ Active/passive failover by switching the domain's single CNAME.
   adoption and with takeover, because the record shape does not change.
 - Cost: no load sharing between healthy agents. That is a non-goal here.
 
-## Data model (migration 36)
+## Data model (migration 38)
 
 - `domain_backups(domain_id, server_id, priority)`, PK `(domain_id, server_id)`,
   FK cascade on both sides. Lower priority value = preferred. The primary is
   always priority 0 implicitly and is not stored here.
 - `domain_failover(domain_id PK, active_server_id, pending_server_id,
-  pending_since, all_down, switched_at, switches)`: the reconciler's decision
-  state. A row exists only for domains that have backups.
+  pending_since, all_down, switched_at, switches, evaluated_at,
+  settle_since)`: the reconciler's decision state. It is only written in a
+  DNS pass under the domain's DNS lock; a domain without backups has its row
+  dropped there.
+- `domain_standby_status(domain_id, agent_id, ready, reason)`: the last
+  standby apply each backup agent acknowledged.
 - Settings: `failover_grace` (seconds, default 30), `failover_failback`
-  (`true`), `failover_failback_delay` (seconds, default 300).
+  (`true`), `failover_failback_delay` (seconds, default 300),
+  `failover_settle` (seconds, default 90).
 
 Validation when backups are set (API, CLI, MCP share one DB function): the
 domain is not cert-only and not being deleted; each server exists, is not the
@@ -65,11 +70,21 @@ Health is the existing liveness signal: an agent is up while its last heartbeat
   "healthy since" mark (`pending_server_id`, `pending_since`) is persisted, so
   an orchestrator restart cannot shorten the delay. With `failover_failback`
   off the record stays on the backup until that one fails.
+- **Settle period:** for `failover_settle` after the orchestrator starts,
+  after a pass that comes later than max(down time, three reconcile
+  intervals) after the previous one, and after an all-down state ends, a
+  down target is held. Agents reconnect with up to 30 s of backoff and
+  heartbeat every 30 s; without the hold the agent that reports first would
+  win and a failback would follow minutes later.
+- **Readiness:** a backup is only selected once its agent acknowledged the
+  standby route without error and, for central TLS, with the certificate in
+  the store (each push installs it before the apply). A failed standby apply
+  makes it ineligible until a later apply succeeds; a rename resets it.
 - An agent that is pending, rejected, has no FQDN, or (for backups) no longer
   serves the zone is never selected.
 
 Every switch writes an audit entry (`failover`, `failback`, `failover_all_down`,
-`failover_recovered`) and bumps `domain_failover.switches`. `/metrics` exports
+`failover_recovered`, `failover_target_removed`) and bumps `domain_failover.switches`. `/metrics` exports
 `nurproxy_domain_failover_switches_total{domain}` and
 `nurproxy_domain_on_backup{domain}`.
 
@@ -121,7 +136,14 @@ domain is renamed (#151, the old host gets a tombstone like on the primary).
 - **Apex:** unchanged; the apex CNAME needs a provider with CNAME flattening.
 - **Cert-only hosts:** no backups. NurProxy does not manage their DNS, so there
   is nothing to switch.
-- **Takeover:** writes the CNAME for the currently active target.
+- **Takeover:** writes the CNAME for the currently active target, under the
+  domain's DNS lock (#173). The takeover preview computes the same decision
+  without storing it or writing audit entries.
+- **Removing backups:** removing the backup the record points at is refused
+  (409) while no server that stays is healthy, so a list edit never sends the
+  record to a down agent. If the target disappears another way (agent
+  deleted), the next pass moves the record to the first healthy candidate, or
+  the primary, and audits `failover_target_removed`.
 - **Rename (#151):** the old record is released as before; the new record is
   created for the active target; standby vhosts get rename tombstones.
 - **Cascade delete:** deleting a server that is a backup is refused with 409;

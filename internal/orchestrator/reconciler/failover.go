@@ -6,45 +6,82 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/failover"
-	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
-	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
-// selectDNSTarget returns the agent dom's CNAME should point at. Without
-// backups that is the primary server's agent, as it always was. With backups
-// the failover decision picks it (failover.Decide); a changed decision is
-// stored and every switch audited before the target is returned, so DNS
-// never moves without a record of why.
-func (r *Reconciler) selectDNSTarget(dom *models.Domain) (*models.Agent, error) {
+// failoverPolicy is the stored policy plus what only the running
+// reconciler knows: when it started, and after how long a gap a pass counts
+// as stale (at least three cycles, so a long reconcile interval never makes
+// every pass look stale).
+func (r *Reconciler) failoverPolicy() failover.Policy {
+	p := failover.LoadPolicy(r.db)
+	p.StartedAt = r.startedAt
+	p.StaleAfter = max(p.DownAfter, 3*r.currentInterval())
+	return p
+}
+
+// dnsTarget is the outcome of a failover evaluation for one domain.
+type dnsTarget struct {
+	agent *models.Agent
+	cands []db.DomainCandidate
+	dec   failover.Decision
+	// failover is false for a domain without backups.
+	failover bool
+}
+
+// decideDNSTarget works out the agent dom's CNAME should point at without
+// changing anything: the primary server's agent without backups, otherwise
+// the failover decision (failover.Decide). The takeover preview uses it as
+// is; selectDNSTarget stores and audits the decision.
+func (r *Reconciler) decideDNSTarget(dom *models.Domain) (*dnsTarget, error) {
 	cands, err := r.db.DomainCandidates(dom)
 	if err != nil {
 		return nil, err
 	}
 	if len(cands) == 1 {
-		return &cands[0].Agent, nil
+		return &dnsTarget{agent: &cands[0].Agent, cands: cands}, nil
 	}
 	st, err := r.db.GetDomainFailover(dom.ID)
 	if err != nil {
 		return nil, err
 	}
-	dec := failover.Decide(db.FailoverCandidates(cands), st, failover.LoadPolicy(r.db), r.clock().UTC())
-	if dec.Changed {
-		if err := r.db.SaveDomainFailover(dec.State); err != nil {
+	dec := failover.Decide(db.FailoverCandidates(cands), st, r.failoverPolicy(), r.clock().UTC())
+	return &dnsTarget{agent: &cands[dec.Active].Agent, cands: cands, dec: dec, failover: true}, nil
+}
+
+// selectDNSTarget is decideDNSTarget that also stores the decision and
+// audits every switch before the target is returned, so DNS never moves
+// without a record of why. A domain without backups drops leftover state, so
+// backups added later start from the primary. Callers hold the domain's DNS
+// lock (domainDNSLock): the state and the record it describes change
+// together.
+func (r *Reconciler) selectDNSTarget(dom *models.Domain) (*models.Agent, error) {
+	t, err := r.decideDNSTarget(dom)
+	if err != nil {
+		return nil, err
+	}
+	if !t.failover {
+		if st, err := r.db.GetDomainFailover(dom.ID); err != nil {
 			return nil, err
+		} else if st.EvaluatedAt != nil || st.ActiveServerID != "" {
+			if err := r.db.DeleteDomainFailover(dom.ID); err != nil {
+				return nil, err
+			}
 		}
+		return t.agent, nil
 	}
-	prev := &cands[0]
-	for i := range cands {
-		if cands[i].Server.ID == st.ActiveServerID {
-			prev = &cands[i]
-		}
+	if err := r.db.SaveDomainFailover(t.dec.State); err != nil {
+		return nil, err
 	}
-	next := &cands[dec.Active]
-	for _, ev := range dec.Events {
+	var prev *db.DomainCandidate
+	if t.dec.Previous >= 0 {
+		prev = &t.cands[t.dec.Previous]
+	}
+	next := &t.cands[t.dec.Active]
+	for _, ev := range t.dec.Events {
 		r.audit("domain", fmt.Sprintf("%d", dom.ID), string(ev), failoverDetail(ev, dom, prev, next))
 	}
-	return &next.Agent, nil
+	return t.agent, nil
 }
 
 func agentLabel(c *db.DomainCandidate) string {
@@ -52,15 +89,21 @@ func agentLabel(c *db.DomainCandidate) string {
 }
 
 func failoverDetail(ev failover.Event, dom *models.Domain, prev, next *db.DomainCandidate) string {
+	prevLabel := "a server that is no longer a candidate"
+	if prev != nil {
+		prevLabel = agentLabel(prev)
+	}
 	switch ev {
 	case failover.EventFailover:
-		return fmt.Sprintf("domain %s: agent %s is down; DNS now points at %s", dom.Subdomain, agentLabel(prev), agentLabel(next))
+		return fmt.Sprintf("domain %s: agent %s is down; DNS now points at %s", dom.Subdomain, prevLabel, agentLabel(next))
 	case failover.EventFailback:
-		return fmt.Sprintf("domain %s: %s was healthy for the failback delay; DNS moves back from %s", dom.Subdomain, agentLabel(next), agentLabel(prev))
+		return fmt.Sprintf("domain %s: %s was healthy for the failback delay; DNS moves back from %s", dom.Subdomain, agentLabel(next), prevLabel)
 	case failover.EventAllDown:
 		return fmt.Sprintf("domain %s: every agent that can serve it is down; DNS stays on %s", dom.Subdomain, agentLabel(next))
 	case failover.EventRecovered:
 		return fmt.Sprintf("domain %s: %s is healthy again", dom.Subdomain, agentLabel(next))
+	case failover.EventTargetRemoved:
+		return fmt.Sprintf("domain %s: the server DNS pointed at was removed from the candidates; DNS now points at %s", dom.Subdomain, agentLabel(next))
 	}
 	return string(ev)
 }
@@ -71,7 +114,7 @@ func (r *Reconciler) markInboundApplied(d desiredRoute, fqdn string) error {
 	if d.standby {
 		return nil
 	}
-	return r.db.MarkDomainApplied(d.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*d.domain) == proxymodel.TLSPolicyCentral)
+	return r.markDomainApplied(d, fqdn)
 }
 
 // markInboundError records a failed inbound route push on the domain; for a

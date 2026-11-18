@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 func TestDomainBackupsAPI(t *testing.T) {
@@ -152,5 +154,101 @@ func TestDomainIDFromArtifactID(t *testing.T) {
 		if (got == nil) != (tc.want == 0) || (got != nil && *got != tc.want) {
 			t.Errorf("domainIDFromArtifactID(%q) = %v, want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+// A backup agent's apply ACK decides whether it may take over: an apply
+// error or a central-TLS domain without its certificate keeps it out.
+func TestRecordStandbyReport(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+	domainID, fqdn := seedDomainTopology(t, srv, cookie)
+	seedMoveTargets(t, srv)
+	if err := database.AddAgentZone("agent-2", "zone-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SetDomainBackups(domainID, []string{"srv-2"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	standbyID := db.StandbyArtifactID(domainID, "agent-2")
+	reason := func() string {
+		t.Helper()
+		dom, err := database.GetDomain(domainID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := database.DomainFailoverStatus(dom, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Candidates[1].Reason
+	}
+	if got := reason(); !strings.Contains(got, "not applied") {
+		t.Fatalf("before any ACK: %q", got)
+	}
+
+	// Another agent's report, or the primary artifact, is ignored.
+	srv.recordStandbyReport("agent-1", &proxymodel.ArtifactReport{ArtifactID: standbyID, Host: fqdn})
+	srv.recordStandbyReport("agent-2", &proxymodel.ArtifactReport{ArtifactID: fmt.Sprintf("dom-%d", domainID), Host: fqdn})
+	if got := reason(); !strings.Contains(got, "not applied") {
+		t.Fatalf("foreign report counted: %q", got)
+	}
+
+	srv.recordStandbyReport("agent-2", &proxymodel.ArtifactReport{ArtifactID: standbyID, Host: fqdn, Error: "nginx -t failed"})
+	if got := reason(); !strings.Contains(got, "nginx -t failed") {
+		t.Fatalf("after a failed apply: %q", got)
+	}
+	srv.recordStandbyReport("agent-2", &proxymodel.ArtifactReport{ArtifactID: standbyID, Host: fqdn})
+	if got := reason(); !strings.Contains(got, "certificate") {
+		t.Fatalf("central TLS without a cert: %q", got)
+	}
+	if err := database.UpsertCertificate(&models.Certificate{ID: "c1", Host: fqdn, Names: []string{fqdn}, CertPEM: "C", KeyPEM: "K"}); err != nil {
+		t.Fatal(err)
+	}
+	srv.recordStandbyReport("agent-2", &proxymodel.ArtifactReport{ArtifactID: standbyID, Host: fqdn})
+	if got := reason(); got != "" {
+		t.Fatalf("ready backup, reason = %q", got)
+	}
+}
+
+// Removing the backup the record points at, with nothing healthy to move to,
+// is a 409.
+func TestSetBackupsRefusesRemovingActiveBackup(t *testing.T) {
+	srv, database := testServer(t)
+	handler := srv.Handler()
+	cookie := setupAdmin(t, handler)
+	domainID, _ := seedDomainTopology(t, srv, cookie)
+	seedMoveTargets(t, srv)
+	if err := database.AddAgentZone("agent-2", "zone-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SetDomainBackups(domainID, []string{"srv-2"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SaveDomainFailover(models.DomainFailoverState{DomainID: domainID, ActiveServerID: "srv-2"}); err != nil {
+		t.Fatal(err)
+	}
+	// The primary has been silent for an hour.
+	primary, err := database.GetAgent("agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-time.Hour)
+	primary.LastSeen = &old
+	if err := database.UpdateAgent(primary); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/api/v1/domains/%d/backups", domainID)
+	w := doRequest(t, handler, http.MethodPut, path, map[string]any{"server_ids": []string{}}, cookie)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("removing the active backup = %d %s, want 409", w.Code, w.Body.String())
+	}
+	if err := database.UpdateAgentHeartbeat("agent-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	w = doRequest(t, handler, http.MethodPut, path, map[string]any{"server_ids": []string{}}, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("with the primary back = %d %s", w.Code, w.Body.String())
 	}
 }

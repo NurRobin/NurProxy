@@ -10,9 +10,8 @@ import (
 )
 
 // Deleting a server, agent, or zone while a domain still references it must be
-// refused with 409. Without the guard the DB's ON DELETE CASCADE hard-removes the
-// domain rows before the reconciler can tear down their DNS records and certs,
-// orphaning them at the provider (the v0.3.0 e2e test reproduced exactly this).
+// refused with 409 naming the blocking domains. The RESTRICT foreign keys would
+// refuse the delete too; the guard turns that into an answer a UI can act on.
 func TestDeleteParent_BlockedWhileDomainsExist(t *testing.T) {
 	srv, database := testServer(t)
 	handler := srv.Handler()

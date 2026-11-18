@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
 // GET /api/v1/domains/{id}/failover — the servers that may serve the domain,
@@ -69,6 +71,9 @@ func (s *Server) handleSetDomainBackups(w http.ResponseWriter, r *http.Request) 
 	case errors.Is(err, db.ErrInvalidBackups):
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	case errors.Is(err, db.ErrActiveBackupInUse):
+		writeError(w, http.StatusConflict, err.Error())
+		return
 	case err != nil:
 		log.Printf("backups: domain %d: %v", id, err)
 		writeError(w, http.StatusInternalServerError, "failed to store backup servers")
@@ -108,6 +113,50 @@ func backupsAuditDetail(before []db.DomainBackup, after []string) string {
 	return fmt.Sprintf("backup servers: [%s] -> [%s]", strings.Join(prev, ", "), strings.Join(after, ", "))
 }
 
+// recordStandbyReport stores whether a backup agent's standby route for a
+// domain is ready to take over (#74): applied without error, and, for a
+// domain on central TLS, with its certificate in the store, which every push
+// installs before the apply. Reports for other artifacts are ignored.
+func (s *Server) recordStandbyReport(agentID string, rep *proxymodel.ArtifactReport) {
+	domainID := domainIDFromArtifactID(rep.ArtifactID)
+	if domainID == nil || rep.ArtifactID != db.StandbyArtifactID(*domainID, agentID) {
+		return
+	}
+	dom, err := s.db.GetDomain(*domainID)
+	if err != nil {
+		return
+	}
+	ready, reason := true, ""
+	switch {
+	case rep.Error != "":
+		ready, reason = false, "last standby apply failed: "+rep.Error
+	case caddygen.TLSPolicyForDomain(*dom) == proxymodel.TLSPolicyCentral && !s.certInStore(dom):
+		ready, reason = false, "certificate not installed on the backup yet"
+	}
+	if err := s.db.RecordStandbyApply(*domainID, agentID, ready, reason); err != nil {
+		log.Printf("ack: %v", err)
+	}
+}
+
+// certInStore reports whether the central certificate dom is served with,
+// its own or its zone's wildcard, is stored.
+func (s *Server) certInStore(dom *models.Domain) bool {
+	zone, err := s.db.GetZone(dom.ZoneID)
+	if err != nil {
+		return false
+	}
+	hosts := []string{dom.FQDN(zone.Name)}
+	if wild := caddygen.WildcardCertHost(*dom, zone.Name); wild != "" {
+		hosts = append(hosts, wild)
+	}
+	for _, host := range hosts {
+		if _, err := s.db.GetCertificate(host); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // fillFailover adds backup servers and the active server to domains for the
 // response. A read failure leaves the fields empty rather than failing the
 // listing.
@@ -133,6 +182,10 @@ func (s *Server) guardBackupServer(w http.ResponseWriter, serverID string, casca
 	}
 	if cascade {
 		agents, err := s.db.RemoveServerFromBackups(serverID, time.Now().UTC())
+		if errors.Is(err, db.ErrActiveBackupInUse) {
+			writeError(w, http.StatusConflict, err.Error())
+			return true
+		}
 		if err != nil {
 			log.Printf("server delete: removing server %s from backup lists: %v", serverID, err)
 			writeError(w, http.StatusInternalServerError, "failed to remove the server from backup lists")
@@ -157,7 +210,7 @@ func (s *Server) guardBackupServer(w http.ResponseWriter, serverID string, casca
 // settings endpoint.
 func validFailoverSetting(key, value string) error {
 	switch key {
-	case "failover_grace", "failover_failback_delay":
+	case "failover_grace", "failover_failback_delay", "failover_settle":
 		n, err := strconv.Atoi(strings.TrimSpace(value))
 		if err != nil || n < 0 || n > 86400 {
 			return fmt.Errorf("%s must be a number of seconds between 0 and 86400", key)

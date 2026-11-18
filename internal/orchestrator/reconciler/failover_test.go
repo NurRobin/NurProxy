@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,7 +35,20 @@ func setupFailover(t *testing.T, d *db.DB) (dom *models.Domain, primary, backup 
 	if _, err := d.SetDomainBackups(dom.ID, []string{"srv-2"}, now); err != nil {
 		t.Fatalf("SetDomainBackups: %v", err)
 	}
+	// The backup acknowledged its standby route.
+	if err := d.RecordStandbyApply(dom.ID, backup.ID, true, ""); err != nil {
+		t.Fatal(err)
+	}
 	return dom, a1, backup
+}
+
+// newFailoverReconciler is a reconciler whose clock reads *now and that is
+// past its start-up settle period.
+func newFailoverReconciler(d *db.DB, now *time.Time) *Reconciler {
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.clock = func() time.Time { return *now }
+	r.startedAt = time.Time{}
+	return r
 }
 
 func setLastSeen(t *testing.T, d *db.DB, agentID string, at time.Time) {
@@ -89,8 +103,7 @@ func TestFailover_switchesCNAMEToBackupAndFailsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	r := New(d, newMockAgentClient(), time.Minute)
-	r.clock = func() time.Time { return now }
+	r := newFailoverReconciler(d, &now)
 	ctx := context.Background()
 
 	if err := r.reconcileDNS(ctx); err != nil {
@@ -157,8 +170,7 @@ func TestFailover_allAgentsOfflineKeepsTheRecord(t *testing.T) {
 	mp := registerMockProvider(t)
 	dom, primary, backup := setupFailover(t, d)
 	now := time.Now().UTC()
-	r := New(d, newMockAgentClient(), time.Minute)
-	r.clock = func() time.Time { return now }
+	r := newFailoverReconciler(d, &now)
 	ctx := context.Background()
 	if err := r.reconcileDNS(ctx); err != nil {
 		t.Fatal(err)
@@ -182,13 +194,22 @@ func TestFailover_allAgentsOfflineKeepsTheRecord(t *testing.T) {
 		t.Fatalf("failover_all_down audited %d times, want once", n)
 	}
 
-	// The backup reports first: it takes over at once.
+	// The backup reports first: the record is held for the settle period,
+	// then moves to it if the primary is still away.
+	setLastSeen(t, d, backup.ID, now)
+	if err := r.reconcileDNS(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cnameContent(t, d, mp, dom.ID); got != primary.FQDN {
+		t.Fatalf("CNAME -> %s, moved before the settle period ended", got)
+	}
+	now = now.Add(91 * time.Second)
 	setLastSeen(t, d, backup.ID, now)
 	if err := r.reconcileDNS(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := cnameContent(t, d, mp, dom.ID); got != backup.FQDN {
-		t.Fatalf("CNAME -> %s, want the backup that came back", got)
+		t.Fatalf("CNAME -> %s, want the backup after the settle period", got)
 	}
 }
 
@@ -200,8 +221,7 @@ func TestFailover_backupLeavingTheZoneIsNotSelected(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	r := New(d, newMockAgentClient(), time.Minute)
-	r.clock = func() time.Time { return now }
+	r := newFailoverReconciler(d, &now)
 	setLastSeen(t, d, primary.ID, now.Add(-time.Hour))
 	if err := r.reconcileDNS(context.Background()); err != nil {
 		t.Fatal(err)
@@ -218,10 +238,25 @@ func TestFailover_takeoverWritesTheActiveTarget(t *testing.T) {
 	now := time.Now().UTC()
 	setLastSeen(t, d, primary.ID, now.Add(-time.Hour))
 	mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.9"})
-	r := New(d, newMockAgentClient(), time.Minute)
-	r.clock = func() time.Time { return now }
-	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+	r := newFailoverReconciler(d, &now)
+
+	// The preview names the backup but stores nothing and audits nothing.
+	plan, err := r.PreviewDomainDNSTakeover(context.Background(), dom.ID)
+	if err != nil || plan.Target != backup.FQDN {
+		t.Fatalf("preview = %+v, %v", plan, err)
+	}
+	if st, _ := d.GetDomainFailover(dom.ID); st.ActiveServerID != "" || st.EvaluatedAt != nil {
+		t.Fatalf("preview stored failover state: %+v", st)
+	}
+	if auditCount(t, d, "failover") != 0 {
+		t.Fatal("preview audited a failover")
+	}
+
+	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 		t.Fatalf("TakeoverDomainDNS: %v", err)
+	}
+	if st, _ := d.GetDomainFailover(dom.ID); st.ActiveServerID != "srv-2" || auditCount(t, d, "failover") != 1 {
+		t.Fatalf("takeover did not store the failover: %+v", st)
 	}
 	if got := cnameContent(t, d, mp, dom.ID); got != backup.FQDN {
 		t.Fatalf("takeover CNAME -> %s, want the active backup %s", got, backup.FQDN)
@@ -321,5 +356,53 @@ func TestFailover_deleteTombstonesStandbyOnNginxBackup(t *testing.T) {
 	}
 	if ids, _ := d.DomainsBackedByServer("srv-2"); len(ids) != 0 {
 		t.Fatalf("backup rows outlived the domain: %v", ids)
+	}
+}
+
+// A backup that has not acknowledged its standby route, or whose last
+// standby apply failed, is never failed over to.
+func TestFailover_onlyReadyBackupsTakeOver(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	dom, primary, backup := setupFailover(t, d)
+	now := time.Now().UTC()
+	r := newFailoverReconciler(d, &now)
+	ctx := context.Background()
+	if err := r.reconcileDNS(ctx); err != nil {
+		t.Fatal(err)
+	}
+	setLastSeen(t, d, primary.ID, now.Add(-time.Hour))
+
+	if err := d.RecordStandbyApply(dom.ID, backup.ID, false, "last standby apply failed: nginx -t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileDNS(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cnameContent(t, d, mp, dom.ID); got != primary.FQDN {
+		t.Fatalf("failed over to a backup whose standby apply failed: %s", got)
+	}
+	status, err := d.DomainFailoverStatus(dom, now)
+	if err != nil || status.Candidates[1].Eligible || !strings.Contains(status.Candidates[1].Reason, "nginx -t") {
+		t.Fatalf("status = %+v, %v", status, err)
+	}
+
+	// Ready now. Every candidate was out, so the settle period runs first.
+	if err := d.RecordStandbyApply(dom.ID, backup.ID, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileDNS(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cnameContent(t, d, mp, dom.ID); got != primary.FQDN {
+		t.Fatalf("moved inside the settle period: %s", got)
+	}
+	now = now.Add(91 * time.Second)
+	setLastSeen(t, d, backup.ID, now)
+	if err := r.reconcileDNS(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cnameContent(t, d, mp, dom.ID); got != backup.FQDN {
+		t.Fatalf("ready backup not selected: %s", got)
 	}
 }

@@ -1,8 +1,9 @@
 // Package failover decides which agent a domain's CNAME points at when the
 // domain has backup servers on other agents (#74). The decision is a pure
 // function of the candidates' heartbeat health, the stored decision state and
-// the policy, so the reconciler (which acts on it) and the API (which shows
-// it) cannot disagree, and the hysteresis can be tested without a clock.
+// the policy, so the reconciler (which acts on it), the takeover preview and
+// the API (which only show it) cannot disagree, and the hysteresis can be
+// tested without a clock.
 package failover
 
 import (
@@ -26,6 +27,12 @@ const (
 	// DefaultFailbackDelay is how long a more preferred candidate must stay
 	// healthy before the record moves back to it.
 	DefaultFailbackDelay = 5 * time.Minute
+	// DefaultSettle is how long the current target is held after the
+	// orchestrator starts, after a pass that came late, and after every agent
+	// was down. Agents reconnect with up to 30 s of backoff and heartbeat
+	// every 30 s; until all had a chance to report, a missing heartbeat says
+	// nothing about the agent.
+	DefaultSettle = 90 * time.Second
 	// MaxBackups bounds the backup list of one domain.
 	MaxBackups = 3
 )
@@ -45,6 +52,15 @@ type Policy struct {
 	// it is until that agent fails.
 	Failback      bool
 	FailbackAfter time.Duration
+	// Settle is how long the current target is held, even when it looks
+	// down, after StartedAt, after a stale pass and after all-down ends.
+	Settle time.Duration
+	// StartedAt is when the deciding orchestrator started; zero for none.
+	StartedAt time.Time
+	// StaleAfter: a pass that comes more than this after the previous one
+	// (the orchestrator was stopped, stuck or cut off) starts a settle
+	// period. Zero disables the check.
+	StaleAfter time.Duration
 }
 
 // OfflineTimeout reads agent_offline_timeout (seconds), clamped to a floor so
@@ -63,12 +79,14 @@ func OfflineTimeout(s SettingsReader) time.Duration {
 }
 
 // LoadPolicy reads the failover settings. Unset or unparsable values fall
-// back to the defaults; negative durations count as zero.
+// back to the defaults; negative durations count as zero. StartedAt and
+// StaleAfter are the caller's to fill in.
 func LoadPolicy(s SettingsReader) Policy {
 	return Policy{
 		DownAfter:     OfflineTimeout(s) + seconds(s, "failover_grace", DefaultGrace),
 		Failback:      boolSetting(s, "failover_failback", true),
 		FailbackAfter: seconds(s, "failover_failback_delay", DefaultFailbackDelay),
+		Settle:        seconds(s, "failover_settle", DefaultSettle),
 	}
 }
 
@@ -106,7 +124,8 @@ func boolSetting(s SettingsReader, key string, def bool) bool {
 type Candidate struct {
 	ServerID string
 	// Eligible is false for an agent that may never be selected: not adopted,
-	// no FQDN to point at, or a backup agent that no longer serves the zone.
+	// no FQDN to point the CNAME at, or a backup agent that no longer serves
+	// the zone or has not applied the standby route and certificate.
 	Eligible bool
 	LastSeen *time.Time
 }
@@ -133,6 +152,10 @@ const (
 	EventAllDown Event = "failover_all_down"
 	// EventRecovered: after all were down, the active agent is healthy again.
 	EventRecovered Event = "failover_recovered"
+	// EventTargetRemoved: the server the record pointed at is no longer a
+	// candidate (its backup entry, server or agent was removed); the record
+	// moves to the first healthy candidate, or to the primary if none is.
+	EventTargetRemoved Event = "failover_target_removed"
 )
 
 // Decision is the outcome of one evaluation.
@@ -140,13 +163,17 @@ type Decision struct {
 	// Active indexes the candidate the record should point at; -1 when there
 	// are no candidates.
 	Active int
+	// Previous indexes the candidate the record pointed at before this pass,
+	// -1 when that server is no longer a candidate.
+	Previous int
 	// State is the decision state to store. Its DomainID is copied from the
 	// input.
 	State models.DomainFailoverState
 	// Events lists what changed, in order.
 	Events []Event
-	// Changed reports whether State differs from the input state.
-	Changed bool
+	// Settling reports that a down target is being held for the settle
+	// period.
+	Settling bool
 }
 
 // Decide picks the candidate the domain's record should point at.
@@ -155,50 +182,94 @@ type Decision struct {
 //     preferred healthy candidate takes over once it has been healthy for
 //     FailbackAfter (when Failback is on).
 //   - When the active candidate is down, the first healthy candidate in
-//     priority order takes over at once; DownAfter already is the grace.
+//     priority order takes over; DownAfter already is the grace. During a
+//     settle period (after StartedAt, after a stale pass, after all-down
+//     ended) a down target is held instead, because agents are still
+//     reconnecting and whoever reports first would win.
 //   - When none is healthy, the record stays on the active candidate: the
 //     last record is never removed.
+//   - A stored target that is no longer a candidate is replaced by the first
+//     healthy candidate, or the primary.
 //
-// An active server that is no longer a candidate (backup removed, primary
-// changed) is replaced by the primary before the rules above apply.
+// The returned state always carries EvaluatedAt=now, so the caller stores it
+// on every pass that acts.
 func Decide(cands []Candidate, st models.DomainFailoverState, p Policy, now time.Time) Decision {
 	if len(cands) == 0 {
-		return Decision{Active: -1, State: st}
+		return Decision{Active: -1, Previous: -1, State: st}
 	}
-	active := 0
+	next := st
+	stamp := now
+	next.EvaluatedAt = &stamp
+	var events []Event
+	healthy := func(i int) bool { return p.Healthy(cands[i], now) }
+	firstHealthy := func() int {
+		for i := range cands {
+			if healthy(i) {
+				return i
+			}
+		}
+		return -1
+	}
+	clearPending := func() { next.PendingServerID, next.PendingSince = "", nil }
+	switchTo := func(i int, ev Event) {
+		next.ActiveServerID = cands[i].ServerID
+		clearPending()
+		at := now
+		next.SwitchedAt = &at
+		next.Switches++
+		events = append(events, ev)
+	}
+
+	if st.EvaluatedAt != nil && p.StaleAfter > 0 && now.Sub(*st.EvaluatedAt) > p.StaleAfter {
+		next.SettleSince = &stamp
+	}
+
+	active := -1
 	for i := range cands {
 		if cands[i].ServerID == st.ActiveServerID {
 			active = i
 			break
 		}
 	}
-	next := st
-	next.ActiveServerID = cands[active].ServerID
-	var events []Event
-	switchTo := func(i int, ev Event) {
-		active = i
-		next.ActiveServerID = cands[i].ServerID
-		next.PendingServerID, next.PendingSince = "", nil
-		at := now
-		next.SwitchedAt = &at
-		next.Switches++
-		events = append(events, ev)
+	if active < 0 {
+		if st.ActiveServerID == "" {
+			// First evaluation: the record points at the primary already.
+			active = 0
+			next.ActiveServerID = cands[0].ServerID
+		} else {
+			target := firstHealthy()
+			if target < 0 {
+				target = 0
+			}
+			next.AllDown = false
+			switchTo(target, EventTargetRemoved)
+			return Decision{Active: target, Previous: -1, State: next, Events: events}
+		}
 	}
-	healthy := func(i int) bool { return p.Healthy(cands[i], now) }
+	prev := active
+
+	if !healthy(active) && st.AllDown && firstHealthy() >= 0 {
+		// All-down ends with someone other than the target reporting first;
+		// give the rest the settle period to report too.
+		next.AllDown = false
+		next.SettleSince = &stamp
+	}
+	settleFrom := p.StartedAt
+	if next.SettleSince != nil && next.SettleSince.After(settleFrom) {
+		settleFrom = *next.SettleSince
+	}
+	settling := p.Settle > 0 && !settleFrom.IsZero() && now.Before(settleFrom.Add(p.Settle))
 
 	if !healthy(active) {
-		next.PendingServerID, next.PendingSince = "", nil
-		replacement := -1
-		for i := range cands {
-			if healthy(i) {
-				replacement = i
-				break
-			}
+		clearPending()
+		if settling {
+			return Decision{Active: active, Previous: prev, State: next, Events: events, Settling: true}
 		}
-		if replacement >= 0 {
+		if i := firstHealthy(); i >= 0 {
 			next.AllDown = false
-			switchTo(replacement, EventFailover)
-		} else if !st.AllDown {
+			switchTo(i, EventFailover)
+			active = i
+		} else if !next.AllDown {
 			next.AllDown = true
 			events = append(events, EventAllDown)
 		}
@@ -217,7 +288,7 @@ func Decide(cands []Candidate, st models.DomainFailoverState, p Policy, now time
 			}
 		}
 		if preferred < 0 {
-			next.PendingServerID, next.PendingSince = "", nil
+			clearPending()
 		} else {
 			if next.PendingServerID != cands[preferred].ServerID || next.PendingSince == nil {
 				at := now
@@ -225,21 +296,9 @@ func Decide(cands []Candidate, st models.DomainFailoverState, p Policy, now time
 			}
 			if now.Sub(*next.PendingSince) >= p.FailbackAfter {
 				switchTo(preferred, EventFailback)
+				active = preferred
 			}
 		}
 	}
-	return Decision{Active: active, State: next, Events: events, Changed: !sameState(st, next)}
-}
-
-func sameState(a, b models.DomainFailoverState) bool {
-	return a.ActiveServerID == b.ActiveServerID && a.PendingServerID == b.PendingServerID &&
-		sameTime(a.PendingSince, b.PendingSince) && a.AllDown == b.AllDown &&
-		sameTime(a.SwitchedAt, b.SwitchedAt) && a.Switches == b.Switches
-}
-
-func sameTime(a, b *time.Time) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return a.Equal(*b)
+	return Decision{Active: active, Previous: prev, State: next, Events: events}
 }

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -36,7 +37,9 @@ func TestDomainFailoverTools(t *testing.T) {
 	if isErr := callTool(t, h, "set_domain_backups", map[string]any{"id": created.ID, "server_ids": []string{"srv-2"}}, &status); isErr {
 		t.Fatal("set_domain_backups returned isError")
 	}
-	if len(status.Candidates) != 2 || status.ActiveServerID != serverID || !status.Candidates[1].Healthy {
+	// Until agent-2 acknowledges the standby route it cannot take over.
+	if len(status.Candidates) != 2 || status.ActiveServerID != serverID || status.Candidates[1].Eligible ||
+		!strings.Contains(status.Candidates[1].Reason, "not applied") {
 		t.Fatalf("status = %+v", status)
 	}
 	if isErr := callTool(t, h, "get_domain_failover", map[string]any{"id": created.ID}, &status); isErr || len(status.Candidates) != 2 {

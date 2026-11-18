@@ -238,6 +238,11 @@ func (d *DB) tombstoneRenamedStandby(before *models.Domain, rename *DomainRename
 		}
 		rename.Standby[agent.ID] = deletion
 	}
+	// The standby routes are rendered again under the new host; until each
+	// backup acknowledges that, it is not ready to take over.
+	if _, err := d.sql.Exec(`DELETE FROM domain_standby_status WHERE domain_id = ?`, before.ID); err != nil {
+		return fmt.Errorf("clearing standby status of domain %d: %w", before.ID, err)
+	}
 	return nil
 }
 

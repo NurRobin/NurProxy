@@ -22,6 +22,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/certstore"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy/nginx"
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
+	"github.com/NurRobin/NurProxy/internal/shared/apacheparse"
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxparse"
@@ -40,6 +41,9 @@ type managedApplyAction struct {
 	// workerGroup resolves the GID of the proxy worker that reads basic-auth
 	// files per request.
 	workerGroup func() (uint32, error)
+	// errorLogTarget reports whether nginx may open the stock error log for
+	// a per-domain error_log directive (see errorLogTargetCheck).
+	errorLogTarget func() error
 }
 
 type managedCompiledFile struct {
@@ -99,7 +103,10 @@ func newManagedApplyAction(agentUID uint32, target ProxyTargetConfig, layout Man
 	workerGroup := func() (uint32, error) {
 		return resolveProxyWorkerGroup(target.Kind, layout.AvailableDir, readTrustedProxyMainConfig, lookupGroupID)
 	}
-	return &managedApplyAction{agentUID: agentUID, ownerUID: 0, stagingRootUID: 0, target: target, layout: layout, journal: journal, host: host, workerGroup: workerGroup}, nil
+	return &managedApplyAction{
+		agentUID: agentUID, ownerUID: 0, stagingRootUID: 0, target: target, layout: layout, journal: journal, host: host,
+		workerGroup: workerGroup, errorLogTarget: newErrorLogTargetCheck(target.Binary).verify,
+	}, nil
 }
 
 func (a *managedApplyAction) Plan(ctx context.Context, intent helperprotocol.ApplyIntent) (ManagedApplyMaterial, error) {
@@ -322,6 +329,18 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		}
 		return authGID, authGIDErr
 	}
+	errorLogChecked, errorLogErr := false, error(nil)
+	checkErrorLog := func() error {
+		if !errorLogChecked {
+			errorLogChecked = true
+			if a.errorLogTarget == nil {
+				errorLogErr = fmt.Errorf("no error log check is configured")
+			} else {
+				errorLogErr = a.errorLogTarget()
+			}
+		}
+		return errorLogErr
+	}
 	routeHosts := make(map[string]struct{}, len(intent.Routes))
 	for host, pair := range certificates {
 		base := certstore.SanitizeHost(host)
@@ -350,12 +369,20 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		var content string
 		preserve := false
 		if route.IsRaw() {
-			content, preserve, err = a.admitRawRoute(route, certPath, keyPath, authPath)
+			content, preserve, err = a.admitRawRoute(route, available, certPath, keyPath, authPath)
 		} else {
 			content, err = a.renderRoute(route, certPath, keyPath, authPath)
 		}
 		if err != nil {
 			return managedCompilation{}, err
+		}
+		// The policy admits only the stock error log path for error_log; the
+		// helper still checks that this host's file is safe for the root
+		// master to open before it writes the directive.
+		if !preserve && a.target.Kind == "nginx" && nginxparse.HasErrorLog(content) {
+			if err := checkErrorLog(); err != nil {
+				return managedCompilation{}, refuseLocally("error log level for %s refused: %v; set the domain's error log level back to default", route.Host, err)
+			}
 		}
 		if !preserve {
 			preserve, err = exactUnmarkedManagedFile(available, []byte(content), a.ownerUID)
@@ -544,38 +571,54 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 }
 
 // admitRawRoute decides whether a raw route is written or kept as an exact
-// policy-foreign file. nginxparse never admits a raw config that carries
-// auth_basic, so raw basic-auth routes are policy-foreign. Those saved from a
-// pre-#147 artifact point auth_basic_user_file at certs/, which the worker
-// cannot read. When such a raw config is exactly what the generator rendered
-// for this route with the old path, it is re-rendered with the auth/ path;
-// any other raw config still on the old path is refused with an error that
-// names both paths.
-func (a *managedApplyAction) admitRawRoute(route proxymodel.Route, certPath, keyPath, authPath string) (string, bool, error) {
+// policy-foreign file. A raw config that passes the backend's managed policy
+// (nginxparse or apacheparse) is written. One that does not is only kept when
+// these exact bytes are already the protected live file at available;
+// otherwise it is refused with the policy's reason.
+//
+// nginxparse never admits a raw config that carries auth_basic, so raw nginx
+// basic-auth routes are policy-foreign. Those saved from a pre-#147 artifact
+// point auth_basic_user_file at certs/, which the worker cannot read. When
+// such a raw config is exactly what the generator rendered for this route
+// with the old path, it is re-rendered with the auth/ path; any other raw
+// config still on the old path is refused with an error that names both
+// paths.
+func (a *managedApplyAction) admitRawRoute(route proxymodel.Route, available, certPath, keyPath, authPath string) (string, bool, error) {
 	content := route.Raw.Content
-	if a.target.Kind != "nginx" {
-		return content, true, nil
+	var policyErr error
+	switch a.target.Kind {
+	case "nginx":
+		policyErr = nginxparse.ValidateManaged(content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath})
+	case "apache":
+		policyErr = apacheparse.ValidateManaged(content, apacheparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath})
+	default:
+		return "", false, refuseLocally("raw config for %s: the helper has no policy for %s raw configs", route.Host, a.target.Kind)
 	}
-	if nginxparse.ValidateManaged(content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}) == nil {
+	if policyErr == nil {
 		return content, false, nil
 	}
-	legacy := legacyManagedAuthFilePath(a.layout.CertificateDir, route.Host)
-	if !strings.Contains(content, legacy) {
+	if a.target.Kind == "nginx" {
+		legacy := legacyManagedAuthFilePath(a.layout.CertificateDir, route.Host)
+		if strings.Contains(content, legacy) {
+			if route.BasicAuth != nil {
+				structured := route
+				structured.Raw = proxymodel.RawConfig{}
+				legacyRender, err := a.renderRoute(structured, certPath, keyPath, legacy)
+				if err != nil {
+					return "", false, err
+				}
+				if proxy.StampManagedArtifact(content) == proxy.StampManagedArtifact(legacyRender) {
+					current, err := a.renderRoute(structured, certPath, keyPath, authPath)
+					return current, false, err
+				}
+			}
+			return "", false, refuseLocally("raw nginx config for %s uses auth_basic_user_file %s, which the %s worker cannot read; change it to %s", route.Host, legacy, a.target.Kind, authPath)
+		}
+	}
+	if _, err := inspectPreservedManagedFile(compiledFile(available, []byte(content), 0o644, "vhost"), a.ownerUID); err == nil {
 		return content, true, nil
 	}
-	if route.BasicAuth != nil {
-		structured := route
-		structured.Raw = proxymodel.RawConfig{}
-		legacyRender, err := a.renderRoute(structured, certPath, keyPath, legacy)
-		if err != nil {
-			return "", false, err
-		}
-		if proxy.StampManagedArtifact(content) == proxy.StampManagedArtifact(legacyRender) {
-			current, err := a.renderRoute(structured, certPath, keyPath, authPath)
-			return current, false, err
-		}
-	}
-	return "", false, fmt.Errorf("raw nginx config for %s uses auth_basic_user_file %s, which the %s worker cannot read; change it to %s", route.Host, legacy, a.target.Kind, authPath)
+	return "", false, refuseLocally("raw %s config for %s refused by the helper policy: %v", a.target.Kind, route.Host, policyErr)
 }
 
 func exactUnmarkedManagedFile(path string, desired []byte, ownerUID uint32) (bool, error) {
@@ -637,7 +680,7 @@ func (a *managedApplyAction) renderRoute(route proxymodel.Route, certPath, keyPa
 	case "nginx":
 		result, err := nginxgen.Render(nginxgen.Input{Route: route, NginxVersion: a.layout.ProxyVersion, CertPath: certPath, KeyPath: keyPath, AuthFile: authPath})
 		if err != nil {
-			return "", err
+			return "", refuseLocally("cannot render the nginx config for %s: %v", route.Host, err)
 		}
 		var content strings.Builder
 		if result.HTTPPreamble != "" {
@@ -651,13 +694,13 @@ func (a *managedApplyAction) renderRoute(route proxymodel.Route, certPath, keyPa
 		// The rendered file must stay inside the same directive allowlists as
 		// a raw config, so a renderer defect can never become a root write.
 		if err := nginxparse.ValidateRendered(content.String(), nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}); err != nil {
-			return "", fmt.Errorf("rendered nginx config for %s failed the managed policy: %w", route.Host, err)
+			return "", refuseLocally("rendered nginx config for %s failed the managed policy: %v", route.Host, err)
 		}
 		return content.String(), nil
 	case "apache":
 		result, err := apachegen.Render(apachegen.Input{Route: route, CertPath: certPath, KeyPath: keyPath, AuthFile: authPath})
 		if err != nil {
-			return "", err
+			return "", refuseLocally("cannot render the apache config for %s: %v", route.Host, err)
 		}
 		var content strings.Builder
 		if result.Preamble != "" {
@@ -668,6 +711,11 @@ func (a *managedApplyAction) renderRoute(route proxymodel.Route, certPath, keyPa
 			content.WriteByte('\n')
 		}
 		content.WriteString(result.VHost)
+		// Same allowlist as a raw config, so a renderer defect can never
+		// become a root write.
+		if err := apacheparse.ValidateManaged(content.String(), apacheparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}); err != nil {
+			return "", refuseLocally("rendered apache config for %s failed the managed policy: %v", route.Host, err)
+		}
 		return content.String(), nil
 	default:
 		return "", fmt.Errorf("managed renderer is unavailable for proxy kind")

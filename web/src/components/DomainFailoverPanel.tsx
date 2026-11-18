@@ -95,6 +95,7 @@ export default function DomainFailoverPanel({ domain, servers, agents, onSaved }
 
       {loadError && <Callout tone="danger">{loadError}</Callout>}
       {status?.all_down && <Callout tone="danger">{t('failover.allDown')}</Callout>}
+      {status?.settling && <Callout tone="info">{t('failover.settling')}</Callout>}
       {status && pendingAgent && status.pending_since && (
         <Callout tone="info">{t('failover.pending', { agent: pendingAgent, since: formatRelativeTime(status.pending_since) })}</Callout>
       )}
@@ -111,6 +112,7 @@ export default function DomainFailoverPanel({ domain, servers, agents, onSaved }
                 <span className="font-medium text-fg">{c.agent_name}</span>
                 <span className="font-mono text-xs text-fg-muted">{c.agent_fqdn}</span>
                 <span className="text-xs text-fg-faint">{c.server_name}</span>
+                {!c.eligible && c.reason && <span className="text-xs text-warning-fg">{c.reason}</span>}
                 <span className="ml-auto flex items-center gap-2">
                   <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${c.healthy ? 'bg-success-soft text-success-fg' : 'bg-danger-soft text-danger-fg'}`}
                     title={c.reason}>
