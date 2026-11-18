@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ type fakeTakeover struct {
 	takeovers int
 	err       error
 	dnsNow    chan int64
+	expect    []string
 }
 
 func (f *fakeTakeover) plan(id int64) *models.DNSTakeoverPlan {
@@ -33,10 +35,11 @@ func (f *fakeTakeover) plan(id int64) *models.DNSTakeoverPlan {
 	}
 }
 
-func (f *fakeTakeover) TakeoverDomainDNS(_ context.Context, id int64) (*models.DNSTakeoverPlan, error) {
+func (f *fakeTakeover) TakeoverDomainDNS(_ context.Context, id int64, expect []string) (*models.DNSTakeoverPlan, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.takeovers++
+	f.expect = expect
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -53,6 +56,42 @@ func (f *fakeTakeover) PreviewDomainDNSTakeover(_ context.Context, id int64) (*m
 func (f *fakeTakeover) ReconcileDomainDNSNow(id int64) {
 	if f.dnsNow != nil {
 		f.dnsNow <- id
+	}
+}
+
+// TestDomainDNSTakeover_expectDelete: the record ids the dashboard or CLI saw
+// in the preview reach the takeover; no body means no check.
+func TestDomainDNSTakeover_expectDelete(t *testing.T) {
+	tests := []struct {
+		name string
+		body any
+		want []string
+	}{
+		{"no body", nil, nil},
+		{"previewed ids", map[string]any{"expect_delete": []string{"r1", "r2"}}, []string{"r1", "r2"}},
+		{"nothing to delete", map[string]any{"expect_delete": []string{}}, []string{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, database := testServer(t)
+			fake := &fakeTakeover{}
+			srv.SetDNSTakeover(fake)
+			handler := srv.Handler()
+			cookie := setupAdmin(t, handler)
+			proxiedFixture(t, database)
+			dom := &models.Domain{Subdomain: "app", ZoneID: "zone-cf", ServerID: "srv-1", Port: 80,
+				SSLMode: models.SSLModeAuto, Status: models.DomainStatusActive}
+			if err := database.CreateDomain(dom); err != nil {
+				t.Fatal(err)
+			}
+			w := doRequest(t, handler, "POST", "/api/v1/domains/"+strconv.FormatInt(dom.ID, 10)+"/dns/takeover", tc.body, cookie)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+			}
+			if (fake.expect == nil) != (tc.want == nil) || strings.Join(fake.expect, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("expect_delete passed = %#v, want %#v", fake.expect, tc.want)
+			}
+		})
 	}
 }
 
@@ -77,6 +116,11 @@ func TestDomainDNSTakeover(t *testing.T) {
 			[]string{"cert-only"}},
 		{"provider failure passes the reason through", false, "", errors.New("old records were already deleted; retry"), http.StatusBadGateway, 0, 1,
 			[]string{"already deleted", "retry"}},
+		{"records changed since the preview is a conflict", false, "", fmt.Errorf("%w: app.example.com now has A", models.ErrDNSTakeoverPlanChanged), http.StatusConflict, 0, 1,
+			[]string{"changed since the preview"}},
+		{"dry_run=1 is a dry run", false, "?dry_run=1", nil, http.StatusOK, 1, 0, []string{`"dry_run":true`}},
+		{"dry_run=false takes over", false, "?dry_run=false", nil, http.StatusOK, 0, 1, []string{"deleted 2 record(s)"}},
+		{"unrecognized dry_run is rejected", false, "?dry_run=yes", nil, http.StatusBadRequest, 0, 0, []string{"dry_run"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

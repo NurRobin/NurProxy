@@ -1780,7 +1780,7 @@ func TestTakeoverDomainDNS(t *testing.T) {
 	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99", Proxied: true})
 
 	r := New(d, newMockAgentClient(), time.Minute)
-	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 		t.Fatalf("TakeoverDomainDNS: %v", err)
 	}
 
@@ -1822,7 +1822,7 @@ func TestTakeoverDomainDNS_adoptsMatchingRecord(t *testing.T) {
 	seedID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN})
 
 	r := New(d, newMockAgentClient(), time.Minute)
-	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 		t.Fatalf("TakeoverDomainDNS: %v", err)
 	}
 

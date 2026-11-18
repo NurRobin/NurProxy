@@ -104,7 +104,7 @@ func TestTakeoverDomainDNS_refused(t *testing.T) {
 			if _, err := r.PreviewDomainDNSTakeover(context.Background(), id); !errors.Is(err, ErrDNSTakeoverRefused) {
 				t.Errorf("preview error = %v, want ErrDNSTakeoverRefused", err)
 			}
-			if _, err := r.TakeoverDomainDNS(context.Background(), id); !errors.Is(err, ErrDNSTakeoverRefused) {
+			if _, err := r.TakeoverDomainDNS(context.Background(), id, nil); !errors.Is(err, ErrDNSTakeoverRefused) {
 				t.Errorf("takeover error = %v, want ErrDNSTakeoverRefused", err)
 			}
 			if _, ok := mp.getRecord(conflictID); !ok {
@@ -156,7 +156,7 @@ func TestTakeoverDomainDNS_multipleRecords(t *testing.T) {
 		t.Fatalf("preview stored a record id %q", got.DNSRecordID)
 	}
 
-	done, err := r.TakeoverDomainDNS(context.Background(), dom.ID)
+	done, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil)
 	if err != nil {
 		t.Fatalf("takeover: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestTakeoverDomainDNS_adoptSetsManaged(t *testing.T) {
 	if got, _ := d.GetDomain(dom.ID); got.DNSRecordID != seedID || got.DNSManaged {
 		t.Fatalf("reconcile should adopt %s unmanaged, got %q managed=%v", seedID, got.DNSRecordID, got.DNSManaged)
 	}
-	plan, err := r.TakeoverDomainDNS(context.Background(), dom.ID)
+	plan, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil)
 	if err != nil {
 		t.Fatalf("takeover: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestTakeoverDomainDNS_incomplete(t *testing.T) {
 			r := New(d, newMockAgentClient(), time.Minute)
 			tc.fail(hp)
 
-			_, err := r.TakeoverDomainDNS(context.Background(), dom.ID)
+			_, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil)
 			var inc *DNSTakeoverIncompleteError
 			if !errors.As(err, &inc) {
 				t.Fatalf("error = %v, want *DNSTakeoverIncompleteError", err)
@@ -259,7 +259,7 @@ func TestTakeoverDomainDNS_incomplete(t *testing.T) {
 
 			hp.createErr = nil
 			hp.failDeleteAt = 0
-			if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+			if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 				t.Fatalf("retry: %v", err)
 			}
 			recs := recordsAt(t, hp, "app.example.com")
@@ -290,7 +290,7 @@ func TestTakeoverDomainDNS_raceWithReconcile(t *testing.T) {
 
 	takeoverErr := make(chan error, 1)
 	go func() {
-		_, err := r.TakeoverDomainDNS(context.Background(), dom.ID)
+		_, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil)
 		takeoverErr <- err
 	}()
 	<-hp.createEnter // the A record is deleted; the name is free at the provider

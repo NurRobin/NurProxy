@@ -375,6 +375,21 @@ func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) erro
 	return d.MarkDomainSynced(id)
 }
 
+// ResetDomainPending sets the domain back to pending with no error, so the
+// next route apply reports its real state. A domain marked for deletion
+// meanwhile keeps that status.
+func (d *DB) ResetDomainPending(id int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := d.sql.Exec(`
+		UPDATE domains SET status = ?, error_msg = '', updated_at = ?
+		WHERE id = ? AND status != ?`,
+		string(models.DomainStatusPending), now, id, string(models.DomainStatusDeleting),
+	); err != nil {
+		return fmt.Errorf("resetting status of domain %d: %w", id, err)
+	}
+	return nil
+}
+
 // SetDomainDNSError records why the domain's DNS record could not be
 // converged and puts the domain in error with that reason. A domain being
 // deleted is left alone.

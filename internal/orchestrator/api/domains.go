@@ -877,7 +877,8 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 // With ?dry_run=true nothing is changed: the response carries the plan, i.e. every
 // record at the name the takeover would delete (MX, TXT and the like included) and
 // the CNAME it would leave. The response of a real takeover carries the plan it
-// carried out. Takeover makes NurProxy the owner of the record (dns_managed=true):
+// carried out. A body {"expect_delete": [ids]} (the ids from the preview) makes
+// the takeover refuse with 409 when the records at the name changed since. Takeover makes NurProxy the owner of the record (dns_managed=true):
 // deleting the domain later deletes the record.
 func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
@@ -903,7 +904,16 @@ func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if strings.EqualFold(r.URL.Query().Get("dry_run"), "true") {
+	dryRun := false
+	if v := r.URL.Query().Get("dry_run"); v != "" {
+		b, pErr := strconv.ParseBool(v)
+		if pErr != nil {
+			writeError(w, http.StatusBadRequest, "dry_run must be true or false")
+			return
+		}
+		dryRun = b
+	}
+	if dryRun {
 		plan, err := s.takeover.PreviewDomainDNSTakeover(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "DNS takeover preview failed: "+err.Error())
@@ -917,9 +927,24 @@ func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	plan, err := s.takeover.TakeoverDomainDNS(r.Context(), id)
+	var req struct {
+		// ExpectDelete: the record ids the caller saw in the preview. Absent
+		// (null) skips the check; [] expects no record to be deleted.
+		ExpectDelete []string `json:"expect_delete"`
+	}
+	if r.ContentLength != 0 {
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	plan, err := s.takeover.TakeoverDomainDNS(r.Context(), id, req.ExpectDelete)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "DNS takeover failed: "+err.Error())
+		code := http.StatusBadGateway
+		if errors.Is(err, models.ErrDNSTakeoverPlanChanged) || errors.Is(err, models.ErrDNSTakeoverRefused) {
+			code = http.StatusConflict
+		}
+		writeError(w, code, "DNS takeover failed: "+err.Error())
 		return
 	}
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "dns_takeover", dom.Subdomain)

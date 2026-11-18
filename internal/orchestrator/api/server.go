@@ -45,7 +45,7 @@ type RoutePusher interface {
 // CNAME that already matched. PreviewDomainDNSTakeover returns the same plan
 // (the records that would be deleted) without changing anything.
 type DNSTakeover interface {
-	TakeoverDomainDNS(ctx context.Context, domID int64) (*models.DNSTakeoverPlan, error)
+	TakeoverDomainDNS(ctx context.Context, domID int64, expectDelete []string) (*models.DNSTakeoverPlan, error)
 	PreviewDomainDNSTakeover(ctx context.Context, domID int64) (*models.DNSTakeoverPlan, error)
 }
 

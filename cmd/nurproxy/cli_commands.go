@@ -540,18 +540,23 @@ func cmdDomain(args []string) {
 
 	case "dns-takeover":
 		var dryRun bool
-		c, _, id := parseClient("domain dns-takeover", rest, "domain id", func(fs *flag.FlagSet) {
+		var expect string
+		c, fs, id := parseClient("domain dns-takeover", rest, "domain id", func(fs *flag.FlagSet) {
 			fs.BoolVar(&dryRun, "dry-run", false, "Only list the records the takeover would delete; change nothing")
+			fs.StringVar(&expect, "expect-delete", "", "Comma-separated record ids from --dry-run; refuse if the records at the name changed (\"none\" when it listed none)")
 		})
 		path := "/api/v1/domains/" + id + "/dns/takeover"
+		var body any
 		if dryRun {
 			path += "?dry_run=true"
+		} else if ids, set := expectDeleteIDs(fs, expect); set {
+			body = map[string]any{"expect_delete": ids}
 		}
-		raw, err := c.do(http.MethodPost, path, nil)
+		raw, err := c.do(http.MethodPost, path, body)
 		if err != nil {
 			fatalf("%v", err)
 		}
-		c.emit(raw, takeoverText(raw, dryRun))
+		c.emit(raw, takeoverText(raw, dryRun, id))
 
 	case "set-cert":
 		var certFile, keyFile string

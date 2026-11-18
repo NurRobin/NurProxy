@@ -222,7 +222,7 @@ export default function Domains() {
     setTakeoverLoading(true);
     setTakeoverError('');
     try {
-      const res = await api.dnsTakeover(detailDomain.id, true);
+      const res = await api.previewDnsTakeover(detailDomain.id);
       setTakeoverPlan(res.plan);
     } catch (err) {
       setTakeoverError(errMessage(err, t('domains.takeoverFailed')));
@@ -232,15 +232,18 @@ export default function Domains() {
   }
 
   async function confirmTakeover() {
-    if (!detailDomain) return;
+    if (!detailDomain || !takeoverPlan) return;
     setTakeoverLoading(true);
     setTakeoverError('');
     try {
-      const res = await api.dnsTakeover(detailDomain.id, false);
+      const res = await api.dnsTakeover(detailDomain.id, takeoverPlan.delete.map((rec) => rec.id));
       toast.success(res.message);
       setTakeoverPlan(null);
       fetchData();
     } catch (err) {
+      // A changed record set (409) leaves nothing changed; drop the stale
+      // list so the operator previews again.
+      setTakeoverPlan(null);
       setTakeoverError(errMessage(err, t('domains.takeoverFailed')));
       fetchData();
     } finally {

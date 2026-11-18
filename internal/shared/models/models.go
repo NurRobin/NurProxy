@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -430,6 +431,16 @@ func (pc ProxyConfig) CheckLoggingSupported(caps *ProxyCapabilities, backend str
 	}
 	return nil
 }
+
+// ErrDNSTakeoverRefused is wrapped by a takeover or preview that is refused
+// because of the domain itself (cert-only, being deleted), not because a
+// provider call failed.
+var ErrDNSTakeoverRefused = errors.New("DNS takeover refused")
+
+// ErrDNSTakeoverPlanChanged is wrapped by a takeover whose caller named the
+// records it expects to delete (from a preview) when the records at the name
+// are no longer exactly those. Nothing was changed.
+var ErrDNSTakeoverPlanChanged = errors.New("DNS records changed since the preview")
 
 // DNSTakeoverAction is what a DNS takeover does at the domain's name.
 type DNSTakeoverAction string

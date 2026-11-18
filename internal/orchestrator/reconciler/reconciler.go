@@ -1197,7 +1197,7 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 			return
 		}
 		r.dnsConverged(dom)
-		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+		if dErr := r.db.ResetDomainPending(dom.ID); dErr != nil {
 			log.Printf("reconciler: failed to clear domain status: %v", dErr)
 		}
 		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_reclaimed",
@@ -1228,7 +1228,7 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		}
 		// Clear any stale DNS error; the proxy apply sets the real status next.
 		r.dnsConverged(dom)
-		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+		if dErr := r.db.ResetDomainPending(dom.ID); dErr != nil {
 			log.Printf("reconciler: failed to clear domain status: %v", dErr)
 		}
 		return
@@ -1620,108 +1620,7 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 	affectedAgents := make(map[string]bool)
 
 	for i := range domains {
-		dom := &domains[i]
-
-		// Note the owning agent before teardown so we can re-push its set afterwards.
-		if srv, sErr := r.db.GetServer(dom.ServerID); sErr == nil {
-			affectedAgents[srv.AgentID] = true
-		}
-
-		// DNS record cleanup, deleting ONLY records NurProxy created (DNSManaged):
-		// an adopted record predates NurProxy and must never be removed, or we would
-		// destroy the operator's own DNS. Deletion is idempotent — a record already
-		// gone at the provider (provider.ErrRecordNotFound) counts as success, so
-		// teardown is never wedged in "deleting" forever — while any OTHER error
-		// keeps the domain around to retry rather than masking a real failure. On
-		// success or already-absent we CLEAR the stored record id immediately, so a
-		// later-step failure this cycle does not re-attempt a delete against an id
-		// that no longer exists.
-		if dom.DNSRecordID != "" && dom.DNSManaged {
-			zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID)
-			if !ok {
-				// The zone→provider chain is unresolvable, so the managed record cannot
-				// be deleted at the provider. Tearing the row down anyway would orphan
-				// that record permanently — nothing would be left to retry the delete.
-				// Keep the domain in "deleting" and retry next cycle, like any other
-				// failed record delete.
-				log.Printf("reconciler: cannot resolve DNS provider for zone %s, deferring teardown of domain %d (managed record %s)", dom.ZoneID, dom.ID, dom.DNSRecordID)
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", fmt.Sprintf("zone/provider unresolvable for managed record %s; teardown deferred", dom.DNSRecordID))
-				continue
-			}
-			provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
-			dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID)
-			switch {
-			case dErr == nil:
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
-			case errors.Is(dErr, provider.ErrRecordNotFound):
-				// Already removed at the provider — proceed with the rest of teardown.
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_skipped", fmt.Sprintf("record %s already absent", dom.DNSRecordID))
-			default:
-				log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
-				r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
-				// Keep the domain around so we retry next cycle.
-				continue
-			}
-			// Record gone: clear its id and the managed flag so a later-step
-			// failure this cycle does not re-attempt a delete against a dead id.
-			if uErr := r.db.UpdateDomainDNSRecord(dom.ID, "", false); uErr != nil {
-				log.Printf("reconciler: failed to clear DNS record id for domain %d: %v", dom.ID, uErr)
-			}
-			dom.DNSRecordID = ""
-		} else if dom.DNSRecordID != "" && !dom.DNSManaged {
-			log.Printf("reconciler: leaving adopted DNS record %s for domain %d in place (NurProxy did not create it)", dom.DNSRecordID, dom.ID)
-			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_left_adopted", fmt.Sprintf("kept operator-owned record %s", dom.DNSRecordID))
-		}
-
-		// Route cleanup on the host rides the dial-out stream (the re-push after this
-		// loop), not an inbound call to the agent — the orchestrator never probes the
-		// agent inbound (invariant #2). Deleting the artifact below shrinks the desired
-		// set; the re-push then makes the agent prune the orphaned vhost.
-
-		// Remove the domain's config artifact from the central store so no ghost
-		// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
-		// applied) is fine.
-		artifactID := artifactIDForDomain(dom.ID)
-		if !dom.CertOnly {
-			srv, srvErr := r.db.GetServer(dom.ServerID)
-			if srvErr != nil {
-				log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
-				continue
-			}
-			agent, agentErr := r.db.GetAgent(srv.AgentID)
-			zone, zoneErr := r.db.GetZone(dom.ZoneID)
-			if agentErr != nil || zoneErr != nil {
-				log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
-				continue
-			}
-			backend := backendForAgent(agent)
-			if backend == "nginx" || backend == "apache" {
-				deletion := helperprotocol.ManagedDeletion{ResourceID: artifactID, Host: dom.FQDN(zone.Name), Backend: backend}
-				if tombstoneErr := r.db.UpsertManagedRouteTombstone(agent.ID, deletion, time.Now().UTC()); tombstoneErr != nil {
-					log.Printf("reconciler: cannot persist route deletion for domain %d: %v", dom.ID, tombstoneErr)
-					continue
-				}
-			}
-		}
-		if _, aErr := r.db.GetConfigArtifact(artifactID); aErr == nil {
-			if dErr := r.db.DeleteConfigArtifact(artifactID); dErr != nil {
-				log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)
-			} else {
-				r.audit("config_artifact", artifactID, "remove", "domain deleted")
-			}
-		}
-
-		// Finally remove the domain row.
-		if dErr := r.db.DeleteDomain(dom.ID); dErr != nil {
-			log.Printf("reconciler: failed to delete domain row %d: %v", dom.ID, dErr)
-			continue
-		}
-		r.audit("domain", fmt.Sprintf("%d", dom.ID), "deleted", "domain removed after cleanup")
-
-		// The host's central certificate goes with its last domain — unless another
-		// live domain still resolves to the same host (certs are keyed by host and
-		// shared), in which case it stays for that consumer.
-		r.cleanupCertForDomain(dom)
+		r.teardownDomainLocked(ctx, domains[i].ID, affectedAgents)
 	}
 
 	// Re-push each affected agent's now-smaller desired set over its stream so it
@@ -1735,6 +1634,132 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// teardownDomainLocked tears down one domain marked for deletion under its DNS
+// lock, from a fresh read of the row, so a takeover that finished in the
+// meantime has its record deleted with the domain instead of orphaned.
+func (r *Reconciler) teardownDomainLocked(ctx context.Context, domainID int64, affectedAgents map[string]bool) {
+	lk := r.domainDNSLock(domainID)
+	lk.Lock()
+	defer lk.Unlock()
+	dom, err := r.db.GetDomain(domainID)
+	if err != nil {
+		if !errors.Is(err, db.ErrDomainNotFound) {
+			log.Printf("reconciler: teardown of domain %d: %v", domainID, err)
+		}
+		return
+	}
+	if dom.Status != models.DomainStatusDeleting {
+		return
+	}
+	r.teardownDomain(ctx, dom, affectedAgents)
+}
+
+// teardownDomain removes one domain's DNS record (only one NurProxy created),
+// config artifact, row and certificate. A step that fails leaves the domain in
+// "deleting" for the next cycle.
+func (r *Reconciler) teardownDomain(ctx context.Context, dom *models.Domain, affectedAgents map[string]bool) {
+	// Note the owning agent before teardown so we can re-push its set afterwards.
+	if srv, sErr := r.db.GetServer(dom.ServerID); sErr == nil {
+		affectedAgents[srv.AgentID] = true
+	}
+
+	// DNS record cleanup, deleting ONLY records NurProxy created (DNSManaged):
+	// an adopted record predates NurProxy and must never be removed, or we would
+	// destroy the operator's own DNS. Deletion is idempotent — a record already
+	// gone at the provider (provider.ErrRecordNotFound) counts as success, so
+	// teardown is never wedged in "deleting" forever — while any OTHER error
+	// keeps the domain around to retry rather than masking a real failure. On
+	// success or already-absent we CLEAR the stored record id immediately, so a
+	// later-step failure this cycle does not re-attempt a delete against an id
+	// that no longer exists.
+	if dom.DNSRecordID != "" && dom.DNSManaged {
+		zone, prov, dnsProvider, ok := r.resolveDNS(dom.ZoneID)
+		if !ok {
+			// The zone→provider chain is unresolvable, so the managed record cannot
+			// be deleted at the provider. Tearing the row down anyway would orphan
+			// that record permanently — nothing would be left to retry the delete.
+			// Keep the domain in "deleting" and retry next cycle, like any other
+			// failed record delete.
+			log.Printf("reconciler: cannot resolve DNS provider for zone %s, deferring teardown of domain %d (managed record %s)", dom.ZoneID, dom.ID, dom.DNSRecordID)
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", fmt.Sprintf("zone/provider unresolvable for managed record %s; teardown deferred", dom.DNSRecordID))
+			return
+		}
+		provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
+		dErr := dnsProvider.DeleteRecord(ctx, provConfig, dom.DNSRecordID)
+		switch {
+		case dErr == nil:
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s", dom.DNSRecordID))
+		case errors.Is(dErr, provider.ErrRecordNotFound):
+			// Already removed at the provider — proceed with the rest of teardown.
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_skipped", fmt.Sprintf("record %s already absent", dom.DNSRecordID))
+		default:
+			log.Printf("reconciler: failed to delete DNS record %s for domain %d: %v", dom.DNSRecordID, dom.ID, dErr)
+			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_delete_failed", dErr.Error())
+			// Keep the domain around so we retry next cycle.
+			return
+		}
+		// Record gone: clear its id and the managed flag so a later-step
+		// failure this cycle does not re-attempt a delete against a dead id.
+		if uErr := r.db.UpdateDomainDNSRecord(dom.ID, "", false); uErr != nil {
+			log.Printf("reconciler: failed to clear DNS record id for domain %d: %v", dom.ID, uErr)
+		}
+		dom.DNSRecordID = ""
+	} else if dom.DNSRecordID != "" && !dom.DNSManaged {
+		log.Printf("reconciler: leaving adopted DNS record %s for domain %d in place (NurProxy did not create it)", dom.DNSRecordID, dom.ID)
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_left_adopted", fmt.Sprintf("kept operator-owned record %s", dom.DNSRecordID))
+	}
+
+	// Route cleanup on the host rides the dial-out stream (the re-push after this
+	// loop), not an inbound call to the agent — the orchestrator never probes the
+	// agent inbound (invariant #2). Deleting the artifact below shrinks the desired
+	// set; the re-push then makes the agent prune the orphaned vhost.
+
+	// Remove the domain's config artifact from the central store so no ghost
+	// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
+	// applied) is fine.
+	artifactID := artifactIDForDomain(dom.ID)
+	if !dom.CertOnly {
+		srv, srvErr := r.db.GetServer(dom.ServerID)
+		if srvErr != nil {
+			log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
+			return
+		}
+		agent, agentErr := r.db.GetAgent(srv.AgentID)
+		zone, zoneErr := r.db.GetZone(dom.ZoneID)
+		if agentErr != nil || zoneErr != nil {
+			log.Printf("reconciler: cannot persist route deletion identity for domain %d", dom.ID)
+			return
+		}
+		backend := backendForAgent(agent)
+		if backend == "nginx" || backend == "apache" {
+			deletion := helperprotocol.ManagedDeletion{ResourceID: artifactID, Host: dom.FQDN(zone.Name), Backend: backend}
+			if tombstoneErr := r.db.UpsertManagedRouteTombstone(agent.ID, deletion, time.Now().UTC()); tombstoneErr != nil {
+				log.Printf("reconciler: cannot persist route deletion for domain %d: %v", dom.ID, tombstoneErr)
+				return
+			}
+		}
+	}
+	if _, aErr := r.db.GetConfigArtifact(artifactID); aErr == nil {
+		if dErr := r.db.DeleteConfigArtifact(artifactID); dErr != nil {
+			log.Printf("reconciler: failed to delete artifact %s for domain %d: %v", artifactID, dom.ID, dErr)
+		} else {
+			r.audit("config_artifact", artifactID, "remove", "domain deleted")
+		}
+	}
+
+	// Finally remove the domain row.
+	if dErr := r.db.DeleteDomain(dom.ID); dErr != nil {
+		log.Printf("reconciler: failed to delete domain row %d: %v", dom.ID, dErr)
+		return
+	}
+	r.audit("domain", fmt.Sprintf("%d", dom.ID), "deleted", "domain removed after cleanup")
+
+	// The host's central certificate goes with its last domain — unless another
+	// live domain still resolves to the same host (certs are keyed by host and
+	// shared), in which case it stays for that consumer.
+	r.cleanupCertForDomain(dom)
 }
 
 // cleanupCertForDomain deletes the stored central certificate for a torn-down

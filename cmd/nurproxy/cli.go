@@ -247,7 +247,7 @@ func dnsCell(d models.Domain) string {
 
 // takeoverText renders a DNS takeover response (or its dry run) for humans:
 // the summary and every record at the name that is (or would be) deleted.
-func takeoverText(raw []byte, dryRun bool) string {
+func takeoverText(raw []byte, dryRun bool, domainID string) string {
 	var resp struct {
 		Message string                 `json:"message"`
 		Plan    models.DNSTakeoverPlan `json:"plan"`
@@ -267,7 +267,42 @@ func takeoverText(raw []byte, dryRun bool) string {
 		}
 		fmt.Fprintf(&b, "\n  delete %s %s -> %s%s [%s]", rec.Type, rec.Name, rec.Content, proxied, rec.ID)
 	}
+	if dryRun {
+		ids := make([]string, len(resp.Plan.Delete))
+		for i, rec := range resp.Plan.Delete {
+			ids[i] = rec.ID
+		}
+		expect := strings.Join(ids, ",")
+		if expect == "" {
+			expect = "none"
+		}
+		fmt.Fprintf(&b, "\nto take over exactly this: nurproxy domain dns-takeover --expect-delete %s %s", expect, domainID)
+	}
 	return b.String()
+}
+
+// expectDeleteIDs turns the --expect-delete flag into the record ids for the
+// takeover request; set is false when the flag was not given. "none" means
+// the preview listed no records.
+func expectDeleteIDs(fs *flag.FlagSet, value string) (ids []string, set bool) {
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "expect-delete" {
+			set = true
+		}
+	})
+	if !set {
+		return nil, false
+	}
+	ids = []string{}
+	if strings.TrimSpace(value) == "none" {
+		return ids, true
+	}
+	for _, id := range strings.Split(value, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, true
 }
 
 // dash renders empty strings as a placeholder for table cells.

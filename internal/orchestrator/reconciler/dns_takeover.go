@@ -9,14 +9,13 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
-// ErrDNSTakeoverRefused is wrapped by a takeover or preview that is refused
-// because of the domain itself (cert-only, being deleted), not because a
-// provider call failed.
-var ErrDNSTakeoverRefused = errors.New("DNS takeover refused")
+// ErrDNSTakeoverRefused is models.ErrDNSTakeoverRefused.
+var ErrDNSTakeoverRefused = models.ErrDNSTakeoverRefused
 
 // DNSTakeoverIncompleteError reports a takeover that changed records at the
 // provider before it failed, so the operator knows the name's DNS is no longer
@@ -163,12 +162,18 @@ func (r *Reconciler) PreviewDomainDNSTakeover(ctx context.Context, domID int64) 
 // matching CNAME the operator created is adopted, so deleting the domain later
 // also deletes that record at the provider.
 //
+// expectDelete, when not nil, is the set of record ids the caller saw in the
+// preview and agreed to delete: if the records at the name are not exactly
+// those any more, nothing is changed and models.ErrDNSTakeoverPlanChanged is
+// returned. nil skips the check.
+//
 // The deletes and the create are separate provider calls. When one of them
 // fails after a record was deleted, the returned *DNSTakeoverIncompleteError
 // says which records are gone; a retry finishes the job. The domain's DNS lock
-// is held throughout, so the reconciler cannot create its own record in the
-// gap.
-func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) (*models.DNSTakeoverPlan, error) {
+// is held throughout, so the reconciler and the teardown cannot write the
+// domain's record in the gap. A rename can still land meanwhile; the record is
+// then stored only while the domain keeps the name it was taken over for.
+func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64, expectDelete []string) (*models.DNSTakeoverPlan, error) {
 	lk := r.domainDNSLock(domID)
 	lk.Lock()
 	defer lk.Unlock()
@@ -179,10 +184,16 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) (*model
 	}
 	dom, plan := t.dom, t.plan
 	domRef := fmt.Sprintf("%d", dom.ID)
+	if expectDelete != nil && !sameIDSet(expectDelete, plan.Delete) {
+		return nil, fmt.Errorf("%w: %s now has %s; preview again before taking over", models.ErrDNSTakeoverPlanChanged, plan.FQDN, describeOrNone(t.existing))
+	}
 
 	if plan.Action == models.DNSTakeoverAdopt {
 		adopt := matchingRecord(t.existing, "CNAME", plan.Target)
-		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, true); dErr != nil {
+		if dErr := r.db.SetDomainDNSRecordIfNamed(dom.ID, dom.Subdomain, dom.ZoneID, adopt.ID, true); dErr != nil {
+			if errors.Is(dErr, db.ErrDomainRenamed) {
+				return nil, fmt.Errorf("domain %d was renamed or deleted during the takeover; nothing was changed at %s", dom.ID, plan.FQDN)
+			}
 			return nil, fmt.Errorf("storing adopted record id: %w", dErr)
 		}
 		r.auditDNS("domain", domRef, "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s (%s)", plan.FQDN, plan.Target, proxiedWord(adopt.Proxied)))
@@ -209,7 +220,10 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) (*model
 				FQDN: plan.FQDN, Target: plan.Target, Deleted: t.existing, Err: cErr,
 			})
 		}
-		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
+		if dErr := r.db.SetDomainDNSRecordIfNamed(dom.ID, dom.Subdomain, dom.ZoneID, recordID, true); dErr != nil {
+			if errors.Is(dErr, db.ErrDomainRenamed) {
+				return nil, r.takeoverLostName(ctx, dom, t, recordID)
+			}
 			return nil, fmt.Errorf("created CNAME %s for %s but could not store it on the domain: %w", recordID, plan.FQDN, dErr)
 		}
 		if len(t.existing) == 0 {
@@ -223,7 +237,7 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) (*model
 	if dErr := r.db.ClearDomainDNSError(dom.ID); dErr != nil {
 		return nil, dErr
 	}
-	if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
+	if dErr := r.db.ResetDomainPending(dom.ID); dErr != nil {
 		return nil, fmt.Errorf("clearing domain status: %w", dErr)
 	}
 	// Re-push so the now-resolvable domain re-renders WITH its certificate — the
@@ -233,6 +247,50 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) (*model
 		log.Printf("reconciler: DNS takeover for %s done, but route re-push failed (next cycle retries): %v", plan.FQDN, pErr)
 	}
 	return plan, nil
+}
+
+// takeoverLostName handles a CNAME the takeover created for a name the domain
+// no longer has: it was renamed, moved or deleted while the takeover ran. A
+// record kept for a renamed domain goes through the cleanup queue like any
+// record a rename released; one for a deleted domain is deleted right away.
+// The returned error says what happened to it.
+func (r *Reconciler) takeoverLostName(ctx context.Context, dom *models.Domain, t *takeoverTarget, recordID string) error {
+	fqdn, target := t.plan.FQDN, t.plan.Target
+	_, gErr := r.db.GetDomain(dom.ID)
+	if errors.Is(gErr, db.ErrDomainNotFound) {
+		if dErr := t.provider.DeleteRecord(ctx, t.config, recordID); dErr != nil && !errors.Is(dErr, provider.ErrRecordNotFound) {
+			r.queueStaleCreatedRecord(dom, fqdn, target, recordID, t.plan.Proxied)
+			return fmt.Errorf("domain %d was deleted during the takeover; deleting the CNAME %s it created at %s failed (%v), so it is queued for cleanup", dom.ID, recordID, fqdn, dErr)
+		}
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_deleted", fmt.Sprintf("deleted record %s at %s created by a takeover that finished after the domain was deleted", recordID, fqdn))
+		return fmt.Errorf("domain %d was deleted during the takeover; the CNAME it created at %s was deleted again", dom.ID, fqdn)
+	}
+	r.queueStaleCreatedRecord(dom, fqdn, target, recordID, t.plan.Proxied)
+	return fmt.Errorf("domain %d was renamed during the takeover; the CNAME created at %s is queued for cleanup and the new name gets its record from the next DNS pass", dom.ID, fqdn)
+}
+
+// sameIDSet reports whether ids names exactly the records in recs.
+func sameIDSet(ids []string, recs []models.DNSRecordInfo) bool {
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	if len(want) != len(recs) {
+		return false
+	}
+	for _, rec := range recs {
+		if !want[rec.ID] {
+			return false
+		}
+	}
+	return true
+}
+
+func describeOrNone(recs []provider.Record) string {
+	if len(recs) == 0 {
+		return "no records"
+	}
+	return describeRecords(recs)
 }
 
 // takeoverIncomplete records a half-done takeover on the domain and in the
