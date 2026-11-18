@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/discovery"
 )
@@ -76,6 +79,8 @@ func clusterFixture() *fakePVE {
 	return &fakePVE{
 		routes: map[string]string{
 			p + "version": `{"data":{"version":"8.2.4","release":"8.2","repoid":"faa83925c9641325"}}`,
+			// The PVEAuditor role on /, as a privilege-separated token sees it.
+			p + "access/permissions": `{"data":{"/":{"Sys.Audit":1,"VM.Audit":1,"Datastore.Audit":1},"/vms":{"VM.Audit":1}}}`,
 			p + "nodes": `{"data":[
 				{"node":"pve1","status":"online","type":"node","id":"node/pve1","maxcpu":8},
 				{"node":"pve2","status":"offline","type":"node","id":"node/pve2"}]}`,
@@ -291,6 +296,8 @@ func TestValidateConfig(t *testing.T) {
 		{"token id without name", `{"url":"pve.lan","token_id":"root@pam","token_secret":"abc"}`, true},
 		{"missing secret", `{"url":"pve.lan","token_id":"root@pam!np"}`, true},
 		{"bad scheme", `{"url":"ftp://pve.lan","token_id":"root@pam!np","token_secret":"abc"}`, true},
+		{"plain http sends the token in clear text", `{"url":"http://pve.lan:8006","token_id":"root@pam!np","token_secret":"abc"}`, true},
+		{"user info in url", `{"url":"https://root:pw@pve.lan:8006","token_id":"root@pam!np","token_secret":"abc"}`, true},
 		{"bad fingerprint", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","fingerprint":"zz"}`, true},
 		{"bad ca", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","ca_pem":"nope"}`, true},
 		{"secret with newline", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"a\nb"}`, true},
@@ -335,5 +342,120 @@ func TestIdentityKey(t *testing.T) {
 	}
 	if discovery.SameMachine(d, "pve/pve1/qemu/101", "pve/pve1/lxc/101") {
 		t.Error("qemu and lxc with the same vmid number are different machines")
+	}
+}
+
+func TestVMAuditScope(t *testing.T) {
+	tests := []struct {
+		name        string
+		perms       string
+		testErr     string
+		discoverErr string
+		incomplete  bool
+	}{
+		{"auditor on /", `{"data":{"/":{"Sys.Audit":1,"VM.Audit":1}}}`, "", "", false},
+		{"VM.Audit on /vms", `{"data":{"/":{"Sys.Audit":1},"/vms":{"VM.Audit":1}}}`, "", "", false},
+		{"only Sys.Audit", `{"data":{"/":{"Sys.Audit":1}}}`, "VM.Audit", "VM.Audit", false},
+		{"pool only", `{"data":{"/":{"Sys.Audit":1},"/pool/web":{"VM.Audit":1}}}`, "", "", true},
+		{"single guest only", `{"data":{"/":{"Sys.Audit":1},"/vms/101":{"VM.Audit":1}}}`, "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := clusterFixture()
+			fake.routes[p+"access/permissions"] = tt.perms
+			srv := httptest.NewTLSServer(fake)
+			defer srv.Close()
+			cfg := configFor(t, srv, nil)
+
+			err := (&Discoverer{}).Test(context.Background(), cfg)
+			if (tt.testErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tt.testErr)) {
+				t.Fatalf("Test = %v, want error containing %q", err, tt.testErr)
+			}
+			res, err := (&Discoverer{}).Discover(context.Background(), cfg)
+			if tt.discoverErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.discoverErr) {
+					t.Fatalf("Discover = %v, want error containing %q", err, tt.discoverErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			if got := !res.Covers("pve/pve1/qemu/101"); got != tt.incomplete {
+				t.Fatalf("incomplete = %v (%q, warnings %q), want %v", got, res.Incomplete, res.Warnings, tt.incomplete)
+			}
+		})
+	}
+}
+
+func TestPermissionsUnreadableMakesRunIncomplete(t *testing.T) {
+	fake := clusterFixture()
+	delete(fake.routes, p+"access/permissions")
+	srv := httptest.NewTLSServer(fake)
+	defer srv.Close()
+	res, err := (&Discoverer{}).Discover(context.Background(), configFor(t, srv, nil))
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if res.Covers("pve/pve1/qemu/101") || len(res.Candidates) != 5 {
+		t.Fatalf("result = %d candidates, incomplete %q; want all guests and nothing covered", len(res.Candidates), res.Incomplete)
+	}
+}
+
+// TestRedirectNotFollowed keeps the Authorization header from being carried
+// to the target of a redirect.
+func TestRedirectNotFollowed(t *testing.T) {
+	var leaked atomic.Int32
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked.Add(1)
+	}))
+	defer target.Close()
+	redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	err := (&Discoverer{}).Test(context.Background(), configFor(t, redirector, nil))
+	if err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("Test against a redirect = %v, want an HTTP 302 error", err)
+	}
+	if leaked.Load() != 0 {
+		t.Fatal("the redirect was followed")
+	}
+}
+
+// TestRunsLeaveNoConnections checks that repeated runs do not pile up
+// connection goroutines.
+func TestRunsLeaveNoConnections(t *testing.T) {
+	srv := httptest.NewTLSServer(clusterFixture())
+	defer srv.Close()
+	cfg := configFor(t, srv, nil)
+	d := &Discoverer{}
+	if _, err := d.Discover(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	settle := func() int {
+		n := runtime.NumGoroutine()
+		for i := 0; i < 50; i++ {
+			time.Sleep(10 * time.Millisecond)
+			if m := runtime.NumGoroutine(); m >= n {
+				break
+			} else {
+				n = m
+			}
+		}
+		return n
+	}
+	before := settle()
+	for i := 0; i < 20; i++ {
+		if _, err := d.Discover(context.Background(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.Test(context.Background(), cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := settle(); after > before+5 {
+		t.Fatalf("goroutines grew from %d to %d over 20 runs", before, after)
 	}
 }

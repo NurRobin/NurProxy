@@ -133,6 +133,18 @@ func (s *Service) Run(ctx context.Context, sourceID string, audit Auditor) (*Vie
 	if err != nil {
 		return nil, err
 	}
+	// Gone is only decided on a run that saw the whole source: a machine
+	// missing from a partial run may have moved into the part that was not
+	// listed (a VM migrated to an offline node). A run that sees no machine
+	// at all while servers are imported is taken as a visibility problem
+	// (PVE hides guests the token may not audit) rather than as every machine
+	// being gone at once.
+	complete := len(res.Incomplete) == 0
+	if len(res.Candidates) == 0 && len(servers) > 0 {
+		complete = false
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"the source reported no machines although %d servers were imported from it; check the token's permissions. Nothing was marked gone", len(servers)))
+	}
 	updates := make([]db.DiscoveryServerUpdate, 0, len(servers))
 	type transition struct{ server, action, details string }
 	var transitions []transition
@@ -143,7 +155,7 @@ func (s *Service) Run(ctx context.Context, sourceID string, audit Auditor) (*Vie
 				transitions = append(transitions, transition{srv.ID, "discovery_found", fmt.Sprintf("%s (%s) is reported again by %s", srv.Name, c.ExternalID, src.Name)})
 			}
 			u.ExternalID, u.MissingSince = c.ExternalID, nil
-		} else if res.Covers(srv.ExternalID) && srv.DiscoveryMissingSince == nil {
+		} else if complete && srv.DiscoveryMissingSince == nil {
 			u.MissingSince = &now
 			transitions = append(transitions, transition{srv.ID, "discovery_missing", fmt.Sprintf("%s (%s) is no longer reported by %s", srv.Name, srv.ExternalID, src.Name)})
 		}
@@ -359,6 +371,22 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// Delete removes a source. It holds the source's lock so a delete cannot
+// interleave with a running sync or import, which would re-link servers to a
+// source that no longer exists.
+func (s *Service) Delete(sourceID string) error {
+	l := s.lock(sourceID)
+	l.Lock()
+	defer l.Unlock()
+	if err := s.db.DeleteDiscoverySource(sourceID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	delete(s.locks, sourceID)
+	s.mu.Unlock()
+	return nil
 }
 
 // ValidSyncInterval reports whether seconds is an allowed sync interval.

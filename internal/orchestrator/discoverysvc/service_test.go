@@ -111,3 +111,29 @@ func TestValidSyncInterval(t *testing.T) {
 		}
 	}
 }
+
+// TestDeleteWaitsForRunningSync keeps a delete from interleaving with a run
+// or import of the same source.
+func TestDeleteWaitsForRunningSync(t *testing.T) {
+	d := testDB(t)
+	if err := d.CreateDiscoverySource(&models.DiscoverySource{ID: "src", Type: "counting", Name: "S", Config: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(d, false)
+	l := svc.lock("src")
+	l.Lock()
+	done := make(chan error, 1)
+	go func() { done <- svc.Delete("src") }()
+	select {
+	case err := <-done:
+		t.Fatalf("Delete finished while the source was locked: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	l.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.GetDiscoverySource("src"); !errors.Is(err, db.ErrDiscoverySourceNotFound) {
+		t.Fatalf("source after delete: %v", err)
+	}
+}

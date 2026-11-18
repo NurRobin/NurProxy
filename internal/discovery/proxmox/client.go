@@ -51,6 +51,10 @@ func newClient(cfg *Config) (*client, error) {
 	}, nil
 }
 
+// close drops the client's idle connections so a finished run leaves no
+// connection goroutines behind.
+func (c *client) close() { c.http.CloseIdleConnections() }
+
 // get fetches /api2/json/<path> and decodes the "data" member into out.
 // Path segments must already be escaped.
 func (c *client) get(ctx context.Context, path string, out any) error {
