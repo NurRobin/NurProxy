@@ -45,6 +45,14 @@ because another service (nginx, Apache) already holds them — the agent **stays
 connected and online** and surfaces the problem on its detail page (**Agent
 problem** / **Local proxy: not running**), instead of silently failing to start.
 
+## Version and upgrades
+
+The agent reports its version on every heartbeat. When it is older than the
+orchestrator it is marked **outdated**, and you can upgrade it from its detail
+page or upgrade all outdated agents in one rollout. This needs a one-time
+`sudo nurproxy-agent self-update-enable` on the host and is refused for package,
+Homebrew and container installs. See [Agent upgrades](agent-upgrades).
+
 ## Servers (upstreams)
 
 Each agent has one or more **servers**: backend addresses it proxies to, like

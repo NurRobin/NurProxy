@@ -5,7 +5,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, Check, X } from 'lucide-react';
 import { api, ApiError } from '../lib/api';
-import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv, RemediationStep } from '../lib/types';
+import type { Agent, Zone, Server, Domain, ProxyPermissions, RuntimeEnv, RemediationStep, UpgradeRollout } from '../lib/types';
 import { CommandBlock } from '../components/CommandBlock';
 import { formatRelativeTime } from '../lib/utils';
 import { isDegraded } from '../lib/status';
@@ -23,6 +23,8 @@ import { useToast, errMessage } from '../components/toast-context';
 import ExistingSetup from './ExistingSetup';
 import LogTailViewer from '../components/LogTailViewer';
 import RecoveryPanel from '../components/RecoveryPanel';
+import { AgentUpgradePanel, UpgradeRolloutPanel } from '../components/AgentUpgrade';
+import { isPrerelease, outdatedAgents, rolloutRunning } from '../lib/upgrade';
 
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.never'));
 
@@ -64,10 +66,26 @@ export default function Agents() {
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [cascadeDomains, setCascadeDomains] = useState<string[] | null>(null);
 
+  const [rollout, setRollout] = useState<UpgradeRollout | null>(null);
+  const [dismissedRolloutId, setDismissedRolloutId] = useState<string | null>(null);
+  const [confirmRollout, setConfirmRollout] = useState(false);
+  const [rolloutStarting, setRolloutStarting] = useState(false);
+  const [orchestratorVersion, setOrchestratorVersion] = useState<string | undefined>();
+
+  useEffect(() => {
+    let active = true;
+    api.health().then((h) => { if (active) setOrchestratorVersion(h.version); }).catch(() => { /* best-effort */ });
+    return () => { active = false; };
+  }, []);
+
   const fetchData = useCallback(async () => {
     try {
-      const [a, z, d] = await Promise.all([api.listAgents(), api.listAllZones(), api.listDomains()]);
-      setAgents(a); setZones(z); setDomains(d);
+      const [a, z, d, r] = await Promise.all([
+        api.listAgents(), api.listAllZones(), api.listDomains(),
+        // The rollout panel is secondary: a failure here must not hide the agent list.
+        api.getUpgradeRollout().then((res) => res.rollout).catch(() => null),
+      ]);
+      setAgents(a); setZones(z); setDomains(d); setRollout(r);
     } catch (err) {
       toast.error(errMessage(err, t('agents.loadFailed')));
     } finally {
@@ -204,7 +222,28 @@ export default function Agents() {
     finally { setDeleteLoading(false); }
   }
 
+  async function handleRollout() {
+    setRolloutStarting(true);
+    try {
+      // A pre-release orchestrator version is only used as the rollout target
+      // because the confirm dialog says so explicitly.
+      const r = await api.upgradeOutdatedAgents(undefined, isPrerelease(orchestratorVersion));
+      setRollout(r);
+      setDismissedRolloutId(null);
+      setConfirmRollout(false);
+      toast.success(t('agents.upgrade.rollout.started'));
+      fetchData();
+    } catch (err) {
+      toast.error(errMessage(err, t('agents.upgrade.rollout.startFailed')));
+    } finally {
+      setRolloutStarting(false);
+    }
+  }
+
   const pendingAgents = agents.filter((a) => a.status === 'pending');
+  const outdated = outdatedAgents(agents);
+  const running = rolloutRunning(rollout);
+  const showRollout = rollout !== null && (running || rollout.id !== dismissedRolloutId);
   const otherAgents = agents.filter((a) => a.status !== 'pending');
   const selected = agents.find((a) => a.id === selectedId) ?? null;
 
@@ -214,12 +253,32 @@ export default function Agents() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="flex items-center gap-2 font-display text-3xl font-bold tracking-tight text-fg">
-          {t('agents.title')} <HelpTip term="agent" />
-        </h1>
-        <p className="mt-1 text-sm text-fg-muted">{t('agents.subtitle')}</p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="flex items-center gap-2 font-display text-3xl font-bold tracking-tight text-fg">
+            {t('agents.title')} <HelpTip term="agent" />
+          </h1>
+          <p className="mt-1 text-sm text-fg-muted">{t('agents.subtitle')}</p>
+        </div>
+        {!empty && (
+          <span title={running ? t('agents.upgrade.rollout.busy') : outdated.length === 0 ? t('agents.upgrade.rollout.noneOutdated') : undefined}>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={running || outdated.length === 0}
+              onClick={() => setConfirmRollout(true)}
+            >
+              {outdated.length > 0
+                ? t('agents.upgrade.rollout.buttonCount', { count: outdated.length })
+                : t('agents.upgrade.rollout.button')}
+            </Button>
+          </span>
+        )}
       </div>
+
+      {showRollout && rollout && (
+        <UpgradeRolloutPanel rollout={rollout} onDismiss={() => setDismissedRolloutId(rollout.id)} />
+      )}
 
       {empty ? (
         <EmptyState
@@ -406,6 +465,9 @@ export default function Agents() {
                 )}
 
                 {selected.status !== 'pending' && <DetectedProxy agent={selected} />}
+                {selected.status !== 'pending' && (
+                  <AgentUpgradePanel key={selected.id} agent={selected} orchestratorVersion={orchestratorVersion} onAgentChanged={fetchData} />
+                )}
                 {selected.status !== 'pending' && <RecoveryPanel key={selected.id} agent={selected} onAgentChanged={fetchData} />}
               </div>
             )}
@@ -506,6 +568,20 @@ export default function Agents() {
           </div>
         )}
       </Modal>
+
+      <ConfirmDialog
+        open={confirmRollout}
+        onClose={() => setConfirmRollout(false)}
+        onConfirm={handleRollout}
+        title={t('agents.upgrade.rollout.confirmTitle')}
+        message={t('agents.upgrade.rollout.confirmBody', {
+          count: outdated.length,
+          names: outdated.map((a) => a.name).join(', '),
+          version: orchestratorVersion || '?',
+        }) + (isPrerelease(orchestratorVersion) ? ' ' + t('agents.upgrade.rollout.confirmPrerelease', { version: orchestratorVersion }) : '')}
+        confirmLabel={t('agents.upgrade.rollout.confirm')}
+        loading={rolloutStarting}
+      />
 
       <ConfirmDialog
         open={deleteAgent !== null && cascadeDomains === null}

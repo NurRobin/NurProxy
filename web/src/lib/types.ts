@@ -181,9 +181,62 @@ export interface Agent {
   safe_auto_repair_override?: boolean | null;
   safe_auto_repair_effective: boolean;
   recovery_capability?: RecoveryCapability;
+  /** Per-agent opt-in: upgrade to the orchestrator's version automatically. Off by default. */
+  auto_upgrade?: boolean;
+  /** The agent's own report whether it can replace its binary on its host. Absent for older agents. */
+  self_update?: AgentSelfUpdate;
+  /** The latest upgrade attempt for this agent, if any. */
+  upgrade?: AgentUpgrade;
   created_at: string;
   updated_at: string;
   servers?: Server[];
+}
+
+export interface AgentSelfUpdate {
+  supported: boolean;
+  /** Why self-update is unavailable (only set when supported is false). */
+  reason?: string;
+  install_kind?: string;
+  service_manager?: string;
+  dry_run?: boolean;
+}
+
+export type AgentUpgradeState =
+  | 'requested' | 'downloading' | 'installed' | 'restarting'
+  | 'done' | 'failed' | 'rolled_back';
+
+export interface AgentUpgrade {
+  id: string;
+  agent_id: string;
+  from_version: string;
+  target_version: string;
+  state: AgentUpgradeState;
+  error?: string;
+  trigger: 'manual' | 'rollout' | 'auto';
+  rollout_id?: string;
+  requested_by?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpgradeRolloutAgent {
+  agent_id: string;
+  name: string;
+  from_version: string;
+  state: 'pending' | 'upgrading' | 'done' | 'failed' | 'skipped';
+  upgrade_id?: string;
+  error?: string;
+}
+
+export interface UpgradeRollout {
+  id: string;
+  target_version: string;
+  state: 'running' | 'done' | 'failed';
+  started_at: string;
+  finished_at?: string;
+  current_agent_id?: string;
+  error?: string;
+  agents: UpgradeRolloutAgent[];
 }
 
 export type RecoveryCode =
