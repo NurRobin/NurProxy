@@ -85,6 +85,12 @@ type Config struct {
 	// file ops — while registration, heartbeat, the stream, and route rendering all
 	// run for real. Lets the full orchestrator↔agent loop run unprivileged anywhere.
 	DryRun bool `yaml:"dry_run"`
+
+	// UpdateMirror replaces GitHub releases as the download source for
+	// self-update (<mirror>/v<version>/<file>). Releases are verified against
+	// the release workflow's signature regardless of where they come from, so a
+	// mirror needs no trust. Must be https.
+	UpdateMirror string `yaml:"update_mirror"`
 }
 
 // Flags carries the command-line flag values into Load. Each field mirrors a
@@ -266,6 +272,9 @@ func mergeFile(dst *Config, src *Config) {
 	if src.DryRun {
 		dst.DryRun = true
 	}
+	if src.UpdateMirror != "" {
+		dst.UpdateMirror = src.UpdateMirror
+	}
 }
 
 func mergeEnv(cfg *Config) {
@@ -327,6 +336,9 @@ func mergeEnv(cfg *Config) {
 	}
 	if envBool("NP_DRY_RUN") {
 		cfg.DryRun = true
+	}
+	if v := os.Getenv("NP_UPDATE_MIRROR"); v != "" {
+		cfg.UpdateMirror = v
 	}
 }
 
