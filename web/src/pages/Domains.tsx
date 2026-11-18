@@ -5,7 +5,7 @@ import { usePolling } from '../lib/usePolling';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
-import { proxyConfigChanges, wildcardEligible } from '../lib/proxy-config';
+import { proxyConfigChanges, wildcardEligible, pathRouteEdit, type PathRouteEdit } from '../lib/proxy-config';
 import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities, DNSTakeoverPlan } from '../lib/types';
 import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
@@ -27,7 +27,7 @@ interface ServerWithAgent extends Server {
   agentName: string;
 }
 
-type EditTab = 'general' | 'headers' | 'advanced';
+type EditTab = 'general' | 'headers' | 'routes' | 'advanced';
 type ProxiedChoice = 'keep' | 'on' | 'off';
 
 function proxiedChoice(p: boolean | null | undefined): ProxiedChoice {
@@ -90,6 +90,7 @@ export default function Domains() {
   const [editErrorLogLevel, setEditErrorLogLevel] = useState('');
   const [editWildcard, setEditWildcard] = useState(false);
   const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
+  const [editRoutes, setEditRoutes] = useState<PathRouteEdit[]>([]);
   const [editRawConfig, setEditRawConfig] = useState('');
   const [editConfigBackend, setEditConfigBackend] = useState('caddy');
   const [configManual, setConfigManual] = useState(false);
@@ -161,6 +162,10 @@ export default function Domains() {
     : '';
   const unsupportedHint = (key: keyof ProxyCapabilities) =>
     supports(key) ? undefined : t('domains.capUnsupported', { backend: backendName });
+  // Path routes are proxied by the domain's agent, so only its servers qualify.
+  const routeServers = detailAgent ? allServers.filter((s) => s.agent_id === detailAgent.id) : allServers;
+  const updateRoute = (i: number, patch: Partial<PathRouteEdit>) =>
+    setEditRoutes(editRoutes.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 
   const filtered = domains.filter((d) => {
     if (statusFilter !== 'all' && d.status !== statusFilter) return false;
@@ -211,6 +216,7 @@ export default function Domains() {
     setEditHeaders(d.proxy_config?.custom_request_headers
       ? Object.entries(d.proxy_config.custom_request_headers).map(([key, value]) => ({ key, value }))
       : []);
+    setEditRoutes((d.proxy_config?.routes ?? []).map(pathRouteEdit));
     setEditRawConfig('');
     setEditConfigBackend('caddy');
     setConfigManual(false);
@@ -274,6 +280,7 @@ export default function Domains() {
           websocket: editWebsocket, force_https: editForceHttps,
           max_body_size: editMaxBody, custom_request_headers: editHeaders,
           access_log: editAccessLog, error_log_level: editErrorLogLevel,
+          routes: detailDomain.cert_only ? undefined : editRoutes,
           tls_wildcard: editWildcard,
         }),
       });
@@ -628,12 +635,12 @@ export default function Domains() {
 
             {/* Tabs */}
             <div className="flex gap-1 border-b border-border">
-              {(['general', 'headers', 'advanced'] as EditTab[]).map((tab) => (
+              {((liveDomain.cert_only ? ['general', 'headers', 'advanced'] : ['general', 'headers', 'routes', 'advanced']) as EditTab[]).map((tab) => (
                 <button key={tab} onClick={() => (tab === 'advanced' ? openAdvanced() : setEditTab(tab))}
                   className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium capitalize transition-colors ${
                     editTab === tab ? 'border-accent text-accent' : 'border-transparent text-fg-muted hover:text-fg'
                   }`}>
-                  {tab === 'general' ? t('domains.tabGeneral') : tab === 'headers' ? t('domains.tabHeaders') : t('domains.tabAdvanced')}
+                  {tab === 'general' ? t('domains.tabGeneral') : tab === 'headers' ? t('domains.tabHeaders') : tab === 'routes' ? t('domains.tabRoutes') : t('domains.tabAdvanced')}
                 </button>
               ))}
             </div>
@@ -714,6 +721,67 @@ export default function Domains() {
                     <button onClick={() => setEditHeaders(editHeaders.filter((_, j) => j !== i))} aria-label="Remove header" className="flex-shrink-0 rounded-lg px-2 text-fg-faint hover:text-danger-fg">
                       <X className="h-4 w-4" />
                     </button>
+                  </div>
+                ))}
+                <div className="flex justify-end pt-1">
+                  <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>
+                </div>
+              </div>
+            )}
+
+            {editTab === 'routes' && (
+              <div className="space-y-4">
+                {/* Unsupported routes stay removable, so a list saved for
+                    another backend can still be cleared. */}
+                {!supports('path_routes') && (
+                  <Callout tone="warning">{t('domains.routesUnsupported', { backend: backendName })}</Callout>
+                )}
+                <p className="text-sm text-fg-muted">{t('domains.routesHint')}</p>
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium text-fg">{t('domains.routes')}</p>
+                  <button
+                    onClick={() => setEditRoutes([...editRoutes, { match: 'prefix', path: '', server_id: liveDomain.server_id, port: '', upstream_scheme: '', websocket: false, strip_prefix: false }])}
+                    disabled={!supports('path_routes') || editRoutes.length >= 32}
+                    className="text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:no-underline">
+                    {t('domains.addRoute')}
+                  </button>
+                </div>
+                {editRoutes.length === 0 && <p className="text-sm text-fg-faint">{t('domains.noRoutes')}</p>}
+                {editRoutes.map((r, i) => (
+                  <div key={i} className="space-y-2 rounded-lg border border-border p-3">
+                    <div className="flex flex-wrap gap-2">
+                      <Select aria-label={t('domains.routeMatch')} value={r.match} className="w-auto" onChange={(e) => updateRoute(i, { match: e.target.value as PathRouteEdit['match'] })}>
+                        <option value="prefix">{t('domains.routePrefix')}</option>
+                        <option value="exact">{t('domains.routeExact')}</option>
+                      </Select>
+                      <div className="min-w-40 flex-1">
+                        <Input aria-label={t('domains.routePath')} value={r.path} onChange={(e) => updateRoute(i, { path: e.target.value })} placeholder="/api" className="font-mono" />
+                      </div>
+                      <button onClick={() => setEditRoutes(editRoutes.filter((_, j) => j !== i))} aria-label={t('domains.removeRoute')} className="flex-shrink-0 rounded-lg px-2 text-fg-faint hover:text-danger-fg">
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <div className="min-w-40 flex-1">
+                        <Select aria-label={t('domains.routeServer')} value={r.server_id} onChange={(e) => updateRoute(i, { server_id: e.target.value })}>
+                          {!routeServers.some((s) => s.id === r.server_id) && <option value={r.server_id}>{r.server_id || '—'}</option>}
+                          {routeServers.map((s) => <option key={s.id} value={s.id}>{s.name} ({s.address})</option>)}
+                        </Select>
+                      </div>
+                      <div className="w-24">
+                        <Input aria-label={t('domains.routePort')} value={r.port} inputMode="numeric" onChange={(e) => updateRoute(i, { port: e.target.value })} placeholder={t('domains.routePort')} />
+                      </div>
+                      <Select aria-label={t('domains.routeScheme')} value={r.upstream_scheme} className="w-auto" onChange={(e) => updateRoute(i, { upstream_scheme: e.target.value })}>
+                        <option value="">http</option>
+                        <option value="https">https</option>
+                      </Select>
+                    </div>
+                    <div className="flex flex-wrap gap-6">
+                      <Checkbox label={t('domains.websocket')} checked={r.websocket} onChange={(e) => updateRoute(i, { websocket: e.target.checked })} />
+                      {r.match === 'prefix' && (
+                        <Checkbox label={t('domains.routeStrip')} checked={r.strip_prefix} onChange={(e) => updateRoute(i, { strip_prefix: e.target.checked })} />
+                      )}
+                    </div>
                   </div>
                 ))}
                 <div className="flex justify-end pt-1">

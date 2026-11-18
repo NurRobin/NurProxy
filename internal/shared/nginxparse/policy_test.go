@@ -61,6 +61,8 @@ var policyTestAccepted = map[string]string{
 	"body size and access list": strings.Replace(policyTestValid, "add_header", "client_max_body_size 10m;\n    deny 1.2.3.4/32;\n    allow 10.0.0.0/8;\n    allow ::1;\n    deny all;\n    add_header", 1),
 	"access log off":            policyTestInServer("access_log off;"),
 	"stock error log level":     policyTestInServer("error_log /var/log/nginx/error.log crit;"),
+	"exact path route":          policyTestWithLocation("= /api/world", "proxy_pass http://192.168.178.210:80;"),
+	"prefix path route":         strings.Replace(policyTestWithLocation("/media/", "proxy_pass http://10.0.0.7:9000;"), "    location / {", "    location = /media { proxy_pass http://10.0.0.7:9000; }\n    location / {", 1),
 	"logging in both servers": strings.Replace(policyTestInRedirect("access_log off;\n    error_log /var/log/nginx/error.log emerg;"),
 		"    location / {", "    access_log off;\n    error_log /var/log/nginx/error.log emerg;\n    location / {", 1),
 	"issue 149 shape": policyTestInServer("access_log off;\n    client_max_body_size 50m;\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    gzip on;\n    gzip_types text/plain application/json;"),
@@ -167,6 +169,11 @@ func policyTestInLocation(statement string) string {
 	return strings.Replace(policyTestValid, "        proxy_pass", "        "+statement+"\n        proxy_pass", 1)
 }
 
+// policyTestWithLocation adds a location block before `location /`.
+func policyTestWithLocation(header, body string) string {
+	return strings.Replace(policyTestValid, "    location / {", "    location "+header+" {\n        "+body+"\n    }\n    location / {", 1)
+}
+
 func policyTestInRedirect(statement string) string {
 	return strings.Replace(policyTestRedirect, "    return", "    "+statement+"\n    return", 1) + policyTestValid
 }
@@ -271,6 +278,28 @@ var policyTestRefused = []struct {
 	{"redirect to other target", strings.Replace(policyTestRedirect, "https://$host$request_uri", "https://victim.example.test$request_uri", 1) + policyTestValid},
 	{"redirect to fixed path", strings.Replace(policyTestRedirect, "https://$host$request_uri", "https://$host/x", 1) + policyTestValid},
 
+	// Path routes (#89): only `location = <path>` and `location <path>/`
+	// with a path proxymodel accepts, the same directives as `location /`,
+	// and exactly one `location /`.
+	{"regex location", policyTestWithLocation("~ ^/api", "proxy_pass http://10.0.0.5:80;")},
+	{"case-insensitive regex location", policyTestWithLocation("~* ^/api", "proxy_pass http://10.0.0.5:80;")},
+	{"prefix priority location", policyTestWithLocation("^~ /api/", "proxy_pass http://10.0.0.5:80;")},
+	{"named location", policyTestWithLocation("@fallback", "proxy_pass http://10.0.0.5:80;")},
+	{"prefix without slash", policyTestWithLocation("/api", "proxy_pass http://10.0.0.5:80;")},
+	{"exact without separate word", policyTestWithLocation("=/api", "proxy_pass http://10.0.0.5:80;")},
+	{"quoted path location", policyTestWithLocation(`= "/api"`, "proxy_pass http://10.0.0.5:80;")},
+	{"encoded path location", policyTestWithLocation("/a%2e/", "proxy_pass http://10.0.0.5:80;")},
+	{"dot segment location", policyTestWithLocation("/a/../", "proxy_pass http://10.0.0.5:80;")},
+	{"wildcard path location", policyTestWithLocation("/a*/", "proxy_pass http://10.0.0.5:80;")},
+	{"path location with root", policyTestWithLocation("/static/", "root /etc;")},
+	{"path location with alias", policyTestWithLocation("= /x", "alias /etc/shadow;")},
+	{"path location with return", policyTestWithLocation("/api/", "return 200 x;")},
+	{"path location with include", policyTestWithLocation("/api/", "include /etc/nginx/x.conf;\n        proxy_pass http://10.0.0.5:80;")},
+	{"path location to socket", policyTestWithLocation("/api/", "proxy_pass http://unix:/run/x.sock:80;")},
+	{"path location with uri", policyTestWithLocation("/api/", "proxy_pass http://10.0.0.5:80/x/;")},
+	{"nested in path location", policyTestWithLocation("/api/", "location /api/x/ { proxy_pass http://10.0.0.5:80; }")},
+	{"duplicate path location", strings.Replace(policyTestWithLocation("/api/", "proxy_pass http://10.0.0.5:80;"), "    location / {", "    location /api/ { proxy_pass http://10.0.0.6:80; }\n    location / {", 1)},
+	{"no root location", strings.Replace(policyTestValid, "location / {", "location /x/ {", 1)},
 	// Tuning directives (#149): only the documented argument forms.
 	{"gzip variable", policyTestInServer("gzip $x;")},
 	{"gzip_types quoted", policyTestInServer(`gzip_types "text/plain";`)},
@@ -493,6 +522,15 @@ func policyTestGeneratedConfigs(t *testing.T) map[string]policyTestGenerated {
 			r.AccessLog = proxymodel.AccessLogOff
 			r.ErrorLogLevel = "emerg"
 		},
+		"path routes": func(r *proxymodel.Route) { r.PathRoutes = policyTestPathRoutes() },
+		"path routes with options": func(r *proxymodel.Route) {
+			r.PathRoutes = policyTestPathRoutes()
+			r.WebSocket = true
+			r.RequestHeaders = map[string]string{"X-A": "1 2"}
+			r.Timeouts = proxymodel.Timeouts{Read: 5, Write: 5}
+			r.Path.StripPrefix = "/app"
+			r.IPAllowlist = []string{"192.168.0.0/16"}
+		},
 		"rate limit":    func(r *proxymodel.Route) { r.RateLimit.RequestsPerSecond = 10 },
 		"slow rate":     func(r *proxymodel.Route) { r.RateLimit.RequestsPerSecond = 0.5 },
 		"wildcard host": func(r *proxymodel.Route) { r.Host = "*.example.test" },
@@ -553,6 +591,18 @@ func policyTestGeneratedConfigs(t *testing.T) map[string]policyTestGenerated {
 		}
 	}
 	return configs
+}
+
+// policyTestPathRoutes covers each path route form nginxgen renders.
+func policyTestPathRoutes() []proxymodel.PathRoute {
+	return []proxymodel.PathRoute{
+		{Match: proxymodel.PathMatchExact, Path: "/api/world", Upstream: proxymodel.Upstream{Addr: "192.168.178.210", Port: 80}},
+		{Match: proxymodel.PathMatchPrefix, Path: "/media", Upstream: proxymodel.Upstream{Addr: "10.0.0.7", Port: 9000}},
+		{Match: proxymodel.PathMatchPrefix, Path: "/ws.v1", StripPrefix: true, WebSocket: true, Upstream: proxymodel.Upstream{Addr: "fd00::5", Port: 8443, Scheme: proxymodel.SchemeHTTPS}},
+		{Match: proxymodel.PathMatchPrefix, Path: "/admin", Upstream: proxymodel.Upstream{Addr: "10.0.0.8", Port: 8081}},
+		{Match: proxymodel.PathMatchExact, Path: "/admin", Upstream: proxymodel.Upstream{Addr: "10.0.0.9", Port: 8082}},
+		{Match: proxymodel.PathMatchExact, Path: "/", Upstream: proxymodel.Upstream{Addr: "10.0.0.10", Port: 8083}},
+	}
 }
 
 // policyTestPolicyFor returns the policy for a generated config's host.

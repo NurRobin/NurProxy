@@ -113,6 +113,78 @@ func (d *DB) CheckDomainBackendOptions(dom *models.Domain) error {
 	return dom.ProxyConfig.CheckHeadersSupported(agent.ProxyCapabilities, kind)
 }
 
+// PathRouteAddrs resolves the servers of a domain's path routes to their
+// addresses. Each server must exist and belong to the same agent as the
+// domain's server: that agent proxies every path of the domain, so a server
+// of another agent would be dialed from the wrong host.
+func (d *DB) PathRouteAddrs(dom models.Domain) (map[string]string, error) {
+	if len(dom.ProxyConfig.Routes) == 0 {
+		return nil, nil
+	}
+	srv, err := d.GetServer(dom.ServerID)
+	if err != nil {
+		return nil, fmt.Errorf("path routes need the domain's server %q, which was not found", dom.ServerID)
+	}
+	addrs := make(map[string]string, len(dom.ProxyConfig.Routes))
+	for _, p := range dom.ProxyConfig.Routes {
+		if _, done := addrs[p.ServerID]; done {
+			continue
+		}
+		if p.ServerID == "" {
+			return nil, fmt.Errorf("path route %q has no server_id", p.Path)
+		}
+		rs, err := d.GetServer(p.ServerID)
+		if err != nil {
+			return nil, fmt.Errorf("path route %q: server %q not found", p.Path, p.ServerID)
+		}
+		if rs.AgentID != srv.AgentID {
+			return nil, fmt.Errorf("path route %q: server %q belongs to another agent than the domain's server %q; the domain's agent proxies every path, so route servers must be on the same agent", p.Path, rs.Name, srv.Name)
+		}
+		addrs[p.ServerID] = rs.Address
+	}
+	return addrs, nil
+}
+
+// CheckDomainRoutes validates a domain's path routes as the REST API and the
+// MCP tools accept them: shape, route servers on the domain's agent, and a
+// backend on that agent that can render them.
+func (d *DB) CheckDomainRoutes(dom *models.Domain) error {
+	if len(dom.ProxyConfig.Routes) == 0 {
+		return nil
+	}
+	if dom.CertOnly {
+		return fmt.Errorf("a cert-only domain serves no vhost and cannot have path routes")
+	}
+	intents := make([]proxymodel.PathRoute, 0, len(dom.ProxyConfig.Routes))
+	for _, p := range dom.ProxyConfig.Routes {
+		intents = append(intents, p.Intent(""))
+	}
+	if err := proxymodel.ValidatePathRoutes(intents, false); err != nil {
+		return err
+	}
+	if _, err := d.PathRouteAddrs(*dom); err != nil {
+		return err
+	}
+	srv, err := d.GetServer(dom.ServerID)
+	if err != nil {
+		return err
+	}
+	agent, err := d.GetAgent(srv.AgentID)
+	if err != nil {
+		return nil
+	}
+	return dom.ProxyConfig.CheckRoutesSupported(agent.ProxyCapabilities, agentBackendName(agent))
+}
+
+// agentBackendName names the proxy an agent serves domains with, for error
+// messages.
+func agentBackendName(agent *models.Agent) string {
+	if agent.ProxyMode == "existing" && agent.ProxyDetection != nil && agent.ProxyDetection.Kind != "" {
+		return agent.ProxyDetection.Kind
+	}
+	return "the built-in Caddy"
+}
+
 // ListServersByAgent returns all servers belonging to the given agent.
 func (d *DB) ListServersByAgent(agentID string) ([]models.Server, error) {
 	rows, err := d.read.Query(`
