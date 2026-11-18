@@ -30,37 +30,21 @@ func replaceWithSymlink(t *testing.T, path string) {
 	mustDo(t, os.Symlink(target, path))
 }
 
-// TestApplierRefusesUntrustedHandoff covers layouts where root must not act at
-// all: Run returns an error before claiming anything.
-func TestApplierRefusesUntrustedHandoff(t *testing.T) {
+// TestApplierRefusesUntrustedState covers a root state location root cannot
+// trust: Run returns an error and writes nothing.
+func TestApplierRefusesUntrustedState(t *testing.T) {
 	cases := []struct {
 		name    string
 		prepare func(t *testing.T, f *applierFixture)
 		wantErr string
 	}{
-		{"self-update dir is a symlink", func(t *testing.T, f *applierFixture) {
-			replaceWithSymlink(t, string(f.dir))
-		}, "self-update"},
 		{"root dir is a symlink", func(t *testing.T, f *applierFixture) {
-			elsewhere := t.TempDir()
-			mustDo(t, os.Symlink(elsewhere, string(f.rootDir)))
-		}, rootStateDirName},
-		{"data dir is a symlink", func(t *testing.T, f *applierFixture) {
-			replaceWithSymlink(t, f.dataDir)
-		}, "data dir"},
-		{"root dir owned by the agent", func(t *testing.T, f *applierFixture) {
+			mustDo(t, os.Symlink(t.TempDir(), string(f.rootDir)))
+		}, filepath.Base(string(f0RootDir))},
+		{"root dir owned by someone else", func(t *testing.T, f *applierFixture) {
 			mustDo(t, os.Mkdir(string(f.rootDir), 0o755))
-			f.owners[rootStateDirName] = 1000
+			f.owners[filepath.Base(string(f.rootDir))] = 1000
 		}, "not root"},
-		{"self-update dir owned by someone else", func(t *testing.T, f *applierFixture) {
-			f.owners[stateDirName] = 1001
-		}, "not the agent user"},
-		{"self-update dir group-writable", func(t *testing.T, f *applierFixture) {
-			mustDo(t, os.Chmod(string(f.dir), 0o770))
-		}, "group- or world-writable"},
-		{"data dir world-writable", func(t *testing.T, f *applierFixture) {
-			mustDo(t, os.Chmod(f.dataDir, 0o777))
-		}, "group- or world-writable"},
 		{"data dir parent not root-owned", func(t *testing.T, f *applierFixture) {
 			f.owners[filepath.Base(filepath.Dir(f.dataDir))] = 1000
 		}, "not in a root-controlled location"},
@@ -76,6 +60,59 @@ func TestApplierRefusesUntrustedHandoff(t *testing.T) {
 			f.binaryIs(t, oldBinary)
 			if f.service.restarts != 0 {
 				t.Fatalf("restarted after a refusal")
+			}
+		})
+	}
+}
+
+// f0RootDir is the base name every fixture's root state dir has.
+const f0RootDir = "data" + rootStateSuffix
+
+// TestApplierRefusesUntrustedHandoff covers an agent-side layout root must not
+// act on: Run refuses, answers with a failure result without an upgrade id,
+// and consumes the request where that is safe so the trigger does not loop.
+func TestApplierRefusesUntrustedHandoff(t *testing.T) {
+	cases := []struct {
+		name        string
+		prepare     func(t *testing.T, f *applierFixture)
+		wantErr     string
+		wantRemoved bool
+	}{
+		{"self-update dir is a symlink", func(t *testing.T, f *applierFixture) {
+			replaceWithSymlink(t, string(f.dir))
+		}, "self-update", true},
+		{"data dir is a symlink", func(t *testing.T, f *applierFixture) {
+			replaceWithSymlink(t, f.dataDir)
+		}, "data dir", false},
+		{"self-update dir owned by someone else", func(t *testing.T, f *applierFixture) {
+			f.owners[stateDirName] = 1001
+		}, "not the agent user", true},
+		{"self-update dir group-writable", func(t *testing.T, f *applierFixture) {
+			mustDo(t, os.Chmod(string(f.dir), 0o770))
+		}, "group- or world-writable", true},
+		{"data dir world-writable", func(t *testing.T, f *applierFixture) {
+			mustDo(t, os.Chmod(f.dataDir, 0o777))
+		}, "group- or world-writable", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newApplierFixture(t)
+			tc.prepare(t, f)
+			res, err := f.applier.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error with %q, got %+v, %v", tc.wantErr, res, err)
+			}
+			f.binaryIs(t, oldBinary)
+			if f.service.restarts != 0 {
+				t.Fatalf("restarted after a refusal")
+			}
+			onDisk, err := f.rootDir.ReadResult()
+			if err != nil || onDisk == nil || onDisk.UpgradeID != "" || onDisk.State != models.UpgradeFailed || !strings.Contains(onDisk.Error, tc.wantErr) {
+				t.Fatalf("refusal result %+v, %v", onDisk, err)
+			}
+			_, statErr := os.Stat(f.dir.path(requestFile))
+			if removed := errors.Is(statErr, os.ErrNotExist); removed != tc.wantRemoved {
+				t.Fatalf("request removed=%v, want %v (%v)", removed, tc.wantRemoved, statErr)
 			}
 		})
 	}
@@ -130,6 +167,9 @@ func TestApplierRefusesUntrustedInput(t *testing.T) {
 			}
 			if _, err := os.Lstat(filepath.Join(string(f.dir), stagedDirName)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("staged files left behind: %v", err)
+			}
+			if onDisk, _ := f.rootDir.ReadResult(); onDisk == nil || onDisk.UpgradeID != "" || onDisk.State != models.UpgradeFailed {
+				t.Fatalf("no refusal result for the agent: %+v", onDisk)
 			}
 		})
 	}

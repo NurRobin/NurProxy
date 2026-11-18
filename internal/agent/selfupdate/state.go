@@ -13,7 +13,7 @@ import (
 )
 
 // The unprivileged agent and the privileged applier talk through two
-// directories in the agent's data dir:
+// directories, one in the agent's data dir:
 //
 //	self-update/        owned by the agent user; root only reads and unlinks
 //	  staged/*          release files the agent downloaded (untrusted input
@@ -23,7 +23,10 @@ import (
 //	  healthy.json      written by the new agent after it reached the
 //	                    orchestrator; the applier waits for it
 //	  reported.json     the last result the agent relayed to the orchestrator
-//	self-update-root/   owned by root, mode 0755; the agent can only read it
+//
+// and, next to the data dir (in its root-owned parent):
+//
+//	<data-dir>.selfupdate/  owned by root, mode 0755; the agent only reads it
 //	  pending.json      written by the applier once it has claimed the
 //	                    request; tells the restarted agent what to prove
 //	  result.json       written by the applier when it is done; the running
@@ -33,19 +36,19 @@ import (
 // could swap entries for symlinks and redirect root's writes, renames or
 // deletes anywhere on the host.
 const (
-	stateDirName     = "self-update"
-	rootStateDirName = "self-update-root"
-	stagedDirName    = "staged"
-	requestFile      = "request.json"
-	pendingFile      = "pending.json"
-	healthyFile      = "healthy.json"
-	reportedFile     = "reported.json"
-	resultFile       = "result.json"
-	stagedArchive    = "release.tar.gz"
-	maxStateBytes    = 64 << 10
-	stateDirPerm     = 0o700
-	stateFilePerm    = 0o644
-	stagedFilePerm   = 0o600
+	stateDirName    = "self-update"
+	rootStateSuffix = ".selfupdate"
+	stagedDirName   = "staged"
+	requestFile     = "request.json"
+	pendingFile     = "pending.json"
+	healthyFile     = "healthy.json"
+	reportedFile    = "reported.json"
+	resultFile      = "result.json"
+	stagedArchive   = "release.tar.gz"
+	maxStateBytes   = 64 << 10
+	stateDirPerm    = 0o700
+	stateFilePerm   = 0o644
+	stagedFilePerm  = 0o600
 )
 
 // Request is what the agent asks the applier to install.
@@ -140,12 +143,13 @@ func (d Dir) ReadReported() (*Reported, error) { return readJSON[Reported](d.pat
 func (d Dir) RemoveRequest() error { return removeIfExists(d.path(requestFile)) }
 func (d Dir) RemoveHealthy() error { return removeIfExists(d.path(healthyFile)) }
 
-// RootDir is the applier's root-owned directory below an agent data dir. The
-// agent only reads it.
+// RootDir is the applier's root-owned state directory for an agent data dir.
+// The agent only reads it.
 type RootDir string
 
-// RootStateDir returns the applier's directory for dataDir.
-func RootStateDir(dataDir string) RootDir { return RootDir(filepath.Join(dataDir, rootStateDirName)) }
+// RootStateDir returns the applier's directory for dataDir: a sibling named
+// <data-dir>.selfupdate.
+func RootStateDir(dataDir string) RootDir { return RootDir(filepath.Clean(dataDir) + rootStateSuffix) }
 
 // ReadPending returns the upgrade the applier is carrying out, or nil.
 func (d RootDir) ReadPending() (*Pending, error) {

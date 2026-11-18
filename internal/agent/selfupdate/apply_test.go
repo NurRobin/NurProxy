@@ -74,7 +74,7 @@ func newApplierFixture(t *testing.T) *applierFixture {
 	f.applier = &Applier{
 		DataDir: dataDir, BinaryPath: binary, CurrentVersion: "1.2.0", Trust: pki.trust,
 		GOOS: "linux", GOARCH: "amd64", Service: f.service,
-		HealthTimeout: 300 * time.Millisecond, PollInterval: 10 * time.Millisecond,
+		HealthTimeout: 300 * time.Millisecond, PollInterval: 10 * time.Millisecond, RefusalBackoff: 10 * time.Millisecond,
 		RefreshBuildID: func(v string) error { f.refreshs = append(f.refreshs, v); return nil },
 		ProbeVersion: func(_ context.Context, path string) (string, error) {
 			data, err := os.ReadFile(path)

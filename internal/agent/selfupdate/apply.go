@@ -48,6 +48,9 @@ type Applier struct {
 	ProbeVersion func(ctx context.Context, path string) (string, error)
 	Now          func() time.Time
 	Logf         func(format string, args ...any)
+	// RefusalBackoff is how long Run waits after refusing a request it could
+	// not remove, so a path trigger that keeps firing on it is throttled.
+	RefusalBackoff time.Duration
 
 	policy fsPolicy
 	h      *handoff
@@ -81,6 +84,9 @@ func (a *Applier) defaults() {
 	if a.PollInterval <= 0 {
 		a.PollInterval = 2 * time.Second
 	}
+	if a.RefusalBackoff <= 0 {
+		a.RefusalBackoff = 30 * time.Second
+	}
 	if a.Now == nil {
 		a.Now = time.Now
 	}
@@ -95,26 +101,38 @@ func (a *Applier) defaults() {
 	}
 }
 
-// Run claims a pending request and carries it out. It returns nil, nil when
-// there was nothing to do. The returned Result has also been written to the
-// hand-off directory for the agent to report.
+// Run first settles an upgrade a previous applier left unfinished, then claims
+// a pending request and carries it out. It returns nil, nil when there was
+// nothing to do. The returned Result has also been written to the root state
+// directory for the agent to report.
 func (a *Applier) Run(ctx context.Context) (*Result, error) {
 	a.defaults()
-	h, err := openHandoff(a.DataDir, a.policy)
+	h, err := openRootState(a.DataDir, a.policy)
 	if err != nil {
+		// Without a trusted state directory there is nowhere safe to write a
+		// verdict; the operator has to fix the layout.
 		return nil, fmt.Errorf("refusing to act on %s: %w", a.DataDir, err)
 	}
 	defer h.Close()
 	a.h = h
 	defer func() { a.h = nil }()
+	if err := h.openAgentSide(); err != nil {
+		return a.refuse(ctx, h.consumeRefusedRequest(), "the agent's self-update directory failed the ownership checks: %v", err)
+	}
+	settled, binaryChanged := a.settleStale(ctx)
+	if binaryChanged {
+		// The binary on disk is no longer the one this process runs; a pending
+		// request is left for the next applier, started from the restored binary.
+		return settled, nil
+	}
 	req, err := h.readRequest()
 	if err != nil {
-		_ = h.removeAgentFile(requestFile)
+		removed := h.removeAgentFile(requestFile) == nil
 		h.clearStaged()
-		return nil, fmt.Errorf("unreadable self-update request discarded: %w", err)
+		return a.refuse(ctx, removed, "unreadable self-update request discarded: %v", err)
 	}
 	if req == nil {
-		return nil, nil
+		return settled, nil
 	}
 	// Claim it first: a systemd PathExists= trigger fires again for as long as
 	// the file exists.
@@ -132,6 +150,68 @@ func (a *Applier) Run(ctx context.Context) (*Result, error) {
 		return &res, nil
 	}
 	return a.finish(&res)
+}
+
+// refuse records a request the applier will not act on as a failed result
+// without an upgrade id; the agent attaches it to the request it is waiting
+// on. When the request could not be removed, a path trigger would start the
+// applier again at once, so it waits RefusalBackoff before returning.
+func (a *Applier) refuse(ctx context.Context, requestRemoved bool, format string, args ...any) (*Result, error) {
+	msg := fmt.Sprintf(format, args...)
+	a.Logf("self-update refused: %s", msg)
+	res := Result{State: models.UpgradeFailed, Version: a.CurrentVersion, Error: msg, FinishedAt: a.Now().UTC()}
+	if err := a.h.writeRootJSON(resultFile, res); err != nil {
+		a.Logf("self-update: writing refusal: %v", err)
+	}
+	if !requestRemoved {
+		select {
+		case <-ctx.Done():
+		case <-time.After(a.RefusalBackoff):
+		}
+	}
+	return &res, errors.New(msg)
+}
+
+// settleStale finishes an upgrade whose applier died while waiting for the
+// health proof (power loss, SIGKILL, OOM), so its pending record does not block
+// every later upgrade. It decides from the binary this process runs (the one
+// on disk when it was started) and the health proof, writes the verdict and
+// reports whether it replaced the binary on disk.
+func (a *Applier) settleStale(ctx context.Context) (*Result, bool) {
+	p, err := readRootJSON[Pending](a.h, pendingFile)
+	if err != nil {
+		a.Logf("self-update: discarding unreadable pending record: %v", err)
+		_ = a.h.removeRootFile(pendingFile)
+		return nil, false
+	}
+	if p == nil {
+		return nil, false
+	}
+	a.Logf("self-update %s: settling an upgrade %s -> %s a previous applier left unfinished", p.UpgradeID, p.FromVersion, p.Version)
+	req := Request{UpgradeID: p.UpgradeID, Version: p.Version, FromVersion: p.FromVersion}
+	var res Result
+	switch a.CurrentVersion {
+	case p.Version:
+		// The new binary is in place. Commit on a health proof, wait out what
+		// is left of the original health window, roll back after it.
+		res = a.awaitHealth(ctx, req, p.Version, p.FromVersion, p.StartedAt.Add(a.HealthTimeout))
+		if res.State == models.UpgradeRolledBack {
+			return &res, true
+		}
+	case p.FromVersion:
+		// The swap never happened or was already undone.
+		_ = a.h.removeRootFile(pendingFile)
+		res = Result{UpgradeID: p.UpgradeID, State: models.UpgradeFailed, Version: p.FromVersion, FinishedAt: a.Now().UTC(),
+			Error: fmt.Sprintf("the applier stopped before finishing; the agent still runs %s", p.FromVersion)}
+	default:
+		_ = a.h.removeRootFile(pendingFile)
+		res = Result{UpgradeID: p.UpgradeID, State: models.UpgradeFailed, Version: a.CurrentVersion, FinishedAt: a.Now().UTC(),
+			Error: fmt.Sprintf("the applier stopped before finishing; the installed binary is %s, neither %s nor %s", a.CurrentVersion, p.FromVersion, p.Version)}
+	}
+	if err := a.h.writeRootJSON(resultFile, res); err != nil {
+		a.Logf("self-update %s: writing result: %v", p.UpgradeID, err)
+	}
+	return &res, false
 }
 
 func (a *Applier) finish(res *Result) (*Result, error) {
@@ -206,17 +286,18 @@ func (a *Applier) apply(ctx context.Context, req Request) Result {
 
 	if a.RefreshBuildID != nil {
 		if err := a.RefreshBuildID(target); err != nil {
-			return a.rollback(req, target, fmt.Sprintf("re-pinning the root helper build failed: %v", err))
+			return a.rollback(req, target, a.CurrentVersion, fmt.Sprintf("re-pinning the root helper build failed: %v", err))
 		}
 	}
 	if err := a.Service.Restart(ctx); err != nil {
-		return a.rollback(req, target, fmt.Sprintf("restarting the agent failed: %v", err))
+		return a.rollback(req, target, a.CurrentVersion, fmt.Sprintf("restarting the agent failed: %v", err))
 	}
-	return a.awaitHealth(ctx, req, target)
+	return a.awaitHealth(ctx, req, target, a.CurrentVersion, a.Now().Add(a.HealthTimeout))
 }
 
-func (a *Applier) awaitHealth(ctx context.Context, req Request, target string) Result {
-	deadline := a.Now().Add(a.HealthTimeout)
+// awaitHealth waits until deadline for the health proof of req, commits on it
+// and otherwise rolls back to from.
+func (a *Applier) awaitHealth(ctx context.Context, req Request, target, from string, deadline time.Time) Result {
 	ticker := time.NewTicker(a.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -231,31 +312,35 @@ func (a *Applier) awaitHealth(ctx context.Context, req Request, target string) R
 			a.Logf("self-update %s: agent %s is healthy", req.UpgradeID, target)
 			return Result{UpgradeID: req.UpgradeID, State: models.UpgradeDone, Version: target, FinishedAt: a.Now().UTC()}
 		case healthRollback:
-			return a.rollback(req, target, fmt.Sprintf("the new agent did not report healthy within %s", a.HealthTimeout))
+			return a.rollback(req, target, from, fmt.Sprintf("the new agent did not report healthy within %s", a.HealthTimeout))
 		}
 		select {
 		case <-ctx.Done():
-			return a.rollback(req, target, "the applier was stopped before the new agent reported healthy")
+			return a.rollback(req, target, from, "the applier was stopped before the new agent reported healthy")
 		case <-ticker.C:
 		}
 	}
 }
 
-// rollback restores the previous binary and restarts the agent on it. The
-// result is written before the restart so the old agent finds it at startup.
-func (a *Applier) rollback(req Request, target, reason string) Result {
+// rollback restores the previous binary (version from) and restarts the agent
+// on it. The result is written before the restart so the old agent finds it at
+// startup. The pending record is cleared in every outcome so a failed restore
+// cannot block later upgrades.
+func (a *Applier) rollback(req Request, target, from, reason string) Result {
 	a.Logf("self-update %s: rolling back from %s: %s", req.UpgradeID, target, reason)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	res := Result{UpgradeID: req.UpgradeID, State: models.UpgradeRolledBack, Version: a.CurrentVersion, Error: reason, FinishedAt: a.Now().UTC()}
+	res := Result{UpgradeID: req.UpgradeID, State: models.UpgradeRolledBack, Version: from, Error: reason, FinishedAt: a.Now().UTC()}
 	if err := restorePrevious(a.BinaryPath, a.policy); err != nil {
+		_ = a.h.removeAgentFile(healthyFile)
+		_ = a.h.removeRootFile(pendingFile)
 		res.State = models.UpgradeFailed
 		res.Version = target
 		res.Error = fmt.Sprintf("%s; restoring %s also failed: %v", reason, PreviousPath(a.BinaryPath), err)
 		return res
 	}
 	if a.RefreshBuildID != nil {
-		if err := a.RefreshBuildID(a.CurrentVersion); err != nil {
+		if err := a.RefreshBuildID(from); err != nil {
 			res.Error += fmt.Sprintf("; re-pinning the root helper failed: %v", err)
 		}
 	}

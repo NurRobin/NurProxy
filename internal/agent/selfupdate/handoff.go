@@ -23,79 +23,110 @@ const maxRequestBytes = 4 << 10
 //   - agent is <data-dir>/self-update, writable by the agent. Root only reads
 //     from it (owner, type, link-count and size checked) and unlinks entries in
 //     it; it never creates, renames or writes there.
-//   - root is <data-dir>/self-update-root, owned by root, mode 0755. Everything
-//     root writes goes here; the agent can only read it.
+//   - root is <data-dir>.selfupdate, a sibling of the data dir owned by root
+//     with mode 0755. Everything root writes goes here; the agent can only read
+//     it. It lives next to the data dir rather than inside it because the
+//     agent owns the data dir and could otherwise rename any root-owned
+//     directory it can reach into that place.
 type handoff struct {
 	pol      fsPolicy
+	parent   *os.File // the data dir's root-owned parent
+	dataName string
+	data     *os.File // nil until openAgentSide succeeded
 	agentUID uint32
 	agent    *os.File // nil when the agent never created self-update/
 	root     *os.File
 }
 
-// openHandoff opens the hand-off directories below dataDir for the root
-// applier. dataDir's parents must be root-owned and not group- or
-// world-writable; dataDir itself must not be a symlink or group- or
-// world-writable, and its owner is taken as the agent user. The root
-// directory is created when missing and refused when someone else owns it.
-func openHandoff(dataDir string, pol fsPolicy) (*handoff, error) {
-	if !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir {
+// openRootState opens the data dir's parent and the applier's root-owned
+// state directory. The parent and everything above it must be root-owned and
+// not group- or world-writable, so only root can have created anything in it;
+// the state directory is created when missing.
+func openRootState(dataDir string, pol fsPolicy) (*handoff, error) {
+	if !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir || filepath.Dir(dataDir) == dataDir {
 		return nil, fmt.Errorf("data dir %q is not a clean absolute path", dataDir)
 	}
-	if err := pol.checkTrustedPath(filepath.Dir(dataDir), true); err != nil {
+	parentPath := filepath.Dir(dataDir)
+	if err := pol.checkTrustedPath(parentPath, true); err != nil {
 		return nil, fmt.Errorf("data dir %s is not in a root-controlled location: %w", dataDir, err)
 	}
-	data, err := openDirAt(nil, dataDir)
+	parent, err := openDirAt(nil, parentPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening data dir: %w", err)
+		return nil, fmt.Errorf("opening %s: %w", parentPath, err)
 	}
-	defer data.Close()
+	h := &handoff{pol: pol, parent: parent, dataName: filepath.Base(dataDir)}
+	if h.root, err = h.openRootDir(filepath.Base(string(RootStateDir(dataDir)))); err != nil {
+		h.Close()
+		return nil, err
+	}
+	return h, nil
+}
+
+// openAgentSide opens the data dir and the agent's hand-off directory. The
+// data dir must not be a symlink or group- or world-writable; its owner is
+// taken as the agent user.
+func (h *handoff) openAgentSide() error {
+	data, err := openDirAt(h.parent, h.dataName)
+	if err != nil {
+		return fmt.Errorf("opening data dir: %w", err)
+	}
+	h.data = data
 	info, err := data.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if info.Mode().Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("data dir %s is group- or world-writable (mode %04o)", dataDir, info.Mode().Perm())
+		return fmt.Errorf("data dir %s is group- or world-writable (mode %04o)", h.dataName, info.Mode().Perm())
 	}
-	h := &handoff{pol: pol, agentUID: pol.owner(info)}
-	if h.root, err = h.openRootDir(data); err != nil {
-		return nil, err
-	}
+	h.agentUID = h.pol.owner(info)
 	agent, err := h.openAgentDir(data, stateDirName)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 	case err != nil:
-		h.Close()
-		return nil, err
+		return err
 	default:
 		h.agent = agent
+	}
+	return nil
+}
+
+// openHandoff is openRootState followed by openAgentSide.
+func openHandoff(dataDir string, pol fsPolicy) (*handoff, error) {
+	h, err := openRootState(dataDir, pol)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.openAgentSide(); err != nil {
+		h.Close()
+		return nil, err
 	}
 	return h, nil
 }
 
 func (h *handoff) Close() {
-	if h.agent != nil {
-		_ = h.agent.Close()
-	}
-	if h.root != nil {
-		_ = h.root.Close()
+	for _, f := range []*os.File{h.agent, h.root, h.data, h.parent} {
+		if f != nil {
+			_ = f.Close()
+		}
 	}
 }
 
-func (h *handoff) openRootDir(data *os.File) (*os.File, error) {
-	if err := mkdirAt(data, rootStateDirName, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("creating %s: %w", rootStateDirName, err)
+func (h *handoff) openRootDir(name string) (*os.File, error) {
+	if err := mkdirAt(h.parent, name, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("creating %s: %w", name, err)
 	}
-	dir, err := openDirAt(data, rootStateDirName)
+	dir, err := openDirAt(h.parent, name)
 	if err != nil {
-		return nil, fmt.Errorf("opening %s: %w", rootStateDirName, err)
+		return nil, fmt.Errorf("opening %s: %w", name, err)
 	}
 	info, err := dir.Stat()
 	if err == nil && h.pol.owner(info) != h.pol.rootUID {
-		err = fmt.Errorf("%s is owned by uid %d, not root; remove it so the applier can recreate it", rootStateDirName, h.pol.owner(info))
+		err = fmt.Errorf("%s is owned by uid %d, not root; remove it so the applier can recreate it", name, h.pol.owner(info))
 	}
 	if err == nil && info.Mode().Perm() != 0o755 {
-		// Only root can have created a root-owned entry here; normalize the
-		// mode so the agent can read what root leaves for it.
+		// The parent is root-owned and writable only by root, so a root-owned
+		// entry in it is root's own; normalize the mode so the agent can read
+		// what root leaves for it.
 		err = dir.Chmod(0o755)
 	}
 	if err != nil {
@@ -103,6 +134,57 @@ func (h *handoff) openRootDir(data *os.File) (*os.File, error) {
 		return nil, err
 	}
 	return dir, nil
+}
+
+// consumeRefusedRequest removes the agent's request after openAgentSide
+// refused the layout, so a path trigger does not fire again for it. It only
+// unlinks names inside directories it opened without following symlinks, and
+// reports whether the request is gone.
+func (h *handoff) consumeRefusedRequest() bool {
+	data := h.data
+	if data == nil {
+		d, err := openDirAt(h.parent, h.dataName)
+		if err != nil {
+			// The data dir itself is a symlink or missing: the parent is
+			// root's, so leave the entry alone.
+			return errors.Is(err, os.ErrNotExist)
+		}
+		defer d.Close()
+		data = d
+	}
+	agent, err := openDirAt(data, stateDirName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+		// self-update is a symlink or not a directory: drop that entry itself;
+		// unlinkat never touches a symlink's target.
+		return unlinkAt(data, stateDirName, false) == nil
+	}
+	defer agent.Close()
+	err = unlinkAt(agent, requestFile, false)
+	return err == nil || errors.Is(err, os.ErrNotExist)
+}
+
+// readRootJSON reads one of root's own state files, or nil when it is absent.
+func readRootJSON[T any](h *handoff, name string) (*T, error) {
+	f, err := openFileAt(h.root, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxStateBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	var v T
+	if err := json.Unmarshal(data, &v); err != nil {
+		return nil, fmt.Errorf("decoding %s: %w", name, err)
+	}
+	return &v, nil
 }
 
 // openAgentDir opens an agent-owned directory below parent and checks that it

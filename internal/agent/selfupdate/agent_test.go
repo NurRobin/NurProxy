@@ -178,7 +178,7 @@ func TestAgentWatchRelaysResultAndHealth(t *testing.T) {
 	}
 
 	// The restarted agent proves health once per upgrade.
-	writeRootState(t, a.DataDir, pendingFile, Pending{UpgradeID: "up-1", FromVersion: "1.2.0", Version: "1.3.0"})
+	writeRootState(t, a.DataDir, pendingFile, Pending{UpgradeID: "up-1", FromVersion: "1.2.0", Version: "1.3.0", StartedAt: time.Now()})
 	a.HeartbeatOK()
 	h, err := dir.ReadHealthy()
 	if err != nil || h == nil || h.UpgradeID != "up-1" || h.Version != "1.3.0" {

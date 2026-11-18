@@ -221,7 +221,9 @@ func (a *Agent) run(ctx context.Context, cmd models.UpgradeCommand) {
 		fail("upgrade %s is still waiting for the privileged applier", req.UpgradeID)
 		return
 	}
-	if p, _ := a.rootDir().ReadPending(); p != nil {
+	// A pending record past its deadline is left over from an applier that
+	// died; the next applier settles it first, so it must not block this one.
+	if p, _ := a.rootDir().ReadPending(); p != nil && !pendingStale(p, time.Now()) {
 		fail("upgrade %s is still in progress", p.UpgradeID)
 		return
 	}
@@ -360,28 +362,35 @@ func (a *Agent) Watch(ctx context.Context) {
 	}
 }
 
+// staleGrace is how long past the applier's health window a pending record
+// may stay before the agent treats its applier as gone.
+const staleGrace = 2 * time.Minute
+
+// pendingStale reports whether the applier that wrote p must have finished or
+// died by now.
+func pendingStale(p *Pending, now time.Time) bool {
+	return now.After(p.StartedAt.Add(DefaultHealthTimeout + staleGrace))
+}
+
 // WatchOnce is one Watch iteration.
 func (a *Agent) WatchOnce(ctx context.Context, claimTimeout time.Duration) {
 	dir := a.dir()
-	if res, err := a.rootDir().ReadResult(); err != nil {
+	res, err := a.rootDir().ReadResult()
+	if err != nil {
 		log.Printf("Self-update: unreadable applier result: %v", err)
-	} else if res != nil && !alreadyReported(dir, res) {
-		if a.Reporter != nil {
-			err := a.Reporter.Report(ctx, models.UpgradeReport{UpgradeID: res.UpgradeID, State: res.State, Version: a.Version, Error: res.Error})
-			if err != nil && !isRejected(err) {
-				return
-			}
+	} else if res != nil && !alreadyReported(dir, res.UpgradeID, res.FinishedAt) {
+		if !a.relayResult(ctx, dir, res) {
+			return
 		}
-		log.Printf("Self-update %s finished: %s %s", res.UpgradeID, res.State, res.Error)
-		// The result lives in the root-owned directory, which the agent cannot
-		// clean up; remembering it keeps it from being reported again.
-		err := dir.Ensure()
-		if err == nil {
-			err = dir.WriteReported(Reported{UpgradeID: res.UpgradeID, FinishedAt: res.FinishedAt})
+		markReported(dir, res.UpgradeID, res.FinishedAt)
+	}
+	p, err := a.rootDir().ReadPending()
+	settled := res != nil && p != nil && res.UpgradeID == p.UpgradeID
+	if err == nil && p != nil && !settled && pendingStale(p, time.Now()) && !alreadyReported(dir, p.UpgradeID, p.StartedAt) {
+		if !a.reportStalePending(ctx, p) {
+			return
 		}
-		if err != nil {
-			log.Printf("Self-update %s: recording the reported result failed: %v", res.UpgradeID, err)
-		}
+		markReported(dir, p.UpgradeID, p.StartedAt)
 	}
 	req, err := dir.ReadRequest()
 	if err != nil || req == nil {
@@ -397,9 +406,64 @@ func (a *Agent) WatchOnce(ctx context.Context, claimTimeout time.Duration) {
 	a.report(ctx, req.UpgradeID, models.UpgradeFailed, msg)
 }
 
-func alreadyReported(dir Dir, res *Result) bool {
+// relayResult reports the applier's verdict. A verdict without an upgrade id
+// is a refusal of whatever request was waiting; it fails that request and
+// removes it. It returns false when the report should be retried.
+func (a *Agent) relayResult(ctx context.Context, dir Dir, res *Result) bool {
+	id := res.UpgradeID
+	if id == "" {
+		req, _ := dir.ReadRequest()
+		if req == nil {
+			log.Printf("Self-update: the privileged applier refused to act: %s", res.Error)
+			return true
+		}
+		id = req.UpgradeID
+		_ = dir.RemoveRequest()
+		dir.ClearStaged()
+	}
+	if a.Reporter != nil {
+		err := a.Reporter.Report(ctx, models.UpgradeReport{UpgradeID: id, State: res.State, Version: a.Version, Error: res.Error})
+		if err != nil && !isRejected(err) {
+			return false
+		}
+	}
+	log.Printf("Self-update %s finished: %s %s", id, res.State, res.Error)
+	return true
+}
+
+// reportStalePending reports an upgrade whose applier stopped without a
+// verdict. Running the target version means the swap happened and this agent
+// came up; anything else is a failure. The next applier run clears the record.
+func (a *Agent) reportStalePending(ctx context.Context, p *Pending) bool {
+	state, msg := models.UpgradeFailed, fmt.Sprintf("the privileged applier stopped before finishing; the agent still runs %s", a.Version)
+	if a.Version == p.Version {
+		state, msg = models.UpgradeDone, ""
+	}
+	if a.Reporter != nil {
+		err := a.Reporter.Report(ctx, models.UpgradeReport{UpgradeID: p.UpgradeID, State: state, Version: a.Version, Error: msg})
+		if err != nil && !isRejected(err) {
+			return false
+		}
+	}
+	log.Printf("Self-update %s: the applier left it unfinished; reported %s %s", p.UpgradeID, state, msg)
+	return true
+}
+
+func alreadyReported(dir Dir, id string, at time.Time) bool {
 	r, err := dir.ReadReported()
-	return err == nil && r != nil && r.UpgradeID == res.UpgradeID && r.FinishedAt.Equal(res.FinishedAt)
+	return err == nil && r != nil && r.UpgradeID == id && r.FinishedAt.Equal(at)
+}
+
+// markReported remembers a relayed verdict. The verdicts live in the
+// root-owned directory, which the agent cannot clean up.
+func markReported(dir Dir, id string, at time.Time) {
+	err := dir.Ensure()
+	if err == nil {
+		err = dir.WriteReported(Reported{UpgradeID: id, FinishedAt: at})
+	}
+	if err != nil {
+		log.Printf("Self-update %s: recording the reported verdict failed: %v", id, err)
+	}
 }
 
 func isRejected(err error) bool { return errors.Is(err, ErrReportRejected) }
