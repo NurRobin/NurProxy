@@ -88,8 +88,8 @@ nurproxy agent adopt  <agent-id> [--name n] [--fqdn f] [--zones id,id] [--dns-mo
 nurproxy agent update <agent-id> [--name n] [--fqdn f] [--zones id,id] [--dns-mode m] [--ddns-interval s]
 nurproxy agent reject <agent-id>            # only while pending
 nurproxy agent delete <agent-id>
-nurproxy agent upgrade <agent-id> [--version X] [--wait]   # default: the orchestrator's version
-nurproxy agent upgrade --all-outdated [--version X] [--wait]
+nurproxy agent upgrade <agent-id> [--version X] [--allow-prerelease] [--wait]   # default: the orchestrator's version
+nurproxy agent upgrade --all-outdated [--version X] [--allow-prerelease] [--wait]
 nurproxy agent upgrades <agent-id>          # upgrade history
 nurproxy agent auto-upgrade <agent-id> --enabled=true|false
 ```

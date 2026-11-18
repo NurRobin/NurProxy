@@ -48,10 +48,15 @@ The trigger runs the agent binary as root on behalf of an unprivileged agent, so
 - every directory above the data dir is root-owned and not group- or
   world-writable, and the data dir itself is not group- or world-writable.
 
-`self-update-enable` also creates `<data-dir>/self-update-root` (root:root,
-0755). The applier keeps its state there; the agent can only read it. If that
-directory exists but belongs to someone else, the applier refuses until you
-remove it.
+`self-update-enable` also creates `<data-dir>.selfupdate` (for example
+`/var/lib/nurproxy-agent.selfupdate`, root:root, 0755) next to the data dir. The
+applier keeps its state there; the agent can only read it. If that directory
+exists but belongs to someone else, the applier refuses until you remove it.
+
+If the agent's directory fails these checks, the applier refuses, removes the
+request where that is safe, and leaves a failure with the reason that the agent
+reports for the upgrade it was waiting on. When it cannot remove the request it
+waits 30 seconds before exiting, so the path trigger does not spin.
 
 ### Hosts that refuse
 
@@ -79,6 +84,12 @@ So self-update is for agents installed with `install.sh` (binary in
   on the new version before it touches the next one, and **stops at the first
   failure**. Agents that are offline or can't self-update are skipped and listed
   with the reason.
+- **Pre-releases** (`-rc`, `-beta`, ...) are refused unless you allow them
+  explicitly: tick **Allow a pre-release** in the dialog, pass
+  `--allow-prerelease` on the CLI or `"allow_prerelease": true` in the API body.
+  This applies to the orchestrator's own version as the default target too; the
+  rollout dialog names a pre-release target before you confirm it. Automatic
+  upgrades never install a pre-release.
 - **Automatic:** **Upgrade automatically** on an agent upgrades it to the
   orchestrator's version once it notices the agent is behind (after you upgrade
   the orchestrator). A target that failed once is not retried automatically.
@@ -86,8 +97,8 @@ So self-update is for agents installed with `install.sh` (binary in
 CLI:
 
 ```bash
-nurproxy agent upgrade <agent-id> [--version 0.6.0] [--wait]
-nurproxy agent upgrade --all-outdated [--version 0.6.0] [--wait]
+nurproxy agent upgrade <agent-id> [--version 0.6.0] [--allow-prerelease] [--wait]
+nurproxy agent upgrade --all-outdated [--version 0.6.0] [--allow-prerelease] [--wait]
 nurproxy agent upgrades <agent-id>            # history
 nurproxy agent auto-upgrade <agent-id> --enabled=true
 ```
@@ -131,6 +142,19 @@ Step by step on the host:
    fails, the applier copies `.prev` back, restarts again and records
    `rolled_back` with the reason. The agent that starts next reports the result.
 
+An upgrade counts as `done` when the agent relays the applier's committed
+result. A heartbeat on the target version alone completes it only after the
+upgrade sat in `restarting` for 5 minutes (longer than the applier's health
+window), in case that report got lost; a `rolled_back` report still overrides
+such a `done`.
+
+If the applier dies while it waits for the health proof (power loss, OOM,
+`kill -9`), its pending record stays behind. The agent reports that upgrade once
+the window has passed (`done` if it runs the target version, `failed`
+otherwise) and is free to start the next one. The next applier run settles the
+record first: it commits on a health proof, waits out what is left of the
+window, or restores `.prev`.
+
 The orchestrator gives up on an upgrade that stops making progress (2 min in
 `requested`, 15 min `downloading`, 5 min `installed`, 10 min `restarting`) and
 marks it `failed`.
@@ -172,16 +196,18 @@ Limits, stated plainly:
 
 ## Root/agent boundary
 
-The agent and the root applier share two directories in the data dir:
+The agent and the root applier share two directories:
 
 | Directory | Owner | Holds |
 |---|---|---|
 | `self-update/` | agent user | `request.json`, `staged/*`, `healthy.json` (written by the agent) |
-| `self-update-root/` | root, `0755` | `pending.json`, `result.json` (written by the applier) |
+| `<data-dir>.selfupdate/` (next to the data dir) | root, `0755` | `pending.json`, `result.json` (written by the applier) |
 
 Root never creates, writes or renames anything in a directory the agent can
 write, because there the agent could swap an entry for a symlink and redirect
-root's write anywhere on the host. In `self-update/` the applier only reads and
+root's write anywhere on the host. Root's directory sits next to the data dir, not
+inside it: the agent owns the data dir and could move a root-owned directory
+from elsewhere into it, while the data dir's parent only root can change. In `self-update/` the applier only reads and
 unlinks. It opens every directory relative to its parent without following
 symlinks and checks owner and mode on the opened descriptor, so nothing can be
 swapped between check and use. Files it reads from the agent must be regular

@@ -40,7 +40,7 @@ traffic. A few things worth knowing.
   [Agent upgrades](agent-upgrades#trust-model).
 - The root applier runs the agent binary, so it refuses unless that binary and
   every directory above it are owned by root and not group- or world-writable.
-  It writes only to its own root-owned `self-update-root/` directory and treats
+  It writes only to its own root-owned `<data-dir>.selfupdate/` directory and treats
   everything the agent leaves in `self-update/` as hostile input. See
   [Root/agent boundary](agent-upgrades#rootagent-boundary).
 
