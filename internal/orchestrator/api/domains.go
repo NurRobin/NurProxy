@@ -143,7 +143,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
-	if err := s.db.CheckDomainLogging(dom); err != nil {
+	if err := s.db.CheckDomainBackendOptions(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -323,7 +323,7 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
-	if err := s.db.CheckDomainLogging(dom); err != nil {
+	if err := s.db.CheckDomainBackendOptions(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
