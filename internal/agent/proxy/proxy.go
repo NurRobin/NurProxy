@@ -201,6 +201,8 @@ type Capabilities struct {
 	// ErrorLogLevel reports that the backend can set a per-route error log
 	// level.
 	ErrorLogLevel bool `json:"error_log_level"`
+	// PathRoutes reports that the backend renders Route.PathRoutes.
+	PathRoutes bool `json:"path_routes"`
 }
 
 // ToModel converts the agent-side Capabilities into the shared wire/storage
@@ -220,6 +222,7 @@ func (c Capabilities) ToModel() *models.ProxyCapabilities {
 		CentralTLS:    c.CentralTLS,
 		AccessLog:     c.AccessLog,
 		ErrorLogLevel: c.ErrorLogLevel,
+		PathRoutes:    c.PathRoutes,
 	}
 }
 

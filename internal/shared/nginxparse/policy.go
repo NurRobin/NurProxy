@@ -250,14 +250,63 @@ func validateProxiedServer(server block, scope policyScope) error {
 	if err := validateDirectives(server.directives, proxiedServerDirectives, scope); err != nil {
 		return err
 	}
-	if len(server.blocks) != 1 {
+	if len(server.blocks) == 0 || len(server.blocks) > 1+2*proxymodel.MaxPathRoutes {
 		return fmt.Errorf("nginx configuration has an unsupported nested scope")
 	}
-	location := server.blocks[0]
-	if !header(location, "location", "/") || len(location.blocks) != 0 {
-		return fmt.Errorf("nginx configuration has an unsupported nested scope")
+	root := 0
+	seen := map[string]bool{}
+	for _, location := range server.blocks {
+		match, ok := managedLocation(location)
+		if !ok || len(location.blocks) != 0 || seen[match] {
+			return fmt.Errorf("nginx configuration has an unsupported nested scope")
+		}
+		seen[match] = true
+		if match == "/" {
+			root++
+		}
+		if err := validateDirectives(location.directives, locationDirectives, scope); err != nil {
+			return err
+		}
 	}
-	return validateDirectives(location.directives, locationDirectives, scope)
+	if root != 1 {
+		return fmt.Errorf("nginx configuration needs exactly one `location /`")
+	}
+	return nil
+}
+
+// managedLocation reports whether a block is one of the location headers
+// nginxgen renders and returns its match as one string: `location /`,
+// `location = <path>` for an exact path route, and `location <path>/` for a
+// prefix path route, with a path proxymodel accepts for that match kind.
+func managedLocation(b block) (string, bool) {
+	if b.comment || len(b.tokens) < 2 || len(b.tokens) > 3 || !header(b, wordsOf(b)...) || b.tokens[0].value != "location" {
+		return "", false
+	}
+	if len(b.tokens) == 3 {
+		path := b.tokens[2].value
+		if b.tokens[1].value != "=" || proxymodel.ValidateRoutePath(proxymodel.PathMatchExact, path) != nil {
+			return "", false
+		}
+		return "= " + path, true
+	}
+	path := b.tokens[1].value
+	if path == "/" {
+		return path, true
+	}
+	if !strings.HasSuffix(path, "/") || proxymodel.ValidateRoutePath(proxymodel.PathMatchPrefix, strings.TrimSuffix(path, "/")) != nil {
+		return "", false
+	}
+	return path, true
+}
+
+// wordsOf returns a block header's token values, for header() to check that
+// each word is plain.
+func wordsOf(b block) []string {
+	words := make([]string, len(b.tokens))
+	for i, t := range b.tokens {
+		words[i] = t.value
+	}
+	return words
 }
 
 func validateRedirectServer(server block, scope policyScope) error {

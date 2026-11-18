@@ -104,6 +104,9 @@ type ProxyCapabilities struct {
 	// ErrorLogLevel reports that the backend can set a per-domain error log
 	// level.
 	ErrorLogLevel bool `json:"error_log_level"`
+	// PathRoutes reports that the backend can route request paths of one
+	// domain to different upstreams.
+	PathRoutes bool `json:"path_routes"`
 }
 
 // ProxyDetection is the agent's read-only Phase-0 detection result (§13.0, §2.1,
@@ -390,6 +393,52 @@ type ProxyConfig struct {
 	// ErrorLogLevel raises the domain's error log threshold to one of
 	// proxymodel.ErrorLogLevels (e.g. "crit"). Empty keeps the host default.
 	ErrorLogLevel string `json:"error_log_level,omitempty"`
+	// Routes send matching request paths to other upstreams; everything else
+	// goes to the domain's server and port. See proxymodel.PathRoute for the
+	// matching rules.
+	Routes []PathRoute `json:"routes,omitempty"`
+}
+
+// PathRoute is one extra path-routed upstream of a domain. ServerID must
+// belong to the same agent as the domain's server, since that agent proxies
+// the request.
+type PathRoute struct {
+	// Match is "prefix" or "exact".
+	Match string `json:"match"`
+	// Path is the request path, starting with "/".
+	Path     string `json:"path"`
+	ServerID string `json:"server_id"`
+	Port     int    `json:"port"`
+	// UpstreamScheme is "http" (default) or "https".
+	UpstreamScheme string `json:"upstream_scheme,omitempty"`
+	WebSocket      bool   `json:"websocket,omitempty"`
+	// StripPrefix removes Path from the forwarded request path (prefix
+	// routes only).
+	StripPrefix bool `json:"strip_prefix,omitempty"`
+}
+
+// Intent converts the stored route into the backend-neutral form with the
+// given upstream address.
+func (p PathRoute) Intent(addr string) proxymodel.PathRoute {
+	return proxymodel.PathRoute{
+		Match:       proxymodel.PathMatch(p.Match),
+		Path:        p.Path,
+		Upstream:    proxymodel.Upstream{Addr: addr, Port: p.Port, Scheme: proxymodel.Scheme(p.UpstreamScheme)},
+		WebSocket:   p.WebSocket,
+		StripPrefix: p.StripPrefix,
+	}
+}
+
+// CheckRoutesSupported refuses path routes when the serving agent reported a
+// backend that cannot render them. A nil matrix is not checked.
+func (pc ProxyConfig) CheckRoutesSupported(caps *ProxyCapabilities, backend string) error {
+	if caps == nil || len(pc.Routes) == 0 || caps.PathRoutes {
+		return nil
+	}
+	if backend == "" {
+		backend = "the agent's proxy"
+	}
+	return fmt.Errorf("%s cannot render path routes", backend)
 }
 
 // NormalizeLogging canonicalizes the logging settings ("default" becomes

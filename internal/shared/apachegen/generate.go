@@ -229,6 +229,15 @@ func Render(in Input) (Result, error) {
 	}
 	upstreamBase := upstreamScheme + "://" + proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port)
 
+	// Path routes come before the default upstream: mod_proxy tries ProxyPass
+	// and ProxyPassMatch in file order and the first match wins, so they are
+	// rendered most specific first. The default upstream's catch-all
+	// RewriteRules run before any ProxyPass (mod_rewrite translates first),
+	// so each one is fenced off from the path routes with a RewriteCond.
+	pathRoutes := proxymodel.SortedPathRoutes(route.PathRoutes)
+	writePathRoutes(&b, pathRoutes, route.Timeouts)
+	exclude := pathRouteExclusions(pathRoutes)
+
 	// Path handling. Apache expresses prefix strip / rewrite via mod_rewrite;
 	// otherwise a plain ProxyPass at "/" forwards everything.
 	switch {
@@ -236,6 +245,7 @@ func Render(in Input) (Result, error) {
 		// Full URI rewrite then proxy: rewrite to the target path and hand to the
 		// upstream via the [P] proxy flag.
 		b.WriteString("\n    RewriteEngine On\n")
+		b.WriteString(exclude)
 		fmt.Fprintf(&b, "    RewriteRule ^.*$ %s%s [P]\n", upstreamBase, route.Path.Rewrite)
 		fmt.Fprintf(&b, "    ProxyPassReverse / %s/\n", upstreamBase)
 	case route.Path.StripPrefix != "":
@@ -243,6 +253,7 @@ func Render(in Input) (Result, error) {
 		// proxy that to the upstream root.
 		prefix := "/" + strings.Trim(route.Path.StripPrefix, "/")
 		b.WriteString("\n    RewriteEngine On\n")
+		b.WriteString(exclude)
 		fmt.Fprintf(&b, "    RewriteRule ^%s/?(.*)$ %s/$1 [P]\n", regexpEscape(prefix), upstreamBase)
 		fmt.Fprintf(&b, "    ProxyPassReverse / %s/\n", upstreamBase)
 	default:
@@ -250,24 +261,12 @@ func Render(in Input) (Result, error) {
 		// WebSocket: route Upgrade requests to ws(s):// via mod_rewrite + mod_proxy_wstunnel
 		// BEFORE the plain ProxyPass, so the upgrade handshake is tunneled.
 		if route.WebSocket {
-			wsScheme := "ws"
-			if upstreamScheme == "https" {
-				wsScheme = "wss"
-			}
 			b.WriteString("    RewriteEngine On\n")
 			b.WriteString("    RewriteCond %{HTTP:Upgrade} =websocket [NC]\n")
-			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s/$1 [P,L]\n", wsScheme, proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port))
+			b.WriteString(exclude)
+			fmt.Fprintf(&b, "    RewriteRule ^/?(.*)$ %s://%s/$1 [P,L]\n", wsScheme(route.EffectiveScheme()), proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port))
 		}
-		fmt.Fprintf(&b, "    ProxyPass / %s/", upstreamBase)
-		// Upstream timeouts map onto ProxyPass connectiontimeout/timeout key=value
-		// worker params (seconds).
-		if route.Timeouts.Write > 0 {
-			fmt.Fprintf(&b, " connectiontimeout=%d", route.Timeouts.Write)
-		}
-		if route.Timeouts.Read > 0 {
-			fmt.Fprintf(&b, " timeout=%d", route.Timeouts.Read)
-		}
-		b.WriteString("\n")
+		fmt.Fprintf(&b, "    ProxyPass / %s/%s\n", upstreamBase, timeoutParams(route.Timeouts))
 		fmt.Fprintf(&b, "    ProxyPassReverse / %s/\n", upstreamBase)
 	}
 
@@ -277,6 +276,94 @@ func Render(in Input) (Result, error) {
 		VHost:    b.String(),
 		Warnings: warnings,
 	}, nil
+}
+
+// timeoutParams renders the upstream timeouts as ProxyPass worker parameters
+// (seconds), with a leading space, or "" when none is set.
+func timeoutParams(t proxymodel.Timeouts) string {
+	var s strings.Builder
+	if t.Write > 0 {
+		fmt.Fprintf(&s, " connectiontimeout=%d", t.Write)
+	}
+	if t.Read > 0 {
+		fmt.Fprintf(&s, " timeout=%d", t.Read)
+	}
+	return s.String()
+}
+
+// wsScheme is the mod_proxy_wstunnel scheme for an upstream scheme.
+func wsScheme(s proxymodel.Scheme) string {
+	if s == proxymodel.SchemeHTTPS {
+		return "wss"
+	}
+	return "ws"
+}
+
+// pathRouteRegex is the regex body (without anchors) matching a path route's
+// request paths: the path itself for an exact route, and the path plus
+// anything below it on a segment boundary for a prefix route.
+func pathRouteRegex(p proxymodel.PathRoute) string {
+	if p.Match == proxymodel.PathMatchExact {
+		return regexpEscape(p.Path)
+	}
+	return regexpEscape(p.Path) + "(?:/.*)?"
+}
+
+// stripRouteRegex matches a stripping prefix route and captures the rest of
+// the path after the prefix and its slash ("" for the prefix itself).
+func stripRouteRegex(p proxymodel.PathRoute) string {
+	return "^" + regexpEscape(p.Path) + "(?:/(.*))?$"
+}
+
+// writePathRoutes renders the path routes, most specific first. Without a
+// substitution in the target, ProxyPassMatch appends the whole request path
+// to it, so a plain route forwards the path unchanged; a stripping route
+// forwards only what follows the prefix. WebSocket upgrades go through
+// mod_rewrite to ws(s):// like the default upstream's, ahead of everything
+// else.
+func writePathRoutes(b *strings.Builder, routes []proxymodel.PathRoute, timeouts proxymodel.Timeouts) {
+	if len(routes) == 0 {
+		return
+	}
+	b.WriteString("\n")
+	engineOn := false
+	for _, p := range routes {
+		if !p.WebSocket {
+			continue
+		}
+		if !engineOn {
+			b.WriteString("    RewriteEngine On\n")
+			engineOn = true
+		}
+		hostPort := proxymodel.UpstreamHostPort(p.Upstream.Addr, p.Upstream.Port)
+		b.WriteString("    RewriteCond %{HTTP:Upgrade} =websocket [NC]\n")
+		if p.StripPrefix {
+			fmt.Fprintf(b, "    RewriteRule %s %s://%s/$1 [P,L]\n", stripRouteRegex(p), wsScheme(p.EffectiveScheme()), hostPort)
+		} else {
+			fmt.Fprintf(b, "    RewriteRule ^(%s)$ %s://%s$1 [P,L]\n", pathRouteRegex(p), wsScheme(p.EffectiveScheme()), hostPort)
+		}
+	}
+	for _, p := range routes {
+		base := string(p.EffectiveScheme()) + "://" + proxymodel.UpstreamHostPort(p.Upstream.Addr, p.Upstream.Port)
+		if p.StripPrefix {
+			fmt.Fprintf(b, "    ProxyPassMatch %s %s/$1%s\n", stripRouteRegex(p), base, timeoutParams(timeouts))
+			fmt.Fprintf(b, "    ProxyPassReverse %s/ %s/\n", p.Path, base)
+			continue
+		}
+		fmt.Fprintf(b, "    ProxyPassMatch ^%s$ %s%s\n", pathRouteRegex(p), base, timeoutParams(timeouts))
+		fmt.Fprintf(b, "    ProxyPassReverse / %s/\n", base)
+	}
+}
+
+// pathRouteExclusions renders one RewriteCond per path route that keeps a
+// following catch-all RewriteRule off the route's paths, or "" without path
+// routes.
+func pathRouteExclusions(routes []proxymodel.PathRoute) string {
+	var s strings.Builder
+	for _, p := range routes {
+		fmt.Fprintf(&s, "    RewriteCond %%{REQUEST_URI} !^%s$\n", pathRouteRegex(p))
+	}
+	return s.String()
 }
 
 // writeAccessControl renders the <Location /> block holding the route's

@@ -806,6 +806,8 @@ func declaredCapsFromNames(names []string) *proxy.Capabilities {
 			c.AccessLog = true
 		case "error_log_level", "errorloglevel":
 			c.ErrorLogLevel = true
+		case "path_routes", "pathroutes":
+			c.PathRoutes = true
 		}
 	}
 	return &c

@@ -1,0 +1,24 @@
+----
+<VirtualHost *:80>
+    ServerName app.example.com
+
+    RequestHeader set X-Forwarded-Proto http
+    ProxyPreserveHost On
+
+    RewriteEngine On
+    RewriteCond %{HTTP:Upgrade} =websocket [NC]
+    RewriteRule ^/ws\.v1(?:/(.*))?$ wss://[fd00::5]:8443/$1 [P,L]
+    ProxyPassMatch ^/api/world$ http://192.168.178.210:80
+    ProxyPassReverse / http://192.168.178.210:80/
+    ProxyPassMatch ^/admin$ http://10.0.0.9:8082
+    ProxyPassReverse / http://10.0.0.9:8082/
+    ProxyPassMatch ^/admin(?:/.*)?$ http://10.0.0.8:8081
+    ProxyPassReverse / http://10.0.0.8:8081/
+    ProxyPassMatch ^/media(?:/.*)?$ http://10.0.0.7:9000
+    ProxyPassReverse / http://10.0.0.7:9000/
+    ProxyPassMatch ^/ws\.v1(?:/(.*))?$ https://[fd00::5]:8443/$1
+    ProxyPassReverse /ws.v1/ https://[fd00::5]:8443/
+
+    ProxyPass / http://10.0.0.4:8080/
+    ProxyPassReverse / http://10.0.0.4:8080/
+</VirtualHost>
