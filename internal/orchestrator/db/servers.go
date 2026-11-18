@@ -56,19 +56,25 @@ func (d *DB) GetServer(id string) (*models.Server, error) {
 	return s, nil
 }
 
-// CheckDomainLogging normalizes a domain's per-domain logging settings and
-// refuses them when the agent serving the domain's server reported a backend
-// that cannot render them. Shared by the REST API and the MCP tools so both
+// CheckDomainBackendOptions normalizes a domain's per-domain logging settings
+// and refuses proxy settings the backend of the agent serving the domain's
+// server cannot render as asked: logging options it lacks, and header values
+// with "${" on Apache. Shared by the REST API and the MCP tools so both
 // reject the same requests.
-func (d *DB) CheckDomainLogging(dom *models.Domain) error {
+func (d *DB) CheckDomainBackendOptions(dom *models.Domain) error {
 	if err := dom.ProxyConfig.NormalizeLogging(); err != nil {
 		return err
 	}
-	if dom.ProxyConfig.AccessLog == "" && dom.ProxyConfig.ErrorLogLevel == "" {
+	logging := dom.ProxyConfig.AccessLog != "" || dom.ProxyConfig.ErrorLogLevel != ""
+	headerVars := proxymodel.CheckHeaderConfigVars(dom.ProxyConfig.CustomRequestHeaders, dom.ProxyConfig.CustomResponseHeaders) != nil
+	if !logging && !headerVars {
 		return nil
 	}
 	srv, err := d.GetServer(dom.ServerID)
 	if err != nil {
+		if !logging {
+			return nil
+		}
 		return fmt.Errorf("logging settings need the domain's server %q, which was not found", dom.ServerID)
 	}
 	agent, err := d.GetAgent(srv.AgentID)
@@ -76,7 +82,14 @@ func (d *DB) CheckDomainLogging(dom *models.Domain) error {
 		// No agent row yet: nothing reported, nothing to check against.
 		return nil
 	}
-	return dom.ProxyConfig.CheckLoggingSupported(agent.ProxyCapabilities, agentBackendName(agent))
+	backend, kind := "the built-in Caddy", ""
+	if agent.ProxyMode == "existing" && agent.ProxyDetection != nil && agent.ProxyDetection.Kind != "" {
+		backend, kind = agent.ProxyDetection.Kind, agent.ProxyDetection.Kind
+	}
+	if err := dom.ProxyConfig.CheckLoggingSupported(agent.ProxyCapabilities, backend); err != nil {
+		return err
+	}
+	return dom.ProxyConfig.CheckHeadersSupported(agent.ProxyCapabilities, kind)
 }
 
 // PathRouteAddrs resolves the servers of a domain's path routes to their
@@ -189,11 +202,12 @@ func (d *DB) UpdateServer(s *models.Server) error {
 	return nil
 }
 
-// DeleteServer removes a server by ID.
+// DeleteServer removes a server by ID. It fails with ErrParentInUse while domains
+// still reference the server.
 func (d *DB) DeleteServer(id string) error {
 	res, err := d.sql.Exec("DELETE FROM servers WHERE id = ?", id)
 	if err != nil {
-		return fmt.Errorf("deleting server: %w", err)
+		return parentDeleteError("server", id, err)
 	}
 
 	n, _ := res.RowsAffected()

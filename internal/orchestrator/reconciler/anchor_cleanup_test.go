@@ -107,7 +107,7 @@ func TestAgentAnchorCleanup(t *testing.T) {
 			}
 
 			if tc.deleteAgent {
-				if err := d.DeleteAgent(agent.ID); err != nil {
+				if err := deleteAgentAndDomains(d, agent.ID); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -211,7 +211,7 @@ func TestAgentAnchorCleanup_FailureAuditedOnce(t *testing.T) {
 	if err := r.reconcileAgentDNS(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.DeleteAgent(agent.ID); err != nil {
+	if err := deleteAgentAndDomains(d, agent.ID); err != nil {
 		t.Fatal(err)
 	}
 	mp.mu.Lock()
@@ -292,6 +292,22 @@ func newAnchorScenario(t *testing.T) *anchorScenario {
 		t.Fatalf("setup: no owned A record (id=%q owned=%v)", got.DNSRecordID, got.DNSRecordOwned)
 	}
 	return &anchorScenario{d: d, mp: mp, r: r, agent: got, zone: zone, dom: dom, oldA: got.DNSRecordID}
+}
+
+// deleteAgentAndDomains removes the agent's domain rows and then the agent.
+// The RESTRICT foreign keys refuse an agent whose servers still have domains;
+// these tests only care about the anchor records, not the domain teardown.
+func deleteAgentAndDomains(d *db.DB, agentID string) error {
+	doms, err := d.ListDomains(db.DomainFilter{AgentID: agentID})
+	if err != nil {
+		return err
+	}
+	for _, dom := range doms {
+		if err := d.DeleteDomain(dom.ID); err != nil {
+			return err
+		}
+	}
+	return d.DeleteAgent(agentID)
 }
 
 // rename changes the agent FQDN through the same DB path the API uses.
@@ -455,7 +471,7 @@ func TestAgentAnchorCleanup_ZoneOrProviderGoneWhileQueued(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			s := newAnchorScenario(t)
-			if err := s.d.DeleteAgent(s.agent.ID); err != nil {
+			if err := deleteAgentAndDomains(s.d, s.agent.ID); err != nil {
 				t.Fatal(err)
 			}
 			if err := s.d.DeleteZone(s.zone.ID); err != nil {

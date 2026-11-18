@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
+import type { Provider, Zone, Agent, Server, Domain, DNSTakeoverPlan, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
 import type { ProxyConfigUpdate } from './proxy-config';
 
 const BASE = '/api/v1';
@@ -184,6 +184,13 @@ export const api = {
     request<{ message: string }>(`/domains/${id}/config`, { method: 'PUT', body: JSON.stringify({ config }) }),
   resetDomainConfig: (id: number) =>
     request<{ message: string }>(`/domains/${id}/config/reset`, { method: 'POST' }),
+  /** Lists the records a DNS takeover would delete; changes nothing. */
+  previewDnsTakeover: (id: number) =>
+    request<{ message: string; plan: DNSTakeoverPlan; dry_run: boolean }>(`/domains/${id}/dns/takeover?dry_run=true`, { method: 'POST' }),
+  /** expectDelete: the record ids from the preview; the server refuses (409)
+   *  when the records at the name changed since. */
+  dnsTakeover: (id: number, expectDelete: string[]) =>
+    request<{ message: string; plan: DNSTakeoverPlan }>(`/domains/${id}/dns/takeover`, { method: 'POST', body: JSON.stringify({ expect_delete: expectDelete }) }),
 
   // Config artifacts + drift review (§11, Phase 3)
   listArtifacts: (params?: Record<string, string>) => {

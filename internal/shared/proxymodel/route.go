@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -376,6 +377,38 @@ func (r Route) ValidateOptions() error {
 		}
 	}
 	return nil
+}
+
+// ConfigVarRef starts a config-time variable in Apache: httpd replaces
+// "${NAME}" in every config line, quoted or not, with an environment variable
+// or Define value before mod_headers sees a header value.
+const ConfigVarRef = "${"
+
+// CheckHeaderConfigVars refuses request and response header values that
+// contain ConfigVarRef. Renderers for backends that substitute such
+// references at config load (Apache) call it; nginx reads "${var}" as a
+// request variable and keeps accepting it.
+func CheckHeaderConfigVars(requestHeaders, responseHeaders map[string]string) error {
+	for _, h := range []struct {
+		kind    string
+		headers map[string]string
+	}{{"request", requestHeaders}, {"response", responseHeaders}} {
+		for _, name := range sortedHeaderNames(h.headers) {
+			if strings.Contains(h.headers[name], ConfigVarRef) {
+				return fmt.Errorf("%s header %s contains %q, which Apache replaces with an environment variable or Define value when it loads the config", h.kind, name, ConfigVarRef)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedHeaderNames(headers map[string]string) []string {
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // validHost accepts a DNS name with an optional leading "*." wildcard label.
