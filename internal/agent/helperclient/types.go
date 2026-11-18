@@ -24,14 +24,13 @@ func (e *RemoteError) Error() string {
 	return fmt.Sprintf("root helper request failed (%s): %s", e.Code, e.Message)
 }
 
-// HelperMessage returns the helper's own bounded error message. The helper
-// only puts fixed texts and operator-facing policy refusals there, so the
-// agent may forward it to the orchestrator.
-func (e *RemoteError) HelperMessage() string {
+// RefusalReason returns the operator-facing reason of a managed apply plan
+// the helper's local policy refused, or "" when the error carries none.
+func (e *RemoteError) RefusalReason() string {
 	if e == nil {
 		return ""
 	}
-	return e.Message
+	return helperprotocol.ManagedPlanRefusalReason(e.Code, e.Message)
 }
 
 type Pin struct {

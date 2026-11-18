@@ -703,3 +703,32 @@ func managedListen(args []token, redirect bool) bool {
 	}
 	return false
 }
+
+// HasErrorLog reports whether a config contains an error_log directive in
+// any scope. A config nginx's tokenizer cannot read counts as having one, so
+// a caller that guards the directive fails closed.
+func HasErrorLog(content string) bool {
+	blocks, directives, err := parseConfig(content)
+	if err != nil {
+		return true
+	}
+	return directivesHaveErrorLog(directives) || blocksHaveErrorLog(blocks)
+}
+
+func blocksHaveErrorLog(blocks []block) bool {
+	for _, b := range blocks {
+		if directivesHaveErrorLog(b.directives) || blocksHaveErrorLog(b.blocks) {
+			return true
+		}
+	}
+	return false
+}
+
+func directivesHaveErrorLog(directives []directive) bool {
+	for _, d := range directives {
+		if len(d.tokens) > 0 && d.tokens[0].value == "error_log" {
+			return true
+		}
+	}
+	return false
+}

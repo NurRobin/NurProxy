@@ -104,6 +104,10 @@ type ProxyCapabilities struct {
 	// ErrorLogLevel reports that the backend can set a per-domain error log
 	// level.
 	ErrorLogLevel bool `json:"error_log_level"`
+	// HeaderConfigVars reports that the backend replaces "${NAME}" in header
+	// values with an environment variable or Define value when it loads the
+	// config (Apache), so such values are refused.
+	HeaderConfigVars bool `json:"header_config_vars"`
 }
 
 // ProxyDetection is the agent's read-only Phase-0 detection result (§13.0, §2.1,
@@ -384,6 +388,11 @@ type ProxyConfig struct {
 	// or for orchestrator-down resilience; "off" disables TLS. Empty is treated as
 	// "central" by the renderer.
 	TLSPolicy string `json:"tls_policy,omitempty"`
+	// TLSWildcard serves the domain from the one "*.<zone>" certificate shared
+	// by every opted-in domain of its zone instead of a per-host certificate.
+	// Only valid with central TLS and for a single label directly below the
+	// zone apex; an imported certificate for the host still takes precedence.
+	TLSWildcard bool `json:"tls_wildcard,omitempty"`
 	// AccessLog is "off" to write no access log for this domain. Empty (or
 	// "default", normalized to empty on save) keeps the proxy's host-wide log.
 	AccessLog string `json:"access_log,omitempty"`
@@ -407,6 +416,21 @@ func (pc *ProxyConfig) NormalizeLogging() error {
 	}
 	if !proxymodel.ValidErrorLogLevel(pc.ErrorLogLevel) {
 		return fmt.Errorf("error_log_level must be empty or one of %s, got %q", strings.Join(proxymodel.ErrorLogLevels, ", "), pc.ErrorLogLevel)
+	}
+	return nil
+}
+
+// CheckHeadersSupported refuses custom header values the serving agent's
+// backend would not send literally: values with "${" on a backend that
+// replaces config-time variables (HeaderConfigVars). backendKind is the
+// detected proxy kind; an Apache agent from before the capability existed
+// reports it as false, so "apache" is refused by kind as well.
+func (pc ProxyConfig) CheckHeadersSupported(caps *ProxyCapabilities, backendKind string) error {
+	if (caps == nil || !caps.HeaderConfigVars) && backendKind != "apache" {
+		return nil
+	}
+	if err := proxymodel.CheckHeaderConfigVars(pc.CustomRequestHeaders, pc.CustomResponseHeaders); err != nil {
+		return fmt.Errorf("the agent's Apache cannot send this header literally: %w", err)
 	}
 	return nil
 }

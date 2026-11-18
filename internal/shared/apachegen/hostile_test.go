@@ -41,9 +41,13 @@ func TestRender_hostileValuesRefused(t *testing.T) {
 		"double-quoted expression": func(r *proxymodel.Route) {
 			r.ResponseHeaders = map[string]string{"X-A": `"expr=%{file:/etc/passwd}"`}
 		},
-		"spaced expression":    func(r *proxymodel.Route) { r.RequestHeaders = map[string]string{"X-A": "  expr=1"} },
-		"leading quote":        func(r *proxymodel.Route) { r.ResponseHeaders = map[string]string{"X-A": "'a b'"} },
-		"spaced leading quote": func(r *proxymodel.Route) { r.ResponseHeaders = map[string]string{"X-A": ` "a`} },
+		"spaced expression": func(r *proxymodel.Route) { r.RequestHeaders = map[string]string{"X-A": "  expr=1"} },
+		"response header config variable": func(r *proxymodel.Route) {
+			r.ResponseHeaders = map[string]string{"X-A": "${APACHE_RUN_USER}"}
+		},
+		"request header config variable": func(r *proxymodel.Route) { r.RequestHeaders = map[string]string{"X-A": "a ${HOME} b"} },
+		"leading quote":                  func(r *proxymodel.Route) { r.ResponseHeaders = map[string]string{"X-A": "'a b'"} },
+		"spaced leading quote":           func(r *proxymodel.Route) { r.ResponseHeaders = map[string]string{"X-A": ` "a`} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
