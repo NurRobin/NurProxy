@@ -264,10 +264,24 @@ func reverseProxy(route proxymodel.Route, upstream proxymodel.Upstream, scheme p
 	return rp
 }
 
+// RouteOptions carries facts about the Caddy instance a route is rendered for
+// that are not part of the route itself. The zero value renders for a Caddy
+// serving HTTPS on the standard port.
+type RouteOptions struct {
+	// HTTPSPort is the port Caddy serves HTTPS on. A value other than 0 or 443
+	// is written into the force-HTTPS redirect target.
+	HTTPSPort int
+}
+
 // GenerateRoute produces a Caddy JSON route configuration from a backend-neutral
 // proxymodel.Route. The returned json.RawMessage is ready to be sent to the
 // Caddy admin API.
 func GenerateRoute(route proxymodel.Route) (json.RawMessage, error) {
+	return GenerateRouteWith(route, RouteOptions{})
+}
+
+// GenerateRouteWith is GenerateRoute for a Caddy described by opts.
+func GenerateRouteWith(route proxymodel.Route, opts RouteOptions) (json.RawMessage, error) {
 	// Manual override: return the raw Caddy JSON directly. The escape hatch is
 	// honored only when tagged for the caddy backend (a payload tagged for
 	// nginx/apache is not ours to emit).
@@ -414,6 +428,12 @@ func GenerateRoute(route proxymodel.Route) (json.RawMessage, error) {
 	// non-TLS requests — otherwise an HTTPS request would also match and create
 	// an infinite redirect loop.
 	if route.ForceHTTPS {
+		// {http.request.host} carries no port, so a non-standard HTTPS port is
+		// spelled out; the standard port keeps the plain form.
+		location := "https://{http.request.host}{http.request.uri}"
+		if opts.HTTPSPort != 0 && opts.HTTPSPort != 443 {
+			location = fmt.Sprintf("https://{http.request.host}:%d{http.request.uri}", opts.HTTPSPort)
+		}
 		topHandlers = append(topHandlers, Handler{
 			Handler: "subroute",
 			Routes: []Route{
@@ -424,7 +444,7 @@ func GenerateRoute(route proxymodel.Route) (json.RawMessage, error) {
 							Handler:    "static_response",
 							StatusCode: "302",
 							Headers: map[string][]string{
-								"Location": {"https://{http.request.host}{http.request.uri}"},
+								"Location": {location},
 							},
 						},
 					},

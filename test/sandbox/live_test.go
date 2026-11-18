@@ -157,8 +157,10 @@ func TestSandboxLiveTraffic(t *testing.T) {
 	if resp.StatusCode < 300 || resp.StatusCode > 399 {
 		t.Fatalf("plain HTTP status = %d, want a redirect", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "https://"+fqdn+"/hello?x=1" {
-		t.Errorf("redirect Location = %q, want https://%s/hello?x=1", loc, fqdn)
+	// The HTTPS port is not 443, so the redirect must carry it.
+	wantLoc := fmt.Sprintf("https://%s:%d/hello?x=1", fqdn, httpsPort)
+	if loc := resp.Header.Get("Location"); loc != wantLoc {
+		t.Errorf("redirect Location = %q, want %s", loc, wantLoc)
 	}
 
 	// A change made through the API reaches the running Caddy: the re-apply
@@ -188,10 +190,13 @@ func TestSandboxLiveTraffic(t *testing.T) {
 	// certificate must be loaded too, which needs the re-apply to replace the
 	// strategy rather than fail on keys that already exist.
 	const fqdn2 = "app2.sandbox.test"
+	var domain2 struct {
+		ID int `json:"id"`
+	}
 	stack.api.post("/api/v1/domains", map[string]any{
 		"subdomain": "app2", "zone_id": stack.zone.ID, "server_id": server.ID,
 		"port": mustAtoi(t, port), "ssl_mode": "central",
-	}, nil)
+	}, &domain2)
 	var stored2 string
 	waitFor(t, 90*time.Second, func() bool {
 		stored2 = findFile(agentDataDir, fqdn2+".crt")
@@ -217,7 +222,41 @@ func TestSandboxLiveTraffic(t *testing.T) {
 		t.Fatalf("second domain never served with its own certificate: last error %v, body %q", lastErr, body)
 	}
 
-	t.Logf("live sandbox: real Caddy on 127.0.0.1:%d/%d served %s and %s via the fake upstream with the dry-issued certs; HTTP redirected; updates applied live", httpPort, httpsPort, fqdn, fqdn2)
+	// Removing every domain leaves no provided cert: the TLS apply must unload
+	// them (an empty load_files, which Caddy accepts where null is refused), so
+	// a handshake for the removed host finds no certificate any more.
+	stack.api.del(fmt.Sprintf("/api/v1/domains/%d", domain2.ID))
+	stack.api.del(fmt.Sprintf("/api/v1/domains/%d", domain.ID))
+	var handshakeErr error
+	deadline = time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		if handshakeErr = tlsHandshake(fmt.Sprintf("127.0.0.1:%d", httpsPort), fqdn, roots); handshakeErr != nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if handshakeErr == nil {
+		t.Fatalf("Caddy still presents the certificate of the removed domain %s", fqdn)
+	}
+	if strings.Contains(agent.logTail(1<<20), "failed to configure TLS strategy") {
+		t.Errorf("agent failed a TLS strategy apply:\n%s", agent.logTail(4000))
+	}
+
+	t.Logf("live sandbox: real Caddy on 127.0.0.1:%d/%d served %s and %s via the fake upstream with the dry-issued certs; HTTP redirected to the HTTPS port; updates applied live; certs unloaded after removal (%v)", httpPort, httpsPort, fqdn, fqdn2, handshakeErr)
+}
+
+// tlsHandshake connects to addr and returns the error of a TLS handshake for
+// serverName against roots. It returns nil when the TCP connection itself
+// fails, so an unreachable listener never counts as a refused handshake.
+func tlsHandshake(addr, serverName string, roots *x509.CertPool) error {
+	raw, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return nil // listener not reachable: not the signal we are waiting for
+	}
+	conn := tls.Client(raw, &tls.Config{ServerName: serverName, RootCAs: roots, MinVersion: tls.VersionTLS12})
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	return conn.Handshake()
 }
 
 // loopbackHTTPSClient returns a client that sends every request to addr with
