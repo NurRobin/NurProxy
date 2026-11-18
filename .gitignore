@@ -2,6 +2,7 @@
 /nurproxy
 /nurproxy-agent
 /nurproxy-headless
+/nurproxy-sandbox-upstream
 *.exe
 *.dll
 *.so
