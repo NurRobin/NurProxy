@@ -55,6 +55,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Raw nginx configs may carry common tuning directives, and a refusal says
+  why (#149).** The root helper's raw-config policy now admits `gzip*`,
+  `proxy_buffering`, `proxy_request_buffering`, proxy buffer sizes and
+  timeouts, `proxy_hide_header`, `proxy_redirect off`, `proxy_ssl_server_name`,
+  `client_body_buffer_size` and `server_tokens`, and allows the existing header,
+  body-size and `access_log off` directives inside `location /` too. A raw
+  config no longer has to match the dashboard's structured form exactly. When
+  the helper refuses a raw config, the domain's error now names the directive
+  and its line (for example `line 12: nginx directive "include" is not allowed
+  in the server block`) instead of only "privileged managed proxy
+  reconciliation failed". File paths in logs stay limited to `access_log off`
+  and the stock error log. The policy also refuses what `nginx -t` would
+  reject: repeated single-value directives and proxy buffer settings that
+  break nginx's size rules (the three buffer directives go together). Raw
+  `rewrite` stays limited to the two forms the path settings render.
+- **A failed `nginx -t` names the domain that broke it.** The helper applies
+  all domains of an agent together, so one broken vhost fails all of them.
+  When the validator output names a managed vhost file, that domain's error
+  now shows the output, and the other domains say which domain blocked them.
 - **Renaming a domain or moving it to another zone cleans up the old name
   (#151).** The DNS record of the old name is queued and deleted through the
   provider and zone it was created in, once the record for the new name exists;
