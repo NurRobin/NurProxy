@@ -52,7 +52,7 @@ func (p *hookDNSProvider) CreateRecord(ctx context.Context, cfg json.RawMessage,
 
 func registerHookProvider(t *testing.T) *hookDNSProvider {
 	t.Helper()
-	hp := &hookDNSProvider{mockDNSProvider: newMockDNSProvider(), }
+	hp := &hookDNSProvider{mockDNSProvider: newMockDNSProvider()}
 	provider.Register(hp)
 	return hp
 }
