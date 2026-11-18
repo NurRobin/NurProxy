@@ -341,6 +341,77 @@ export interface Server {
   address: string;
   notes?: string;
   created_at: string;
+  /** Set on servers imported from a discovery source (#25). */
+  discovery_source_id?: string;
+  external_id?: string;
+  /** Set while the source no longer reports the machine. */
+  discovery_missing_since?: string;
+}
+
+export interface DiscoveryType {
+  id: string;
+  name: string;
+  description: string;
+  secret_fields: string[];
+}
+
+export interface DiscoverySource {
+  id: string;
+  type: string;
+  type_name: string;
+  name: string;
+  /** Endpoint and token ID; never the secret. */
+  summary: string;
+  /** The stored config without its secret fields. */
+  settings: Record<string, unknown>;
+  /** Seconds; 0 = only on demand. */
+  sync_interval: number;
+  last_run_at?: string;
+  last_error?: string;
+  created_at: string;
+  candidates: number;
+  imported: number;
+  missing: number;
+}
+
+export type DiscoveredAddressKind = 'private' | 'shared' | 'public' | 'container-bridge' | 'link-local' | 'loopback';
+
+export interface DiscoveredAddress {
+  ip: string;
+  prefix?: number;
+  interface?: string;
+  kind: DiscoveredAddressKind;
+}
+
+export interface DiscoveryCandidate {
+  external_id: string;
+  name: string;
+  kind?: string;
+  location?: string;
+  status?: string;
+  addresses: DiscoveredAddress[];
+  suggested_address?: string;
+  address_source?: string;
+  notes?: string;
+  /** Set when the machine is already imported. */
+  server_id?: string;
+  server_name?: string;
+  agent_id?: string;
+}
+
+export interface DiscoveryView {
+  source_id: string;
+  last_run_at?: string;
+  last_error?: string;
+  has_result: boolean;
+  candidates: DiscoveryCandidate[];
+  warnings?: string[];
+  missing: Server[];
+}
+
+export interface DiscoveryImportResult {
+  created: Server[];
+  skipped: { external_id: string; server_id?: string; reason: string }[];
 }
 
 export interface Domain {
