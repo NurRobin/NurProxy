@@ -5,6 +5,7 @@ import dnsModes from '../../../wiki/dns-modes.md?raw';
 import domainsDoc from '../../../wiki/domains.md?raw';
 import failoverDoc from '../../../wiki/failover.md?raw';
 import agentsDoc from '../../../wiki/agents.md?raw';
+import agentUpgrades from '../../../wiki/agent-upgrades.md?raw';
 import existingProxies from '../../../wiki/existing-proxies.md?raw';
 import existingProxyPermissions from '../../../wiki/existing-proxy-permissions.md?raw';
 import security from '../../../wiki/security.md?raw';
@@ -26,6 +27,7 @@ export const TOPICS: Topic[] = [
   { slug: 'cloudflare-token', title: 'Cloudflare API token', blurb: 'Exactly which permissions, and where to click.', content: cloudflareToken },
   { slug: 'agent-reachability', title: 'Agent can’t connect', blurb: 'Fix the #1 setup snag: the orchestrator URL.', content: agentReachability },
   { slug: 'agents', title: 'Agents', blurb: 'Register, approve, and manage edge servers.', content: agentsDoc },
+  { slug: 'agent-upgrades', title: 'Agent upgrades', blurb: 'Upgrade agents from the dashboard, safely and one at a time.', content: agentUpgrades },
   { slug: 'servers', title: 'Servers', blurb: 'Backends an agent forwards to, and config suggestions.', content: serversDoc },
   { slug: 'server-discovery', title: 'Server discovery (Proxmox)', blurb: 'Import VMs and containers from Proxmox VE as servers.', content: serverDiscovery },
   { slug: 'domains', title: 'Domains', blurb: 'Proxy a subdomain to a server, plus advanced config.', content: domainsDoc },

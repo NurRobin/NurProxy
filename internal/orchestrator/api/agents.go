@@ -47,6 +47,7 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	if agents == nil {
 		agents = []models.Agent{}
 	}
+	s.attachUpgradeInfo(agents)
 
 	// Build response with zones included
 	type agentResponse struct {
@@ -481,6 +482,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// overwriting while unresolved. Empty/omitted leaves drift state untouched.
 		ArtifactChecksums  []proxymodel.ArtifactChecksum `json:"artifact_checksums"`
 		RecoveryCapability *recoverymodel.Capability     `json:"recovery_capability"`
+		// SelfUpdate is the agent's verdict on whether it can self-update (#73).
+		// Nil (older agent) leaves the stored report as it is.
+		SelfUpdate *models.SelfUpdateStatus `json:"self_update"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -581,6 +585,16 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("failed to update agent version: %v", uerr)
 		}
 	}
+
+	if req.SelfUpdate != nil {
+		if uerr := s.db.SetAgentSelfUpdateCapability(id, req.SelfUpdate); uerr != nil {
+			log.Printf("failed to store agent %s self-update capability: %v", id, uerr)
+		}
+	}
+	// An unfinished upgrade is complete once the agent runs the target version.
+	s.upgrades.observeVersion(id, req.Version, func(action, details string) {
+		s.audit(r, "agent", id, action, details)
+	})
 
 	// Drift detection (§11): compare each reported on-disk checksum against the
 	// accepted state. A divergence flags the artifact for review (never

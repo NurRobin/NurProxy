@@ -34,6 +34,10 @@ type Heartbeat struct {
 	checksumsFn          func() []proxymodel.ArtifactChecksum
 	recoveryCapabilityFn func() *recoverymodel.Capability
 	recoveryPolicyFn     func(bool)
+	versionFn            func() string
+	selfUpdateFn         func() *models.SelfUpdateStatus
+	onSuccess            func()
+	kick                 chan struct{}
 	client               *http.Client
 	cancel               context.CancelFunc
 	wg                   sync.WaitGroup
@@ -72,6 +76,9 @@ type heartbeatPayload struct {
 	// state. Omitted when the agent manages nothing.
 	ArtifactChecksums  []proxymodel.ArtifactChecksum `json:"artifact_checksums,omitempty"`
 	RecoveryCapability *recoverymodel.Capability     `json:"recovery_capability,omitempty"`
+	// SelfUpdate is the agent's verdict on whether it can replace its own
+	// binary on this host (and why not).
+	SelfUpdate *models.SelfUpdateStatus `json:"self_update,omitempty"`
 }
 
 // New creates a new Heartbeat sender. healthFn supplies the agent's current
@@ -85,6 +92,7 @@ func New(orchestratorURL, agentID, token, version string, interval time.Duration
 		version:         version,
 		interval:        interval,
 		healthFn:        healthFn,
+		kick:            make(chan struct{}, 1),
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -139,6 +147,23 @@ func (h *Heartbeat) SetRecoveryPolicyFn(fn func(bool)) {
 }
 
 // Start begins the heartbeat loop. It blocks until the context is canceled.
+// SetVersionFn makes the reported version dynamic. A dry-run agent that
+// simulated an upgrade reports the target version through it.
+func (h *Heartbeat) SetVersionFn(fn func() string) {
+	h.versionFn = fn
+}
+
+// SetSelfUpdateFn sets the self-update capability reported each beat.
+func (h *Heartbeat) SetSelfUpdateFn(fn func() *models.SelfUpdateStatus) {
+	h.selfUpdateFn = fn
+}
+
+// SetOnSuccess registers a callback run after every heartbeat the orchestrator
+// accepted: proof that this process reaches its orchestrator.
+func (h *Heartbeat) SetOnSuccess(fn func()) {
+	h.onSuccess = fn
+}
+
 func (h *Heartbeat) Start(ctx context.Context) {
 	ctx, h.cancel = context.WithCancel(ctx)
 	h.wg.Add(1)
@@ -158,12 +183,22 @@ func (h *Heartbeat) Start(ctx context.Context) {
 				return
 			case <-ticker.C:
 				h.sendHeartbeat(ctx)
+			case <-h.kick:
+				h.sendHeartbeat(ctx)
 			}
 		}
 	}()
 }
 
 // Stop cancels the heartbeat loop and waits for it to finish.
+// Kick sends a heartbeat now instead of at the next tick.
+func (h *Heartbeat) Kick() {
+	select {
+	case h.kick <- struct{}{}:
+	default:
+	}
+}
+
 func (h *Heartbeat) Stop() {
 	if h.cancel != nil {
 		h.cancel()
@@ -226,11 +261,21 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		}
 	}
 
+	version := h.version
+	if h.versionFn != nil {
+		version = h.versionFn()
+	}
+	var selfUpdate *models.SelfUpdateStatus
+	if h.selfUpdateFn != nil {
+		selfUpdate = h.selfUpdateFn()
+	}
+
 	payload := heartbeatPayload{
 		AgentID:            h.agentID,
 		PublicIP:           ip,
 		PublicIP6:          ip6,
-		Version:            h.version,
+		Version:            version,
+		SelfUpdate:         selfUpdate,
 		CaddyRunning:       caddyRunning,
 		LastError:          lastError,
 		ProxyMode:          mode,
@@ -266,6 +311,9 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 	if resp.StatusCode >= 400 {
 		log.Printf("Heartbeat: orchestrator returned status %d", resp.StatusCode)
 		return
+	}
+	if h.onSuccess != nil {
+		h.onSuccess()
 	}
 	if h.recoveryPolicyFn != nil {
 		var response struct {

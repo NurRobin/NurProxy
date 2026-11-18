@@ -29,6 +29,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
 	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
+	"github.com/NurRobin/NurProxy/internal/agent/selfupdate"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
@@ -101,6 +102,15 @@ func main() {
 			return
 		case "helper-bootstrap":
 			cmdHelperBootstrap(os.Args[2:])
+			return
+		case "self-update-apply":
+			cmdSelfUpdateApply(os.Args[2:])
+			return
+		case "self-update-enable":
+			cmdSelfUpdateEnable(os.Args[2:])
+			return
+		case "self-update-disable":
+			cmdSelfUpdateDisable(os.Args[2:])
 			return
 		}
 	}
@@ -451,6 +461,24 @@ func main() {
 		WithLogPaths(cfg.ProxyLogPaths).
 		WithCertStore(certStore)
 
+	// Self-update (#73): operator-requested upgrades arrive on the stream. The
+	// agent downloads and verifies the release and hands it to the privileged
+	// applier; Watch relays the applier's verdict, HeartbeatOK writes the health
+	// proof after a restart into a new binary.
+	updater, updaterErr := selfupdate.NewAgent(version, cfg.DataDir, env, cfg.DryRun, selfupdate.HTTPReporter{
+		OrchestratorURL: cfg.OrchestratorURL, AgentID: mgr.AgentID(), Token: mgr.Token(),
+	})
+	if updaterErr != nil {
+		log.Printf("WARNING: self-update unavailable: %v", updaterErr)
+	} else {
+		updater.Fetcher = selfupdate.Fetcher{BaseURL: cfg.UpdateMirror}
+		if cfg.DryRun {
+			updater.DryRunFail = os.Getenv("NP_DRY_RUN_UPDATE_FAIL")
+		}
+		streamClient.WithUpgrades(updater)
+		go updater.Watch(ctx)
+	}
+
 	// Recovery is optional at startup and fail-closed: if durable storage or path
 	// guards cannot be established, the agent keeps reconciling normally but does
 	// not advertise or execute automatic repairs.
@@ -557,6 +585,12 @@ func main() {
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
 	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
+	if updater != nil {
+		hb.SetVersionFn(updater.CurrentVersion)
+		hb.SetSelfUpdateFn(func() *models.SelfUpdateStatus { status := updater.Status(); return &status })
+		hb.SetOnSuccess(updater.HeartbeatOK)
+		updater.AfterSimulatedRestart = hb.Kick
+	}
 	if recoveryCoordinator != nil {
 		hb.SetRecoveryCapabilityFn(func() *recoverymodel.Capability { capability := recoveryCoordinator.Capability(); return &capability })
 		hb.SetRecoveryPolicyFn(recoveryCoordinator.SetPolicy)
