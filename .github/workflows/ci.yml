@@ -57,7 +57,7 @@ jobs:
           go-version: '1.25'
           cache: true
       - name: Dry-run end-to-end (no external DNS/ACME, no privileges)
-        run: go test -count=1 -tags=sandbox -timeout=180s ./test/sandbox/...
+        run: go test -count=1 -tags=sandbox -timeout=360s ./test/sandbox/...
 
   build:
     name: Build

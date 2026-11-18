@@ -182,6 +182,7 @@ func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.storeArtifactReport(r, id, rep)
+		s.recordStandbyReport(id, rep)
 	}
 
 	domains, err := s.db.ListDomainsByAgent(id)
@@ -333,14 +334,20 @@ func (s *Server) auditDroppedOptions(r *http.Request, rep *proxymodel.ArtifactRe
 }
 
 // domainIDFromArtifactID recovers the domain ID from a generated artifact's
-// stable identity ("dom-<id>"), mirroring the reconciler's artifactIDForDomain.
-// Returns nil for an artifact whose ID is not in that form (e.g. adopted files).
+// stable identity ("dom-<id>", or "dom-<id>-sb-<agent hash>" for a failover
+// standby route, db.StandbyArtifactID), mirroring the reconciler's
+// artifactIDForDomain. Returns nil for an artifact whose ID is not in that
+// form (e.g. adopted files).
 func domainIDFromArtifactID(artifactID string) *int64 {
 	const prefix = "dom-"
 	if !strings.HasPrefix(artifactID, prefix) {
 		return nil
 	}
-	v, err := strconv.ParseInt(artifactID[len(prefix):], 10, 64)
+	rest := artifactID[len(prefix):]
+	if i := strings.Index(rest, "-sb-"); i > 0 {
+		rest = rest[:i]
+	}
+	v, err := strconv.ParseInt(rest, 10, 64)
 	if err != nil {
 		return nil
 	}

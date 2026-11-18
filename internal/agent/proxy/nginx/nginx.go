@@ -190,6 +190,7 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		CentralTLS:    b.certs != nil,
 		AccessLog:     true,
 		ErrorLogLevel: b.errorLogLevel,
+		PathRoutes:    true,
 	}
 }
 
