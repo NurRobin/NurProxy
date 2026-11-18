@@ -682,8 +682,11 @@ func TestSandboxEndToEnd(t *testing.T) {
 			ID int `json:"id"`
 		}
 		api.get("/api/v1/domains", &doms)
-		if len(doms) != 0 {
-			return false
+		// Only the Caddy agent's domain may remain: it belongs to edge2.
+		for _, d := range doms {
+			if d.ID != caddyDomain.ID {
+				return false
+			}
 		}
 		var agents []struct {
 			ID string `json:"id"`
@@ -704,15 +707,19 @@ func TestSandboxEndToEnd(t *testing.T) {
 			Details    string `json:"details"`
 		} `json:"entries"`
 	}
-	api.get("/api/v1/audit-log?limit=500", &cascadeAudit)
+	api.get("/api/v1/audit-log?limit=1000", &cascadeAudit)
 	sawFinalized := false
+	var agentEntries []string
 	for _, e := range cascadeAudit.Entries {
+		if e.EntityType == "agent" && e.EntityID == agentID {
+			agentEntries = append(agentEntries, e.Action+": "+e.Details)
+		}
 		if e.EntityType == "agent" && e.EntityID == agentID && e.Action == "delete" && strings.Contains(e.Details, "cascade finalized") {
 			sawFinalized = true
 		}
 	}
 	if !sawFinalized {
-		t.Fatal("agent cascade delete was not finalized by the reconciler")
+		t.Fatalf("agent cascade delete was not finalized by the reconciler; agent audit: %q", agentEntries)
 	}
 
 	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; stale managed temp auto-healed and an unclassified validation failure remained diagnosis-only (validator/reload are hermetic fixtures, not native nginx proof)", dom.DNSRecordID)
