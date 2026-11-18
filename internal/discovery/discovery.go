@@ -8,7 +8,10 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -44,6 +47,10 @@ type Info struct {
 	// SecretFields are the config keys that hold credentials. They are never
 	// returned by the API.
 	SecretFields []string `json:"secret_fields"`
+	// SecretBoundFields are the config keys that decide where a secret is
+	// sent and how the peer is authenticated (endpoint, TLS checks). A stored
+	// secret is only kept while all of them stay unchanged.
+	SecretBoundFields []string `json:"secret_bound_fields,omitempty"`
 }
 
 // Candidate is one machine a source reported.
@@ -139,36 +146,91 @@ func List() []Info {
 	return out
 }
 
+// ErrSecretRequired is returned by MergeConfig when an update changes a field
+// the stored secret is bound to without sending the secret again.
+var ErrSecretRequired = errors.New("secret required")
+
 // MergeConfig overlays the top-level keys of update onto base. It lets a
 // client change one setting of a stored config without resending the secret:
-// a secret field sent as an empty string keeps the stored value.
-func MergeConfig(base, update json.RawMessage, secretFields []string) (json.RawMessage, error) {
-	merged := map[string]json.RawMessage{}
+// a secret field left out or sent as an empty string keeps the stored value.
+// That only holds while every field in info.SecretBoundFields stays the same;
+// otherwise a stored secret could be redirected to a different endpoint or sent
+// over a weaker TLS check, so every kept secret must be sent again.
+func MergeConfig(base, update json.RawMessage, info Info) (json.RawMessage, error) {
+	stored := map[string]json.RawMessage{}
 	if len(base) > 0 {
-		if err := json.Unmarshal(base, &merged); err != nil {
+		if err := json.Unmarshal(base, &stored); err != nil {
 			return nil, fmt.Errorf("stored config is not a JSON object: %w", err)
 		}
 	}
 	var patch map[string]json.RawMessage
-	if err := json.Unmarshal(update, &patch); err != nil {
-		return nil, fmt.Errorf("config must be a JSON object: %w", err)
+	if err := json.Unmarshal(update, &patch); err != nil || patch == nil {
+		return nil, errors.New("config must be a JSON object")
 	}
+	merged := make(map[string]json.RawMessage, len(stored)+len(patch))
+	for k, v := range stored {
+		merged[k] = v
+	}
+	var kept []string
 	for k, v := range patch {
-		if isSecret(k, secretFields) && string(v) == `""` {
-			if _, kept := merged[k]; kept {
-				continue
-			}
+		if slices.Contains(info.SecretFields, k) && isEmptyString(v) {
+			continue
 		}
 		merged[k] = v
+	}
+	for _, k := range info.SecretFields {
+		if v, ok := stored[k]; ok && !isEmptyString(v) && !sentNonEmpty(patch, k) {
+			kept = append(kept, k)
+		}
+	}
+	if len(kept) > 0 {
+		for _, k := range info.SecretBoundFields {
+			if !sameJSON(stored[k], merged[k]) {
+				return nil, fmt.Errorf("%w: changing %s needs %s sent again", ErrSecretRequired, k, strings.Join(kept, ", "))
+			}
+		}
 	}
 	return json.Marshal(merged)
 }
 
-func isSecret(key string, secretFields []string) bool {
-	for _, f := range secretFields {
-		if f == key {
-			return true
+func sentNonEmpty(patch map[string]json.RawMessage, key string) bool {
+	v, ok := patch[key]
+	return ok && !isEmptyString(v)
+}
+
+func isEmptyString(v json.RawMessage) bool {
+	var s string
+	return json.Unmarshal(v, &s) == nil && s == ""
+}
+
+// sameJSON compares two JSON values by meaning, so formatting differences do
+// not count as a change. An absent value, null, false, "" and 0 are all the
+// unset value: a form that sends every field must not look like a change.
+func sameJSON(a, b json.RawMessage) bool {
+	var va, vb any
+	if len(a) > 0 && json.Unmarshal(a, &va) != nil {
+		return false
+	}
+	if len(b) > 0 && json.Unmarshal(b, &vb) != nil {
+		return false
+	}
+	return reflect.DeepEqual(unsetToNil(va), unsetToNil(vb))
+}
+
+func unsetToNil(v any) any {
+	switch x := v.(type) {
+	case bool:
+		if !x {
+			return nil
+		}
+	case string:
+		if x == "" {
+			return nil
+		}
+	case float64:
+		if x == 0 {
+			return nil
 		}
 	}
-	return false
+	return v
 }

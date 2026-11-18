@@ -46,6 +46,9 @@ func (*Discoverer) Info() discovery.Info {
 		Name:         "Proxmox VE",
 		Description:  "QEMU VMs and LXC containers from a Proxmox VE node or cluster, read with an API token",
 		SecretFields: []string{"token_secret"},
+		// The token secret goes to url and is protected by the TLS settings,
+		// and it only belongs to token_id.
+		SecretBoundFields: []string{"url", "token_id", "verify_tls", "ca_pem", "fingerprint"},
 	}
 }
 

@@ -62,7 +62,10 @@ cluster is not reachable yet, tick *Save without testing the connection*.
 
 The token secret is stored encrypted (AES-256-GCM, like DNS provider tokens)
 and is never shown again or written to logs or the audit log. To change other
-settings later, leave the secret field empty and the stored one is kept.
+settings later, leave the secret field empty and the stored one is kept. This
+does not apply to the URL, token ID, **Verify TLS**, fingerprint or CA: when
+one of them changes, enter the secret again (the API answers 400 otherwise),
+so a stored secret is never sent to another host or over a weaker TLS check.
 
 ## Import servers
 

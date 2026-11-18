@@ -299,12 +299,41 @@ func TestDiscoverySourceProxmoxValidationAndMasking(t *testing.T) {
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &created)
 
-	// Changing a setting without the secret keeps the stored secret.
+	// Saving the edit form unchanged (every field sent, secret empty) keeps the
+	// stored secret.
 	w = doRequest(t, handler, "PUT", "/api/v1/discovery/sources/"+created.ID, map[string]any{
-		"skip_test": true, "config": map[string]any{"verify_tls": true, "token_secret": ""},
+		"skip_test": true, "config": map[string]any{
+			"url": "pve.lan", "token_id": "nurproxy@pve!disc", "token_secret": "",
+			"verify_tls": false, "fingerprint": "", "ca_pem": "",
+		},
 	}, cookie)
 	if w.Code != http.StatusOK {
-		t.Fatalf("update: %d %s", w.Code, w.Body.String())
+		t.Fatalf("unchanged update: %d %s", w.Code, w.Body.String())
+	}
+
+	// A changed endpoint or TLS check without the secret is refused, so the
+	// stored secret can't be sent somewhere else.
+	for _, cfg := range []map[string]any{
+		{"url": "https://attacker.example:8006"},
+		{"verify_tls": true, "token_secret": ""},
+		{"fingerprint": "AA:BB"},
+	} {
+		w = doRequest(t, handler, "PUT", "/api/v1/discovery/sources/"+created.ID, map[string]any{"skip_test": true, "config": cfg}, cookie)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "token_secret sent again") {
+			t.Errorf("update %v without secret: %d %s", cfg, w.Code, w.Body.String())
+		}
+		w = doRequest(t, handler, "POST", "/api/v1/discovery/test", map[string]any{"source_id": created.ID, "config": cfg}, cookie)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "token_secret sent again") {
+			t.Errorf("test %v without secret: %d %s", cfg, w.Code, w.Body.String())
+		}
+	}
+
+	// With the secret sent again the change goes through.
+	w = doRequest(t, handler, "PUT", "/api/v1/discovery/sources/"+created.ID, map[string]any{
+		"skip_test": true, "config": map[string]any{"verify_tls": true, "token_secret": "very-secret-uuid"},
+	}, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update with secret: %d %s", w.Code, w.Body.String())
 	}
 	src, err := database.GetDiscoverySource(created.ID)
 	if err != nil {

@@ -904,6 +904,7 @@
     "tokenIdHint": "benutzer@realm!tokenname",
     "tokenSecret": "Token-Secret",
     "tokenSecretKeep": "Leer lassen, um das gespeicherte Secret zu behalten.",
+    "tokenSecretRequired": "Secret erneut eingeben: URL, Token-ID oder TLS-Einstellungen wurden geändert.",
     "permissionsHint": "Ein Nur-Lese-Token reicht: Gib ihm die Rolle PVEAuditor auf / (Sys.Audit, VM.Audit). Für Adressen aus dem Gast-Agenten braucht es unter PVE 8 zusätzlich VM.Monitor (unter PVE 9 VM.GuestAgent.Audit); ohne fallen VMs auf ihre Cloud-Init-Adresse zurück.",
     "verifyTls": "TLS-Zertifikat prüfen",
     "fingerprint": "Zertifikats-Fingerabdruck (optional)",
