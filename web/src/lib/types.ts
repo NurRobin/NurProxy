@@ -359,11 +359,43 @@ export interface Domain {
    *  live record has; true/false is enforced. Only Cloudflare zones accept true. */
   proxied?: boolean | null;
   dns_record_id?: string;
+  /** Failover backup servers on other agents, most preferred first (#74). */
+  backup_server_ids?: string[];
+  /** The server whose agent the domain's CNAME points at: the primary
+   *  (server_id) unless the reconciler failed over to a backup. */
+  active_server_id?: string;
   status: 'pending' | 'active' | 'error' | 'deleting' | 'degraded';
   error_msg?: string;
   last_synced?: string;
   created_at: string;
   updated_at: string;
+}
+
+/** One server that may serve a domain, with its agent's health (#74). */
+export interface FailoverCandidate {
+  server_id: string;
+  server_name: string;
+  agent_id: string;
+  agent_name: string;
+  agent_fqdn: string;
+  primary: boolean;
+  priority: number;
+  eligible: boolean;
+  healthy: boolean;
+  active: boolean;
+  last_seen?: string;
+  reason?: string;
+}
+
+export interface DomainFailoverStatus {
+  domain_id: number;
+  active_server_id: string;
+  pending_server_id?: string;
+  pending_since?: string;
+  all_down: boolean;
+  switched_at?: string;
+  switches: number;
+  candidates: FailoverCandidate[];
 }
 
 export interface ProxyConfig {

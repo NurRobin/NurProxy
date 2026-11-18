@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
@@ -543,8 +544,94 @@ func cmdDomain(args []string) {
 		}
 		c.emit(raw, msg)
 
+	case "backups":
+		var set string
+		var clear bool
+		c, fs, id := parseClient("domain backups", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&set, "set", "", "Comma-separated backup server IDs, most preferred first (each on its own agent that serves the zone)")
+			fs.BoolVar(&clear, "clear", false, "Remove all backup servers (no failover)")
+		})
+		setGiven := false
+		fs.Visit(func(f *flag.Flag) { setGiven = setGiven || f.Name == "set" })
+		if setGiven && clear {
+			fatalf("domain backups: use either --set or --clear")
+		}
+		if !setGiven && !clear {
+			printFailover(c, id)
+			return
+		}
+		ids := splitCSV(set)
+		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id+"/backups", map[string]any{"server_ids": ids})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		if c.asJSON {
+			c.emit(raw, "")
+			return
+		}
+		if len(ids) == 0 {
+			fmt.Println("backup servers removed for domain " + id)
+		} else {
+			fmt.Println("backup servers set for domain " + id + ": " + strings.Join(ids, ", "))
+		}
+		printFailoverStatus(raw)
+
+	case "failover":
+		c, _, id := parseClient("domain failover", rest, "domain id", nil)
+		printFailover(c, id)
+
 	default:
-		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE")
+		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE",
+			"backups <id> [--set srv-a,srv-b | --clear]", "failover <id>")
+	}
+}
+
+// printFailover shows which servers may serve a domain and where its DNS
+// record points (#74).
+func printFailover(c *client, id string) {
+	raw, err := c.get("/api/v1/domains/" + id + "/failover")
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if c.asJSON {
+		c.emit(raw, "")
+		return
+	}
+	printFailoverStatus(raw)
+}
+
+func printFailoverStatus(raw []byte) {
+	var st models.DomainFailoverStatus
+	if err := json.Unmarshal(raw, &st); err != nil {
+		fatalf("decoding failover status: %v", err)
+	}
+	rows := make([][]string, len(st.Candidates))
+	for i, cand := range st.Candidates {
+		role := "backup " + strconv.Itoa(cand.Priority)
+		if cand.Primary {
+			role = "primary"
+		}
+		active, health := "", "up"
+		if cand.Active {
+			active = "*"
+		}
+		if !cand.Healthy {
+			health = "down"
+			if cand.Reason != "" {
+				health += " (" + cand.Reason + ")"
+			}
+		}
+		rows[i] = []string{active, role, cand.ServerID, cand.AgentName, cand.AgentFQDN, health}
+	}
+	printTable([]string{"ACTIVE", "ROLE", "SERVER", "AGENT", "AGENT FQDN", "HEALTH"}, rows)
+	if len(st.Candidates) < 2 {
+		fmt.Println("no backup servers: the DNS record always points at the primary agent")
+	}
+	if st.AllDown {
+		fmt.Println("every agent is down; the record stays on the active one")
+	}
+	if st.PendingServerID != "" && st.PendingSince != nil {
+		fmt.Printf("failback to %s pending since %s\n", st.PendingServerID, st.PendingSince.Format(time.RFC3339))
 	}
 }
 

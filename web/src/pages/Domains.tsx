@@ -15,6 +15,7 @@ import EmptyState from '../components/EmptyState';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
+import DomainFailoverPanel from '../components/DomainFailoverPanel';
 import { Field, Input, Select, Textarea, Checkbox } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
 import { useUndoableDelete } from '../lib/undo';
@@ -27,7 +28,7 @@ interface ServerWithAgent extends Server {
   agentName: string;
 }
 
-type EditTab = 'general' | 'headers' | 'advanced';
+type EditTab = 'general' | 'headers' | 'failover' | 'advanced';
 type ProxiedChoice = 'keep' | 'on' | 'off';
 
 function proxiedChoice(p: boolean | null | undefined): ProxiedChoice {
@@ -421,6 +422,11 @@ export default function Domains() {
               {filtered.map((d) => {
                 const zone = getZoneName(d.zone_id);
                 const srv = getServerInfo(d.server_id);
+                // With failover backups the record may point at another
+                // agent than the primary's (#74).
+                const activeSrv = d.active_server_id ? getServerInfo(d.active_server_id) : srv;
+                const onBackup = !!d.active_server_id && d.active_server_id !== d.server_id;
+                const backupCount = d.backup_server_ids?.length ?? 0;
                 return (
                   <tr key={d.id} className={`transition-colors ${selected.has(d.id) ? 'bg-accent-soft/50' : 'hover:bg-surface-2'}`}>
                     <td className="px-4 py-3">
@@ -441,7 +447,17 @@ export default function Domains() {
                       )}
                     </td>
                     <td className="px-4 py-3 font-mono text-xs text-fg-muted">{srv ? `${srv.address}:${d.port}` : `:${d.port}`}</td>
-                    <td className="px-4 py-3 text-fg-muted">{srv?.agentName ?? '—'}</td>
+                    <td className="px-4 py-3 text-fg-muted">
+                      {activeSrv?.agentName ?? srv?.agentName ?? '—'}
+                      {onBackup && (
+                        <span title={t('failover.onBackupTitle')} className="ml-2 inline-flex items-center rounded-full bg-warning-soft px-2 py-0.5 align-middle text-[11px] font-medium text-warning-fg">
+                          {t('failover.onBackup')}
+                        </span>
+                      )}
+                      {!onBackup && backupCount > 0 && (
+                        <span className="ml-2 align-middle text-[11px] text-fg-faint">{t('failover.backupCount', { count: backupCount })}</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3"><StatusBadge status={d.status} /></td>
                     <td className="px-4 py-3 text-xs text-fg-faint">{seen(d.last_synced)}</td>
                     <td className="px-4 py-3">
@@ -532,12 +548,12 @@ export default function Domains() {
 
             {/* Tabs */}
             <div className="flex gap-1 border-b border-border">
-              {(['general', 'headers', 'advanced'] as EditTab[]).map((tab) => (
+              {(['general', 'headers', 'failover', 'advanced'] as EditTab[]).map((tab) => (
                 <button key={tab} onClick={() => (tab === 'advanced' ? openAdvanced() : setEditTab(tab))}
                   className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium capitalize transition-colors ${
                     editTab === tab ? 'border-accent text-accent' : 'border-transparent text-fg-muted hover:text-fg'
                   }`}>
-                  {tab === 'general' ? t('domains.tabGeneral') : tab === 'headers' ? t('domains.tabHeaders') : t('domains.tabAdvanced')}
+                  {tab === 'general' ? t('domains.tabGeneral') : tab === 'headers' ? t('domains.tabHeaders') : tab === 'failover' ? t('failover.tab') : t('domains.tabAdvanced')}
                 </button>
               ))}
             </div>
@@ -609,6 +625,10 @@ export default function Domains() {
                   <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>
                 </div>
               </div>
+            )}
+
+            {editTab === 'failover' && (
+              <DomainFailoverPanel domain={liveDomain} servers={allServers} agents={agents} onSaved={fetchData} />
             )}
 
             {editTab === 'advanced' && (
