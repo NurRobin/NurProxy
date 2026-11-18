@@ -103,14 +103,39 @@ func TestMarkDomainApplied(t *testing.T) {
 }
 
 // A domain whose server is gone gets a plain message, not a database error.
-func TestCheckDomainLoggingMissingServer(t *testing.T) {
+func TestCheckDomainBackendOptionsMissingServer(t *testing.T) {
 	d := testDB(t)
 	dom := &models.Domain{ServerID: "srv-gone", CertOnly: true, ProxyConfig: models.ProxyConfig{AccessLog: "off"}}
-	err := d.CheckDomainLogging(dom)
+	err := d.CheckDomainBackendOptions(dom)
 	if err == nil || !strings.Contains(err.Error(), `server "srv-gone", which was not found`) || strings.Contains(err.Error(), "querying") {
-		t.Fatalf("CheckDomainLogging() error = %v", err)
+		t.Fatalf("CheckDomainBackendOptions() error = %v", err)
 	}
-	if err := d.CheckDomainLogging(&models.Domain{ServerID: "srv-gone"}); err != nil {
+	if err := d.CheckDomainBackendOptions(&models.Domain{ServerID: "srv-gone"}); err != nil {
 		t.Fatalf("a domain without logging settings needs no server lookup: %v", err)
+	}
+}
+
+// A deleting domain stays deleting: a route ACK or sync result read before the
+// delete must not pull it out of the reconciler teardown.
+func TestDeletingDomainStatusIsFinal(t *testing.T) {
+	d, id := markDomainAppliedFixture(t)
+	if err := d.UpdateDomainStatus(id, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatal(err)
+	}
+	writes := map[string]func() error{
+		"UpdateDomainStatus error": func() error { return d.UpdateDomainStatus(id, models.DomainStatusError, "apply failed") },
+		"MarkDomainSynced":         func() error { return d.MarkDomainSynced(id) },
+		"MarkDomainApplied":        func() error { return d.MarkDomainApplied(id, "app.example.com", true) },
+	}
+	for name, write := range writes {
+		if err := write(); err != nil {
+			t.Fatalf("%s on a deleting domain: %v", name, err)
+		}
+		if got := domainStatus(t, d, id); got != models.DomainStatusDeleting {
+			t.Fatalf("%s changed status to %s", name, got)
+		}
+	}
+	if err := d.UpdateDomainStatus(9999, models.DomainStatusError, ""); err == nil {
+		t.Fatal("status write to a missing domain succeeded")
 	}
 }

@@ -134,6 +134,8 @@ export interface ProxyCapabilities {
   /** Absent on agents that predate per-domain logging control. */
   access_log?: boolean;
   error_log_level?: boolean;
+  /** True when the backend replaces ${NAME} in header values at config load (Apache). */
+  header_config_vars?: boolean;
 }
 
 export interface Agent {

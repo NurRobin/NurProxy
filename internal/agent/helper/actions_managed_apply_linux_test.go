@@ -93,8 +93,9 @@ func newManagedApplyTest(t *testing.T) (*managedApplyAction, helperprotocol.Appl
 	}}
 	action := &managedApplyAction{
 		agentUID: uint32(os.Getuid()), ownerUID: uint32(os.Getuid()), stagingRootUID: uint32(os.Getuid()), journal: journal, host: host,
-		workerGroup: func() (uint32, error) { return uint32(os.Getgid()), nil },
-		target:      ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
+		workerGroup:    func() (uint32, error) { return uint32(os.Getgid()), nil },
+		errorLogTarget: func() error { return nil },
+		target:         ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
 		layout: ManagedApplyTargetConfig{
 			StagingDir: filepath.Join(root, "staging"), AvailableDir: filepath.Join(root, "available"), EnabledDir: filepath.Join(root, "enabled"),
 			CertificateDir: filepath.Join(root, "certs"), CustomPolicyVersion: "proxy-policy-v1", ProxyVersion: "1.22.1",

@@ -408,7 +408,7 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		Status:     models.DomainStatusPending,
 	}
 	applyLoggingArgs(&dom.ProxyConfig, in.AccessLog, in.ErrorLogLevel)
-	if err := d.CheckDomainLogging(dom); err != nil {
+	if err := d.CheckDomainBackendOptions(dom); err != nil {
 		return nil, err
 	}
 	if err := d.CreateDomain(dom); err != nil {
@@ -487,7 +487,7 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	applyLoggingArgs(&dom.ProxyConfig, in.AccessLog, in.ErrorLogLevel)
-	if err := d.CheckDomainLogging(dom); err != nil {
+	if err := d.CheckDomainBackendOptions(dom); err != nil {
 		return nil, err
 	}
 	dom.Status = models.DomainStatusPending // re-queue for reconciliation

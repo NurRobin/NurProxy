@@ -143,7 +143,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
-	if err := s.db.CheckDomainLogging(dom); err != nil {
+	if err := s.db.CheckDomainBackendOptions(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -326,7 +326,7 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
-	if err := s.db.CheckDomainLogging(dom); err != nil {
+	if err := s.db.CheckDomainBackendOptions(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -465,16 +465,14 @@ func artifactIDForDomainID(domainID int64) string {
 	return "dom-" + strconv.FormatInt(domainID, 10)
 }
 
-// DELETE /api/v1/domains/{id}
 // guardChildDomains refuses to delete a parent (server, agent, or zone) while
 // domains still reference it. It writes a 409 listing the blocking subdomains and
-// returns true when deletion must abort. Without this guard the DB's ON DELETE
-// CASCADE hard-removes those domain rows the instant the parent is deleted, which
-// runs BEFORE the reconciler's teardown (reconcileDeletions) and so never deletes
-// their managed DNS records or certificates — they leak at the provider with no
-// audit. Domains must be deleted first, individually, so each routes through the
-// reconciler teardown. The 409 body carries the domain list so a UI/CLI can offer
-// an explicit cascade (delete the domains first, then retry) rather than guessing.
+// returns true when deletion must abort. The foreign keys are ON DELETE RESTRICT,
+// so the delete would fail anyway; the guard turns that into a useful answer.
+// Domains must go through the reconciler teardown (reconcileDeletions) so their
+// managed DNS records and certificates are removed and audited. The 409 body
+// carries the domain list so a UI/CLI can offer an explicit cascade
+// (?cascade=true) rather than guessing.
 func (s *Server) guardChildDomains(w http.ResponseWriter, parent string, filter db.DomainFilter) bool {
 	doms, err := s.db.ListDomains(filter)
 	if err != nil {
@@ -495,6 +493,18 @@ func (s *Server) guardChildDomains(w http.ResponseWriter, parent string, filter 
 	return true
 }
 
+// writeParentDeleteError answers a failed parent delete: 409 when a domain was
+// added after the guard ran and the RESTRICT foreign key refused the delete,
+// otherwise 404.
+func writeParentDeleteError(w http.ResponseWriter, parent string, err error) {
+	if errors.Is(err, db.ErrParentInUse) {
+		writeError(w, http.StatusConflict, parent+" still has domains; delete them first")
+		return
+	}
+	writeError(w, http.StatusNotFound, parent+" not found")
+}
+
+// DELETE /api/v1/domains/{id}
 func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
 	if err != nil {

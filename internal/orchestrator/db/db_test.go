@@ -591,14 +591,14 @@ func TestAgent_Delete_CascadesToServers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Delete agent — server should be cascade-deleted.
+	// Delete agent — DeleteAgent removes its servers before the agent row.
 	if err := d.DeleteAgent(a.ID); err != nil {
 		t.Fatal(err)
 	}
 
 	_, err := d.GetServer(s.ID)
 	if err == nil {
-		t.Fatal("expected server to be deleted via cascade")
+		t.Fatal("expected server to be deleted with its agent")
 	}
 }
 
