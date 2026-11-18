@@ -412,32 +412,80 @@ func validateProxiedServer(server block, scope policyScope) error {
 	if n := countDirectives(server.directives, "server_name"); n != 1 {
 		return fmt.Errorf("line %d: the proxied server block needs exactly one server_name %s, found %d", scope.line(server.offset), scope.Host, n)
 	}
-	for _, nested := range server.blocks {
-		if !header(nested, "location", "/") {
-			return fmt.Errorf("line %d: nginx block %s is not allowed in the server block, only one location /", scope.line(nested.offset), blockName(nested))
-		}
-	}
-	if len(server.blocks) != 1 {
-		return fmt.Errorf("line %d: the server block may hold only one location / block", scope.line(server.blocks[1].offset))
-	}
-	location := server.blocks[0]
-	if len(location.blocks) != 0 {
-		return fmt.Errorf("line %d: nginx block %s is not allowed inside location /", scope.line(location.blocks[0].offset), blockName(location.blocks[0]))
-	}
-	if err := validateDirectives(location.directives, locationDirectives, scope, "location /"); err != nil {
-		return err
-	}
-	if n := countDirectives(location.directives, "proxy_pass"); n != 1 {
-		return fmt.Errorf("line %d: location / needs exactly one proxy_pass, found %d", scope.line(location.offset), n)
+	if len(server.blocks) > 1+2*proxymodel.MaxPathRoutes {
+		return fmt.Errorf("line %d: the server block holds more than %d location blocks", scope.line(server.offset), 1+2*proxymodel.MaxPathRoutes)
 	}
 	serverBuffers := readProxyBuffers(server.directives)
 	if err := serverBuffers.check(); err != nil {
 		return fmt.Errorf("line %d: the server block's proxy buffer settings %v", scope.line(server.offset), err)
 	}
-	if err := serverBuffers.inherit(readProxyBuffers(location.directives)).check(); err != nil {
-		return fmt.Errorf("line %d: the proxy buffer settings of location / %v", scope.line(location.offset), err)
+	root := 0
+	seen := map[string]bool{}
+	for _, location := range server.blocks {
+		match, ok := managedLocation(location)
+		if !ok {
+			return fmt.Errorf("line %d: nginx block %s is not allowed in the server block, only location /, location = <path> and location <path>/", scope.line(location.offset), blockName(location))
+		}
+		if seen[match] {
+			return fmt.Errorf("line %d: the server block holds location %s twice", scope.line(location.offset), match)
+		}
+		seen[match] = true
+		if match == "/" {
+			root++
+		}
+		where := "location " + match
+		if len(location.blocks) != 0 {
+			return fmt.Errorf("line %d: nginx block %s is not allowed inside %s", scope.line(location.blocks[0].offset), blockName(location.blocks[0]), where)
+		}
+		if err := validateDirectives(location.directives, locationDirectives, scope, where); err != nil {
+			return err
+		}
+		if n := countDirectives(location.directives, "proxy_pass"); n != 1 {
+			return fmt.Errorf("line %d: %s needs exactly one proxy_pass, found %d", scope.line(location.offset), where, n)
+		}
+		if err := serverBuffers.inherit(readProxyBuffers(location.directives)).check(); err != nil {
+			return fmt.Errorf("line %d: the proxy buffer settings of %s %v", scope.line(location.offset), where, err)
+		}
+	}
+	if root != 1 {
+		return fmt.Errorf("line %d: the server block needs exactly one location / block, found %d", scope.line(server.offset), root)
 	}
 	return nil
+}
+
+// managedLocation reports whether a block is one of the location headers
+// nginxgen renders and returns its match as one string: `location /`,
+// `location = <path>` for an exact path route, and `location <path>/` for a
+// prefix path route, with a path proxymodel accepts for that match kind.
+func managedLocation(b block) (string, bool) {
+	if b.comment || len(b.tokens) < 2 || len(b.tokens) > 3 || !header(b, wordsOf(b)...) || b.tokens[0].value != "location" {
+		return "", false
+	}
+	if len(b.tokens) == 3 {
+		path := b.tokens[2].value
+		if b.tokens[1].value != "=" || proxymodel.ValidateRoutePath(proxymodel.PathMatchExact, path) != nil {
+			return "", false
+		}
+		return "= " + path, true
+	}
+	path := b.tokens[1].value
+	if path == "/" {
+		return path, true
+	}
+	if !strings.HasSuffix(path, "/") || proxymodel.ValidateRoutePath(proxymodel.PathMatchPrefix, strings.TrimSuffix(path, "/")) != nil {
+		return "", false
+	}
+	return path, true
+}
+
+// wordsOf returns a block header's token values, for header() to check that
+// each word is plain.
+func wordsOf(b block) []string {
+	words := make([]string, len(b.tokens))
+	for i, t := range b.tokens {
+		words[i] = t.value
+	}
+	return words
 }
 
 // proxyBuffers are the proxy buffer directives of one block, 0 when unset.

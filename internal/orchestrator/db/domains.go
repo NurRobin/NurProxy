@@ -16,6 +16,9 @@ type DomainFilter struct {
 	ServerID string
 	ZoneID   string
 	Status   string
+	// RouteServerID matches domains with a path route to this server
+	// (proxy_config.routes[].server_id).
+	RouteServerID string
 }
 
 // CreateDomain inserts a new domain record. ProxyConfig is marshaled to JSON.
@@ -155,6 +158,10 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 	if filter.AgentID != "" {
 		conditions = append(conditions, "server_id IN (SELECT id FROM servers WHERE agent_id = ?)")
 		args = append(args, filter.AgentID)
+	}
+	if filter.RouteServerID != "" {
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(proxy_config) THEN proxy_config ELSE '{}' END, '$.routes') WHERE json_extract(value, '$.server_id') = ?)`)
+		args = append(args, filter.RouteServerID)
 	}
 
 	if len(conditions) > 0 {
