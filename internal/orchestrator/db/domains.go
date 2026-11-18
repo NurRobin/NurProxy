@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -348,16 +349,20 @@ func (d *DB) MarkDomainSynced(id int64) error {
 // plaintext HTTP (TLS and any force_https redirect were dropped), so the domain
 // is marked "degraded" with an explanatory error rather than a bare "active"
 // that would hide the downgrade (§78). Otherwise the domain is marked active.
-func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) error {
+// fallbackHosts are further store keys that serve fqdn, such as the zone
+// wildcard cert "*.<zone>" of a domain opted into it.
+func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool, fallbackHosts ...string) error {
 	if wantsCentralTLS {
 		// Distinguish a genuinely absent certificate (degrade — the route is
 		// served plaintext) from a transient DB read error (propagate — do not
 		// mislabel a healthy domain as degraded). A bare existence probe avoids
 		// the key decryption that GetCertificate performs and lets sql.ErrNoRows
 		// cleanly signal not-found.
+		hosts := append([]any{fqdn}, toAnySlice(fallbackHosts)...)
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",")
 		var dummy int
 		err := d.read.QueryRow(
-			"SELECT 1 FROM certificates WHERE host = ?", fqdn,
+			"SELECT 1 FROM certificates WHERE host IN ("+placeholders+") LIMIT 1", hosts...,
 		).Scan(&dummy)
 		switch {
 		case err == sql.ErrNoRows:
@@ -484,4 +489,12 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 		domains = append(domains, *dom)
 	}
 	return domains, rows.Err()
+}
+
+func toAnySlice(values []string) []any {
+	out := make([]any, len(values))
+	for i, v := range values {
+		out[i] = v
+	}
+	return out
 }

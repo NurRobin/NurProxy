@@ -5,7 +5,7 @@ import { usePolling } from '../lib/usePolling';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
-import { proxyConfigChanges } from '../lib/proxy-config';
+import { proxyConfigChanges, wildcardEligible } from '../lib/proxy-config';
 import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities, DNSTakeoverPlan } from '../lib/types';
 import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
@@ -69,6 +69,7 @@ export default function Domains() {
   const [createForceHttps, setCreateForceHttps] = useState(true);
   const [createCertOnly, setCreateCertOnly] = useState(false);
   const [createProxied, setCreateProxied] = useState<ProxiedChoice>('keep');
+  const [createWildcard, setCreateWildcard] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState('');
 
@@ -87,6 +88,7 @@ export default function Domains() {
   const [editProxied, setEditProxied] = useState<ProxiedChoice>('keep');
   const [editAccessLog, setEditAccessLog] = useState('');
   const [editErrorLogLevel, setEditErrorLogLevel] = useState('');
+  const [editWildcard, setEditWildcard] = useState(false);
   const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
   const [editRawConfig, setEditRawConfig] = useState('');
   const [editConfigBackend, setEditConfigBackend] = useState('caddy');
@@ -181,11 +183,13 @@ export default function Domains() {
         ...(!createCertOnly && zoneSupportsProxy(createZone) && createProxied !== 'keep'
           ? { proxied: proxiedValue(createProxied) }
           : {}),
+        ...(createWildcard && wildcardEligible(createSub) ? { proxy_config: { tls_wildcard: true } } : {}),
       });
       toast.success(t('domains.created', { fqdn: domainFqdn(createSub, getZoneName(createZone)) }));
       setShowCreate(false);
       setCreateSub(''); setCreateZone(''); setCreateServer(''); setCreatePort('80');
       setCreateWebsocket(false); setCreateForceHttps(true); setCreateCertOnly(false); setCreateProxied('keep');
+      setCreateWildcard(false);
       fetchData();
     } catch (err) {
       setCreateError(errMessage(err, t('domains.createFailed')));
@@ -203,6 +207,7 @@ export default function Domains() {
     setEditProxied(proxiedChoice(d.proxied));
     setEditAccessLog(d.proxy_config?.access_log ?? '');
     setEditErrorLogLevel(d.proxy_config?.error_log_level ?? '');
+    setEditWildcard(d.proxy_config?.tls_wildcard ?? false);
     setEditHeaders(d.proxy_config?.custom_request_headers
       ? Object.entries(d.proxy_config.custom_request_headers).map(([key, value]) => ({ key, value }))
       : []);
@@ -269,6 +274,7 @@ export default function Domains() {
           websocket: editWebsocket, force_https: editForceHttps,
           max_body_size: editMaxBody, custom_request_headers: editHeaders,
           access_log: editAccessLog, error_log_level: editErrorLogLevel,
+          tls_wildcard: editWildcard,
         }),
       });
       toast.success(t('domains.updated'));
@@ -550,6 +556,15 @@ export default function Domains() {
           {!createCertOnly && zoneSupportsProxy(createZone) && createProxied === 'on' && (
             <Callout tone="info">{t('domains.proxiedHelp')}</Callout>
           )}
+          {wildcardEligible(createSub) && createZone && (
+            <div>
+              <Checkbox label={t('domains.tlsWildcard')} checked={createWildcard} onChange={(e) => setCreateWildcard(e.target.checked)} />
+              <p className="mt-1.5 text-xs text-fg-faint">{t('domains.tlsWildcardHint', { zone: getZoneName(createZone) })}</p>
+            </div>
+          )}
+          {createWildcard && wildcardEligible(createSub) && (
+            <Callout tone="warning">{t('domains.tlsWildcardWarning')}</Callout>
+          )}
           {createCertOnly && (
             <Callout tone="info">
               {t('domains.certOnlyHelp')}
@@ -641,6 +656,21 @@ export default function Domains() {
                     {editProxied === 'on' && <Callout tone="info">{t('domains.proxiedHelp')}</Callout>}
                   </>
                 )}
+                {(() => {
+                  const eligible = wildcardEligible(liveDomain.subdomain, liveDomain.ssl_mode, liveDomain.proxy_config?.tls_policy);
+                  return (
+                    <>
+                      <div>
+                        {/* Stays editable while set, so an opt-in that no longer fits can be cleared. */}
+                        <Checkbox label={t('domains.tlsWildcard')} checked={editWildcard} disabled={!eligible && !editWildcard} onChange={(e) => setEditWildcard(e.target.checked)} />
+                        <p className="mt-1.5 text-xs text-fg-faint">
+                          {eligible ? t('domains.tlsWildcardHint', { zone: getZoneName(liveDomain.zone_id) }) : t('domains.tlsWildcardUnavailable')}
+                        </p>
+                      </div>
+                      {editWildcard && <Callout tone="warning">{t('domains.tlsWildcardWarning')}</Callout>}
+                    </>
+                  );
+                })()}
                 <Field label={t('domains.maxBodySize')} help="max-body-size" hint={supports('reverse_proxy') ? t('domains.maxBodyHint') : unsupportedHint('reverse_proxy')}>
                   <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder={t('domains.maxBodyPh')} />
                 </Field>

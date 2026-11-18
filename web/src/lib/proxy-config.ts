@@ -15,6 +15,8 @@ export interface ProxyConfigFormEdits {
   access_log: string;
   /** "" keeps the host default level. */
   error_log_level: string;
+  /** Use the zone's shared *.<zone> certificate instead of a per-host one. */
+  tls_wildcard: boolean;
   custom_request_headers: { key: string; value: string }[];
 }
 
@@ -36,6 +38,7 @@ export function proxyConfigChanges(stored: ProxyConfig | undefined, edits: Proxy
   if (edits.max_body_size !== (stored?.max_body_size ?? '')) changes.max_body_size = edits.max_body_size || null;
   if (edits.access_log !== (stored?.access_log ?? '')) changes.access_log = edits.access_log || null;
   if (edits.error_log_level !== (stored?.error_log_level ?? '')) changes.error_log_level = edits.error_log_level || null;
+  if (edits.tls_wildcard !== (stored?.tls_wildcard ?? false)) changes.tls_wildcard = edits.tls_wildcard;
 
   const headers: Record<string, string> = {};
   for (const h of edits.custom_request_headers) if (h.key.trim()) headers[h.key.trim()] = h.value;
@@ -43,4 +46,17 @@ export function proxyConfigChanges(stored: ProxyConfig | undefined, edits: Proxy
     changes.custom_request_headers = Object.keys(headers).length > 0 ? headers : null;
   }
   return Object.keys(changes).length > 0 ? changes : undefined;
+}
+
+/**
+ * Whether a domain may use its zone's shared *.<zone> certificate. Mirrors the
+ * orchestrator's ValidateTLSWildcard: the wildcard covers exactly one label
+ * below the zone, so the apex ("@") and deeper names are excluded, and only
+ * central TLS serves a provided certificate.
+ */
+export function wildcardEligible(subdomain: string, sslMode?: string, tlsPolicy?: string): boolean {
+  const label = subdomain.trim();
+  if (label === '' || label === '@' || label.includes('.')) return false;
+  if (tlsPolicy === 'self-acme' || tlsPolicy === 'off') return false;
+  return tlsPolicy === 'central' || sslMode !== 'off';
 }

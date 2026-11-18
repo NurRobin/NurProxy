@@ -172,6 +172,21 @@ func TestSandboxEndToEnd(t *testing.T) {
 		"port": 8080, "ssl_mode": "central", "proxied": true,
 	}, &apex)
 
+	// Two domains opted into the zone wildcard certificate (#69). Created now so
+	// they converge in the same cycle; both must end up on ONE shared
+	// "*.sandbox.test" cert, issued once.
+	wildcardIDs := make([]int, 0, 2)
+	for _, sub := range []string{"w1", "w2"} {
+		var wd struct {
+			ID int `json:"id"`
+		}
+		api.post("/api/v1/domains", map[string]any{
+			"subdomain": sub, "zone_id": zone.ID, "server_id": server.ID,
+			"port": 8080, "ssl_mode": "central", "tls_wildcard": true,
+		}, &wd)
+		wildcardIDs = append(wildcardIDs, wd.ID)
+	}
+
 	// --- assert convergence ---------------------------------------------------
 	// The CNAME (which flips the domain to active) is written on a reconciler
 	// cycle; the default interval is 60s, so allow one full cycle plus margin.
@@ -205,6 +220,62 @@ func TestSandboxEndToEnd(t *testing.T) {
 	})
 	if apexFinal != "active" {
 		t.Fatalf("apex (@) domain never became active (last status %q)", apexFinal)
+	}
+
+	// Both wildcard domains converge to active on the same self-signed
+	// "*.sandbox.test" cert, installed on the agent once per FQDN.
+	for _, id := range wildcardIDs {
+		var status string
+		waitFor(t, 75*time.Second, func() bool {
+			var d struct {
+				Status string `json:"status"`
+			}
+			api.get(fmt.Sprintf("/api/v1/domains/%d", id), &d)
+			status = d.Status
+			return d.Status == "active"
+		})
+		if status != "active" {
+			t.Fatalf("wildcard domain %d never became active (last status %q)", id, status)
+		}
+	}
+	var w1Cert, w2Cert string
+	waitFor(t, 30*time.Second, func() bool {
+		w1Cert = readFileNamed(agentDataDir, "w1.sandbox.test.crt")
+		w2Cert = readFileNamed(agentDataDir, "w2.sandbox.test.crt")
+		return w1Cert != "" && w1Cert == w2Cert
+	})
+	if w1Cert == "" || w1Cert != w2Cert {
+		t.Fatal("wildcard domains did not receive the same certificate on the agent")
+	}
+	block, _ := pem.Decode([]byte(w1Cert))
+	if block == nil {
+		t.Fatal("wildcard certificate on the agent is not PEM")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse wildcard certificate: %v", err)
+	}
+	if len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != "*.sandbox.test" || leaf.Issuer.String() != leaf.Subject.String() {
+		t.Fatalf("wildcard certificate names=%v issuer=%q subject=%q, want one self-signed *.sandbox.test", leaf.DNSNames, leaf.Issuer, leaf.Subject)
+	}
+	var wildAudit struct {
+		Entries []struct {
+			EntityID string `json:"entity_id"`
+			Action   string `json:"action"`
+		} `json:"entries"`
+	}
+	api.get("/api/v1/audit-log?limit=200", &wildAudit)
+	issued := 0
+	for _, e := range wildAudit.Entries {
+		if e.Action == "renewed" && e.EntityID == "*.sandbox.test" {
+			issued++
+		}
+		if e.Action == "renewed" && (e.EntityID == "w1.sandbox.test" || e.EntityID == "w2.sandbox.test") {
+			t.Fatalf("wildcard domain got a per-host certificate: %+v", e)
+		}
+	}
+	if issued != 1 {
+		t.Fatalf("*.sandbox.test issued %d times, want exactly once", issued)
 	}
 
 	// The DNS record must be a simulated one (dryrun-* ID from the in-memory store).
@@ -828,6 +899,23 @@ func sandboxServerCert(t *testing.T, host string) (certPEM, keyPEM string) {
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
 		string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+}
+
+// readFileNamed returns the content of the first file named name below root,
+// or "" when there is none (yet).
+func readFileNamed(root, name string) string {
+	found := ""
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != name {
+			return nil
+		}
+		if got, rErr := os.ReadFile(path); rErr == nil {
+			found = string(got)
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // findFileWithContent returns the path of a file named name below root whose
