@@ -413,7 +413,7 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 		if c.health != nil {
 			c.health.SetError("privileged managed proxy reconciliation failed")
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed", nil)
+		c.sendManagedAck(ctx, envelope.IntentSet, managedApplyFailureMessage(err), nil)
 		return
 	}
 	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
@@ -429,6 +429,35 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 		c.health.SetError("")
 	}
 	c.sendManagedAck(ctx, envelope.IntentSet, "", receipt.Envelope.Payload.ManagedArtifacts)
+}
+
+// maxManagedRefusalBytes bounds the helper's refusal reason in an artifact
+// report.
+const maxManagedRefusalBytes = 400
+
+// managedApplyFailureMessage is the artifact error for a failed privileged
+// apply. When the root helper's local policy refused the desired state with
+// a reason (a refused raw config directive, an unsafe error log target), the
+// reason is appended so it reaches the domain's error message.
+func managedApplyFailureMessage(err error) string {
+	const message = "privileged managed proxy reconciliation failed"
+	var refusal interface{ RefusalReason() string }
+	if !errors.As(err, &refusal) {
+		return message
+	}
+	reason := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(refusal.RefusalReason(), ""))
+	if len(reason) > maxManagedRefusalBytes {
+		reason = strings.ToValidUTF8(reason[:maxManagedRefusalBytes], "")
+	}
+	if reason = strings.TrimSpace(reason); reason == "" {
+		return message
+	}
+	return message + ": " + reason
 }
 
 func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string, attested []helperprotocol.ManagedArtifactReceipt) {
