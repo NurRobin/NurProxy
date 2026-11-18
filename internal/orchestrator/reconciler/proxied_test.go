@@ -204,7 +204,7 @@ func TestTakeoverDomainDNS_proxiedSetting(t *testing.T) {
 			d, mp, agent, dom := proxiedScenario(t, tc.setting)
 			mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99", Proxied: tc.existing})
 			r := New(d, newMockAgentClient(), time.Minute)
-			if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+			if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 				t.Fatalf("TakeoverDomainDNS: %v", err)
 			}
 			rec := onlyRecord(t, mp)
@@ -222,7 +222,7 @@ func TestTakeoverDomainDNS_proxiedSetting(t *testing.T) {
 			d, mp, agent, dom := proxiedScenario(t, tc.setting)
 			mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN, Proxied: tc.existing})
 			r := New(d, newMockAgentClient(), time.Minute)
-			if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+			if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 				t.Fatalf("TakeoverDomainDNS: %v", err)
 			}
 			if rec := onlyRecord(t, mp); rec.Proxied != tc.want {

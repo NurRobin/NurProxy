@@ -63,6 +63,90 @@ var policyTestAccepted = map[string]string{
 	"stock error log level":     policyTestInServer("error_log /var/log/nginx/error.log crit;"),
 	"logging in both servers": strings.Replace(policyTestInRedirect("access_log off;\n    error_log /var/log/nginx/error.log emerg;"),
 		"    location / {", "    access_log off;\n    error_log /var/log/nginx/error.log emerg;\n    location / {", 1),
+	"issue 149 shape": policyTestInServer("access_log off;\n    client_max_body_size 50m;\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    gzip on;\n    gzip_types text/plain application/json;"),
+}
+
+// policyTestTuning are the tuning directives (#149) a raw config may carry in
+// the server block and in location /. Each one is admitted in both scopes.
+var policyTestTuning = []string{
+	"client_max_body_size 0;",
+	"client_max_body_size 2g;",
+	"client_max_body_size 999999999g;",
+	"client_body_buffer_size 128k;",
+	"client_body_buffer_size 16m;",
+	"add_header X-Robots-Tag noindex;",
+	`add_header Content-Security-Policy "default-src 'self'" always;`,
+	"access_log off;",
+	"proxy_set_header X-Forwarded-Host $host;",
+	"proxy_hide_header X-Powered-By;",
+	"proxy_http_version 1.1;",
+	"proxy_connect_timeout 5s;",
+	"proxy_send_timeout 2m;",
+	"proxy_read_timeout 3600;",
+	"proxy_read_timeout 500ms;",
+	"proxy_read_timeout 1h;",
+	"proxy_read_timeout 999999h;",
+	"proxy_connect_timeout 999999ms;",
+	"proxy_buffering off;",
+	"proxy_request_buffering off;",
+	"proxy_buffer_size 16k; proxy_buffers 8 16k; proxy_busy_buffers_size 32k;",
+	"proxy_buffer_size 4k; proxy_buffers 2 4k; proxy_busy_buffers_size 4k;",
+	"proxy_buffer_size 128k; proxy_buffers 4 256k; proxy_busy_buffers_size 256k;",
+	"proxy_buffer_size 16m; proxy_buffers 64 16m; proxy_busy_buffers_size 16m;",
+	"proxy_buffer_size 1k; proxy_buffers 64 1k; proxy_busy_buffers_size 63k;",
+	"proxy_redirect off;",
+	"proxy_ssl_server_name on;",
+	"gzip on;",
+	"gzip_vary on;",
+	"gzip_comp_level 1;",
+	"gzip_comp_level 9;",
+	"gzip_min_length 1k;",
+	"gzip_min_length 1024m;",
+	"gzip_types text/css application/javascript image/svg+xml;",
+	"gzip_types *;",
+	"gzip_proxied expired no-cache no-store private auth;",
+	"gzip_proxied any;",
+	"gzip_proxied off expired no-cache no-store private no_last_modified no_etag auth any;",
+	"gzip_types " + strings.TrimSpace(strings.Repeat("text/x-a ", 32)) + ";",
+	"add_header X-A 1; add_header X-A 2;",
+	"proxy_set_header X-A 1; proxy_set_header X-B 2;",
+	"proxy_hide_header X-A; proxy_hide_header X-B;",
+	"access_log off; access_log off;",
+	"gzip_types text/css; gzip_types text/xml;",
+	"gzip_proxied any; gzip_proxied auth;",
+}
+
+// policyTestServerOnly are admitted only directly in the proxied server.
+var policyTestServerOnly = []string{
+	"server_tokens off;",
+	"error_log /var/log/nginx/error.log warn;",
+	"allow 10.0.0.0/8;",
+	"allow 10.0.0.0/8; deny all;",
+	"error_log /var/log/nginx/error.log warn; error_log /var/log/nginx/error.log crit;",
+}
+
+func TestValidateManagedAdmitsTuningDirectives(t *testing.T) {
+	for _, statement := range policyTestTuning {
+		for scope, content := range map[string]string{"server": policyTestInServer(statement), "location": policyTestInLocation(statement)} {
+			t.Run(scope+"/"+statement, func(t *testing.T) {
+				if err := ValidateManaged(content, policyTestPolicy); err != nil {
+					t.Fatalf("allowed directive refused: %v\n%s", err, content)
+				}
+			})
+		}
+	}
+	for _, statement := range policyTestServerOnly {
+		t.Run("server/"+statement, func(t *testing.T) {
+			if err := ValidateManaged(policyTestInServer(statement), policyTestPolicy); err != nil {
+				t.Fatalf("allowed directive refused: %v", err)
+			}
+		})
+		t.Run("location/"+statement, func(t *testing.T) {
+			if err := ValidateManaged(policyTestInLocation(statement), policyTestPolicy); err == nil {
+				t.Fatalf("server-only directive admitted in location /")
+			}
+		})
+	}
 }
 
 func TestValidateManagedAdmitsBoundedVHost(t *testing.T) {
@@ -111,7 +195,6 @@ var policyTestRefused = []struct {
 	{"access_log to syslog", policyTestInServer("access_log syslog:server=10.0.0.1;")},
 	{"access_log off with format", policyTestInServer("access_log off combined;")},
 	{"access_log quoted off", policyTestInServer(`access_log "off";`)},
-	{"access_log off in location", policyTestInLocation("access_log off;")},
 	{"error_log stock path without level", policyTestInServer("error_log /var/log/nginx/error.log;")},
 	{"error_log debug", policyTestInServer("error_log /var/log/nginx/error.log debug;")},
 	{"error_log uppercase level", policyTestInServer("error_log /var/log/nginx/error.log CRIT;")},
@@ -188,8 +271,164 @@ var policyTestRefused = []struct {
 	{"redirect to other target", strings.Replace(policyTestRedirect, "https://$host$request_uri", "https://victim.example.test$request_uri", 1) + policyTestValid},
 	{"redirect to fixed path", strings.Replace(policyTestRedirect, "https://$host$request_uri", "https://$host/x", 1) + policyTestValid},
 
+	// Tuning directives (#149): only the documented argument forms.
+	{"gzip variable", policyTestInServer("gzip $x;")},
+	{"gzip_types quoted", policyTestInServer(`gzip_types "text/plain";`)},
+	{"gzip_types variable", policyTestInServer("gzip_types $x;")},
+	{"gzip_types bad mime", policyTestInServer("gzip_types text;")},
+	{"gzip_proxied unknown flag", policyTestInServer("gzip_proxied all;")},
+	{"gzip_comp_level 10", policyTestInServer("gzip_comp_level 10;")},
+	{"gzip_disable regex", policyTestInServer(`gzip_disable "msie6";`)},
+	{"gzip_static", policyTestInServer("gzip_static on;")},
+	{"proxy_buffering variable", policyTestInLocation("proxy_buffering $x;")},
+	{"proxy_buffers one arg", policyTestInLocation("proxy_buffers 16k;")},
+	{"proxy_buffers zero", policyTestInLocation("proxy_buffers 0 16k;")},
+	{"proxy_buffer_size gigabytes", policyTestInLocation("proxy_buffer_size 1g;")},
+	{"proxy_redirect mapping", policyTestInLocation("proxy_redirect http://a/ http://b/;")},
+	{"proxy_redirect default", policyTestInLocation("proxy_redirect default;")},
+	{"proxy_ssl_verify", policyTestInLocation("proxy_ssl_verify on;")},
+	{"proxy_ssl_trusted_certificate", policyTestInLocation("proxy_ssl_trusted_certificate /etc/shadow;")},
+	{"proxy_ssl_certificate", policyTestInLocation("proxy_ssl_certificate /etc/shadow;")},
+	{"proxy_temp_path", policyTestInLocation("proxy_temp_path /etc/cron.d;")},
+	{"proxy_cache_path", policyTestInServer("proxy_cache_path /tmp/c keys_zone=c:1m;")},
+	{"proxy_store", policyTestInLocation("proxy_store /etc/x;")},
+	{"proxy_timeout variable", policyTestInLocation("proxy_read_timeout $x;")},
+	{"proxy_timeout days", policyTestInLocation("proxy_read_timeout 1d;")},
+	{"proxy_hide_header value", policyTestInLocation("proxy_hide_header X-A b;")},
+	{"proxy_http_version 2", policyTestInLocation("proxy_http_version 2.0;")},
+	{"client_body_temp_path", policyTestInServer("client_body_temp_path /etc;")},
+	{"client_max_body_size variable", policyTestInLocation("client_max_body_size $x;")},
+	{"server_tokens build", policyTestInServer("server_tokens build;")},
+	{"server_tokens in location", policyTestInLocation("server_tokens off;")},
+	{"proxy_pass in server", policyTestInServer("proxy_pass http://127.0.0.1:3000;")},
+	{"rewrite in server", policyTestInServer(`rewrite ^/a$ /b break;`)},
+	{"allow in location", policyTestInLocation("allow 10.0.0.0/8;")},
+	{"error_log in location stock path", policyTestInLocation("error_log /var/log/nginx/error.log warn;")},
+
+	// Forms nginx -t rejects: duplicates, buffer sets that break nginx's
+	// merge checks, out-of-range values.
+	{"duplicate gzip", policyTestInServer("gzip on;\n    gzip on;")},
+	{"duplicate gzip in location", policyTestInLocation("gzip on; gzip off;")},
+	{"duplicate server_tokens", policyTestInServer("server_tokens off; server_tokens on;")},
+	{"duplicate client_max_body_size", policyTestInServer("client_max_body_size 1m; client_max_body_size 2m;")},
+	{"duplicate proxy_buffering", policyTestInLocation("proxy_buffering off; proxy_buffering off;")},
+	{"duplicate http2", strings.Replace(policyTestValid, "listen 443 ssl;", "listen 443 ssl;\n    http2 on;\n    http2 on;", 1)},
+	{"duplicate proxy_read_timeout", policyTestInLocation("proxy_read_timeout 1s; proxy_read_timeout 2s;")},
+	{"proxy_buffer_size alone", policyTestInLocation("proxy_buffer_size 1m;")},
+	{"proxy_busy_buffers_size alone", policyTestInLocation("proxy_busy_buffers_size 1m;")},
+	{"proxy_buffers alone", policyTestInLocation("proxy_buffers 8 16k;")},
+	{"proxy_buffers one buffer", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 1 4k; proxy_busy_buffers_size 4k;")},
+	{"proxy_buffers 65", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 65 4k; proxy_busy_buffers_size 8k;")},
+	{"busy above buffers minus one", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 2 4k; proxy_busy_buffers_size 8k;")},
+	{"busy below buffer size", policyTestInLocation("proxy_buffer_size 8k; proxy_buffers 4 4k; proxy_busy_buffers_size 4k;")},
+	{"busy below one buffer", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 4 8k; proxy_busy_buffers_size 4k;")},
+	{"location overrides into bad set", strings.Replace(policyTestInServer("proxy_buffer_size 4k; proxy_buffers 8 4k; proxy_busy_buffers_size 8k;"), "        proxy_pass", "        proxy_buffers 2 4k;\n        proxy_pass", 1)},
+	{"buffer size above cap", policyTestInLocation("proxy_buffer_size 17m; proxy_buffers 64 17m; proxy_busy_buffers_size 17m;")},
+	{"client_body_buffer_size above cap", policyTestInServer("client_body_buffer_size 17m;")},
+	{"gzip_min_length above cap", policyTestInServer("gzip_min_length 1025m;")},
+	{"client_max_body_size ten digits", policyTestInServer("client_max_body_size 9999999999g;")},
+	{"timeout seven digits", policyTestInLocation("proxy_read_timeout 9999999h;")},
+	{"gzip_types 33", policyTestInServer("gzip_types " + strings.TrimSpace(strings.Repeat("text/x-a ", 33)) + ";")},
+
+	// Only the two rewrite forms nginxgen renders.
+	{"rewrite nested quantifier", policyTestInLocation("rewrite (a+)+$ /x break;")},
+	{"rewrite to absolute URL", policyTestInLocation("rewrite ^ http://evil.example/ break;")},
+	{"rewrite unescaped dot prefix", policyTestInLocation("rewrite ^/a.b/?(.*)$ /$1 break;")},
+	{"rewrite strip with other replacement", policyTestInLocation("rewrite ^/a/?(.*)$ /x$1 break;")},
+	{"rewrite strip relative prefix", policyTestInLocation("rewrite ^a/?(.*)$ /$1 break;")},
+	{"rewrite last", policyTestInLocation("rewrite ^.*$ /x last;")},
+
+	// Files, code and other scopes stay out.
+	{"access_log to managed-looking path", policyTestInLocation("access_log /var/log/nginx/app.example.test.access.log;")},
+	{"access_log with variable path", policyTestInServer("access_log /var/log/nginx/$host.log;")},
+	{"access_log with condition", policyTestInServer("access_log off if=$x;")},
+	{"lua block", policyTestInLocation("content_by_lua_block { ngx.say(1); }")},
+	{"lua directive", policyTestInLocation(`access_by_lua 'os.execute("id")';`)},
+	{"lua file", policyTestInServer("rewrite_by_lua_file /tmp/x.lua;")},
+	{"perl", policyTestInLocation("perl Module::handler;")},
+	{"js_content", policyTestInLocation("js_content x.y;")},
+	{"load_module", "load_module /tmp/x.so;\n" + policyTestValid},
+	{"root", policyTestInServer("root /;")},
+	{"alias", policyTestInLocation("alias /etc/;")},
+	{"if block", policyTestInLocation("if ($x) { return 403; }")},
+	{"set variable", policyTestInLocation("set $x 1;")},
+	{"map block", "map $a $b { default 1; }\n" + policyTestValid},
+	{"upstream block", "upstream u { server 127.0.0.1:3000; }\n" + policyTestValid},
+	{"proxy_pass to upstream name", strings.Replace(policyTestValid, "http://127.0.0.1:3000", "http://u", 1)},
+	{"proxy_pass with variable", strings.Replace(policyTestValid, "http://127.0.0.1:3000", "http://$host:3000", 1)},
+	{"proxy_pass port zero", strings.Replace(policyTestValid, "127.0.0.1:3000", "127.0.0.1:0", 1)},
+	{"proxy_pass port too high", strings.Replace(policyTestValid, "127.0.0.1:3000", "127.0.0.1:70000", 1)},
+	{"two proxy_pass", policyTestInLocation("proxy_pass http://127.0.0.1:4000;")},
+	{"no proxy_pass", strings.Replace(policyTestValid, "        proxy_pass http://127.0.0.1:3000;\n", "", 1)},
+	{"no server_name", strings.Replace(policyTestValid, "    server_name app.example.test;\n", "", 1)},
+	{"two server_names", policyTestInServer("server_name app.example.test;")},
+	{"auth_basic_user_file raw", policyTestInServer("auth_basic_user_file " + policyTestAuth + ";")},
+
 	{"long line", strings.Replace(policyTestValid, "DENY always", "\""+strings.Repeat("a", 4096)+"\" always", 1)},
 	{"long comment", "#" + strings.Repeat("a", 4096) + "\n" + policyTestValid},
+}
+
+// TestValidateManagedNamesDirectiveAndLine checks that a refusal tells the
+// operator which directive on which line broke the policy, without quoting
+// argument values.
+func TestValidateManagedNamesDirectiveAndLine(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"unknown directive in server", policyTestInServer("include /etc/nginx/secret.conf;"), `line 8: nginx directive "include" is not allowed in the server block`},
+		{"unknown directive in location", policyTestInLocation("proxy_cache_path /etc/x keys_zone=a:1m;"), `line 9: nginx directive "proxy_cache_path" is not allowed in location /`},
+		{"bad arguments", policyTestInLocation("access_log /etc/cron.d/x;"), `line 9: nginx directive "access_log" has unsupported arguments in location /`},
+		{"lua block", policyTestInLocation("content_by_lua_block { ngx.say(1); }"), `line 9: nginx block "content_by_lua_block" is not allowed inside location /`},
+		{"second location", strings.Replace(policyTestValid, "    location / {", "    location /x {\n    }\n    location / {", 1), `line 8: nginx block "location" is not allowed in the server block`},
+		{"top-level directive", "\n\nerror_log /tmp/x.log;\n" + policyTestValid, `line 3: top-level directives are not allowed`},
+		{"redirect server", policyTestInRedirect("root /;"), `line 5: nginx directive "root" is not allowed in the redirect server block`},
+		{"quoted name", policyTestInServer(`"include" /etc/x;`), `line 8: nginx directive is not in plain form`},
+		{"no proxy_pass", strings.Replace(policyTestValid, "        proxy_pass http://127.0.0.1:3000;\n", "", 1), `line 8: location / needs exactly one proxy_pass, found 0`},
+		{"duplicate", policyTestInServer("gzip on;\n    gzip on;"), `line 9: nginx directive "gzip" appears more than once in the server block`},
+		{"buffer set", policyTestInLocation("proxy_buffer_size 1m;"), `line 8: the proxy buffer settings of location / must set proxy_buffer_size, proxy_buffers and proxy_busy_buffers_size together`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateManaged(tt.content, policyTestPolicy)
+			if err == nil {
+				t.Fatalf("refused config admitted:\n%s", tt.content)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %q, want it to contain %q", err, tt.want)
+			}
+			for _, secret := range []string{"/etc/nginx/secret.conf", "/etc/cron.d/x", "ngx.say", "keys_zone"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error quotes an argument value %q: %q", secret, err)
+				}
+			}
+		})
+	}
+}
+
+// policyTestNginxRejects names refused cases that nginx -t itself rejects.
+// The Docker agreement test checks that, so these cases keep exercising the
+// nginx checks the policy mirrors.
+var policyTestNginxRejects = map[string]bool{
+	"duplicate gzip": true, "duplicate gzip in location": true, "duplicate server_tokens": true,
+	"duplicate client_max_body_size": true, "duplicate proxy_buffering": true,
+	"duplicate http2": true, "duplicate proxy_read_timeout": true,
+	"proxy_buffer_size alone": true, "proxy_busy_buffers_size alone": true, "proxy_buffers one buffer": true,
+	"busy above buffers minus one": true, "busy below buffer size": true, "busy below one buffer": true,
+	"location overrides into bad set": true,
+}
+
+func TestPolicyTestNginxRejectsNamesRefusedCases(t *testing.T) {
+	refused := map[string]bool{}
+	for _, tt := range policyTestRefused {
+		refused[tt.name] = true
+	}
+	for name := range policyTestNginxRejects {
+		if !refused[name] {
+			t.Errorf("policyTestNginxRejects names %q, which is not a refused case", name)
+		}
+	}
 }
 
 func TestValidateManagedRefusesUnboundedVHost(t *testing.T) {

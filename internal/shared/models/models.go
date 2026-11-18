@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -104,6 +105,10 @@ type ProxyCapabilities struct {
 	// ErrorLogLevel reports that the backend can set a per-domain error log
 	// level.
 	ErrorLogLevel bool `json:"error_log_level"`
+	// HeaderConfigVars reports that the backend replaces "${NAME}" in header
+	// values with an environment variable or Define value when it loads the
+	// config (Apache), so such values are refused.
+	HeaderConfigVars bool `json:"header_config_vars"`
 }
 
 // ProxyDetection is the agent's read-only Phase-0 detection result (§13.0, §2.1,
@@ -406,6 +411,11 @@ type ProxyConfig struct {
 	// or for orchestrator-down resilience; "off" disables TLS. Empty is treated as
 	// "central" by the renderer.
 	TLSPolicy string `json:"tls_policy,omitempty"`
+	// TLSWildcard serves the domain from the one "*.<zone>" certificate shared
+	// by every opted-in domain of its zone instead of a per-host certificate.
+	// Only valid with central TLS and for a single label directly below the
+	// zone apex; an imported certificate for the host still takes precedence.
+	TLSWildcard bool `json:"tls_wildcard,omitempty"`
 	// AccessLog is "off" to write no access log for this domain. Empty (or
 	// "default", normalized to empty on save) keeps the proxy's host-wide log.
 	AccessLog string `json:"access_log,omitempty"`
@@ -433,6 +443,21 @@ func (pc *ProxyConfig) NormalizeLogging() error {
 	return nil
 }
 
+// CheckHeadersSupported refuses custom header values the serving agent's
+// backend would not send literally: values with "${" on a backend that
+// replaces config-time variables (HeaderConfigVars). backendKind is the
+// detected proxy kind; an Apache agent from before the capability existed
+// reports it as false, so "apache" is refused by kind as well.
+func (pc ProxyConfig) CheckHeadersSupported(caps *ProxyCapabilities, backendKind string) error {
+	if (caps == nil || !caps.HeaderConfigVars) && backendKind != "apache" {
+		return nil
+	}
+	if err := proxymodel.CheckHeaderConfigVars(pc.CustomRequestHeaders, pc.CustomResponseHeaders); err != nil {
+		return fmt.Errorf("the agent's Apache cannot send this header literally: %w", err)
+	}
+	return nil
+}
+
 // CheckLoggingSupported refuses logging settings the serving agent's backend
 // cannot render. A nil matrix (agent never reported one) is not checked.
 // Agents from before these capabilities existed report them as false, which
@@ -451,6 +476,54 @@ func (pc ProxyConfig) CheckLoggingSupported(caps *ProxyCapabilities, backend str
 		return fmt.Errorf("%s cannot set a per-domain error log level", backend)
 	}
 	return nil
+}
+
+// ErrDNSTakeoverRefused is wrapped by a takeover or preview that is refused
+// because of the domain itself (cert-only, being deleted), not because a
+// provider call failed.
+var ErrDNSTakeoverRefused = errors.New("DNS takeover refused")
+
+// ErrDNSTakeoverPlanChanged is wrapped by a takeover whose caller named the
+// records it expects to delete (from a preview) when the records at the name
+// are no longer exactly those. Nothing was changed.
+var ErrDNSTakeoverPlanChanged = errors.New("DNS records changed since the preview")
+
+// DNSTakeoverAction is what a DNS takeover does at the domain's name.
+type DNSTakeoverAction string
+
+const (
+	// DNSTakeoverAdopt: the desired CNAME already exists; it is taken over as
+	// managed and nothing is deleted.
+	DNSTakeoverAdopt DNSTakeoverAction = "adopt"
+	// DNSTakeoverReplace: every record at the name is deleted, then the CNAME
+	// is created.
+	DNSTakeoverReplace DNSTakeoverAction = "replace"
+	// DNSTakeoverCreate: the name is free; the CNAME is created.
+	DNSTakeoverCreate DNSTakeoverAction = "create"
+)
+
+// DNSRecordInfo is a provider record as shown to an operator.
+type DNSRecordInfo struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Content string `json:"content"`
+	Proxied bool   `json:"proxied"`
+}
+
+// DNSTakeoverPlan describes what a DNS takeover of one domain does: the
+// records it deletes and the CNAME it leaves in place. The preview returns it
+// without changing anything; the takeover returns what it carried out.
+type DNSTakeoverPlan struct {
+	DomainID int64             `json:"domain_id"`
+	FQDN     string            `json:"fqdn"`
+	Target   string            `json:"target"`
+	Action   DNSTakeoverAction `json:"action"`
+	// Delete lists every record at the name the takeover deletes, of any
+	// type (MX, TXT and so on included): a CNAME cannot share its name.
+	Delete []DNSRecordInfo `json:"delete"`
+	// Proxied is the Cloudflare proxy state the CNAME gets (or keeps).
+	Proxied bool `json:"proxied"`
 }
 
 // Domain represents a proxied subdomain.
@@ -482,12 +555,16 @@ type Domain struct {
 	// proxy state the live record already has (a new record starts DNS-only).
 	// true / false are enforced by the reconciler as desired state. Only zones
 	// whose provider supports proxying accept true.
-	Proxied    *bool        `json:"proxied"`
-	Status     DomainStatus `json:"status"`
-	ErrorMsg   string       `json:"error_msg,omitempty"`
-	LastSynced *time.Time   `json:"last_synced,omitempty"`
-	CreatedAt  time.Time    `json:"created_at"`
-	UpdatedAt  time.Time    `json:"updated_at"`
+	Proxied  *bool        `json:"proxied"`
+	Status   DomainStatus `json:"status"`
+	ErrorMsg string       `json:"error_msg,omitempty"`
+	// DNSError is why the domain's public DNS record could not be created,
+	// adopted or corrected in the last DNS pass. While it is set the domain
+	// stays in error with this reason, whatever the route apply reports.
+	DNSError   string     `json:"dns_error,omitempty"`
+	LastSynced *time.Time `json:"last_synced,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 // OptionalBool is a PATCH-style JSON field for a tri-state bool: Set is false
