@@ -57,9 +57,14 @@ func (s AgentUpgradeState) Terminal() bool {
 
 // CanTransitionUpgrade reports whether an upgrade in state from may move to
 // state to. Moves are forward-only, may skip intermediate states (a lost report
-// must not wedge the machine), and never leave a terminal state. Repeating the
+// must not wedge the machine), and never leave a terminal state, with one
+// exception: done may still become rolled_back, because done can be inferred
+// from a heartbeat before the applier's own verdict arrives. Repeating the
 // current non-terminal state is allowed so a retried report is idempotent.
 func CanTransitionUpgrade(from, to AgentUpgradeState) bool {
+	if from == UpgradeDone && to == UpgradeRolledBack {
+		return true
+	}
 	if !from.Valid() || !to.Valid() || from.Terminal() {
 		return false
 	}
@@ -225,6 +230,13 @@ func isDigits(s string) bool {
 // numericIdentifier is a non-empty digit string without a leading zero.
 func numericIdentifier(s string) bool {
 	return isDigits(s) && (s == "0" || s[0] != '0') && len(s) <= 9
+}
+
+// IsPrereleaseVersion reports whether v is a release version with a
+// -prerelease suffix (an -rc, -beta and so on).
+func IsPrereleaseVersion(v string) bool {
+	rv, ok := parseReleaseVersion(strings.TrimPrefix(strings.TrimSpace(v), "v"))
+	return ok && len(rv.pre) > 0
 }
 
 // CompareReleaseVersions orders two release versions by semver precedence

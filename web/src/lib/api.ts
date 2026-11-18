@@ -144,13 +144,19 @@ export const api = {
       method: 'POST', body: JSON.stringify({ diagnostic_id: diagnosticId, action }),
     }),
   // Agent self-update (#73). An empty version means the orchestrator's own.
-  upgradeAgent: (id: string, version?: string) =>
-    request<AgentUpgrade>(`/agents/${id}/upgrade`, { method: 'POST', body: JSON.stringify(version ? { version } : {}) }),
+  upgradeAgent: (id: string, version?: string, allowPrerelease = false) =>
+    request<AgentUpgrade>(`/agents/${id}/upgrade`, {
+      method: 'POST',
+      body: JSON.stringify({ ...(version ? { version } : {}), ...(allowPrerelease ? { allow_prerelease: true } : {}) }),
+    }),
   listAgentUpgrades: (id: string) => request<AgentUpgrade[]>(`/agents/${id}/upgrades`),
   setAgentAutoUpgrade: (id: string, enabled: boolean) =>
     request<{ auto_upgrade: boolean }>(`/agents/${id}/auto-upgrade`, { method: 'PUT', body: JSON.stringify({ enabled }) }),
-  upgradeOutdatedAgents: (version?: string) =>
-    request<UpgradeRollout>('/agents/upgrade-outdated', { method: 'POST', body: JSON.stringify(version ? { version } : {}) }),
+  upgradeOutdatedAgents: (version?: string, allowPrerelease = false) =>
+    request<UpgradeRollout>('/agents/upgrade-outdated', {
+      method: 'POST',
+      body: JSON.stringify({ ...(version ? { version } : {}), ...(allowPrerelease ? { allow_prerelease: true } : {}) }),
+    }),
   getUpgradeRollout: () => request<{ rollout: UpgradeRollout | null }>('/agents/upgrade-rollout'),
   setAgentSafeAutoRepair: (id: string, mode: 'inherit' | 'enabled' | 'disabled') =>
     request<{ mode: string; safe_auto_repair_effective: boolean }>(`/agents/${id}/safe-auto-repair`, {

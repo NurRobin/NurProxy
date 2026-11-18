@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { outdatedAgents, rolloutRunning, upgradeActive, upgradeAvailability, upgradeTone } from '../src/lib/upgrade.ts';
+import { isPrerelease, outdatedAgents, rolloutRunning, upgradeActive, upgradeAvailability, upgradeTone } from '../src/lib/upgrade.ts';
 import type { Agent, AgentUpgrade, AgentUpgradeState } from '../src/lib/types.ts';
 
 const upgrade = (state: AgentUpgradeState) => ({ id: 'u1', agent_id: 'a1', state } as AgentUpgrade);
@@ -44,4 +44,9 @@ test('rolloutRunning', () => {
   assert.equal(rolloutRunning(null), false);
   assert.equal(rolloutRunning({ state: 'running' } as never), true);
   assert.equal(rolloutRunning({ state: 'failed' } as never), false);
+});
+
+test('isPrerelease recognizes -rc and -beta release versions only', () => {
+  for (const v of ['1.4.0-rc.1', 'v0.6.0-beta.2']) assert.equal(isPrerelease(v), true, v);
+  for (const v of ['1.4.0', 'v1.4.0', 'dev', '', undefined]) assert.equal(isPrerelease(v), false, String(v));
 });

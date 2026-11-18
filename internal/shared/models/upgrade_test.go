@@ -16,6 +16,8 @@ func TestCanTransitionUpgrade(t *testing.T) {
 		{UpgradeRestarting, UpgradeRolledBack, true},
 		{UpgradeRestarting, UpgradeInstalled, false},
 		{UpgradeDone, UpgradeFailed, false},
+		{UpgradeDone, UpgradeRolledBack, true},
+		{UpgradeFailed, UpgradeRolledBack, false},
 		{UpgradeFailed, UpgradeDone, false},
 		{UpgradeRolledBack, UpgradeRolledBack, false},
 		{"bogus", UpgradeDone, false},
@@ -24,6 +26,17 @@ func TestCanTransitionUpgrade(t *testing.T) {
 	for _, tc := range cases {
 		if got := CanTransitionUpgrade(tc.from, tc.to); got != tc.want {
 			t.Errorf("%s -> %s: got %v, want %v", tc.from, tc.to, got, tc.want)
+		}
+	}
+}
+
+func TestIsPrereleaseVersion(t *testing.T) {
+	cases := map[string]bool{
+		"1.0.0": false, "v1.0.0": false, "1.0.0-rc.1": true, "v0.6.0-beta.2": true, "dev": false, "": false,
+	}
+	for v, want := range cases {
+		if got := IsPrereleaseVersion(v); got != want {
+			t.Errorf("IsPrereleaseVersion(%q) = %v, want %v", v, got, want)
 		}
 	}
 }

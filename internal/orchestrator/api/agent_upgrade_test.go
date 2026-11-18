@@ -225,6 +225,32 @@ func TestAgentUpgradeRefusals(t *testing.T) {
 		}
 	}
 
+	// Pre-releases need an explicit opt-in, as a requested version and as the
+	// orchestrator's own default.
+	if code, body := e.admin("POST", "/api/v1/agents/fine/upgrade", map[string]string{"version": "1.4.0-rc.1"}); code != http.StatusBadRequest || !strings.Contains(body, "pre-release") {
+		t.Fatalf("pre-release without opt-in: %d %s", code, body)
+	}
+	if code, body := e.admin("POST", "/api/v1/agents/fine/upgrade", map[string]any{"version": "1.4.0-rc.1", "allow_prerelease": true}); code != http.StatusAccepted {
+		t.Fatalf("pre-release with opt-in: %d %s", code, body)
+	}
+	rc := newUpgradeEnv(t, "1.4.0-rc.1")
+	rc.agent("a", "1.2.0", true)
+	if code, body := rc.admin("POST", "/api/v1/agents/a/upgrade", nil); code != http.StatusBadRequest || !strings.Contains(body, "pre-release") {
+		t.Fatalf("pre-release default target: %d %s", code, body)
+	}
+	if code, body := rc.admin("POST", "/api/v1/agents/upgrade-outdated", nil); code != http.StatusBadRequest || !strings.Contains(body, "pre-release") {
+		t.Fatalf("pre-release rollout: %d %s", code, body)
+	}
+	if code, body := rc.admin("PUT", "/api/v1/agents/a/auto-upgrade", map[string]bool{"enabled": true}); code != http.StatusOK {
+		t.Fatalf("auto-upgrade: %d %s", code, body)
+	}
+	rc.srv.upgrades.autoUpgradeOnce(context.Background())
+	select {
+	case ev := <-rc.events["a"]:
+		t.Fatalf("auto-upgrade installed a pre-release: %s", ev.Type)
+	default:
+	}
+
 	dev := newUpgradeEnv(t, "dev")
 	dev.agent("a", "1.2.0", true)
 	if code, body := dev.admin("POST", "/api/v1/agents/a/upgrade", nil); code != http.StatusBadRequest || !strings.Contains(body, "not a release") {
@@ -252,13 +278,31 @@ func TestAgentUpgradeCompletionRules(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 
-	// A heartbeat on the target version completes a restarting upgrade even if
-	// the done report was lost.
+	// A heartbeat on the target version does not complete a restarting upgrade
+	// while the applier may still roll back...
 	id = start()
 	e.report("a", id, models.UpgradeRestarting, "1.2.0", "")
 	e.heartbeat("a", map[string]any{"version": "1.3.0"})
+	if got := e.upgrade(id); got.State != models.UpgradeRestarting {
+		t.Fatalf("heartbeat completed the upgrade before the applier committed: %+v", got)
+	}
+	// ...but does after the confirmation window, so a lost done report does not
+	// leave it hanging.
+	e.srv.upgrades.now = func() time.Time { return time.Now().Add(upgradeConfirmWindow + time.Second) }
+	e.heartbeat("a", map[string]any{"version": "1.3.0"})
+	e.srv.upgrades.now = time.Now
 	if got := e.upgrade(id); got.State != models.UpgradeDone {
-		t.Fatalf("heartbeat did not complete the upgrade: %+v", got)
+		t.Fatalf("heartbeat after the window did not complete the upgrade: %+v", got)
+	}
+	// A rollback the applier reports afterwards still wins over that done.
+	if code := e.report("a", id, models.UpgradeRolledBack, "1.2.0", "the new agent did not report healthy"); code != http.StatusOK {
+		t.Fatalf("rolled_back after done: HTTP %d", code)
+	}
+	if got := e.upgrade(id); got.State != models.UpgradeRolledBack {
+		t.Fatalf("rolled_back did not override done: %+v", got)
+	}
+	if code := e.report("a", id, models.UpgradeDone, "1.3.0", ""); code != http.StatusConflict {
+		t.Fatalf("done after rolled_back: HTTP %d", code)
 	}
 
 	// A rolled-back report keeps the agent's error.

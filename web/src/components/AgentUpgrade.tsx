@@ -46,6 +46,7 @@ export function AgentUpgradePanel({ agent, orchestratorVersion, onAgentChanged }
   const toast = useToast();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [version, setVersion] = useState('');
+  const [allowPrerelease, setAllowPrerelease] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [autoSaving, setAutoSaving] = useState<boolean | null>(null);
   const [history, setHistory] = useState<AgentUpgrade[] | null>(null);
@@ -60,6 +61,7 @@ export function AgentUpgradePanel({ agent, orchestratorVersion, onAgentChanged }
 
   function openDialog() {
     setVersion('');
+    setAllowPrerelease(false);
     setDialogOpen(true);
   }
 
@@ -67,7 +69,7 @@ export function AgentUpgradePanel({ agent, orchestratorVersion, onAgentChanged }
     setSubmitting(true);
     try {
       const target = version.trim();
-      await api.upgradeAgent(agent.id, target || undefined);
+      await api.upgradeAgent(agent.id, target || undefined, allowPrerelease);
       toast.success(t('agents.upgrade.requested', { name: agent.name }));
       setDialogOpen(false);
       setHistory(null);
@@ -190,6 +192,14 @@ export function AgentUpgradePanel({ agent, orchestratorVersion, onAgentChanged }
               autoComplete="off"
             />
           </Field>
+          <div>
+            <Checkbox
+              label={t('agents.upgrade.allowPrerelease')}
+              checked={allowPrerelease}
+              onChange={(e) => setAllowPrerelease(e.target.checked)}
+            />
+            <p className="mt-1 pl-6 text-xs text-fg-faint">{t('agents.upgrade.allowPrereleaseHint')}</p>
+          </div>
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={() => setDialogOpen(false)}>{t('common.cancel')}</Button>
             <Button onClick={submit} loading={submitting}>{t('agents.upgrade.confirm')}</Button>

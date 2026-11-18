@@ -330,7 +330,7 @@ func cmdAgent(args []string) {
 
 	default:
 		usage("agent", "list", "status <id>", "adopt <id>", "update <id>", "reject <id>", "delete <id> [--cascade]",
-			"upgrade <id> [--version X] [--wait]", "upgrade --all-outdated [--version X] [--wait]", "upgrades <id>", "auto-upgrade <id> --enabled=true|false")
+			"upgrade <id> [--version X] [--allow-prerelease] [--wait]", "upgrade --all-outdated [--version X] [--allow-prerelease] [--wait]", "upgrades <id>", "auto-upgrade <id> --enabled=true|false")
 	}
 }
 
@@ -344,17 +344,21 @@ func cmdAgentUpgrade(args []string) {
 		}
 	}
 	var version string
-	var wait *bool
+	var wait, allowPrerelease *bool
 	setup := func(fs *flag.FlagSet) {
 		fs.StringVar(&version, "version", "", "target release (default: the orchestrator's version)")
 		wait = fs.Bool("wait", false, "wait until the upgrade (or rollout) finishes")
+		allowPrerelease = fs.Bool("allow-prerelease", false, "allow a pre-release target (-rc, -beta); refused otherwise")
 		fs.Bool("all-outdated", false, "upgrade every outdated agent, one at a time, stopping at the first failure")
 	}
-	body := map[string]string{}
+	body := map[string]any{}
 	if all {
 		c, _, _ := parseClient("agent upgrade", args, "", setup)
 		if version != "" {
 			body["version"] = version
+		}
+		if *allowPrerelease {
+			body["allow_prerelease"] = true
 		}
 		raw, err := c.do(http.MethodPost, "/api/v1/agents/upgrade-outdated", body)
 		if err != nil {
@@ -396,6 +400,9 @@ func cmdAgentUpgrade(args []string) {
 	c, _, id := parseClient("agent upgrade", args, "agent id", setup)
 	if version != "" {
 		body["version"] = version
+	}
+	if *allowPrerelease {
+		body["allow_prerelease"] = true
 	}
 	raw, err := c.do(http.MethodPost, "/api/v1/agents/"+id+"/upgrade", body)
 	if err != nil {

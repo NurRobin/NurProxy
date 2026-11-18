@@ -19,9 +19,12 @@ import (
 
 // Agent self-update coordination (#73). The orchestrator records an upgrade,
 // pushes the command down the agent's stream and follows the agent's progress
-// reports. A sweeper fails upgrades that stop reporting, a heartbeat that
-// carries the target version completes one, and a rollout runs upgrades one
-// agent at a time and stops at the first failure.
+// reports. Success normally comes from the agent relaying the root applier's
+// committed result. A sweeper fails upgrades that stop reporting, a heartbeat
+// on the target version completes one only after upgradeConfirmWindow (the
+// applier may still roll back before that), and a rollout runs upgrades one
+// agent at a time and stops at the first failure. Pre-releases are only
+// installed when the operator asks for them explicitly.
 
 // How long an upgrade may sit in a state before the orchestrator gives up.
 // restarting covers the agent's own health window (3 min) plus a rollback.
@@ -31,6 +34,12 @@ var upgradeStateTimeouts = map[models.AgentUpgradeState]time.Duration{
 	models.UpgradeInstalled:   5 * time.Minute,
 	models.UpgradeRestarting:  10 * time.Minute,
 }
+
+// upgradeConfirmWindow is how long a restarting upgrade must have been waiting
+// before a heartbeat on the target version alone completes it. It exceeds the
+// applier's health window (selfupdate.DefaultHealthTimeout, 3 min), so by then
+// the applier has either committed or rolled back and reported it.
+const upgradeConfirmWindow = 5 * time.Minute
 
 // Rollout agent states.
 const (
@@ -74,11 +83,12 @@ type upgradeCoordinator struct {
 
 	poll          time.Duration
 	settleTimeout time.Duration
+	confirmWindow time.Duration
 	now           func() time.Time
 }
 
 func newUpgradeCoordinator(s *Server) *upgradeCoordinator {
-	return &upgradeCoordinator{s: s, poll: 2 * time.Second, settleTimeout: 2 * time.Minute, now: time.Now}
+	return &upgradeCoordinator{s: s, poll: 2 * time.Second, settleTimeout: 2 * time.Minute, confirmWindow: upgradeConfirmWindow, now: time.Now}
 }
 
 // upgradeError carries the HTTP status for a refused upgrade request.
@@ -93,18 +103,23 @@ func refuse(status int, format string, args ...any) error {
 	return &upgradeError{status: status, msg: fmt.Sprintf(format, args...)}
 }
 
-// resolveTarget picks the requested version or the orchestrator's own.
-func (c *upgradeCoordinator) resolveTarget(requested string) (string, error) {
+// resolveTarget picks the requested version or the orchestrator's own. A
+// pre-release target (-rc, -beta, ...) is refused unless allowPrerelease is set.
+func (c *upgradeCoordinator) resolveTarget(requested string, allowPrerelease bool) (string, error) {
+	var v string
 	if strings.TrimSpace(requested) == "" {
-		v, ok := models.NormalizeReleaseVersion(c.s.version)
-		if !ok {
+		var ok bool
+		if v, ok = models.NormalizeReleaseVersion(c.s.version); !ok {
 			return "", refuse(http.StatusBadRequest, "the orchestrator runs %q, which is not a release; pass an explicit version", c.s.version)
 		}
-		return v, nil
+	} else {
+		var ok bool
+		if v, ok = models.NormalizeReleaseVersion(requested); !ok {
+			return "", refuse(http.StatusBadRequest, "invalid version %q (want MAJOR.MINOR.PATCH[-PRERELEASE])", requested)
+		}
 	}
-	v, ok := models.NormalizeReleaseVersion(requested)
-	if !ok {
-		return "", refuse(http.StatusBadRequest, "invalid version %q (want MAJOR.MINOR.PATCH[-PRERELEASE])", requested)
+	if models.IsPrereleaseVersion(v) && !allowPrerelease {
+		return "", refuse(http.StatusBadRequest, "%s is a pre-release; agents only move to final releases unless you allow pre-releases explicitly (allow_prerelease)", v)
 	}
 	return v, nil
 }
@@ -185,14 +200,19 @@ func (c *upgradeCoordinator) systemAudit(actor, agentID string) func(action, det
 	}
 }
 
-// observeVersion completes an unfinished upgrade once the agent reports the
-// target version (a lost "done" report must not leave it hanging).
+// observeVersion completes a restarting upgrade when the agent heartbeats the
+// target version and the applier had upgradeConfirmWindow to report, so a lost
+// "done" report does not leave it hanging. Earlier, the version alone proves
+// nothing: the applier may still roll back.
 func (c *upgradeCoordinator) observeVersion(agentID, version string, audit func(action, details string)) {
 	up, err := c.s.db.ActiveAgentUpgrade(agentID)
-	if err != nil || up == nil {
+	if err != nil || up == nil || up.State != models.UpgradeRestarting {
 		return
 	}
 	if v, ok := models.NormalizeReleaseVersion(version); !ok || v != up.TargetVersion {
+		return
+	}
+	if c.now().Sub(up.UpdatedAt) < c.confirmWindow {
 		return
 	}
 	if _, err := c.apply(up.ID, models.UpgradeDone, "", audit); err != nil && !errors.Is(err, db.ErrUpgradeTransition) {
@@ -415,7 +435,8 @@ func (c *upgradeCoordinator) waitHealthy(ctx context.Context, upgradeID, agentID
 // this version.
 func (c *upgradeCoordinator) autoUpgradeOnce(ctx context.Context) {
 	target, ok := models.NormalizeReleaseVersion(c.s.version)
-	if !ok || c.s.hub == nil {
+	// Automatic upgrades never install a pre-release.
+	if !ok || c.s.hub == nil || models.IsPrereleaseVersion(target) {
 		return
 	}
 	settings, err := c.s.db.ListAgentSelfUpdate()
@@ -492,31 +513,35 @@ func writeUpgradeError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "upgrade failed")
 }
 
-// readOptionalVersion decodes {"version": "..."} from an optional body.
-func readOptionalVersion(r *http.Request) (string, error) {
-	var req struct {
-		Version string `json:"version"`
-	}
+// upgradeRequest is the optional body of the upgrade endpoints.
+type upgradeRequest struct {
+	Version         string `json:"version"`
+	AllowPrerelease bool   `json:"allow_prerelease"`
+}
+
+// readUpgradeRequest decodes an optional upgradeRequest body.
+func readUpgradeRequest(r *http.Request) (upgradeRequest, error) {
+	var req upgradeRequest
 	if r.Body == nil {
-		return "", nil
+		return req, nil
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 4096))
 	if err != nil {
-		return "", fmt.Errorf("reading request body: %w", err)
+		return req, fmt.Errorf("reading request body: %w", err)
 	}
 	if strings.TrimSpace(string(body)) == "" {
-		return "", nil
+		return req, nil
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return "", fmt.Errorf("invalid JSON body: %w", err)
+		return req, fmt.Errorf("invalid JSON body: %w", err)
 	}
-	return req.Version, nil
+	return req, nil
 }
 
 // POST /api/v1/agents/{id}/upgrade
 func (s *Server) handleUpgradeAgent(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
-	requested, err := readOptionalVersion(r)
+	req, err := readUpgradeRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -526,7 +551,7 @@ func (s *Server) handleUpgradeAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
 	}
-	target, err := s.upgrades.resolveTarget(requested)
+	target, err := s.upgrades.resolveTarget(req.Version, req.AllowPrerelease)
 	if err != nil {
 		writeUpgradeError(w, err)
 		return
@@ -581,12 +606,12 @@ func (s *Server) handleSetAutoUpgrade(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/v1/agents/upgrade-outdated
 func (s *Server) handleUpgradeOutdated(w http.ResponseWriter, r *http.Request) {
-	requested, err := readOptionalVersion(r)
+	req, err := readUpgradeRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	target, err := s.upgrades.resolveTarget(requested)
+	target, err := s.upgrades.resolveTarget(req.Version, req.AllowPrerelease)
 	if err != nil {
 		writeUpgradeError(w, err)
 		return

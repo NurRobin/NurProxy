@@ -7,6 +7,11 @@ export function upgradeActive(upgrade: AgentUpgrade | undefined | null): boolean
   return !!upgrade && ACTIVE_STATES.has(upgrade.state);
 }
 
+/** True for a release version with a pre-release suffix such as -rc.1 or -beta.2. */
+export function isPrerelease(version: string | undefined | null): boolean {
+  return !!version && /^v?\d+\.\d+\.\d+-[0-9A-Za-z.-]+$/.test(version.trim());
+}
+
 export type UpgradeTone = 'progress' | 'success' | 'danger';
 
 export function upgradeTone(state: AgentUpgradeState): UpgradeTone {

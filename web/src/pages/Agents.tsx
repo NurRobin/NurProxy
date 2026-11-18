@@ -24,7 +24,7 @@ import ExistingSetup from './ExistingSetup';
 import LogTailViewer from '../components/LogTailViewer';
 import RecoveryPanel from '../components/RecoveryPanel';
 import { AgentUpgradePanel, UpgradeRolloutPanel } from '../components/AgentUpgrade';
-import { outdatedAgents, rolloutRunning } from '../lib/upgrade';
+import { isPrerelease, outdatedAgents, rolloutRunning } from '../lib/upgrade';
 
 const seen = (d?: string) => (d ? formatRelativeTime(d) : i18n.t('time.never'));
 
@@ -225,7 +225,9 @@ export default function Agents() {
   async function handleRollout() {
     setRolloutStarting(true);
     try {
-      const r = await api.upgradeOutdatedAgents();
+      // A pre-release orchestrator version is only used as the rollout target
+      // because the confirm dialog says so explicitly.
+      const r = await api.upgradeOutdatedAgents(undefined, isPrerelease(orchestratorVersion));
       setRollout(r);
       setDismissedRolloutId(null);
       setConfirmRollout(false);
@@ -576,7 +578,7 @@ export default function Agents() {
           count: outdated.length,
           names: outdated.map((a) => a.name).join(', '),
           version: orchestratorVersion || '?',
-        })}
+        }) + (isPrerelease(orchestratorVersion) ? ' ' + t('agents.upgrade.rollout.confirmPrerelease', { version: orchestratorVersion }) : '')}
         confirmLabel={t('agents.upgrade.rollout.confirm')}
         loading={rolloutStarting}
       />
