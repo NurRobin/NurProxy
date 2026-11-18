@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
@@ -70,6 +71,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		// Proxied is the Cloudflare orange-cloud setting (#126): omitted/null
 		// keeps whatever the live record has, true/false is enforced.
 		Proxied *bool `json:"proxied"`
+		// TLSWildcard sets proxy_config.tls_wildcard without sending the
+		// whole proxy_config.
+		TLSWildcard *bool `json:"tls_wildcard"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -147,6 +151,13 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.TLSWildcard != nil {
+		dom.ProxyConfig.TLSWildcard = *req.TLSWildcard
+	}
+	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if err := s.db.CreateDomain(dom); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create domain")
@@ -154,6 +165,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "create", dom.Subdomain)
+	if dom.ProxyConfig.TLSWildcard {
+		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "tls_wildcard_set", dom.Subdomain+": on; "+tls.WildcardSharedKeyWarning)
+	}
 	if err := s.db.ClaimDomainRoute(dom); err != nil {
 		log.Printf("create: cannot drop colliding route tombstones for domain %d: %v", dom.ID, err)
 	}
@@ -172,6 +186,8 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 // that wants no central cert (self-acme / off) is skipped here, and the periodic
 // scan is the backstop if the async attempt fails. A no-op when no issuer is
 // wired (tests / headless without ACME) or the domain's zone can't be resolved.
+// A wildcard domain asks for its zone's shared "*.<zone>" cert, which the
+// issuer's per-host lock and on-file check issue only once per zone.
 func (s *Server) triggerCertIssuance(dom *models.Domain) {
 	if s.issuer == nil || dom == nil {
 		return
@@ -184,6 +200,9 @@ func (s *Server) triggerCertIssuance(dom *models.Domain) {
 		return
 	}
 	host := dom.FQDN(zone.Name)
+	if wildHost := caddygen.WildcardCertHost(*dom, zone.Name); wildHost != "" {
+		host = wildHost
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
@@ -263,6 +282,8 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		// proxy_config keys, applied after proxy_config.
 		AccessLog     *string `json:"access_log"`
 		ErrorLogLevel *string `json:"error_log_level"`
+		// TLSWildcard is the shortcut for proxy_config.tls_wildcard.
+		TLSWildcard *bool `json:"tls_wildcard"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -330,6 +351,15 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.TLSWildcard != nil {
+		dom.ProxyConfig.TLSWildcard = *req.TLSWildcard
+	}
+	// Checked against the final subdomain, zone and TLS policy, so a rename to a
+	// deeper name or a switch away from central TLS cannot leave a stale opt-in.
+	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Mark as pending for reconciler to pick up
 	dom.Status = models.DomainStatusPending
@@ -364,6 +394,13 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "update", dom.Subdomain)
+	if before.ProxyConfig.TLSWildcard != dom.ProxyConfig.TLSWildcard {
+		detail := dom.Subdomain + ": off"
+		if dom.ProxyConfig.TLSWildcard {
+			detail = dom.Subdomain + ": on; " + tls.WildcardSharedKeyWarning
+		}
+		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "tls_wildcard_set", detail)
+	}
 	if models.ProxiedLabel(before.Proxied) != models.ProxiedLabel(dom.Proxied) {
 		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "proxied_set",
 			fmt.Sprintf("%s: %s -> %s", dom.Subdomain, models.ProxiedLabel(before.Proxied), models.ProxiedLabel(dom.Proxied)))
@@ -390,8 +427,12 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.triggerAgentPush(dom.ServerID)
-	if rename != nil {
+	// Switching between the zone wildcard and a per-host cert changes which
+	// cert the host needs; issue it now rather than at the next scan.
+	if rename != nil || before.ProxyConfig.TLSWildcard != dom.ProxyConfig.TLSWildcard {
 		s.triggerCertIssuance(dom)
+	}
+	if rename != nil {
 		s.triggerDNSReconcile(dom.ID)
 	}
 

@@ -475,7 +475,11 @@ func (r *Renewer) issueAndSave(ctx context.Context, t RenewTarget) error {
 		r.logger.WarnContext(ctx, "tls: could not clear rate-limit backoff",
 			slog.String("host", t.Host), slog.Any("error", err))
 	}
-	r.auditEvent("certificate", t.Host, "renewed", fmt.Sprintf("re-issued %d name(s), re-pushing to serving agent", len(res.Names)))
+	details := fmt.Sprintf("re-issued %d name(s), re-pushing to serving agent", len(res.Names))
+	if t.IsWildcard {
+		details += "; " + WildcardSharedKeyWarning
+	}
+	r.auditEvent("certificate", t.Host, "renewed", details)
 
 	if r.reloader != nil {
 		if err := r.reloader.RepushCertForHost(ctx, t.Host); err != nil {
