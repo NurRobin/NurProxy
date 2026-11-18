@@ -64,6 +64,79 @@ the automatic config entirely. It's an expert escape hatch — the editor valida
 the JSON before saving and tells you if it's malformed. Use **Reset to automatic**
 to drop your overrides and go back to the generated config.
 
+## Advanced: raw nginx config
+
+On an nginx agent the Advanced tab holds the domain's nginx `server` block.
+The agent's root helper only writes a raw nginx config that stays inside a
+fixed policy, checked the way nginx itself reads the file:
+
+- At most two `server` blocks: the proxied server with exactly one
+  `location / { ... }`, and optionally a port-80 server that only does
+  `return 301 https://$host$request_uri;`. No other blocks (`http`, `map`,
+  `upstream`, `if`, nested or additional `location`s, `*_by_lua_block`, ...)
+  and no directives outside the server blocks.
+- The values NurProxy owns must match exactly: `server_name` (once) is the
+  domain, `listen` is `80`, `[::]:80`, `443 ssl` or `[::]:443 ssl` (plus
+  `http2` on old nginx), `ssl_certificate` / `ssl_certificate_key` are the
+  agent's certificate paths, and `location /` has exactly one
+  `proxy_pass http(s)://host:port;` without variables.
+
+Directives allowed in the server block and in `location /`:
+
+| Directive | Accepted values |
+|-----------|-----------------|
+| `client_max_body_size` | a size such as `50m`, `1g`, `0` |
+| `client_body_buffer_size` | a size up to `16m`, such as `128k` |
+| `add_header` | name, value (plain or double-quoted), optional `always` |
+| `proxy_set_header` | name, value (plain or double-quoted) |
+| `proxy_hide_header` | a header name |
+| `proxy_http_version` | `1.0` or `1.1` |
+| `proxy_connect_timeout`, `proxy_send_timeout`, `proxy_read_timeout` | a time of up to six digits, such as `60`, `30s`, `500ms`, `5m`, `1h` |
+| `proxy_buffering`, `proxy_request_buffering`, `proxy_ssl_server_name` | `on` or `off` |
+| `proxy_buffer_size`, `proxy_busy_buffers_size` | a size up to `16m`, such as `16k` (see below) |
+| `proxy_buffers` | a count from 2 to 64 and a size up to `16m`, e.g. `8 16k` (see below) |
+| `proxy_redirect` | `off` |
+| `gzip`, `gzip_vary` | `on` or `off` |
+| `gzip_comp_level` | `1` to `9` |
+| `gzip_min_length` | a size up to `1024m`, such as `1k` |
+| `gzip_types` | MIME types such as `text/css application/json`, or `*` |
+| `gzip_proxied` | nginx's flags (`off`, `expired`, `no-cache`, `no-store`, `private`, `no_last_modified`, `no_etag`, `auth`, `any`) |
+| `access_log` | `off` |
+
+Each directive may appear only once per block, except `add_header`,
+`proxy_set_header`, `proxy_hide_header`, `access_log`, `gzip_types` and
+`gzip_proxied` (and `allow`, `deny`, `error_log` in the server block), which
+nginx accepts repeatedly.
+
+The three proxy buffer directives must be set together (in the server block,
+in `location /`, or split between the two, which nginx merges), and they must
+pass nginx's own checks: `proxy_busy_buffers_size` at least as large as
+`proxy_buffer_size` and one `proxy_buffers` buffer, and at most the size of all
+`proxy_buffers` minus one buffer. For example
+`proxy_buffer_size 128k; proxy_buffers 4 256k; proxy_busy_buffers_size 256k;`.
+nginx's defaults for them depend on the host's memory page size, so setting
+only one of them could pass on one host and fail `nginx -t` on another.
+
+Only in the server block: `allow` / `deny` (an address, CIDR or `all`),
+`server_tokens on|off`, and `error_log /var/log/nginx/error.log <level>`
+(level `info` … `emerg`, the same form the Logging setting renders). Only in
+`location /`: `proxy_pass` and the two rewrite forms the path settings render,
+`rewrite ^/prefix/?(.*)$ /$1 break;` (with every regex character in the prefix
+escaped) and `rewrite ^.*$ /new/path break;`. The port-80 redirect server takes `listen`, `server_name`,
+`return` and the two logging directives.
+
+Everything else is refused: `include`, `root`, `alias`, `set`, Lua/Perl/njs,
+any directive that names a file (an `access_log` path, `proxy_temp_path`,
+`proxy_ssl_certificate`, ...), variables or quotes where a plain value is
+expected, and basic auth (use the domain's Basic auth setting instead). A
+refused config is only kept if exactly these bytes are already live on the
+host; otherwise the domain goes to **Error** and its message names the line
+and directive, for example:
+
+```
+privileged managed proxy reconciliation failed: local managed apply planning refused the desired state: raw nginx config for app.example.com: line 12: nginx directive "include" is not allowed in the server block; ...
+```
+
 ## Status
 
 - **Pending** — being created or synced.

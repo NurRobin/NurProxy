@@ -514,6 +514,59 @@ func TestManagedApplyRawNginxLogDirectivesPolicy(t *testing.T) {
 	}
 }
 
+// TestManagedApplyRawNginxTuningAndRefusalReason checks that a raw config with
+// common tuning directives is written, and that a refused one fails planning
+// with a reason that names the route, directive and line but no argument.
+func TestManagedApplyRawNginxTuningAndRefusalReason(t *testing.T) {
+	const base = `server {
+    listen 80;
+    server_name app.example.com;
+    client_max_body_size 50m;
+    %s
+    location / {
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_pass http://10.0.0.2:8080;
+    }
+}`
+	tests := []struct {
+		name       string
+		statement  string
+		wantReason string
+	}{
+		{name: "tuning admitted", statement: "gzip on;\n    add_header X-Robots-Tag noindex;"},
+		{name: "include refused", statement: "include /etc/nginx/private.conf;", wantReason: `raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "include" is not allowed in the server block`},
+		{name: "access_log file refused", statement: "access_log /etc/nginx/private.log;", wantReason: `raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "access_log" has unsupported arguments in the server block`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, intent, _ := newManagedApplyTest(t)
+			intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: fmt.Sprintf(base, tt.statement)}
+			_, err := action.Plan(context.Background(), intent)
+			if tt.wantReason == "" {
+				if err != nil {
+					t.Fatalf("raw config with tuning directives was refused: %v", err)
+				}
+				compilation, err := action.compile(intent)
+				if err != nil || len(compilation.Files) != 1 || compilation.Files[0].Preserve || !strings.Contains(string(compilation.Files[0].Content), "gzip on;") {
+					t.Fatalf("raw config with tuning directives was not compiled for writing: %+v, %v", compilation, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("policy-foreign raw config was admitted")
+			}
+			message := localPolicyRefusalReason(err)
+			if message != tt.wantReason {
+				t.Fatalf("refusal reason = %q, want %q", message, tt.wantReason)
+			}
+			if strings.Contains(message, "/etc/nginx/private") {
+				t.Fatalf("refusal message quotes an argument: %q", message)
+			}
+		})
+	}
+}
+
 func TestManagedApplyPreservesExactExistingPolicyForeignRawConfiguration(t *testing.T) {
 	action, intent, host := newManagedApplyTest(t)
 	action.agentUID = uint32(os.Getuid()) + 1

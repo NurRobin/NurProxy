@@ -59,6 +59,14 @@ func TestValidateManagedAgreesWithRealNginx(t *testing.T) {
 	for name, generated := range policyTestGeneratedConfigs(t) {
 		cases = append(cases, nginxCase{name: "generated/" + name, content: offline.Replace(generated.full), admitted: true, validate: ValidateRendered})
 	}
+	for i, statement := range policyTestTuning {
+		cases = append(cases,
+			nginxCase{name: fmt.Sprintf("tuning server/%02d %s", i, statement), content: policyTestInServer(statement), admitted: true, validate: ValidateManaged},
+			nginxCase{name: fmt.Sprintf("tuning location/%02d %s", i, statement), content: policyTestInLocation(statement), admitted: true, validate: ValidateManaged})
+	}
+	for i, statement := range policyTestServerOnly {
+		cases = append(cases, nginxCase{name: fmt.Sprintf("tuning server only/%02d %s", i, statement), content: policyTestInServer(statement), admitted: true, validate: ValidateManaged})
+	}
 	for _, tt := range policyTestRefused {
 		cases = append(cases, nginxCase{name: "refused/" + tt.name, content: tt.content, validate: ValidateManaged})
 	}
@@ -184,6 +192,9 @@ true`
 		}
 		if c.admitted && !nginxOK {
 			t.Errorf("%s: admitted config fails nginx -t:\n%s", c.name, c.content)
+		}
+		if policyTestNginxRejects[strings.TrimPrefix(c.name, "refused/")] && nginxOK {
+			t.Errorf("%s: nginx -t accepts a case listed as rejected by nginx:\n%s", c.name, c.content)
 		}
 		ours := tokenizerSeesLogDirective(c.content, markers[i])
 		if opened[markers[i]] != (ours && nginxOK) {
