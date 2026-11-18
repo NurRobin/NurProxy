@@ -196,7 +196,7 @@ func listInstalledModules(ctx context.Context) ([]string, error) {
 // is the Caddy route JSON produced by caddygen (the pure renderer), and the
 // target is the virtual caddy-route handle keyed by the route's admin-API @id.
 func (b *Backend) Render(ctx context.Context, route proxymodel.Route) (proxy.Artifact, error) {
-	raw, err := caddygen.GenerateRoute(route)
+	raw, err := caddygen.GenerateRouteWith(route, caddygen.RouteOptions{HTTPSPort: b.client.HTTPSPort()})
 	if err != nil {
 		return proxy.Artifact{}, fmt.Errorf("rendering caddy route: %w", err)
 	}
@@ -534,6 +534,11 @@ func (b *Backend) EnsureServerTLS(ctx context.Context, intents []proxy.TLSIntent
 	}
 
 	strategy := caddygen.GenerateServerTLS(hosts)
+	if strategy.LoadFiles == nil {
+		// Caddy rejects a null load_files ("module value cannot be null"); an
+		// empty list unloads every previously provided cert.
+		strategy.LoadFiles = []caddygen.LoadFile{}
+	}
 	loadFiles, err := json.Marshal(strategy.LoadFiles)
 	if err != nil {
 		return fmt.Errorf("marshaling tls load_files: %w", err)

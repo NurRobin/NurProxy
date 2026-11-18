@@ -438,3 +438,63 @@ func TestLoadDryRunDataDir(t *testing.T) {
 		t.Fatalf("explicit data dir not respected in dry-run: got %s want %s", cfg3.DataDir, dir)
 	}
 }
+
+func TestLoadCaddyListen(t *testing.T) {
+	tests := []struct {
+		name      string
+		file      string
+		env       map[string]string
+		flags     Flags
+		wantHost  string
+		wantHTTP  int
+		wantHTTPS int
+		wantErr   string
+	}{
+		{name: "defaults are zero"},
+		{name: "file", file: "caddy_http_port: 18080\ncaddy_https_port: 18443\ncaddy_listen_host: 127.0.0.1\n",
+			wantHost: "127.0.0.1", wantHTTP: 18080, wantHTTPS: 18443},
+		{name: "env over file", file: "caddy_http_port: 18080\n",
+			env:      map[string]string{"NP_CADDY_HTTP_PORT": "28080", "NP_CADDY_HTTPS_PORT": "28443", "NP_CADDY_LISTEN_HOST": "::1"},
+			wantHost: "::1", wantHTTP: 28080, wantHTTPS: 28443},
+		{name: "flags over env", env: map[string]string{"NP_CADDY_HTTP_PORT": "28080"},
+			flags:    Flags{CaddyHTTPPort: 38080, CaddyHTTPSPort: 38443, CaddyListenHost: "127.0.0.2"},
+			wantHost: "127.0.0.2", wantHTTP: 38080, wantHTTPS: 38443},
+		{name: "out of range", flags: Flags{CaddyHTTPSPort: 70000}, wantErr: "invalid caddy_https_port"},
+		{name: "same port twice", flags: Flags{CaddyHTTPPort: 18080, CaddyHTTPSPort: 18080}, wantErr: "must differ"},
+		{name: "https on the default http port", flags: Flags{CaddyHTTPSPort: 80}, wantErr: "must differ"},
+		{name: "http on the default https port", flags: Flags{CaddyHTTPPort: 443}, wantErr: "must differ"},
+		{name: "hostname", flags: Flags{CaddyListenHost: "edge-1.example.com"}, wantHost: "edge-1.example.com"},
+		{name: "host with port", flags: Flags{CaddyListenHost: "127.0.0.1:80"}, wantErr: "invalid caddy_listen_host"},
+		{name: "bracketed IPv6", flags: Flags{CaddyListenHost: "[::1]"}, wantErr: "invalid caddy_listen_host"},
+		{name: "bad hostname", flags: Flags{CaddyListenHost: "-bad.example"}, wantErr: "invalid caddy_listen_host"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.file != "" {
+				if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte(tt.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			f := tt.flags
+			f.Orchestrator, f.FQDN, f.DataDir = "http://orchestrator:8080", "agent.example.com", dir
+			cfg, err := Load(f)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Load error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.CaddyListenHost != tt.wantHost || cfg.CaddyHTTPPort != tt.wantHTTP || cfg.CaddyHTTPSPort != tt.wantHTTPS {
+				t.Errorf("caddy listen = %q %d %d, want %q %d %d",
+					cfg.CaddyListenHost, cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort, tt.wantHost, tt.wantHTTP, tt.wantHTTPS)
+			}
+		})
+	}
+}

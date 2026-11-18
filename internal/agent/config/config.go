@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -34,6 +36,14 @@ type Config struct {
 	// "0.0.0.0") only when the orchestrator must reach this agent inbound.
 	APIBind        string `yaml:"api_bind"`
 	CaddyAdminPort int    `yaml:"caddy_admin_port"`
+	// CaddyHTTPPort and CaddyHTTPSPort are the ports the bundled Caddy serves
+	// plain HTTP and HTTPS on. Zero means the standard 80/443. Non-standard
+	// values let an unprivileged agent serve real traffic (the live sandbox).
+	CaddyHTTPPort  int `yaml:"caddy_http_port"`
+	CaddyHTTPSPort int `yaml:"caddy_https_port"`
+	// CaddyListenHost restricts the bundled Caddy's HTTP/HTTPS listeners to one
+	// address (e.g. "127.0.0.1"). Empty binds every interface.
+	CaddyListenHost string `yaml:"caddy_listen_host"`
 
 	// ProxyMode selects built-in (bundled Caddy, default) vs existing (manage an
 	// installed proxy on disk), per §2/§9.
@@ -103,6 +113,10 @@ type Flags struct {
 	APIPort      int
 	APIBind      string
 	CaddyPort    int
+
+	CaddyHTTPPort   int
+	CaddyHTTPSPort  int
+	CaddyListenHost string
 
 	ProxyMode      string
 	ProxyType      string
@@ -189,6 +203,27 @@ func Load(f Flags) (*Config, error) {
 	if cfg.FQDN == "" {
 		return nil, fmt.Errorf("FQDN is required (flag --fqdn or env NP_FQDN)")
 	}
+	for _, p := range []struct {
+		name string
+		port int
+	}{{"caddy_http_port", cfg.CaddyHTTPPort}, {"caddy_https_port", cfg.CaddyHTTPSPort}} {
+		if p.port < 0 || p.port > 65535 {
+			return nil, fmt.Errorf("invalid %s %d (must be 1-65535, or 0 for the default)", p.name, p.port)
+		}
+	}
+	httpPort, httpsPort := cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort
+	if httpPort == 0 {
+		httpPort = 80
+	}
+	if httpsPort == 0 {
+		httpsPort = 443
+	}
+	if httpPort == httpsPort {
+		return nil, fmt.Errorf("caddy_http_port and caddy_https_port must differ (both %d, 0 means 80/443)", httpPort)
+	}
+	if err := validateListenHost(cfg.CaddyListenHost); err != nil {
+		return nil, err
+	}
 	if cfg.ProxyMode != ProxyModeBuiltIn && cfg.ProxyMode != ProxyModeExisting {
 		return nil, fmt.Errorf("invalid proxy_mode %q (must be %q or %q)", cfg.ProxyMode, ProxyModeBuiltIn, ProxyModeExisting)
 	}
@@ -229,6 +264,15 @@ func mergeFile(dst *Config, src *Config) {
 	}
 	if src.CaddyAdminPort != 0 {
 		dst.CaddyAdminPort = src.CaddyAdminPort
+	}
+	if src.CaddyHTTPPort != 0 {
+		dst.CaddyHTTPPort = src.CaddyHTTPPort
+	}
+	if src.CaddyHTTPSPort != 0 {
+		dst.CaddyHTTPSPort = src.CaddyHTTPSPort
+	}
+	if src.CaddyListenHost != "" {
+		dst.CaddyListenHost = src.CaddyListenHost
 	}
 	if src.ProxyMode != "" {
 		dst.ProxyMode = src.ProxyMode
@@ -295,6 +339,19 @@ func mergeEnv(cfg *Config) {
 	if v := os.Getenv("NP_API_BIND"); v != "" {
 		cfg.APIBind = v
 	}
+	if v := os.Getenv("NP_CADDY_HTTP_PORT"); v != "" {
+		if port, err := strconv.Atoi(v); err == nil {
+			cfg.CaddyHTTPPort = port
+		}
+	}
+	if v := os.Getenv("NP_CADDY_HTTPS_PORT"); v != "" {
+		if port, err := strconv.Atoi(v); err == nil {
+			cfg.CaddyHTTPSPort = port
+		}
+	}
+	if v := os.Getenv("NP_CADDY_LISTEN_HOST"); v != "" {
+		cfg.CaddyListenHost = v
+	}
 	if v := os.Getenv("NP_PROXY_MODE"); v != "" {
 		cfg.ProxyMode = ProxyMode(v)
 	}
@@ -341,6 +398,32 @@ func mergeEnv(cfg *Config) {
 		cfg.UpdateMirror = v
 	}
 }
+
+// validateListenHost accepts an empty value, an IP address (IPv6 without
+// brackets, since the port is joined later) or a DNS hostname; never a port.
+func validateListenHost(host string) error {
+	if host == "" {
+		return nil
+	}
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	if len(host) <= 253 {
+		ok := true
+		for _, label := range strings.Split(host, ".") {
+			if !hostnameLabel.MatchString(label) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid caddy_listen_host %q (want an IP address or hostname without port or brackets)", host)
+}
+
+var hostnameLabel = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 // dryRunDataDir returns a writable, per-agent temp data dir for sandbox mode.
 // Including the FQDN keeps multiple dry-run agents on one host isolated (separate
@@ -407,6 +490,15 @@ func mergeFlags(cfg *Config, f Flags) {
 	}
 	if f.CaddyPort != 0 {
 		cfg.CaddyAdminPort = f.CaddyPort
+	}
+	if f.CaddyHTTPPort != 0 {
+		cfg.CaddyHTTPPort = f.CaddyHTTPPort
+	}
+	if f.CaddyHTTPSPort != 0 {
+		cfg.CaddyHTTPSPort = f.CaddyHTTPSPort
+	}
+	if f.CaddyListenHost != "" {
+		cfg.CaddyListenHost = f.CaddyListenHost
 	}
 	if f.ProxyMode != "" {
 		cfg.ProxyMode = ProxyMode(f.ProxyMode)

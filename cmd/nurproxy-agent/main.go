@@ -59,6 +59,9 @@ var (
 	apiPort         = flag.Int("api-port", 8780, "Agent API port")
 	apiBind         = flag.String("api-bind", "", "Agent API bind address (default 127.0.0.1; widen only if the orchestrator must reach this agent inbound)")
 	caddyAdminPort  = flag.Int("caddy-admin-port", 2019, "Caddy admin API port (localhost)")
+	caddyHTTPPort   = flag.Int("caddy-http-port", 0, "Port the bundled Caddy serves plain HTTP on (default 80)")
+	caddyHTTPSPort  = flag.Int("caddy-https-port", 0, "Port the bundled Caddy serves HTTPS on (default 443)")
+	caddyListenHost = flag.String("caddy-listen-host", "", "Address the bundled Caddy's HTTP/HTTPS listeners bind (default all interfaces)")
 	showVersion     = flag.Bool("version", false, "Print version and exit")
 	dryRun          = flag.Bool("dry-run", false, "Sandbox mode: simulate the proxy in-memory (no Caddy process, no :80/:443, unprivileged)")
 
@@ -126,21 +129,24 @@ func main() {
 
 	// Load config with priority: flags > env > config file > defaults.
 	cfg, err := agentconfig.Load(agentconfig.Flags{
-		Orchestrator:   *orchestratorURL,
-		FQDN:           *fqdn,
-		DataDir:        *dataDir,
-		APIPort:        *apiPort,
-		APIBind:        *apiBind,
-		CaddyPort:      *caddyAdminPort,
-		ProxyMode:      *proxyMode,
-		ProxyType:      *proxyType,
-		ProxyBinary:    *proxyBinary,
-		ProxyConfigDir: *proxyConfigDir,
-		ProxyReloadCmd: *proxyReloadCmd,
-		ProxyTestCmd:   *proxyTestCmd,
-		ProxyLogPaths:  *proxyLogPaths,
-		ProxyService:   *proxyService,
-		DryRun:         *dryRun,
+		Orchestrator:    *orchestratorURL,
+		FQDN:            *fqdn,
+		DataDir:         *dataDir,
+		APIPort:         *apiPort,
+		APIBind:         *apiBind,
+		CaddyPort:       *caddyAdminPort,
+		CaddyHTTPPort:   *caddyHTTPPort,
+		CaddyHTTPSPort:  *caddyHTTPSPort,
+		CaddyListenHost: *caddyListenHost,
+		ProxyMode:       *proxyMode,
+		ProxyType:       *proxyType,
+		ProxyBinary:     *proxyBinary,
+		ProxyConfigDir:  *proxyConfigDir,
+		ProxyReloadCmd:  *proxyReloadCmd,
+		ProxyTestCmd:    *proxyTestCmd,
+		ProxyLogPaths:   *proxyLogPaths,
+		ProxyService:    *proxyService,
+		DryRun:          *dryRun,
 	})
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
@@ -152,6 +158,9 @@ func main() {
 	log.Printf("  Data dir:     %s", cfg.DataDir)
 	log.Printf("  API port:     %d", cfg.APIPort)
 	log.Printf("  Caddy admin:  %d", cfg.CaddyAdminPort)
+	if cfg.CaddyHTTPPort != 0 || cfg.CaddyHTTPSPort != 0 || cfg.CaddyListenHost != "" {
+		log.Printf("  Caddy listen: host=%q http=%d https=%d (0 = default)", cfg.CaddyListenHost, cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort)
+	}
 	log.Printf("  Proxy mode:   %s", cfg.ProxyMode)
 	if cfg.DryRun {
 		log.Printf("  DRY-RUN:      proxy simulated in-memory — no Caddy process, no :80/:443, no privileged file ops")
@@ -287,6 +296,7 @@ func main() {
 	} else {
 		caddyClient = caddy.NewClient(cfg.CaddyAdminPort)
 	}
+	caddyClient.WithListen(cfg.CaddyListenHost, cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort)
 
 	// Drive the bundled Caddy through the proxy.Proxy interface: the agent
 	// reconciles routes via the admin-API caddy backend (§5) instead of the raw
@@ -400,7 +410,8 @@ func main() {
 		CertKey:            certKey,
 		Detection:          rawDetection,
 		CaddyFactory: func() proxy.Proxy {
-			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort))
+			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort).
+				WithListen(cfg.CaddyListenHost, cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort))
 			if certStore != nil {
 				b.WithCertStore(certStore)
 			}

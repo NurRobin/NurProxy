@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as path routes and lists every location it cannot carry over. A server used
   by a path route cannot be deleted. Domains without path routes render
   exactly as before.
+- **Live sandbox profile (#96).** `PROFILE=live make dev-sandbox` and
+  `make test-sandbox-live` run the agents with a real Caddy on unprivileged
+  loopback ports in front of a fake upstream, while DNS and ACME stay
+  simulated, so real HTTP and TLS go through the rendered config. The sandbox
+  tests also run the rendered config through `caddy validate` and `nginx -t`
+  when those binaries (or docker) are available; CI does both. New agent
+  options `-caddy-http-port`, `-caddy-https-port` and `-caddy-listen-host`
+  (default: 80/443 on all interfaces, as before).
+
 - **Per-domain access log and error log level (#150).** A domain can turn its
   access log off (`access_log: off`) and set a minimum error log level
   (`error_log_level`: info … emerg), so visitor IPs of that domain stay out of
@@ -87,6 +96,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all domains of an agent together, so one broken vhost fails all of them.
   When the validator output names a managed vhost file, that domain's error
   now shows the output, and the other domains say which domain blocked them.
+- **Built-in Caddy loads certificates of domains added later.** Every TLS
+  apply after the first failed against a running Caddy (`409 key already
+  exists` on `automatic_https`), so a central-TLS domain added to a built-in
+  agent that already served one never got its certificate loaded until the
+  agent restarted. The apply now replaces the existing values. Found by the
+  live sandbox.
+- **Built-in Caddy unloads certificates when no central domain is left.**
+  With no provided cert the TLS apply sent `load_files: null`, which Caddy
+  refuses, so the removed domain's certificate stayed loaded and the agent
+  reported an error. It now sends an empty list.
+
 - **Renaming a domain or moving it to another zone cleans up the old name
   (#151).** The DNS record of the old name is queued and deleted through the
   provider and zone it was created in, once the record for the new name exists;

@@ -1,4 +1,4 @@
-.PHONY: build build-agent build-headless build-all build-release-matrix test test-integration test-e2e test-sandbox lint clean dev dev-sandbox help
+.PHONY: build build-agent build-headless build-all build-release-matrix test test-integration test-e2e test-sandbox test-sandbox-live lint clean dev dev-sandbox build-sandbox-upstream help
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -44,8 +44,11 @@ test-integration: ## Run integration tests
 test-e2e: ## Run E2E tests
 	go test -race -count=1 -tags=e2e ./...
 
-test-sandbox: build-headless build-agent ## Run the dry-run sandbox e2e test (full stack, no external deps)
-	go test -count=1 -tags=sandbox -timeout=360s ./test/sandbox/...
+test-sandbox: build-headless build-agent ## Run the sandbox e2e tests (full stack, no external deps; real-proxy checks when caddy/nginx exist)
+	go test -count=1 -tags=sandbox -timeout=480s ./test/sandbox/...
+
+test-sandbox-live: ## Run the live sandbox e2e test (real Caddy on loopback ports; skips without caddy)
+	go test -count=1 -tags=sandbox -timeout=180s -run TestSandboxLiveTraffic -v ./test/sandbox/...
 
 test-cover: ## Run tests with coverage
 	go test -race -coverprofile=coverage.out ./...
@@ -59,8 +62,11 @@ lint-fix: ## Run linters with auto-fix
 	golangci-lint run --fix ./...
 
 ## Sandbox
-dev-sandbox: build build-agent ## Bring up a full dry-run stack (orchestrator + agents) and seed it
-	ORCH_BIN=./nurproxy AGENT_BIN=./nurproxy-agent ./scripts/dev-sandbox.sh
+dev-sandbox: build build-agent build-sandbox-upstream ## Bring up a full sandbox stack and seed it (PROFILE=live for a real Caddy)
+	ORCH_BIN=./nurproxy AGENT_BIN=./nurproxy-agent UPSTREAM_BIN=./nurproxy-sandbox-upstream ./scripts/dev-sandbox.sh
+
+build-sandbox-upstream: ## Build the fake upstream the live sandbox proxies to
+	go build -tags sandbox -o nurproxy-sandbox-upstream ./test/sandbox/fakeupstream
 
 ## Frontend
 dev: ## Run dashboard dev server
@@ -74,7 +80,7 @@ web-install: ## Install dashboard dependencies
 
 ## Clean
 clean: ## Remove build artifacts
-	rm -f nurproxy nurproxy-agent
+	rm -f nurproxy nurproxy-agent nurproxy-sandbox-upstream
 	rm -f coverage.out coverage.html
 	rm -rf web/dist
 

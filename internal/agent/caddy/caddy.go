@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -136,6 +139,12 @@ func (p *Process) IsMock() bool {
 	return p.mock
 }
 
+// Default ports Caddy uses for plain HTTP and HTTPS.
+const (
+	DefaultHTTPPort  = 80
+	DefaultHTTPSPort = 443
+)
+
 // Client communicates with the Caddy Admin API.
 type Client struct {
 	baseURL    string
@@ -143,6 +152,72 @@ type Client struct {
 	mock       bool
 	mockConfig map[string]interface{}
 	mu         sync.Mutex
+
+	// listenHost, httpPort and httpsPort shape srv0's listeners. Zero ports
+	// mean the Caddy defaults (80/443); an empty host binds every interface.
+	listenHost string
+	httpPort   int
+	httpsPort  int
+}
+
+// WithListen sets the address srv0 listens on. Zero ports keep the defaults
+// (80/443) and an empty host binds every interface. Non-default ports are also
+// written to the http app's http_port/https_port, because Caddy decides which
+// listener stays plaintext by comparing it against http_port. Returns the
+// receiver for chaining.
+func (c *Client) WithListen(host string, httpPort, httpsPort int) *Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listenHost = host
+	c.httpPort = httpPort
+	c.httpsPort = httpsPort
+	return c
+}
+
+// HTTPSPort returns the port srv0 serves HTTPS on (443 unless WithListen set
+// another). Safe on a nil client.
+func (c *Client) HTTPSPort() int {
+	if c == nil {
+		return DefaultHTTPSPort
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.httpsPort == 0 {
+		return DefaultHTTPSPort
+	}
+	return c.httpsPort
+}
+
+// listen returns srv0's listener addresses, HTTPS first.
+func (c *Client) listen() []string {
+	httpPort, httpsPort := c.httpPort, c.httpsPort
+	if httpPort == 0 {
+		httpPort = DefaultHTTPPort
+	}
+	if httpsPort == 0 {
+		httpsPort = DefaultHTTPSPort
+	}
+	return []string{
+		net.JoinHostPort(c.listenHost, strconv.Itoa(httpsPort)),
+		net.JoinHostPort(c.listenHost, strconv.Itoa(httpPort)),
+	}
+}
+
+// httpAppPorts returns the http app's http_port/https_port fields for
+// non-default ports; nil when both are the defaults, so the production config
+// stays unchanged.
+func (c *Client) httpAppPorts() map[string]interface{} {
+	out := map[string]interface{}{}
+	if c.httpPort != 0 && c.httpPort != DefaultHTTPPort {
+		out["http_port"] = c.httpPort
+	}
+	if c.httpsPort != 0 && c.httpsPort != DefaultHTTPSPort {
+		out["https_port"] = c.httpsPort
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // NewClient creates a new Caddy Admin API client.
@@ -178,10 +253,11 @@ func (c *Client) SetMock(mock bool) {
 // if not.
 func (c *Client) EnsureServer(ctx context.Context) error {
 	c.mu.Lock()
+	listen, ports := c.listen(), c.httpAppPorts()
 	if c.mock {
 		if c.mockConfig["server"] == nil {
 			c.mockConfig["server"] = map[string]interface{}{
-				"listen": []string{":443", ":80"},
+				"listen": listen,
 				"routes": []json.RawMessage{},
 			}
 		}
@@ -211,7 +287,7 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 	// The fresh srv0 (no routes yet — routes are added afterwards). We only get
 	// here when srv0 is absent, so there are no existing routes to preserve.
 	server := map[string]interface{}{
-		"listen": []string{":443", ":80"},
+		"listen": listen,
 		"routes": []json.RawMessage{},
 	}
 
@@ -230,7 +306,11 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 		}
 		srvData, _ := json.Marshal(server)
 		httpApp.Servers["srv0"] = srvData
-		appData, err := json.Marshal(map[string]interface{}{"servers": httpApp.Servers})
+		app := map[string]interface{}{"servers": httpApp.Servers}
+		for k, v := range ports {
+			app[k] = v
+		}
+		appData, err := json.Marshal(app)
 		if err != nil {
 			return fmt.Errorf("marshaling http app: %w", err)
 		}
@@ -241,6 +321,9 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 	}
 
 	httpApp := map[string]interface{}{"servers": map[string]interface{}{"srv0": server}}
+	for k, v := range ports {
+		httpApp[k] = v
+	}
 
 	if _, err := c.doRequest(ctx, http.MethodGet, "/config/apps", nil); err == nil {
 		// apps exists but http doesn't — create just the http app.
@@ -280,6 +363,11 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 // uses. A nil/empty load_files set still writes automatic_https (e.g. disable for
 // a pure-provided fleet or a managed self-ACME server with no loaded files).
 func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automaticHTTPS json.RawMessage, connPolicies json.RawMessage) error {
+	// Caddy rejects a null load_files ("module value cannot be null"); no
+	// provided certs is an empty list, which also unloads earlier ones.
+	if s := strings.TrimSpace(string(loadFiles)); s == "" || s == "null" {
+		loadFiles = json.RawMessage(`[]`)
+	}
 	c.mu.Lock()
 	if c.mock {
 		c.mockConfig["tls_load_files"] = loadFiles
@@ -293,7 +381,7 @@ func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automa
 	// Set the http server's automatic_https policy. srv0 must already exist
 	// (EnsureServer runs first); PUT replaces just the automatic_https sub-object.
 	if len(automaticHTTPS) > 0 {
-		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http/servers/srv0/automatic_https", automaticHTTPS); err != nil {
+		if err := c.setKey(ctx, "/config/apps/http/servers/srv0/automatic_https", automaticHTTPS); err != nil {
 			return fmt.Errorf("setting automatic_https: %w", err)
 		}
 	}
@@ -302,7 +390,7 @@ func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automa
 	// without this srv0 serves plaintext on :443. PUT the default policy so it
 	// terminates TLS using the provided certs loaded below (matched by SNI).
 	if len(connPolicies) > 0 {
-		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/http/servers/srv0/tls_connection_policies", connPolicies); err != nil {
+		if err := c.setKey(ctx, "/config/apps/http/servers/srv0/tls_connection_policies", connPolicies); err != nil {
 			return fmt.Errorf("setting tls_connection_policies: %w", err)
 		}
 	}
@@ -318,7 +406,7 @@ func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automa
 		if err != nil {
 			return fmt.Errorf("marshaling tls certificates: %w", err)
 		}
-		if _, err := c.doRequest(ctx, http.MethodPut, "/config/apps/tls/certificates", data); err != nil {
+		if err := c.setKey(ctx, "/config/apps/tls/certificates", data); err != nil {
 			return fmt.Errorf("loading tls certificates: %w", err)
 		}
 		return nil
@@ -480,8 +568,32 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("caddy API returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 
 	return respBody, nil
+}
+
+// APIError is a non-2xx answer from the Caddy admin API.
+type APIError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("caddy API returned %d: %s", e.StatusCode, e.Body)
+}
+
+// setKey writes body at a config path whether or not the key exists yet. The
+// admin API's PUT creates a key but answers 409 when it already exists, POST
+// would append to an existing array, and PATCH replaces only an existing key;
+// so PUT first and PATCH on conflict. A re-apply therefore replaces the value
+// instead of failing.
+func (c *Client) setKey(ctx context.Context, path string, body []byte) error {
+	_, err := c.doRequest(ctx, http.MethodPut, path, body)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
+		_, err = c.doRequest(ctx, http.MethodPatch, path, body)
+	}
+	return err
 }
