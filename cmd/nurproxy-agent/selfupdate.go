@@ -21,7 +21,9 @@ import (
 
 // cmdSelfUpdateApply is the privileged applier. It is started by the trigger
 // that `self-update-enable` installs (or, on OpenRC, by a root agent) and
-// replaces the binary it was itself started from.
+// replaces the binary it was itself started from. Applier.Run refuses unless
+// that binary and its parent directories are root-owned and not writable by
+// others, and unless the data dir layout passes its ownership checks.
 func cmdSelfUpdateApply(args []string) {
 	fs := flag.NewFlagSet("self-update-apply", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "Agent data directory holding self-update/ (required)")
@@ -52,7 +54,7 @@ func cmdSelfUpdateApply(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	applier := &selfupdate.Applier{
-		Dir: selfupdate.StateDir(*dataDir), BinaryPath: exe, CurrentVersion: version, Trust: trust,
+		DataDir: filepath.Clean(*dataDir), BinaryPath: exe, CurrentVersion: version, Trust: trust,
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, Service: service,
 		RefreshBuildID: func(buildID string) error {
 			_, err := helper.RefreshRootConfigBuildID(helper.DefaultRootConfigPath, buildID)
@@ -99,8 +101,19 @@ func parseSelfUpdateFlags(name string, args []string) selfUpdateTarget {
 // apply operator-requested upgrades. It is the host-level opt-in.
 func cmdSelfUpdateEnable(args []string) {
 	t := parseSelfUpdateFlags("self-update-enable", args)
+	// The trigger runs t.bin as root on behalf of an unprivileged agent. If the
+	// agent user could replace that file or a directory above it, it could run
+	// any code as root.
+	if err := selfupdate.CheckRootOwnedBinary(t.bin); err != nil {
+		log.Fatalf("self-update-enable refused: %v", err)
+	}
+	rootDir, err := selfupdate.PrepareRootDir(t.dataDir)
+	if err != nil {
+		log.Fatalf("self-update-enable refused: %v", err)
+	}
+	fmt.Printf("• %s (root-owned applier state)\n", rootDir)
 	host := selfupdate.DetectHost(version, runtimeenv.Detect(), false)
-	host.Executable = t.bin
+	host.Executable, host.UnsafeExecutable = t.bin, ""
 	host.TriggerPresent = true
 	if st := host.Status(); !st.Supported && st.InstallKind != selfupdate.InstallStandalone {
 		log.Fatalf("self-update-enable refused: %s", st.Reason)

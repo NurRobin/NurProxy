@@ -33,7 +33,10 @@ func (f *fakeService) Restart(context.Context) error {
 type applierFixture struct {
 	applier  *Applier
 	binary   string
+	dataDir  string
 	dir      Dir
+	rootDir  RootDir
+	owners   map[string]uint32
 	service  *fakeService
 	refreshs []string
 	release  Release
@@ -56,7 +59,11 @@ func newApplierFixture(t *testing.T) *applierFixture {
 	if err := os.WriteFile(binary, []byte(oldBinary), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f := &applierFixture{binary: binary, dir: StateDir(filepath.Join(root, "data")), service: &fakeService{}}
+	dataDir := filepath.Join(root, "data")
+	f := &applierFixture{
+		binary: binary, dataDir: dataDir, dir: StateDir(dataDir), rootDir: RootStateDir(dataDir),
+		owners: map[string]uint32{}, service: &fakeService{},
+	}
 	f.release = pki.release(t, "1.3.0", "linux", "amd64", []byte(newBinary))
 	if err := f.dir.Stage(f.release); err != nil {
 		t.Fatal(err)
@@ -65,7 +72,7 @@ func newApplierFixture(t *testing.T) *applierFixture {
 		t.Fatal(err)
 	}
 	f.applier = &Applier{
-		Dir: f.dir, BinaryPath: binary, CurrentVersion: "1.2.0", Trust: pki.trust,
+		DataDir: dataDir, BinaryPath: binary, CurrentVersion: "1.2.0", Trust: pki.trust,
 		GOOS: "linux", GOARCH: "amd64", Service: f.service,
 		HealthTimeout: 300 * time.Millisecond, PollInterval: 10 * time.Millisecond,
 		RefreshBuildID: func(v string) error { f.refreshs = append(f.refreshs, v); return nil },
@@ -82,10 +89,38 @@ func newApplierFixture(t *testing.T) *applierFixture {
 			}
 			return "", errors.New("exec format error")
 		},
-		Logf: t.Logf,
+		Logf:   t.Logf,
+		policy: testPolicy(root, f.owners),
 	}
 	return f
 }
+
+// testPolicy stands in for root ownership in unprivileged tests. Paths outside
+// base (the temp dir's ancestors, among them the world-writable /tmp) look like
+// root-owned 0755 directories; inside base the real modes and file types count
+// and owners maps base names to uids, defaulting to root (0).
+func testPolicy(base string, owners map[string]uint32) fsPolicy {
+	return fsPolicy{
+		rootUID: 0,
+		lstat: func(p string) (os.FileInfo, error) {
+			if p == base || strings.HasPrefix(p, base+string(filepath.Separator)) {
+				return os.Lstat(p)
+			}
+			return fakeDirInfo(filepath.Base(p)), nil
+		},
+		owner:     func(fi os.FileInfo) uint32 { return owners[fi.Name()] },
+		chownRoot: func(*os.File) error { return nil },
+	}
+}
+
+type fakeDirInfo string
+
+func (f fakeDirInfo) Name() string     { return string(f) }
+func (fakeDirInfo) Size() int64        { return 0 }
+func (fakeDirInfo) Mode() os.FileMode  { return os.ModeDir | 0o755 }
+func (fakeDirInfo) ModTime() time.Time { return time.Time{} }
+func (fakeDirInfo) IsDir() bool        { return true }
+func (fakeDirInfo) Sys() any           { return nil }
 
 // newAgentComesUp makes the fake service play the restarted agent writing its
 // health proof.
@@ -95,7 +130,7 @@ func (f *applierFixture) newAgentComesUp(t *testing.T) {
 		if string(data) != newBinary {
 			return
 		}
-		p, err := f.dir.ReadPending()
+		p, err := f.rootDir.ReadPending()
 		if err != nil || p == nil {
 			t.Errorf("no pending upgrade visible to the restarted agent: %v", err)
 			return
@@ -126,7 +161,7 @@ func (f *applierFixture) run(t *testing.T) *Result {
 	if res == nil {
 		t.Fatal("no result")
 	}
-	onDisk, err := f.dir.ReadResult()
+	onDisk, err := f.rootDir.ReadResult()
 	if err != nil || onDisk == nil || onDisk.State != res.State {
 		t.Fatalf("result on disk %+v (%v) does not match %+v", onDisk, err, res)
 	}
@@ -155,7 +190,7 @@ func TestApplierSuccess(t *testing.T) {
 	if f.service.restarts != 1 || strings.Join(f.refreshs, ",") != "1.3.0" {
 		t.Fatalf("restarts=%d refresh=%v", f.service.restarts, f.refreshs)
 	}
-	if p, _ := f.dir.ReadPending(); p != nil {
+	if p, _ := f.rootDir.ReadPending(); p != nil {
 		t.Fatal("pending left behind")
 	}
 	if _, err := os.Stat(filepath.Join(string(f.dir), stagedDirName)); !errors.Is(err, os.ErrNotExist) {

@@ -12,31 +12,40 @@ import (
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
-// The hand-off between the unprivileged agent and the privileged applier is a
-// directory in the agent's data dir:
+// The unprivileged agent and the privileged applier talk through two
+// directories in the agent's data dir:
 //
-//	self-update/staged/*   release files the agent downloaded (untrusted input
-//	                       for the applier, which verifies them again)
-//	self-update/request.json   written by the agent; its appearance starts the
-//	                           applier (systemd path unit / launchd WatchPaths)
-//	self-update/pending.json   written by the applier once it has claimed the
-//	                           request; tells the restarted agent what to prove
-//	self-update/healthy.json   written by the new agent after it reached the
-//	                           orchestrator; the applier waits for it
-//	self-update/result.json    written by the applier when it is done; the
-//	                           running agent reports it and removes it
+//	self-update/        owned by the agent user; root only reads and unlinks
+//	  staged/*          release files the agent downloaded (untrusted input
+//	                    for the applier, which verifies them again)
+//	  request.json      written by the agent; its appearance starts the
+//	                    applier (systemd path unit / launchd WatchPaths)
+//	  healthy.json      written by the new agent after it reached the
+//	                    orchestrator; the applier waits for it
+//	  reported.json     the last result the agent relayed to the orchestrator
+//	self-update-root/   owned by root, mode 0755; the agent can only read it
+//	  pending.json      written by the applier once it has claimed the
+//	                    request; tells the restarted agent what to prove
+//	  result.json       written by the applier when it is done; the running
+//	                    agent reports it once
+//
+// Root never writes into a directory the agent can write: there the agent
+// could swap entries for symlinks and redirect root's writes, renames or
+// deletes anywhere on the host.
 const (
-	stateDirName   = "self-update"
-	stagedDirName  = "staged"
-	requestFile    = "request.json"
-	pendingFile    = "pending.json"
-	healthyFile    = "healthy.json"
-	resultFile     = "result.json"
-	stagedArchive  = "release.tar.gz"
-	maxStateBytes  = 64 << 10
-	stateDirPerm   = 0o700
-	stateFilePerm  = 0o644
-	stagedFilePerm = 0o600
+	stateDirName     = "self-update"
+	rootStateDirName = "self-update-root"
+	stagedDirName    = "staged"
+	requestFile      = "request.json"
+	pendingFile      = "pending.json"
+	healthyFile      = "healthy.json"
+	reportedFile     = "reported.json"
+	resultFile       = "result.json"
+	stagedArchive    = "release.tar.gz"
+	maxStateBytes    = 64 << 10
+	stateDirPerm     = 0o700
+	stateFilePerm    = 0o644
+	stagedFilePerm   = 0o600
 )
 
 // Request is what the agent asks the applier to install.
@@ -72,7 +81,7 @@ type Result struct {
 	FinishedAt time.Time                `json:"finished_at"`
 }
 
-// Dir is the hand-off directory below an agent data dir.
+// Dir is the agent-owned hand-off directory below an agent data dir.
 type Dir string
 
 // StateDir returns the hand-off directory for dataDir.
@@ -104,55 +113,49 @@ func (d Dir) Stage(r Release) error {
 	return nil
 }
 
-// LoadStaged reads the staged release for version and asset without following
-// symlinks, so a hostile agent cannot point the root applier at other files.
-func (d Dir) LoadStaged(version, asset string) (Release, error) {
-	r := Release{Version: version, Asset: asset}
-	for _, f := range []struct {
-		name string
-		max  int64
-		dst  *[]byte
-	}{
-		{ChecksumsFile, maxChecksumsBytes, &r.Checksums},
-		{SignatureFile, maxSignatureBytes, &r.Signature},
-		{CertificateFile, maxCertificateBytes, &r.Certificate},
-		{stagedArchive, maxArchiveBytes, &r.Archive},
-	} {
-		data, err := readRegular(d.staged(f.name), f.max)
-		if err != nil {
-			return Release{}, fmt.Errorf("reading staged %s: %w", f.name, err)
-		}
-		*f.dst = data
-	}
-	return r, nil
-}
-
 // ClearStaged removes the staged release files.
 func (d Dir) ClearStaged() {
 	_ = os.RemoveAll(filepath.Join(string(d), stagedDirName))
 }
 
-func (d Dir) WriteRequest(r Request) error { return writeJSON(d.path(requestFile), r) }
-func (d Dir) WritePending(p Pending) error { return writeJSON(d.path(pendingFile), p) }
-func (d Dir) WriteHealthy(h Healthy) error { return writeJSON(d.path(healthyFile), h) }
-func (d Dir) WriteResult(r Result) error   { return writeJSON(d.path(resultFile), r) }
+// Reported records which applier result the agent already relayed.
+type Reported struct {
+	UpgradeID  string    `json:"upgrade_id"`
+	FinishedAt time.Time `json:"finished_at"`
+}
+
+func (d Dir) WriteRequest(r Request) error   { return writeJSON(d.path(requestFile), r) }
+func (d Dir) WriteHealthy(h Healthy) error   { return writeJSON(d.path(healthyFile), h) }
+func (d Dir) WriteReported(r Reported) error { return writeJSON(d.path(reportedFile), r) }
 
 // ReadRequest returns the request, or nil when there is none.
 func (d Dir) ReadRequest() (*Request, error) { return readJSON[Request](d.path(requestFile)) }
 
-// ReadPending returns the pending upgrade, or nil.
-func (d Dir) ReadPending() (*Pending, error) { return readJSON[Pending](d.path(pendingFile)) }
-
 // ReadHealthy returns the health proof, or nil.
 func (d Dir) ReadHealthy() (*Healthy, error) { return readJSON[Healthy](d.path(healthyFile)) }
 
-// ReadResult returns the applier's verdict, or nil.
-func (d Dir) ReadResult() (*Result, error) { return readJSON[Result](d.path(resultFile)) }
+// ReadReported returns the last relayed result, or nil.
+func (d Dir) ReadReported() (*Reported, error) { return readJSON[Reported](d.path(reportedFile)) }
 
 func (d Dir) RemoveRequest() error { return removeIfExists(d.path(requestFile)) }
-func (d Dir) RemovePending() error { return removeIfExists(d.path(pendingFile)) }
 func (d Dir) RemoveHealthy() error { return removeIfExists(d.path(healthyFile)) }
-func (d Dir) RemoveResult() error  { return removeIfExists(d.path(resultFile)) }
+
+// RootDir is the applier's root-owned directory below an agent data dir. The
+// agent only reads it.
+type RootDir string
+
+// RootStateDir returns the applier's directory for dataDir.
+func RootStateDir(dataDir string) RootDir { return RootDir(filepath.Join(dataDir, rootStateDirName)) }
+
+// ReadPending returns the upgrade the applier is carrying out, or nil.
+func (d RootDir) ReadPending() (*Pending, error) {
+	return readJSON[Pending](filepath.Join(string(d), pendingFile))
+}
+
+// ReadResult returns the applier's verdict, or nil.
+func (d RootDir) ReadResult() (*Result, error) {
+	return readJSON[Result](filepath.Join(string(d), resultFile))
+}
 
 func removeIfExists(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {

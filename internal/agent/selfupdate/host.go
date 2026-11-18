@@ -46,6 +46,9 @@ type Host struct {
 	PackageOwner   string // one of the Install* package kinds, or ""
 	TriggerPresent bool
 	DryRun         bool
+	// UnsafeExecutable says why the root applier would refuse to run
+	// Executable (see CheckRootOwnedBinary), or is empty.
+	UnsafeExecutable string
 }
 
 // DetectHost inspects the running agent. It only reads.
@@ -59,6 +62,9 @@ func DetectHost(version string, env runtimeenv.Env, dryRun bool) Host {
 			exe = resolved
 		}
 		h.Executable = exe
+		if err := CheckRootOwnedBinary(exe); err != nil {
+			h.UnsafeExecutable = err.Error()
+		}
 	}
 	h.InContainer = inContainer(os.Getenv, fileExists, readFile)
 	h.PackageOwner = packageOwner(h.Executable, packageProbes{
@@ -110,6 +116,10 @@ func (h Host) Status() models.SelfUpdateStatus {
 		}
 		if _, ok := models.NormalizeReleaseVersion(h.Version); !ok {
 			st.Reason = fmt.Sprintf("this is a development build (version %q); only release builds can self-update", h.Version)
+			return st
+		}
+		if h.UnsafeExecutable != "" {
+			st.Reason = h.UnsafeExecutable
 			return st
 		}
 		switch h.Init {

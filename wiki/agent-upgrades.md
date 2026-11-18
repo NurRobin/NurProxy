@@ -34,6 +34,25 @@ removes the trigger again.
 Until the trigger exists, the agent reports why it can't self-update, and the
 **Upgrade** button stays disabled with that reason as its tooltip.
 
+### Ownership requirements
+
+The trigger runs the agent binary as root on behalf of an unprivileged agent, so
+`self-update-enable` and the applier both refuse unless:
+
+- the agent binary (`/usr/local/bin/nurproxy-agent` with `install.sh`) and every
+  directory above it are **owned by root and not group- or world-writable**,
+  and none of them is a symlink. Otherwise the agent user could replace the file
+  and get its own code run as root. Fix it with
+  `sudo chown root:root /usr/local/bin/nurproxy-agent && sudo chmod 0755 /usr/local/bin/nurproxy-agent`
+  (and the same for any parent directory the error names);
+- every directory above the data dir is root-owned and not group- or
+  world-writable, and the data dir itself is not group- or world-writable.
+
+`self-update-enable` also creates `<data-dir>/self-update-root` (root:root,
+0755). The applier keeps its state there; the agent can only read it. If that
+directory exists but belongs to someone else, the applier refuses until you
+remove it.
+
 ### Hosts that refuse
 
 Self-update refuses, and says so on the agent page, when:
@@ -98,10 +117,12 @@ Step by step on the host:
    On failure it reports `failed` and nothing changes.
 3. It stages the files under `<data-dir>/self-update/staged/` and writes
    `request.json`. The trigger starts the root applier.
-4. The applier **verifies the staged files again** with its own copy of the trust
-   roots (it does not trust the unprivileged agent), extracts the binary, writes it
-   next to the current one, fsyncs it, and runs it with `-version` to make sure it
-   starts on this machine and is the expected version.
+4. The applier reads the request and the staged files into its own memory,
+   treating them as hostile (see [Root/agent boundary](#rootagent-boundary)), and
+   **verifies that copy again** with its own trust roots. It extracts the binary,
+   writes it next to the current one as `root:root` mode `0755`, fsyncs it, and
+   runs it with `-version` to make sure it starts on this machine and is the
+   expected version.
 5. It keeps the current binary as `nurproxy-agent.prev`, renames the new one into
    place, re-pins the root helper's build identity if the host has one, and
    restarts the service (on systemd also the root helper).
@@ -148,6 +169,25 @@ Limits, stated plainly:
 - A compromised agent process can ask the applier to install any **genuine,
   newer** release, but nothing else: the applier re-verifies everything, takes
   the binary path from its own executable, and never downgrades.
+
+## Root/agent boundary
+
+The agent and the root applier share two directories in the data dir:
+
+| Directory | Owner | Holds |
+|---|---|---|
+| `self-update/` | agent user | `request.json`, `staged/*`, `healthy.json` (written by the agent) |
+| `self-update-root/` | root, `0755` | `pending.json`, `result.json` (written by the applier) |
+
+Root never creates, writes or renames anything in a directory the agent can
+write, because there the agent could swap an entry for a symlink and redirect
+root's write anywhere on the host. In `self-update/` the applier only reads and
+unlinks. It opens every directory relative to its parent without following
+symlinks and checks owner and mode on the opened descriptor, so nothing can be
+swapped between check and use. Files it reads from the agent must be regular
+files (no symlinks, FIFOs or hard links) owned by the agent user and below a size
+limit; JSON is decoded strictly (unknown fields or trailing data are refused).
+Anything off and the applier discards the request and installs nothing.
 
 ## Rolling back by hand
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -112,7 +113,12 @@ func TestAgentStagesVerifiedRelease(t *testing.T) {
 	if err != nil || req == nil || req.UpgradeID != "up-1" || req.Version != "1.3.0" || req.FromVersion != "1.2.0" {
 		t.Fatalf("request %+v, %v", req, err)
 	}
-	staged, err := dir.LoadStaged("1.3.0", rel.Asset)
+	h, err := openHandoff(a.DataDir, testPolicy(a.DataDir, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	staged, err := h.loadStaged("1.3.0", rel.Asset)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,9 +178,7 @@ func TestAgentWatchRelaysResultAndHealth(t *testing.T) {
 	}
 
 	// The restarted agent proves health once per upgrade.
-	if err := dir.WritePending(Pending{UpgradeID: "up-1", FromVersion: "1.2.0", Version: "1.3.0"}); err != nil {
-		t.Fatal(err)
-	}
+	writeRootState(t, a.DataDir, pendingFile, Pending{UpgradeID: "up-1", FromVersion: "1.2.0", Version: "1.3.0"})
 	a.HeartbeatOK()
 	h, err := dir.ReadHealthy()
 	if err != nil || h == nil || h.UpgradeID != "up-1" || h.Version != "1.3.0" {
@@ -189,15 +193,27 @@ func TestAgentWatchRelaysResultAndHealth(t *testing.T) {
 		t.Fatal("old binary wrote a health proof")
 	}
 
-	if err := dir.WriteResult(Result{UpgradeID: "up-1", State: models.UpgradeDone, Version: "1.3.0"}); err != nil {
-		t.Fatal(err)
-	}
+	writeRootState(t, a.DataDir, resultFile, Result{UpgradeID: "up-1", State: models.UpgradeDone, Version: "1.3.0", FinishedAt: time.Now().UTC()})
 	a.WatchOnce(context.Background(), time.Minute)
 	if rep.states() != "done" || rep.last().UpgradeID != "up-1" || rep.last().Version != "1.3.0" {
 		t.Fatalf("reports %+v", rep.reports)
 	}
-	if r, _ := dir.ReadResult(); r != nil {
-		t.Fatal("result not removed after reporting")
+	// The agent cannot delete the root-owned result; it must not relay it twice.
+	a.WatchOnce(context.Background(), time.Minute)
+	if rep.states() != "done" {
+		t.Fatalf("result relayed again: %s", rep.states())
+	}
+}
+
+// writeRootState plays the applier writing into its root-owned directory.
+func writeRootState(t *testing.T, dataDir, name string, v any) {
+	t.Helper()
+	dir := string(RootStateDir(dataDir))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(dir, name), v); err != nil {
+		t.Fatal(err)
 	}
 }
 

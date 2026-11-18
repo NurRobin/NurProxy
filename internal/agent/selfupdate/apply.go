@@ -23,14 +23,17 @@ const DefaultHealthTimeout = 3 * time.Minute
 
 // Applier is the privileged half of a self-update. It runs as root (started by
 // the systemd path unit, the launchd WatchPaths job, or the root agent itself on
-// OpenRC), treats everything in the hand-off directory as untrusted, verifies
-// the staged release again with its own embedded trust, swaps the binary it was
-// itself started from, restarts the agent and rolls back if the new agent does
-// not come up.
+// OpenRC), treats everything in the agent's hand-off directory as untrusted,
+// verifies the staged release again with its own embedded trust, swaps the
+// binary it was itself started from, restarts the agent and rolls back if the
+// new agent does not come up. It writes only to its root-owned directory and
+// the binary's directory, both of which it checks first (see handoff).
 type Applier struct {
-	Dir Dir
+	// DataDir is the agent's data directory.
+	DataDir string
 	// BinaryPath is the agent binary to replace. It comes from the applier's own
-	// executable path, never from the request.
+	// executable path, never from the request, and must be root-owned with
+	// root-owned, non-writable parents.
 	BinaryPath     string
 	CurrentVersion string
 	Trust          Trust
@@ -45,6 +48,9 @@ type Applier struct {
 	ProbeVersion func(ctx context.Context, path string) (string, error)
 	Now          func() time.Time
 	Logf         func(format string, args ...any)
+
+	policy fsPolicy
+	h      *handoff
 }
 
 type healthDecision int
@@ -84,6 +90,9 @@ func (a *Applier) defaults() {
 	if a.ProbeVersion == nil {
 		a.ProbeVersion = probeVersion
 	}
+	if a.policy.lstat == nil {
+		a.policy = defaultPolicy()
+	}
 }
 
 // Run claims a pending request and carries it out. It returns nil, nil when
@@ -91,9 +100,17 @@ func (a *Applier) defaults() {
 // hand-off directory for the agent to report.
 func (a *Applier) Run(ctx context.Context) (*Result, error) {
 	a.defaults()
-	req, err := a.Dir.ReadRequest()
+	h, err := openHandoff(a.DataDir, a.policy)
 	if err != nil {
-		_ = a.Dir.RemoveRequest()
+		return nil, fmt.Errorf("refusing to act on %s: %w", a.DataDir, err)
+	}
+	defer h.Close()
+	a.h = h
+	defer func() { a.h = nil }()
+	req, err := h.readRequest()
+	if err != nil {
+		_ = h.removeAgentFile(requestFile)
+		h.clearStaged()
 		return nil, fmt.Errorf("unreadable self-update request discarded: %w", err)
 	}
 	if req == nil {
@@ -101,24 +118,32 @@ func (a *Applier) Run(ctx context.Context) (*Result, error) {
 	}
 	// Claim it first: a systemd PathExists= trigger fires again for as long as
 	// the file exists.
-	if err := a.Dir.RemoveRequest(); err != nil {
+	if err := h.removeAgentFile(requestFile); err != nil {
 		return nil, fmt.Errorf("claiming self-update request: %w", err)
+	}
+	_ = h.removeRootFile(resultFile)
+	if err := a.policy.checkBinary(a.BinaryPath); err != nil {
+		res := a.fail(*req, "%v", err)
+		return a.finish(&res)
 	}
 	res := a.apply(ctx, *req)
 	if res.State == models.UpgradeRolledBack {
-		// rollback wrote it before restarting the old agent, which may already
-		// have reported and removed it.
+		// rollback wrote it before restarting the old agent.
 		return &res, nil
 	}
-	if err := a.Dir.WriteResult(res); err != nil {
-		return &res, fmt.Errorf("writing self-update result: %w", err)
+	return a.finish(&res)
+}
+
+func (a *Applier) finish(res *Result) (*Result, error) {
+	if err := a.h.writeRootJSON(resultFile, res); err != nil {
+		return res, fmt.Errorf("writing self-update result: %w", err)
 	}
-	return &res, nil
+	return res, nil
 }
 
 func (a *Applier) fail(req Request, format string, args ...any) Result {
-	a.Dir.ClearStaged()
-	_ = a.Dir.RemovePending()
+	a.h.clearStaged()
+	_ = a.h.removeRootFile(pendingFile)
 	msg := fmt.Sprintf(format, args...)
 	a.Logf("self-update %s failed: %s", req.UpgradeID, msg)
 	return Result{UpgradeID: req.UpgradeID, State: models.UpgradeFailed, Version: a.CurrentVersion, Error: msg, FinishedAt: a.Now().UTC()}
@@ -140,7 +165,7 @@ func (a *Applier) apply(ctx context.Context, req Request) Result {
 	if err != nil {
 		return a.fail(req, "%v", err)
 	}
-	staged, err := a.Dir.LoadStaged(target, asset)
+	staged, err := a.h.loadStaged(target, asset)
 	if err != nil {
 		return a.fail(req, "%v", err)
 	}
@@ -148,17 +173,13 @@ func (a *Applier) apply(ctx context.Context, req Request) Result {
 	if err != nil {
 		return a.fail(req, "release verification failed: %v", err)
 	}
-	a.Dir.ClearStaged()
-	_ = a.Dir.RemoveHealthy()
-	if err := a.Dir.WritePending(Pending{UpgradeID: req.UpgradeID, FromVersion: a.CurrentVersion, Version: target, StartedAt: a.Now().UTC()}); err != nil {
+	a.h.clearStaged()
+	_ = a.h.removeAgentFile(healthyFile)
+	if err := a.h.writeRootJSON(pendingFile, Pending{UpgradeID: req.UpgradeID, FromVersion: a.CurrentVersion, Version: target, StartedAt: a.Now().UTC()}); err != nil {
 		return a.fail(req, "recording pending upgrade: %v", err)
 	}
 
-	info, err := os.Stat(a.BinaryPath)
-	if err != nil {
-		return a.fail(req, "inspecting current binary: %v", err)
-	}
-	candidate, err := writeCandidate(a.BinaryPath, binary, info)
+	candidate, err := writeCandidate(a.BinaryPath, binary, a.policy)
 	if err != nil {
 		return a.fail(req, "writing new binary: %v", err)
 	}
@@ -172,7 +193,7 @@ func (a *Applier) apply(ctx context.Context, req Request) Result {
 	if got != target {
 		return a.fail(req, "new binary reports version %q, want %q", got, target)
 	}
-	if err := keepPrevious(a.BinaryPath, info); err != nil {
+	if err := keepPrevious(a.BinaryPath, a.policy); err != nil {
 		return a.fail(req, "keeping the previous binary: %v", err)
 	}
 	if err := os.Rename(candidate, a.BinaryPath); err != nil {
@@ -199,14 +220,14 @@ func (a *Applier) awaitHealth(ctx context.Context, req Request, target string) R
 	ticker := time.NewTicker(a.PollInterval)
 	defer ticker.Stop()
 	for {
-		healthy, err := a.Dir.ReadHealthy()
+		healthy, err := a.h.readHealthy()
 		if err != nil {
 			healthy = nil
 		}
 		switch decideHealth(healthy, req.UpgradeID, target, !a.Now().Before(deadline)) {
 		case healthCommit:
-			_ = a.Dir.RemoveHealthy()
-			_ = a.Dir.RemovePending()
+			_ = a.h.removeAgentFile(healthyFile)
+			_ = a.h.removeRootFile(pendingFile)
 			a.Logf("self-update %s: agent %s is healthy", req.UpgradeID, target)
 			return Result{UpgradeID: req.UpgradeID, State: models.UpgradeDone, Version: target, FinishedAt: a.Now().UTC()}
 		case healthRollback:
@@ -227,7 +248,7 @@ func (a *Applier) rollback(req Request, target, reason string) Result {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	res := Result{UpgradeID: req.UpgradeID, State: models.UpgradeRolledBack, Version: a.CurrentVersion, Error: reason, FinishedAt: a.Now().UTC()}
-	if err := restorePrevious(a.BinaryPath); err != nil {
+	if err := restorePrevious(a.BinaryPath, a.policy); err != nil {
 		res.State = models.UpgradeFailed
 		res.Version = target
 		res.Error = fmt.Sprintf("%s; restoring %s also failed: %v", reason, PreviousPath(a.BinaryPath), err)
@@ -238,9 +259,9 @@ func (a *Applier) rollback(req Request, target, reason string) Result {
 			res.Error += fmt.Sprintf("; re-pinning the root helper failed: %v", err)
 		}
 	}
-	_ = a.Dir.RemoveHealthy()
-	_ = a.Dir.RemovePending()
-	if err := a.Dir.WriteResult(res); err != nil {
+	_ = a.h.removeAgentFile(healthyFile)
+	_ = a.h.removeRootFile(pendingFile)
+	if err := a.h.writeRootJSON(resultFile, res); err != nil {
 		a.Logf("self-update %s: writing rollback result: %v", req.UpgradeID, err)
 	}
 	if err := a.Service.Restart(ctx); err != nil {
@@ -266,9 +287,12 @@ func CheckUpgradePolicy(current, target string) error {
 // PreviousPath is where the replaced binary is kept for rollback.
 func PreviousPath(binary string) string { return binary + ".prev" }
 
-// writeCandidate writes data next to binary with binary's mode and owner and
-// fsyncs it.
-func writeCandidate(binary string, data []byte, like os.FileInfo) (string, error) {
+// installedBinaryPerm is the mode of every binary the applier writes. The
+// owner is always root:root: the old binary's owner is never carried over.
+const installedBinaryPerm = 0o755
+
+// writeCandidate writes data next to binary as root:root 0755 and fsyncs it.
+func writeCandidate(binary string, data []byte, pol fsPolicy) (string, error) {
 	f, err := os.CreateTemp(filepath.Dir(binary), "."+filepath.Base(binary)+".new-*")
 	if err != nil {
 		return "", err
@@ -284,30 +308,36 @@ func writeCandidate(binary string, data []byte, like os.FileInfo) (string, error
 	if _, err := f.Write(data); err != nil {
 		return "", err
 	}
-	if err := f.Chmod(like.Mode().Perm() | 0o500); err != nil {
-		return "", err
-	}
-	if err := f.Sync(); err != nil {
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	if err := copyOwner(like, name); err != nil {
+	if err := sealBinary(f, pol); err != nil {
 		return "", err
 	}
 	ok = true
 	return name, nil
 }
 
+// sealBinary makes f root:root 0755, fsyncs and closes it.
+func sealBinary(f *os.File, pol fsPolicy) error {
+	if err := pol.chownRoot(f); err != nil {
+		return err
+	}
+	if err := f.Chmod(installedBinaryPerm); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
 // keepPrevious atomically replaces binary.prev with the current binary: a hard
-// link when the filesystem allows it, a copy otherwise.
-func keepPrevious(binary string, info os.FileInfo) error {
+// link when the filesystem allows it (the binary passed checkBinary, so it is
+// already root-owned), a root:root copy otherwise.
+func keepPrevious(binary string, pol fsPolicy) error {
 	prev := PreviousPath(binary)
 	tmp := prev + ".tmp"
 	_ = os.Remove(tmp)
 	if err := os.Link(binary, tmp); err != nil {
-		if err := copyFile(binary, tmp, info); err != nil {
+		if err := copyBinary(binary, tmp, pol); err != nil {
 			return err
 		}
 	}
@@ -318,16 +348,12 @@ func keepPrevious(binary string, info os.FileInfo) error {
 	return syncDir(filepath.Dir(binary))
 }
 
-// restorePrevious puts binary.prev back in place and keeps the .prev copy.
-func restorePrevious(binary string) error {
-	prev := PreviousPath(binary)
-	info, err := os.Stat(prev)
-	if err != nil {
-		return err
-	}
+// restorePrevious puts a root:root copy of binary.prev back in place and keeps
+// the .prev file.
+func restorePrevious(binary string, pol fsPolicy) error {
 	tmp := binary + ".restore"
 	_ = os.Remove(tmp)
-	if err := copyFile(prev, tmp, info); err != nil {
+	if err := copyBinary(PreviousPath(binary), tmp, pol); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, binary); err != nil {
@@ -337,13 +363,20 @@ func restorePrevious(binary string) error {
 	return syncDir(filepath.Dir(binary))
 }
 
-func copyFile(src, dst string, info os.FileInfo) error {
-	in, err := os.Open(src)
+// copyBinary copies the regular file src (never a symlink) to the new file
+// dst as root:root 0755.
+func copyBinary(src, dst string, pol fsPolicy) error {
+	in, err := openNoFollow(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if info, err := in.Stat(); err != nil {
+		return err
+	} else if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, installedBinaryPerm)
 	if err != nil {
 		return err
 	}
@@ -352,16 +385,12 @@ func copyFile(src, dst string, info os.FileInfo) error {
 		_ = os.Remove(dst)
 		return err
 	}
-	if err := out.Sync(); err != nil {
+	if err := sealBinary(out, pol); err != nil {
 		_ = out.Close()
 		_ = os.Remove(dst)
 		return err
 	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(dst)
-		return err
-	}
-	return copyOwner(info, dst)
+	return nil
 }
 
 // probeVersion runs `<path> -version` and parses "nurproxy-agent <version>".

@@ -159,6 +159,8 @@ func (a *Agent) Status() models.SelfUpdateStatus {
 
 func (a *Agent) dir() Dir { return StateDir(a.DataDir) }
 
+func (a *Agent) rootDir() RootDir { return RootStateDir(a.DataDir) }
+
 // Handle starts an upgrade in the background. A second command while one runs
 // is reported as failed.
 func (a *Agent) Handle(ctx context.Context, cmd models.UpgradeCommand) {
@@ -219,7 +221,7 @@ func (a *Agent) run(ctx context.Context, cmd models.UpgradeCommand) {
 		fail("upgrade %s is still waiting for the privileged applier", req.UpgradeID)
 		return
 	}
-	if p, _ := dir.ReadPending(); p != nil {
+	if p, _ := a.rootDir().ReadPending(); p != nil {
 		fail("upgrade %s is still in progress", p.UpgradeID)
 		return
 	}
@@ -241,7 +243,6 @@ func (a *Agent) run(ctx context.Context, cmd models.UpgradeCommand) {
 		fail("release verification failed: %v", err)
 		return
 	}
-	_ = dir.RemoveResult()
 	if err := dir.Stage(rel); err != nil {
 		fail("%v", err)
 		return
@@ -313,7 +314,7 @@ func (a *Agent) HeartbeatOK() {
 	if a.DryRun {
 		return
 	}
-	p, err := a.dir().ReadPending()
+	p, err := a.rootDir().ReadPending()
 	if err != nil || p == nil || p.Version != a.Version {
 		return
 	}
@@ -362,10 +363,9 @@ func (a *Agent) Watch(ctx context.Context) {
 // WatchOnce is one Watch iteration.
 func (a *Agent) WatchOnce(ctx context.Context, claimTimeout time.Duration) {
 	dir := a.dir()
-	if res, err := dir.ReadResult(); err != nil {
-		log.Printf("Self-update: discarding unreadable result: %v", err)
-		_ = dir.RemoveResult()
-	} else if res != nil {
+	if res, err := a.rootDir().ReadResult(); err != nil {
+		log.Printf("Self-update: unreadable applier result: %v", err)
+	} else if res != nil && !alreadyReported(dir, res) {
 		if a.Reporter != nil {
 			err := a.Reporter.Report(ctx, models.UpgradeReport{UpgradeID: res.UpgradeID, State: res.State, Version: a.Version, Error: res.Error})
 			if err != nil && !isRejected(err) {
@@ -373,7 +373,15 @@ func (a *Agent) WatchOnce(ctx context.Context, claimTimeout time.Duration) {
 			}
 		}
 		log.Printf("Self-update %s finished: %s %s", res.UpgradeID, res.State, res.Error)
-		_ = dir.RemoveResult()
+		// The result lives in the root-owned directory, which the agent cannot
+		// clean up; remembering it keeps it from being reported again.
+		err := dir.Ensure()
+		if err == nil {
+			err = dir.WriteReported(Reported{UpgradeID: res.UpgradeID, FinishedAt: res.FinishedAt})
+		}
+		if err != nil {
+			log.Printf("Self-update %s: recording the reported result failed: %v", res.UpgradeID, err)
+		}
 	}
 	req, err := dir.ReadRequest()
 	if err != nil || req == nil {
@@ -387,6 +395,11 @@ func (a *Agent) WatchOnce(ctx context.Context, claimTimeout time.Duration) {
 	msg := "the privileged applier never picked up the staged release; check that nurproxy-agent-update.path (or the launchd job) is installed and active"
 	log.Printf("Self-update %s failed: %s", req.UpgradeID, msg)
 	a.report(ctx, req.UpgradeID, models.UpgradeFailed, msg)
+}
+
+func alreadyReported(dir Dir, res *Result) bool {
+	r, err := dir.ReadReported()
+	return err == nil && r != nil && r.UpgradeID == res.UpgradeID && r.FinishedAt.Equal(res.FinishedAt)
 }
 
 func isRejected(err error) bool { return errors.Is(err, ErrReportRejected) }
