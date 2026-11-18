@@ -181,8 +181,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 35 {
-		t.Fatalf("this test pins the schema target at 35 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 36 {
+		t.Fatalf("this test pins the schema target at 36 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -197,6 +197,7 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		{"public_ip6", ""},         // migration 18
 		{"dns_record_id6", ""},     // migration 18
 		{"token_enc", ""},          // migration 19
+		{"detected_certs", ""},     // migration 36
 	}
 	for _, tc := range agentStr {
 		t.Run("agent_col_"+tc.col, func(t *testing.T) {

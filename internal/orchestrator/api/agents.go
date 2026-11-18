@@ -37,6 +37,16 @@ var registerLimiter = ratelimit.New(10, 15*time.Minute, 15*time.Minute)
 // real host's interface/log/upstream/conflict count.
 const maxProxyDetectionEntries = 256
 
+// detectionTooLarge reports whether any list in a reported detection exceeds
+// maxProxyDetectionEntries.
+func detectionTooLarge(d *models.ProxyDetection) bool {
+	return len(d.LogPaths) > maxProxyDetectionEntries ||
+		len(d.PortConflicts) > maxProxyDetectionEntries ||
+		len(d.DiscoveredUpstreams) > maxProxyDetectionEntries ||
+		len(d.Networks) > maxProxyDetectionEntries ||
+		len(d.DiscoveredCerts) > maxProxyDetectionEntries
+}
+
 // GET /api/v1/agents
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents, err := s.db.ListAgents()
@@ -118,10 +128,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	// Bound the variable-length detection slices a single registration can
 	// persist (the body cap still permits many tiny entries).
 	if d := req.ProxyDetection; d != nil {
-		if len(d.LogPaths) > maxProxyDetectionEntries ||
-			len(d.PortConflicts) > maxProxyDetectionEntries ||
-			len(d.DiscoveredUpstreams) > maxProxyDetectionEntries ||
-			len(d.Networks) > maxProxyDetectionEntries {
+		if detectionTooLarge(d) {
 			writeError(w, http.StatusBadRequest, "proxy_detection has too many entries")
 			return
 		}
@@ -508,7 +515,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Persist the agent's read-only proxy detection (§13.0). It's a narrow update
 	// so it doesn't clobber operator-owned fields or the health self-report just
 	// written above. Only update when the agent actually reported detection.
-	if req.ProxyDetection != nil {
+	if req.ProxyDetection != nil && detectionTooLarge(req.ProxyDetection) {
+		log.Printf("agent %s reported a detection with too many entries; ignoring it", id)
+	} else if req.ProxyDetection != nil {
 		if uerr := s.db.UpdateAgentDetection(id, req.ProxyDetection); uerr != nil {
 			log.Printf("failed to update agent %s detection: %v", id, uerr)
 		}

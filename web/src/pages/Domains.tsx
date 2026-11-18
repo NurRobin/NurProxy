@@ -14,6 +14,7 @@ import ConfirmDialog from '../components/ConfirmDialog';
 import EmptyState from '../components/EmptyState';
 import Button from '../components/Button';
 import Callout from '../components/Callout';
+import DiskCertificates from '../components/DiskCertificates';
 import HelpTip from '../components/HelpTip';
 import { Field, Input, Select, Textarea, Checkbox } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
@@ -579,6 +580,7 @@ export default function Domains() {
                     </Select>
                   </Field>
                 </div>
+                <DiskCertificates domainId={liveDomain.id} />
                 <div className="flex justify-end gap-3 pt-1">
                   <Button variant="danger-ghost" onClick={() => removeDomain(liveDomain)}>{t('common.delete')}</Button>
                   <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>

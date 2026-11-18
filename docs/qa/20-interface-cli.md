@@ -59,6 +59,8 @@ the same calls regardless of dry/real; only the orchestrator behind it differs.
 - [ ] `domain update <id>` (same flags; tri-state bool handling)
 - [ ] `domain delete <id>`
 - [ ] `domain set-cert <id> --cert FILE --key FILE` (import an existing certificate; see 06-tls-acme §16)
+- [ ] `domain cert-candidates <id>` (certificates agents found on disk for the host; see 06-tls-acme §17)
+- [ ] `domain adopt-cert <id> [--fingerprint FP] [--agent ID]` (adopt one; the fingerprint may be omitted when exactly one is adoptable)
 - [ ] `apikey show`
 - [ ] `apikey create`
 - [ ] `apikey revoke`

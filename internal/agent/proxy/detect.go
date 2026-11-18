@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/NurRobin/NurProxy/internal/agent/certdiscover"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/netdiscover"
 	"github.com/NurRobin/NurProxy/internal/shared/nginxdiscover"
@@ -62,6 +63,9 @@ type Detection struct {
 	// Networks are the IP subnets attached to the host's interfaces (§38), so the
 	// dashboard can suggest a CIDR when adding a Server. Reported regardless of proxy.
 	Networks []netdiscover.Network `json:"networks,omitempty"`
+	// DiscoveredCerts are certificate bundles already on the host that the
+	// operator can adopt (#80). Only scanned when a cert scanner is configured.
+	DiscoveredCerts []models.DiscoveredCert `json:"discovered_certs,omitempty"`
 }
 
 // PortConflict identifies which process holds a listening port (§2.1). It is
@@ -107,6 +111,7 @@ func (d Detection) ToModel() *models.ProxyDetection {
 			Network:      n.Network,
 		})
 	}
+	m.DiscoveredCerts = d.DiscoveredCerts
 	return m
 }
 
@@ -135,6 +140,64 @@ type Detector struct {
 	// points NurProxy at a non-default config tree (the §9 minority) has THAT
 	// scanned, not the OS default. Set via WithConfigDir from the agent config.
 	configDirOverride string
+	// certScanner, when set, makes Detect report the certificate bundles on the
+	// host (#80), including those the detected proxy's vhosts reference.
+	certScanner    *certdiscover.Scanner
+	certConfigRefs bool
+}
+
+// WithCertScanner enables certificate discovery with the given base scanner.
+// With configRefs, the pairs the detected nginx/apache config references are
+// scanned too.
+func (d *Detector) WithCertScanner(s certdiscover.Scanner, configRefs bool) *Detector {
+	d.certScanner = &s
+	d.certConfigRefs = configRefs
+	return d
+}
+
+// CertScanner returns the configured scanner extended with the certificate
+// pairs the host proxy's config references, or ok=false when certificate
+// discovery is off. The agent uses it to load the bundle an operator adopts,
+// so a load sees exactly the bundles a scan reports.
+func (d *Detector) CertScanner() (certdiscover.Scanner, bool) {
+	if d.certScanner == nil {
+		return certdiscover.Scanner{}, false
+	}
+	s := *d.certScanner
+	s.Refs = append([]certdiscover.Pair(nil), s.Refs...)
+	if !d.certConfigRefs {
+		return s, true
+	}
+	for _, c := range candidates {
+		if c.kind != KindNginx && c.kind != KindApache {
+			continue
+		}
+		if _, ok := d.resolveBinary(c.binaries); !ok {
+			continue
+		}
+		configDir := ResolvePaths(c.kind).ConfigDir
+		if d.configDirOverride != "" {
+			configDir = d.configDirOverride
+		}
+		s.Refs = append(s.Refs, configCertRefs(c.kind, configDir)...)
+		break
+	}
+	return s, true
+}
+
+// configCertRefs extracts the certificate pairs a proxy config serves.
+func configCertRefs(kind Kind, configDir string) []certdiscover.Pair {
+	var refs []certdiscover.Pair
+	switch kind {
+	case KindNginx:
+		for _, r := range nginxdiscover.CertRefs(gatherNginxConfig(configDir), "/etc/nginx") {
+			refs = append(refs, certdiscover.Pair{CertPath: r.CertPath, KeyPath: r.KeyPath, Source: certdiscover.SourceNginx})
+		}
+	case KindApache:
+		root := firstExistingDir("/etc/apache2", "/etc/httpd")
+		refs = certdiscover.ApacheRefs(gatherApacheConfig(configDir), root)
+	}
+	return refs
 }
 
 // WithConfigDir overrides the §9-detected config directory used for the reported
@@ -209,6 +272,10 @@ func (d *Detector) Detect(ctx context.Context) (Detection, error) {
 			det.DiscoveredUpstreams = nginxdiscover.Discover(gatherNginxConfig(configDir))
 		}
 		break
+	}
+
+	if s, ok := d.CertScanner(); ok {
+		det.DiscoveredCerts = s.Scan()
 	}
 
 	det.PortConflicts = d.detectPortConflicts(ctx)

@@ -92,6 +92,7 @@
   | Method | Path | Auth | Purpose | Body |
   |---|---|---|---|---|
   | POST | `/api/v1/agents/{id}/logs/chunk` | agent | agent posts tailed lines up | `LogChunk` |
+  | POST | `/api/v1/agents/{id}/certificates/upload` | agent | agent answers a `cert_upload_request` | `CertUpload` |
   | POST | `/api/v1/agents/{id}/logs/tail` | auth | dashboard starts a tail | `{"path":"...","lines"?:N}` |
   | GET | `/api/v1/agents/{id}/logs/tail/{session}` | auth | poll buffered lines (`?cursor=N`) | — |
   | DELETE | `/api/v1/agents/{id}/logs/tail/{session}` | auth | stop a tail | — |
@@ -125,6 +126,8 @@
   | PUT | `/api/v1/domains/{id}/config` | auth | set a manual config override | `{"config": <json|string>}` |
   | POST | `/api/v1/domains/{id}/config/reset` | auth | clear manual override | — |
   | PUT | `/api/v1/domains/{id}/certificate` | auth | import an operator certificate (central TLS only; see 06-tls-acme §16) | `{"cert_pem","key_pem"}` |
+  | GET | `/api/v1/domains/{id}/certificate/candidates` | auth | certificates agents found on disk for the host (see 06-tls-acme §17) | — |
+  | POST | `/api/v1/domains/{id}/certificate/adopt` | auth | adopt one of them; the agent uploads it over its stream | `{"fingerprint","agent_id"?}` |
 
   **Config artifacts + drift (§11/§6)**
   | Method | Path | Auth | Purpose | Body |
@@ -164,7 +167,7 @@
   ```
 - **Pass:** the printed `METHOD PATH` list equals the table above (40 `/api/v1` routes). `/mcp` + `/mcp/` come from `main.go`, not this list.
 - **Coverage:** D.
-- **Pitfalls:** routes are registered with Go 1.22 method-scoped patterns (`"GET /api/v1/..."`), so the method is part of the route key — a wrong verb is a 405, not a 404 (see method-not-allowed test). `register`, `heartbeat`, `stream`, `routes/ack`, `artifacts/adopt`, `logs/chunk`, `admin-ops/claim`, `admin-ops/{opId}/ack` are **agent-driven** — you normally never call them by hand with the admin key.
+- **Pitfalls:** routes are registered with Go 1.22 method-scoped patterns (`"GET /api/v1/..."`), so the method is part of the route key — a wrong verb is a 405, not a 404 (see method-not-allowed test). `register`, `heartbeat`, `stream`, `routes/ack`, `artifacts/adopt`, `logs/chunk`, `certificates/upload`, `admin-ops/claim`, `admin-ops/{opId}/ack` are **agent-driven** — you normally never call them by hand with the admin key.
 
 ### Auth class: `none` (public endpoints)
 - **Must:** `GET /api/v1/health`, `GET /api/v1/auth/status`, `POST /api/v1/auth/{setup,login,logout}`, and `POST /api/v1/agents/register` require **no** credentials (`server.go:133-143`). `register` still validates its body and 409s on a duplicate FQDN (`agents.go:68-77`).
@@ -218,7 +221,7 @@
 - **Pitfalls:** the token you pass to `register` is hashed before storage (`agents.go:80`); only the original plaintext authenticates afterward — there is no way to recover it from the DB. RELEASE-QA §2.6 note: "agent bearer on its own agent route → 200; on a wrong agent route → 403."
 
 ### Auth class: `requireAgentAuth` — enforcement
-- **Must:** routes wrapped with `requireAgentAuth` (`heartbeat`, `stream`, `routes/ack`, `artifacts/adopt`, `logs/chunk`, `admin-ops/claim`, `admin-ops/{opId}/ack`) reject a request with no Bearer token (**401** `agent authentication required`) and a Bearer token that matches no agent (**401** `invalid agent token`) (`middleware.go:68-94`). An **admin API key** does **not** satisfy `requireAgentAuth` (it isn't an agent token) → also 401.
+- **Must:** routes wrapped with `requireAgentAuth` (`heartbeat`, `stream`, `routes/ack`, `artifacts/adopt`, `logs/chunk`, `certificates/upload`, `admin-ops/claim`, `admin-ops/{opId}/ack`) reject a request with no Bearer token (**401** `agent authentication required`) and a Bearer token that matches no agent (**401** `invalid agent token`) (`middleware.go:68-94`). An **admin API key** does **not** satisfy `requireAgentAuth` (it isn't an agent token) → also 401.
 - **Access:** REST.
 - **Steps:**
   ```bash

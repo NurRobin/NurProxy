@@ -134,6 +134,32 @@ type ProxyDetection struct {
 	// Networks are the IP subnets attached to the agent host's interfaces (§38), so
 	// the dashboard can suggest a CIDR when adding a Server.
 	Networks []DiscoveredNetwork `json:"networks,omitempty"`
+	// DiscoveredCerts are certificate bundles already on the agent host (certbot,
+	// acme.sh, files referenced by the host proxy's vhosts) that an operator can
+	// adopt instead of having NurProxy order a new certificate (#80). Metadata
+	// only: private keys never leave the host until the operator adopts one.
+	DiscoveredCerts []DiscoveredCert `json:"discovered_certs,omitempty"`
+}
+
+// DiscoveredCert describes one certificate bundle found on an agent host. The
+// agent reports it so the operator can adopt it for a domain; the bundle itself
+// is uploaded only when the operator asks for that specific fingerprint.
+type DiscoveredCert struct {
+	// Fingerprint is the lowercase hex SHA-256 of the leaf certificate's DER.
+	// Empty when the certificate file could not be read or parsed.
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	Names       []string  `json:"names,omitempty"`
+	Issuer      string    `json:"issuer,omitempty"`
+	NotBefore   time.Time `json:"not_before"`
+	NotAfter    time.Time `json:"not_after"`
+	// Source names where the bundle was found: certbot, acme.sh, nginx, apache
+	// or dryrun.
+	Source   string `json:"source"`
+	CertPath string `json:"cert_path"`
+	KeyPath  string `json:"key_path,omitempty"`
+	// Error says why the bundle cannot be adopted as found, for example a key
+	// the agent may not read or a key that does not match the certificate.
+	Error string `json:"error,omitempty"`
 }
 
 // DiscoveredNetwork is one IP subnet attached to the agent host (§38): the host's

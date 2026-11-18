@@ -162,6 +162,9 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		if inBackoff(fqdn) {
 			continue
 		}
+		if s.awaitingAdoption(dom, fqdn, time.Now().UTC()) {
+			continue
+		}
 		t, ok := s.resolveTarget(fqdn, []string{fqdn}, false, zones)
 		if !ok {
 			log.Printf("reconciler: first-issuance: cannot resolve zone/provider for %q, skipping", fqdn)
@@ -204,11 +207,67 @@ func (s *CertRenewalStore) TargetForHost(_ context.Context, host string) (*tls.R
 	if err != nil {
 		return nil, fmt.Errorf("listing zones: %w", err)
 	}
+	if dom := s.domainForHost(host, zones); dom != nil && s.awaitingAdoption(dom, host, time.Now().UTC()) {
+		return nil, nil
+	}
 	t, ok := s.resolveTarget(host, []string{host}, false, zones)
 	if !ok {
 		return nil, nil // no zone/provider covers this host — nothing to issue against
 	}
 	return &t, nil
+}
+
+// awaitingAdoption reports whether first issuance for host should wait: the
+// domain is younger than tls.AdoptionGrace and its serving agent reports an
+// adoptable certificate for host on disk (#80). Ordering now would spend a CA
+// order (and the duplicate-certificate quota) on a host the operator is
+// probably about to adopt a certificate for. Lookup errors never hold
+// issuance back.
+func (s *CertRenewalStore) awaitingAdoption(dom *models.Domain, host string, now time.Time) bool {
+	until := dom.CreatedAt.Add(tls.AdoptionGrace)
+	if dom.CreatedAt.IsZero() || !now.Before(until) || dom.ServerID == "" {
+		return false
+	}
+	srv, err := s.db.GetServer(dom.ServerID)
+	if err != nil {
+		return false
+	}
+	agent, err := s.db.GetAgent(srv.AgentID)
+	if err != nil || agent.ProxyDetection == nil {
+		return false
+	}
+	for _, dc := range agent.ProxyDetection.DiscoveredCerts {
+		if ok, _ := tls.AdoptableFor(dc, host, now); ok {
+			log.Printf("reconciler: first-issuance for %q waits until %s: agent %s has an adoptable certificate on disk (%s)",
+				host, until.UTC().Format(time.RFC3339), agent.Name, dc.CertPath)
+			return true
+		}
+	}
+	return false
+}
+
+// domainForHost returns the non-deleting central-TLS domain whose FQDN is
+// host, or nil.
+func (s *CertRenewalStore) domainForHost(host string, zones []models.Zone) *models.Domain {
+	domains, err := s.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return nil
+	}
+	zoneNames := make(map[string]string, len(zones))
+	for i := range zones {
+		zoneNames[zones[i].ID] = zones[i].Name
+	}
+	for i := range domains {
+		dom := &domains[i]
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok || dom.Status == models.DomainStatusDeleting || dom.FQDN(zoneName) != host {
+			continue
+		}
+		if caddygen.TLSPolicyForDomain(*dom) == proxymodel.TLSPolicyCentral {
+			return dom
+		}
+	}
+	return nil
 }
 
 // resolveTarget builds a RenewTarget for a host by finding its zone and that

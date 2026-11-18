@@ -543,9 +543,88 @@ func cmdDomain(args []string) {
 		}
 		c.emit(raw, msg)
 
+	case "cert-candidates":
+		c, _, id := parseClient("domain cert-candidates", rest, "domain id", nil)
+		cands := fetchCertCandidates(c, id)
+		if c.asJSON {
+			c.emit(mustJSON(cands), "")
+			return
+		}
+		rows := make([][]string, 0, len(cands.Candidates))
+		for _, cand := range cands.Candidates {
+			state := "yes"
+			if !cand.Adoptable {
+				state = "no: " + cand.Reason
+			}
+			rows = append(rows, []string{cand.AgentName, cand.Fingerprint, strings.Join(cand.Names, ","),
+				cand.NotAfter.Format("2006-01-02"), cand.Source, cand.CertPath, state})
+		}
+		printTable([]string{"AGENT", "FINGERPRINT", "NAMES", "EXPIRES", "SOURCE", "PATH", "ADOPTABLE"}, rows)
+		for _, h := range cands.Hints {
+			fmt.Fprintf(os.Stderr, "note: agent %s cannot scan %s: %s\n", h.AgentName, h.Path, h.Error)
+		}
+
+	case "adopt-cert":
+		var fingerprint, agentID string
+		c, _, id := parseClient("domain adopt-cert", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&fingerprint, "fingerprint", "", "SHA-256 fingerprint from 'domain cert-candidates' (optional when exactly one certificate is adoptable)")
+			fs.StringVar(&agentID, "agent", "", "Agent ID holding the certificate (default: the agent reporting the fingerprint, serving agent first)")
+		})
+		if fingerprint == "" {
+			var adoptable []certCandidateRow
+			for _, cand := range fetchCertCandidates(c, id).Candidates {
+				if cand.Adoptable && (agentID == "" || cand.AgentID == agentID) {
+					adoptable = append(adoptable, cand)
+				}
+			}
+			if len(adoptable) != 1 {
+				fatalf("domain adopt-cert: %d adoptable certificates found; pick one with --fingerprint (see 'domain cert-candidates %s')", len(adoptable), id)
+			}
+			fingerprint, agentID = adoptable[0].Fingerprint, adoptable[0].AgentID
+		}
+		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/certificate/adopt", map[string]string{
+			"fingerprint": fingerprint, "agent_id": agentID,
+		})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		msg := "certificate adopted for domain " + id + " from " + gjson(raw, "source_path") + ", expires " + gjson(raw, "expires_at")
+		if warning := gjson(raw, "warning"); warning != "" {
+			msg += "\nwarning: " + warning
+		}
+		c.emit(raw, msg)
+
 	default:
-		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE")
+		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE",
+			"cert-candidates <id>", "adopt-cert <id> [--fingerprint FP] [--agent ID]")
 	}
+}
+
+// certCandidateRow mirrors one entry of GET /api/v1/domains/{id}/certificate/candidates.
+type certCandidateRow struct {
+	models.DiscoveredCert
+	AgentID   string `json:"agent_id"`
+	AgentName string `json:"agent_name"`
+	Adoptable bool   `json:"adoptable"`
+	Reason    string `json:"reason"`
+}
+
+type certCandidates struct {
+	Host       string             `json:"host"`
+	Candidates []certCandidateRow `json:"candidates"`
+	Hints      []struct {
+		AgentName string `json:"agent_name"`
+		Path      string `json:"path"`
+		Error     string `json:"error"`
+	} `json:"hints"`
+}
+
+func fetchCertCandidates(c *client, domainID string) certCandidates {
+	var out certCandidates
+	if err := c.getInto("/api/v1/domains/"+domainID+"/certificate/candidates", &out); err != nil {
+		fatalf("%v", err)
+	}
+	return out
 }
 
 // --- apikey --------------------------------------------------------------

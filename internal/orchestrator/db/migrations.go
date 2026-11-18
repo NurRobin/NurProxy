@@ -843,6 +843,13 @@ var migrations = []string{
 	CREATE INDEX idx_domain_dns_cleanups_record
 		ON domain_dns_cleanups(zone_external_id, record_id);
 	`,
+
+	// Migration 36: certificate bundles the agent found on its host (#80), as
+	// a JSON array of models.DiscoveredCert. Metadata only, never key material;
+	// the operator adopts one explicitly and only then the agent uploads it.
+	`
+	ALTER TABLE agents ADD COLUMN detected_certs TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

@@ -43,18 +43,18 @@ func (d *DB) CreateAgent(a *models.Agent) error {
 			caddy_running, last_error, dns_error,
 			detected_proxy_kind, detected_proxy_version, detected_binary_path,
 			detected_config_dir, detected_log_paths, detected_port_conflicts,
-			detected_upstreams, detected_networks,
+			detected_upstreams, detected_networks, detected_certs,
 			detected_installed, detected_at, detected_capabilities,
 			auto_reconcile_config, safe_auto_repair_override, recovery_capability,
 			created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.FQDN, a.APIURL, a.TokenHash,
 		string(a.DNSMode), a.DDNSInterval, a.PublicIP, a.PublicIP6, a.DNSRecordID, a.DNSRecordID6,
 		boolToInt(a.DNSRecordOwned), boolToInt(a.DNSRecordOwned6), a.DNSRecordZoneID, a.DNSRecordZoneID6,
 		string(a.Status), lastSeen, a.Version,
 		boolToInt(a.CaddyRunning), a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
-		det.logPaths, det.portConflicts, det.upstreams, det.networks, det.installed, detectedAt, caps,
+		det.logPaths, det.portConflicts, det.upstreams, det.networks, det.certs, det.installed, detectedAt, caps,
 		boolToInt(a.AutoReconcileConfig),
 		nullableBoolValue(a.SafeAutoRepairOverride), recoveryCapability,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
@@ -75,6 +75,7 @@ type detectionCols struct {
 	portConflicts string // JSON array
 	upstreams     string // JSON array (discovered nginx upstreams, §52)
 	networks      string // JSON array (discovered host subnets, §38)
+	certs         string // JSON array (discovered certificate bundles, #80)
 	installed     int
 }
 
@@ -109,6 +110,12 @@ func encodeDetection(d *models.ProxyDetection) detectionCols {
 			networks = string(b)
 		}
 	}
+	certs := ""
+	if len(d.DiscoveredCerts) > 0 {
+		if b, err := json.Marshal(d.DiscoveredCerts); err == nil {
+			certs = string(b)
+		}
+	}
 	return detectionCols{
 		kind:          d.Kind,
 		version:       d.Version,
@@ -118,6 +125,7 @@ func encodeDetection(d *models.ProxyDetection) detectionCols {
 		portConflicts: conflicts,
 		upstreams:     upstreams,
 		networks:      networks,
+		certs:         certs,
 		installed:     boolToInt(d.Installed),
 	}
 }
@@ -134,7 +142,7 @@ func decodeDetection(c detectionCols, detectedAt sql.NullString) (*models.ProxyD
 	}
 	// Nothing was ever reported: leave detection nil.
 	if at == nil && c.installed == 0 && c.kind == "" && c.version == "" &&
-		c.binaryPath == "" && c.configDir == "" && c.logPaths == "" && c.portConflicts == "" && c.upstreams == "" && c.networks == "" {
+		c.binaryPath == "" && c.configDir == "" && c.logPaths == "" && c.portConflicts == "" && c.upstreams == "" && c.networks == "" && c.certs == "" {
 		return nil, nil
 	}
 	d := &models.ProxyDetection{
@@ -155,6 +163,9 @@ func decodeDetection(c detectionCols, detectedAt sql.NullString) (*models.ProxyD
 	}
 	if c.networks != "" {
 		_ = json.Unmarshal([]byte(c.networks), &d.Networks)
+	}
+	if c.certs != "" {
+		_ = json.Unmarshal([]byte(c.certs), &d.DiscoveredCerts)
 	}
 	return d, at
 }
@@ -271,7 +282,7 @@ func scanAgent(sc interface {
 		&a.Status, &lastSeen, &a.Version, &caddyRunning, &a.LastError,
 		&a.DNSError,
 		&det.kind, &det.version, &det.binaryPath, &det.configDir,
-		&det.logPaths, &det.portConflicts, &det.upstreams, &det.networks, &det.installed, &detectedAt,
+		&det.logPaths, &det.portConflicts, &det.upstreams, &det.networks, &det.certs, &det.installed, &detectedAt,
 		&capabilities,
 		&autoReconcile,
 		&safeAutoRepairOverride, &recoveryCapability,
@@ -318,7 +329,7 @@ const agentColumns = `id, name, fqdn, api_url, token_hash, dns_mode,
 	caddy_running, last_error, dns_error,
 	detected_proxy_kind, detected_proxy_version, detected_binary_path,
 	detected_config_dir, detected_log_paths, detected_port_conflicts,
-	detected_upstreams, detected_networks,
+	detected_upstreams, detected_networks, detected_certs,
 	detected_installed, detected_at, detected_capabilities,
 	auto_reconcile_config, safe_auto_repair_override, recovery_capability,
 	proxy_mode, proxy_permissions,
@@ -453,7 +464,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 			detected_proxy_kind = ?, detected_proxy_version = ?,
 			detected_binary_path = ?, detected_config_dir = ?,
 			detected_log_paths = ?, detected_port_conflicts = ?,
-			detected_upstreams = ?, detected_networks = ?,
+			detected_upstreams = ?, detected_networks = ?, detected_certs = ?,
 			detected_installed = ?, detected_at = ?, detected_capabilities = ?,
 			auto_reconcile_config = ?,
 			updated_at = ?
@@ -463,7 +474,7 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 		string(a.Status), lastSeen, a.Version, boolToInt(a.CaddyRunning),
 		a.LastError, a.DNSError,
 		det.kind, det.version, det.binaryPath, det.configDir,
-		det.logPaths, det.portConflicts, det.upstreams, det.networks, det.installed, detectedAt, caps,
+		det.logPaths, det.portConflicts, det.upstreams, det.networks, det.certs, det.installed, detectedAt, caps,
 		boolToInt(a.AutoReconcileConfig),
 		a.UpdatedAt.Format(time.RFC3339),
 		a.ID,
@@ -610,11 +621,11 @@ func (d *DB) UpdateAgentDetection(id string, det *models.ProxyDetection) error {
 		SET detected_proxy_kind = ?, detected_proxy_version = ?,
 			detected_binary_path = ?, detected_config_dir = ?,
 			detected_log_paths = ?, detected_port_conflicts = ?,
-			detected_upstreams = ?, detected_networks = ?,
+			detected_upstreams = ?, detected_networks = ?, detected_certs = ?,
 			detected_installed = ?, detected_at = ?, updated_at = ?
 		WHERE id = ?`,
 		c.kind, c.version, c.binaryPath, c.configDir,
-		c.logPaths, c.portConflicts, c.upstreams, c.networks, c.installed, now, now, id,
+		c.logPaths, c.portConflicts, c.upstreams, c.networks, c.certs, c.installed, now, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("updating agent detection: %w", err)

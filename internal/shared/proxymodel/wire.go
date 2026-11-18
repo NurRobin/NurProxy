@@ -384,3 +384,24 @@ func AdoptedArtifactID(agentID, backend, path string) string {
 	}
 	return "adopt-" + agentID + "-" + backend + "-" + cleaned
 }
+
+// CertUploadRequest asks the agent to upload one certificate bundle it reported
+// in its detection (#80). Only the fingerprint travels: the agent looks the
+// bundle up among the bundles it discovered itself, so the orchestrator can
+// never make it read an arbitrary path.
+type CertUploadRequest struct {
+	RequestID   string `json:"request_id"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+// CertUpload is the agent's answer to a CertUploadRequest, POSTed over the
+// agent-authenticated control plane. Either the PEM bundle or Error is set.
+type CertUpload struct {
+	RequestID   string `json:"request_id"`
+	Fingerprint string `json:"fingerprint"`
+	CertPEM     string `json:"cert_pem,omitempty"`
+	KeyPEM      string `json:"key_pem,omitempty"`
+	// SourcePath is the certificate file the bundle was read from.
+	SourcePath string `json:"source_path,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
