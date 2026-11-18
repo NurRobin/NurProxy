@@ -127,10 +127,10 @@ nurproxy discovery delete <source-id>       # imported servers are kept
 nurproxy domain list [--agent <id>] [--server <id>] [--status <s>]
 nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port 8080 \
                     [--websocket] [--force-https] [--ssl-mode auto] \
-                    [--access-log off] [--error-log-level crit] \
+                    [--access-log off] [--error-log-level crit] [--tls-wildcard] \
                     [--proxy-config-file ./proxy.json]
 nurproxy domain update <domain-id> [--subdomain s] [--port n] [--websocket] [--force-https] [--ssl-mode m] \
-                    [--access-log off|default] [--error-log-level <level>|default]
+                    [--access-log off|default] [--error-log-level <level>|default] [--tls-wildcard[=false]]
 nurproxy domain delete <domain-id>          # marks for deletion; reconciler cleans up
 ```
 
@@ -146,6 +146,12 @@ of the main nginx.conf, and otherwise doesn't offer it, so source builds and
 OpenResty keep their own log. The built-in Caddy writes no access log anyway
 and has no per-domain error level. The orchestrator refuses a setting the
 domain's agent doesn't offer.
+
+`--tls-wildcard` serves the domain from its zone's shared `*.<zone>`
+certificate instead of a per-host one; `--tls-wildcard=false` on `update` turns
+it off again. Only a single label directly below the zone with central TLS can
+use it, and the private key is then shared by every agent serving a wildcard
+domain of the zone. See [Domains](domains.md#zone-wildcard-certificate).
 
 For advanced per-domain proxy options (custom headers, timeouts, basic auth, IP
 allow/block lists, path rewriting), pass a `ProxyConfig` JSON document via

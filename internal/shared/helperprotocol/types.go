@@ -122,6 +122,24 @@ func (r HelperHello) Validate() error {
 	return nil
 }
 
+// ManagedPlanRefusedMessage is the error message of a managed apply plan the
+// helper's local policy refused. When the refusal has a reason meant for the
+// operator, the message is this text, ": " and the reason.
+const ManagedPlanRefusedMessage = "local managed apply planning refused the desired state"
+
+// ManagedPlanRefusalReason returns the operator-facing reason carried in a
+// managed plan refusal message, or "" when the message carries none.
+func ManagedPlanRefusalReason(code ErrorCode, message string) string {
+	if code != ErrorAmbiguousLocalTarget {
+		return ""
+	}
+	reason, ok := strings.CutPrefix(message, ManagedPlanRefusedMessage+": ")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(reason)
+}
+
 type ErrorResponse struct {
 	RequestID string    `json:"request_id"`
 	Code      ErrorCode `json:"code"`

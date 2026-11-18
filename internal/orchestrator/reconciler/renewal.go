@@ -65,11 +65,14 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		zoneNames[zones[i].ID] = zones[i].Name
 	}
 
-	// centralHosts is the set of FQDNs a stored cert can currently be consumed
-	// for: every non-deleting domain that resolves to the host AND wants central
-	// TLS (the same host→domain matching gatherCerts uses, and the same policy
-	// resolution the renderers use). It gates the renewal pass below.
+	// centralHosts is the set of FQDNs a per-host cert can currently be
+	// consumed for: every non-deleting domain that resolves to the host AND wants
+	// central TLS from its own cert (the same host→domain matching gatherCerts
+	// uses, and the same policy resolution the renderers use). wildcardHosts is
+	// the set of "*.<zone>" certs some domain opted into instead. Both gate the
+	// renewal pass below.
 	centralHosts := make(map[string]bool)
+	wildcardHosts := make(map[string]bool)
 	for i := range domains {
 		dom := &domains[i]
 		if dom.Status == models.DomainStatusDeleting {
@@ -80,6 +83,10 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 			continue
 		}
 		if caddygen.TLSPolicyForDomain(*dom) != proxymodel.TLSPolicyCentral {
+			continue
+		}
+		if wildHost := caddygen.WildcardCertHost(*dom, zoneName); wildHost != "" {
+			wildcardHosts[wildHost] = true
 			continue
 		}
 		centralHosts[dom.FQDN(zoneName)] = true
@@ -119,7 +126,14 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		if c.Source == models.CertSourceImported {
 			c = &models.Certificate{Host: c.Host, Names: []string{c.Host}}
 		}
-		if !certHasCentralConsumer(c, centralHosts) {
+		consumed := certHasCentralConsumer(c, centralHosts)
+		if isZoneWildcardCert(c) {
+			// A "*.<zone>" cert serves the domains that opted into it and the
+			// zone's catch-all "*" domain, not every central host that happens
+			// to sit below the zone.
+			consumed = wildcardHosts[c.Host] || centralHosts[c.Host]
+		}
+		if !consumed {
 			log.Printf("reconciler: renewal: no central-TLS domain consumes cert host %q, skipping renewal", c.Host)
 			continue
 		}
@@ -139,7 +153,8 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 	// 2) Central-TLS domains with no cert yet — first issuance. Without this a brand
 	//    new domain would never get a cert (the file backends then render plaintext;
 	//    built-in Caddy hides it via self-ACME). Skip domains being deleted and any
-	//    host already covered by the renewal pass above.
+	//    host already covered by the renewal pass above. Wildcard domains of one
+	//    zone share a single "*.<zone>" target, issued once for all of them.
 	for i := range domains {
 		dom := &domains[i]
 		if dom.Status == models.DomainStatusDeleting {
@@ -150,11 +165,16 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 			continue
 		}
 		fqdn := dom.FQDN(zoneName)
-		if seen[fqdn] {
-			continue
-		}
 		if caddygen.TLSPolicyForDomain(*dom) != proxymodel.TLSPolicyCentral {
 			continue // self-acme / off domains need no provided cert
+		}
+		if wildHost := caddygen.WildcardCertHost(*dom, zoneName); wildHost != "" {
+			fqdn = wildHost
+		}
+		// A catch-all "*" domain's own FQDN is the same "*.<zone>" name.
+		isWildcard := strings.HasPrefix(fqdn, "*.")
+		if seen[fqdn] {
+			continue
 		}
 		if _, gErr := s.db.GetCertificate(fqdn); gErr == nil {
 			continue // already have a cert (renewal pass owns expiry)
@@ -162,7 +182,7 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		if inBackoff(fqdn) {
 			continue
 		}
-		t, ok := s.resolveTarget(fqdn, []string{fqdn}, false, zones)
+		t, ok := s.resolveTarget(fqdn, []string{fqdn}, isWildcard, zones)
 		if !ok {
 			log.Printf("reconciler: first-issuance: cannot resolve zone/provider for %q, skipping", fqdn)
 			continue
@@ -176,14 +196,17 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 }
 
 // TargetForHost resolves the issuance target for a single host on demand (the
-// on-create fast path). It returns (nil, nil) when nothing should be issued: the
-// host's zone/provider cannot be resolved, or a certificate is already on file
-// (the periodic scan owns renewal). The caller is responsible for only invoking
-// this for hosts whose domain actually wants a central cert.
+// on-create fast path). host is a domain FQDN, or "*.<zone>" for a zone
+// wildcard cert. It returns (nil, nil) when nothing should be issued: the
+// host's zone/provider cannot be resolved, a certificate is already on file
+// (the periodic scan owns renewal), or every domain at the FQDN is served from
+// its zone wildcard cert. The caller is responsible for only invoking this for
+// hosts whose domain actually wants a central cert.
 func (s *CertRenewalStore) TargetForHost(_ context.Context, host string) (*tls.RenewTarget, error) {
 	if host == "" {
 		return nil, nil
 	}
+	isWildcard := strings.HasPrefix(host, "*.")
 	if _, err := s.db.GetCertificate(host); err == nil {
 		return nil, nil // already have a cert; let the scan handle renewal
 	}
@@ -204,11 +227,47 @@ func (s *CertRenewalStore) TargetForHost(_ context.Context, host string) (*tls.R
 	if err != nil {
 		return nil, fmt.Errorf("listing zones: %w", err)
 	}
-	t, ok := s.resolveTarget(host, []string{host}, false, zones)
+	if !isWildcard {
+		covered, cErr := s.coveredOnlyByWildcard(host, zones)
+		if cErr != nil {
+			return nil, cErr
+		}
+		if covered {
+			return nil, nil // the zone wildcard cert serves this host; no per-host order
+		}
+	}
+	t, ok := s.resolveTarget(host, []string{host}, isWildcard, zones)
 	if !ok {
 		return nil, nil // no zone/provider covers this host — nothing to issue against
 	}
 	return &t, nil
+}
+
+// coveredOnlyByWildcard reports whether host has at least one live domain and
+// every one of them is served from its zone wildcard cert, so a per-host order
+// for it would only duplicate the shared cert.
+func (s *CertRenewalStore) coveredOnlyByWildcard(host string, zones []models.Zone) (bool, error) {
+	domains, err := s.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return false, fmt.Errorf("listing domains for %q: %w", host, err)
+	}
+	zoneNames := make(map[string]string, len(zones))
+	for i := range zones {
+		zoneNames[zones[i].ID] = zones[i].Name
+	}
+	matched := false
+	for i := range domains {
+		dom := &domains[i]
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if dom.Status == models.DomainStatusDeleting || !ok || dom.FQDN(zoneName) != host {
+			continue
+		}
+		if caddygen.WildcardCertHost(*dom, zoneName) == "" {
+			return false, nil
+		}
+		matched = true
+	}
+	return matched, nil
 }
 
 // resolveTarget builds a RenewTarget for a host by finding its zone and that

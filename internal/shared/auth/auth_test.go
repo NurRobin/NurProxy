@@ -3,6 +3,8 @@ package auth
 import (
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestGenerateAgentToken(t *testing.T) {
@@ -178,5 +180,22 @@ func TestSessionManager_DifferentKeys(t *testing.T) {
 
 	if _, err := sm2.Verify(signed); err == nil {
 		t.Error("Verify with different key should fail")
+	}
+}
+
+func TestHashPasswordUsesDefaultCost(t *testing.T) {
+	hash, err := HashPassword("correct horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost, err := bcrypt.Cost([]byte(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost != DefaultHashCost {
+		t.Fatalf("bcrypt cost = %d, want %d", cost, DefaultHashCost)
+	}
+	if err := CheckPassword(hash, "correct horse"); err != nil {
+		t.Fatalf("CheckPassword: %v", err)
 	}
 }
