@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Raw nginx configs may carry common tuning directives, and a refusal says
+  why (#149).** The root helper's raw-config policy now admits `gzip*`,
+  `proxy_buffering`, `proxy_request_buffering`, proxy buffer sizes and
+  timeouts, `proxy_hide_header`, `proxy_redirect off`, `proxy_ssl_server_name`,
+  `client_body_buffer_size` and `server_tokens`, and allows the existing header,
+  body-size and `access_log off` directives inside `location /` too. A raw
+  config no longer has to match the dashboard's structured form exactly. When
+  the helper refuses a raw config, the domain's error now names the directive
+  and its line (for example `line 12: nginx directive "include" is not allowed
+  in the server block`) instead of only "privileged managed proxy
+  reconciliation failed". File paths in logs stay limited to `access_log off`
+  and the stock error log.
 - **Renaming a domain or moving it to another zone cleans up the old name
   (#151).** The DNS record of the old name is queued and deleted through the
   provider and zone it was created in, once the record for the new name exists;
