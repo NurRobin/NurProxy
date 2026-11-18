@@ -843,6 +843,37 @@ var migrations = []string{
 	CREATE INDEX idx_domain_dns_cleanups_record
 		ON domain_dns_cleanups(zone_external_id, record_id);
 	`,
+
+	// Migration 36: agent self-update (#73). agent_upgrades records every
+	// operator-requested upgrade and its progress; the partial unique index
+	// keeps at most one unfinished upgrade per agent. agent_self_update holds
+	// the per-agent auto-upgrade opt-in (off by default) and the agent's last
+	// self-update capability report. Both live beside the agents table so the
+	// hot agent row and its scanner stay unchanged; rows go with the agent.
+	`
+	CREATE TABLE agent_upgrades (
+		id             TEXT PRIMARY KEY,
+		agent_id       TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		from_version   TEXT NOT NULL DEFAULT '',
+		target_version TEXT NOT NULL,
+		state          TEXT NOT NULL CHECK (state IN ('requested', 'downloading', 'installed', 'restarting', 'done', 'failed', 'rolled_back')),
+		error          TEXT NOT NULL DEFAULT '',
+		triggered_by   TEXT NOT NULL DEFAULT 'manual' CHECK (triggered_by IN ('manual', 'rollout', 'auto')),
+		rollout_id     TEXT NOT NULL DEFAULT '',
+		requested_by   TEXT NOT NULL DEFAULT '',
+		created_at     TEXT NOT NULL,
+		updated_at     TEXT NOT NULL
+	);
+	CREATE INDEX idx_agent_upgrades_agent ON agent_upgrades(agent_id, created_at);
+	CREATE UNIQUE INDEX idx_agent_upgrades_active ON agent_upgrades(agent_id)
+		WHERE state IN ('requested', 'downloading', 'installed', 'restarting');
+	CREATE TABLE agent_self_update (
+		agent_id     TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+		auto_upgrade INTEGER NOT NULL DEFAULT 0 CHECK (auto_upgrade IN (0, 1)),
+		capability   TEXT,
+		updated_at   TEXT NOT NULL
+	);
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
