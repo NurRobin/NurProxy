@@ -141,7 +141,7 @@ func TestToolsList(t *testing.T) {
 	want := map[string]bool{
 		"create_domain": true, "delete_domain": true, "update_domain": true,
 		"list_domains": true, "list_agents": true, "list_servers": true,
-		"get_agent_status": true,
+		"get_agent_status": true, "get_domain_failover": true, "set_domain_backups": true,
 	}
 	if len(list) != len(want) {
 		t.Errorf("expected %d tools, got %d", len(want), len(list))

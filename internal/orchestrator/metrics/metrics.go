@@ -17,6 +17,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
 var (
@@ -60,6 +61,16 @@ var (
 		"Number of open recovery circuit breakers by action.",
 		[]string{"action"}, nil,
 	)
+	failoverSwitchesDesc = prometheus.NewDesc(
+		"nurproxy_domain_failover_switches_total",
+		"How often the DNS target of a domain with failover backups switched agents (failover and failback, #74).",
+		[]string{"domain"}, nil,
+	)
+	onBackupDesc = prometheus.NewDesc(
+		"nurproxy_domain_on_backup",
+		"1 while a domain's DNS record points at a backup agent instead of its primary (#74).",
+		[]string{"domain"}, nil,
+	)
 	scrapeErrDesc = prometheus.NewDesc(
 		"nurproxy_metrics_scrape_errors",
 		"Database read failures during this scrape (0 on a clean scrape).",
@@ -82,6 +93,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- recoveryOperationsTotalDesc
 	ch <- recoveryOperationsInProgressDesc
 	ch <- recoveryCircuitBreakersOpenDesc
+	ch <- failoverSwitchesDesc
+	ch <- onBackupDesc
 	ch <- scrapeErrDesc
 }
 
@@ -108,6 +121,10 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 		for status, n := range counts {
 			ch <- prometheus.MustNewConstMetric(domainsDesc, prometheus.GaugeValue, float64(n), status)
+		}
+		if err := c.collectFailover(ch, domains); err != nil {
+			scrapeErrs++
+			log.Printf("metrics: reading failover state: %v", err)
 		}
 	} else {
 		scrapeErrs++
@@ -159,6 +176,42 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	ch <- prometheus.MustNewConstMetric(scrapeErrDesc, prometheus.GaugeValue, float64(scrapeErrs))
+}
+
+// collectFailover exports the failover series for every domain with backup
+// servers, labelled by the domain's FQDN.
+func (c *collector) collectFailover(ch chan<- prometheus.Metric, domains []models.Domain) error {
+	states, err := c.db.ListDomainFailoverStates()
+	if err != nil {
+		return err
+	}
+	if err := c.db.FillDomainFailover(domains); err != nil {
+		return err
+	}
+	zoneNames := map[string]string{}
+	for i := range domains {
+		dom := &domains[i]
+		if len(dom.BackupServerIDs) == 0 {
+			continue
+		}
+		name, ok := zoneNames[dom.ZoneID]
+		if !ok {
+			zone, err := c.db.GetZone(dom.ZoneID)
+			if err != nil {
+				continue
+			}
+			name = zone.Name
+			zoneNames[dom.ZoneID] = name
+		}
+		fqdn := dom.FQDN(name)
+		onBackup := 0.0
+		if dom.ActiveServerID != dom.ServerID {
+			onBackup = 1
+		}
+		ch <- prometheus.MustNewConstMetric(onBackupDesc, prometheus.GaugeValue, onBackup, fqdn)
+		ch <- prometheus.MustNewConstMetric(failoverSwitchesDesc, prometheus.CounterValue, float64(states[dom.ID].Switches), fqdn)
+	}
+	return nil
 }
 
 // Handler returns the /metrics HTTP handler: a dedicated Prometheus registry

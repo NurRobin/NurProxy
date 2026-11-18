@@ -120,6 +120,11 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 	// Refuse while domains still reference this server: the ON DELETE CASCADE would
 	// orphan their DNS records/certs ahead of the reconciler teardown (see
 	// guardChildDomains).
+	// A server that is a failover backup (#74) holds standby routes on its
+	// agent; it leaves the backup lists before it can go.
+	if s.guardBackupServer(w, id, cascadeRequested(r)) {
+		return
+	}
 	if cascadeRequested(r) {
 		s.cascadeDeleteParent(w, r, "server", id, db.DomainFilter{ServerID: id})
 		return

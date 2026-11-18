@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/failover"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
@@ -78,6 +79,9 @@ type Reconciler struct {
 	applyAuthority interface {
 		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
 	}
+
+	// clock is the time failover decisions are made at; tests replace it.
+	clock func() time.Time
 }
 
 func (r *Reconciler) SetApplyAuthority(authority interface {
@@ -95,6 +99,7 @@ func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reco
 		anchorRenameGrace: defaultAnchorRenameGrace,
 
 		domainDNSCleanupMaxWait: defaultDomainDNSCleanupMaxWait,
+		clock:                   time.Now,
 	}
 }
 
@@ -359,6 +364,7 @@ func (r *Reconciler) liveCertificateKeep(agent *models.Agent) []string {
 		}
 		hosts = append(hosts, domain.FQDN(zoneName))
 	}
+	hosts = append(hosts, r.standbyHosts(agent)...)
 	sort.Strings(hosts)
 	return hosts
 }
@@ -400,51 +406,30 @@ func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertB
 	return bundles
 }
 
-// RepushCertForHost re-pushes the config + cert bundle for the agent serving
-// host (an FQDN), so a centrally-renewed certificate reaches that agent and is
-// reloaded. It is the post-renewal hook the TLS Renewer calls (§7): it resolves
-// host -> domain -> server -> agent, then re-runs the agent's instant push,
-// which gathers the now-renewed cert from the store and rides it down the
-// agent-initiated stream ahead of the intents (preflight ordering). It satisfies
-// tls.Reloader. Best-effort by contract: if the agent is offline PushAgentRoutes
-// is a no-op and the agent re-syncs (with the fresh cert) on reconnect.
+// RepushCertForHost re-pushes the config + cert bundle to every agent serving
+// host (an FQDN): the primary agent and, for a domain with failover backups,
+// each standby agent (#74), so a centrally-renewed certificate reaches all of
+// them and is reloaded. It is the post-renewal hook the TLS Renewer calls (§7):
+// it resolves host -> domain -> servers -> agents, then re-runs each agent's
+// instant push, which gathers the now-renewed cert from the store and rides it
+// down the agent-initiated stream ahead of the intents (preflight ordering). It
+// satisfies tls.Reloader. Best-effort by contract: if an agent is offline
+// PushAgentRoutes is a no-op and the agent re-syncs (with the fresh cert) on
+// reconnect; the first push error is returned after all agents were tried.
 func (r *Reconciler) RepushCertForHost(_ context.Context, host string) error {
-	agentID, err := r.agentServingHost(host)
+	agentIDs, err := r.agentsServingHost(host)
 	if err != nil {
 		return err
 	}
-	if agentID == "" {
-		// No domain matches this host (e.g. it was deleted). Nothing to push; the
-		// stored cert simply has no current consumer.
-		return nil
-	}
-	return r.PushAgentRoutes(agentID)
-}
-
-// agentServingHost resolves an FQDN to the id of the agent currently serving it,
-// by matching the host against each domain's computed FQDN and following
-// domain -> server -> agent. Returns "" (no error) when no domain matches.
-func (r *Reconciler) agentServingHost(host string) (string, error) {
-	domains, err := r.db.ListDomains(db.DomainFilter{})
-	if err != nil {
-		return "", fmt.Errorf("listing domains to resolve host %q: %w", host, err)
-	}
-	for i := range domains {
-		dom := &domains[i]
-		zone, zErr := r.db.GetZone(dom.ZoneID)
-		if zErr != nil {
-			continue
+	// No domain matching this host (e.g. it was deleted) means nothing to push;
+	// the stored cert simply has no current consumer.
+	var first error
+	for _, agentID := range agentIDs {
+		if pErr := r.PushAgentRoutes(agentID); pErr != nil && first == nil {
+			first = pErr
 		}
-		if dom.FQDN(zone.Name) != host {
-			continue
-		}
-		srv, sErr := r.db.GetServer(dom.ServerID)
-		if sErr != nil {
-			return "", fmt.Errorf("resolving server for host %q: %w", host, sErr)
-		}
-		return srv.AgentID, nil
 	}
-	return "", nil
+	return first
 }
 
 // gatherCerts collects the cert bundles for the FQDNs in the desired route set, so
@@ -693,18 +678,7 @@ func (r *Reconciler) reconcileAgents(_ context.Context) error {
 // considered offline. It reads the agent_offline_timeout setting (seconds),
 // clamped to a sane floor so a misconfiguration can't make agents flap.
 func (r *Reconciler) offlineTimeout() time.Duration {
-	const def = 90 * time.Second
-	const floor = 15 * time.Second
-	if v, err := r.db.GetSetting("agent_offline_timeout"); err == nil && v != "" {
-		if secs, err := strconv.Atoi(v); err == nil {
-			d := time.Duration(secs) * time.Second
-			if d < floor {
-				return floor
-			}
-			return d
-		}
-	}
-	return def
+	return failover.OfflineTimeout(r.db)
 }
 
 // ---------------------------------------------------------------------------
@@ -720,133 +694,160 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing domains for agent %s: %w", agent.ID, err)
 	}
+	// Domains this agent holds as warm standby for failover (#74): the same
+	// route, proxied to the backup server on this agent, under its own
+	// artifact identity.
+	standby, err := r.db.ListStandbyDomains(agent.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing standby domains for agent %s: %w", agent.ID, err)
+	}
 
-	zoneNames := make(map[string]string) // zoneID -> name
+	b := &desiredBuilder{
+		agent:     agent,
+		zoneNames: make(map[string]string),
+		desired:   make(map[string]desiredRoute),
+	}
+	for i := range domains {
+		dom := &domains[i]
+		r.addDesiredRoute(b, dom, dom.ServerID, artifactIDForDomain(dom.ID), false)
+	}
+	for i := range standby {
+		sd := &standby[i]
+		r.addDesiredRoute(b, &sd.Domain, sd.Server.ID, db.StandbyArtifactID(sd.Domain.ID, agent.ID), true)
+	}
+	return b.desired, b.keepExtra, nil
+}
 
+// desiredBuilder collects one agent's desired route set.
+type desiredBuilder struct {
+	agent     *models.Agent
+	zoneNames map[string]string // zoneID -> name
+	desired   map[string]desiredRoute
 	// keepExtra holds generated artifact paths the agent must RETAIN even though
 	// they are not in the pushed intents this round — currently the drifted ones we
 	// skip (awaiting review). The agent's prune keeps applied-targets ∪ keepExtra,
 	// so a drifted file is never mistaken for a deleted domain's orphan (invariant #3).
-	var keepExtra []string
+	keepExtra []string
+}
 
-	desiredByFQDN := make(map[string]desiredRoute)
-	for i := range domains {
-		dom := &domains[i]
+// addDesiredRoute renders dom's route through serverID for the builder's agent
+// and adds it under artifactID, unless the domain is not served (deleting,
+// cert-only), is held back for review, or cannot be rendered.
+func (r *Reconciler) addDesiredRoute(b *desiredBuilder, dom *models.Domain, serverID, artifactID string, standby bool) {
+	agent := b.agent
+	zoneNames := b.zoneNames
 
-		// Domains being deleted are handled by reconcileDeletions; do not
-		// (re-)push routes for them here.
-		if dom.Status == models.DomainStatusDeleting {
-			continue
+	// Domains being deleted are handled by reconcileDeletions; do not
+	// (re-)push routes for them here.
+	if dom.Status == models.DomainStatusDeleting {
+		return
+	}
+
+	// Cert-only domains get a certificate installed on the agent but NO vhost
+	// (§7): the operator hand-writes the config. Exclude them from the route
+	// set; their certs ride the push via gatherCertOnlyCerts.
+	if dom.CertOnly {
+		return
+	}
+
+	// Resolve zone name from the domain's zone.
+	zoneName, ok := zoneNames[dom.ZoneID]
+	if !ok {
+		zone, zErr := r.db.GetZone(dom.ZoneID)
+		if zErr != nil {
+			log.Printf("reconciler: cannot resolve zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
+			return
 		}
+		zoneName = zone.Name
+		zoneNames[dom.ZoneID] = zoneName
+	}
+	fqdn := dom.FQDN(zoneName)
 
-		// Cert-only domains get a certificate installed on the agent but NO vhost
-		// (§7): the operator hand-writes the config. Exclude them from the route
-		// set; their certs ride the push via gatherCertOnlyCerts.
-		if dom.CertOnly {
-			continue
+	// Resolve server address.
+	srv, sErr := r.db.GetServer(serverID)
+	if sErr != nil {
+		log.Printf("reconciler: cannot resolve server %s for domain %d: %v", serverID, dom.ID, sErr)
+		return
+	}
+
+	storedArt, artErr := r.db.GetConfigArtifact(artifactID)
+
+	// Drift = review, not bulldoze (§11, invariant #3): if this domain's
+	// artifact is in an unresolved drifted state, do NOT push it — leave the
+	// operator's on-disk change in place until they Accept or Reject it. The
+	// opt-in per-agent auto-reconcile policy overrides this, restoring the old
+	// hands-off auto-correction (the artifact is pushed normally so the agent
+	// re-applies the generated content over the drift). DNS reconciliation is
+	// untouched by this gate — it stays automatic.
+	if !agent.AutoReconcileConfig && artErr == nil && storedArt.Drifted {
+		log.Printf("reconciler: skipping push for %s (artifact %s drifted, awaiting review)", fqdn, artifactID)
+		// Retain the drifted file: it is under review, not deleted. Without this
+		// the agent's prune would treat the skipped file as an orphan and remove
+		// it, clobbering the operator's edit (invariant #3).
+		if storedArt.Target.Path != "" {
+			b.keepExtra = append(b.keepExtra, storedArt.Target.Path)
 		}
+		return
+	}
 
-		// Resolve zone name from the domain's zone.
-		zoneName, ok := zoneNames[dom.ZoneID]
-		if !ok {
-			zone, zErr := r.db.GetZone(dom.ZoneID)
-			if zErr != nil {
-				log.Printf("reconciler: cannot resolve zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
-				continue
+	var intent proxymodel.Route
+	if artErr == nil && storedArt.Source == models.ArtifactSourceManual {
+		// The operator's accepted hand-edit (drift-accept / raw-edit / rollback to
+		// a manual version) is authoritative: push the stored content verbatim as a
+		// raw intent so the agent re-applies exactly those bytes (idempotent with
+		// on-disk) instead of re-rendering from the domain and clobbering the edit
+		// (§6/§11). The artifact stays in the desired set, so the Fix-1 prune never
+		// mistakes it for an orphan.
+		intent = proxymodel.Route{
+			Host: fqdn,
+			Raw:  proxymodel.RawConfig{Backend: backendForAgent(agent), Content: storedArt.Content},
+		}
+	} else {
+		intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+		// The agent's helper refuses the whole apply batch when one route
+		// fails validation. Hold back only this route, keep its current
+		// file on the agent (like a drifted artifact) and show the reason
+		// on the domain, so one bad stored value neither blocks the other
+		// domains nor goes unnoticed.
+		if vErr := intent.Validate(); vErr != nil {
+			log.Printf("reconciler: not pushing domain %d (%s): stored proxy settings are invalid: %v", dom.ID, fqdn, vErr)
+			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("proxy settings are invalid, fix them to apply this domain again: %v", vErr)); dErr != nil {
+				log.Printf("reconciler: failed to update domain status: %v", dErr)
 			}
-			zoneName = zone.Name
-			zoneNames[dom.ZoneID] = zoneName
-		}
-		fqdn := dom.FQDN(zoneName)
-
-		// Resolve server address.
-		srv, sErr := r.db.GetServer(dom.ServerID)
-		if sErr != nil {
-			log.Printf("reconciler: cannot resolve server %s for domain %d: %v", dom.ServerID, dom.ID, sErr)
-			continue
-		}
-
-		artifactID := artifactIDForDomain(dom.ID)
-		storedArt, artErr := r.db.GetConfigArtifact(artifactID)
-
-		// Drift = review, not bulldoze (§11, invariant #3): if this domain's
-		// artifact is in an unresolved drifted state, do NOT push it — leave the
-		// operator's on-disk change in place until they Accept or Reject it. The
-		// opt-in per-agent auto-reconcile policy overrides this, restoring the old
-		// hands-off auto-correction (the artifact is pushed normally so the agent
-		// re-applies the generated content over the drift). DNS reconciliation is
-		// untouched by this gate — it stays automatic.
-		if !agent.AutoReconcileConfig && artErr == nil && storedArt.Drifted {
-			log.Printf("reconciler: skipping push for %s (artifact %s drifted, awaiting review)", fqdn, artifactID)
-			// Retain the drifted file: it is under review, not deleted. Without this
-			// the agent's prune would treat the skipped file as an orphan and remove
-			// it, clobbering the operator's edit (invariant #3).
-			if storedArt.Target.Path != "" {
-				keepExtra = append(keepExtra, storedArt.Target.Path)
+			if artErr == nil && storedArt.Target.Path != "" {
+				b.keepExtra = append(b.keepExtra, storedArt.Target.Path)
 			}
-			continue
-		}
-
-		var intent proxymodel.Route
-		if artErr == nil && storedArt.Source == models.ArtifactSourceManual {
-			// The operator's accepted hand-edit (drift-accept / raw-edit / rollback to
-			// a manual version) is authoritative: push the stored content verbatim as a
-			// raw intent so the agent re-applies exactly those bytes (idempotent with
-			// on-disk) instead of re-rendering from the domain and clobbering the edit
-			// (§6/§11). The artifact stays in the desired set, so the Fix-1 prune never
-			// mistakes it for an orphan.
-			intent = proxymodel.Route{
-				Host: fqdn,
-				Raw:  proxymodel.RawConfig{Backend: backendForAgent(agent), Content: storedArt.Content},
-			}
-		} else {
-			intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
-			// The agent's helper refuses the whole apply batch when one route
-			// fails validation. Hold back only this route, keep its current
-			// file on the agent (like a drifted artifact) and show the reason
-			// on the domain, so one bad stored value neither blocks the other
-			// domains nor goes unnoticed.
-			if vErr := intent.Validate(); vErr != nil {
-				log.Printf("reconciler: not pushing domain %d (%s): stored proxy settings are invalid: %v", dom.ID, fqdn, vErr)
-				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("proxy settings are invalid, fix them to apply this domain again: %v", vErr)); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
-				if artErr == nil && storedArt.Target.Path != "" {
-					keepExtra = append(keepExtra, storedArt.Target.Path)
-				}
-				continue
-			}
-		}
-
-		// route (Caddy JSON) feeds only the inbound same-host fallback; the stream
-		// path uses intent. A raw intent for a file backend can't render to Caddy
-		// JSON, so fall back to the raw bytes there (the fallback never serves a
-		// file backend anyway). Read them from the intent, not storedArt: a raw
-		// intent can also come from the domain row's manual config before any
-		// artifact exists (ConfigFromDomain), where storedArt is nil.
-		route, gErr := caddygen.GenerateRoute(intent)
-		if gErr != nil {
-			if intent.IsRaw() {
-				route = json.RawMessage(intent.Raw.Content)
-			} else {
-				log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
-				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
-					log.Printf("reconciler: failed to update domain status: %v", dErr)
-				}
-				continue
-			}
-		}
-
-		desiredByFQDN[fqdn] = desiredRoute{
-			domain:     dom,
-			fqdn:       fqdn,
-			route:      route,
-			intent:     intent,
-			artifactID: artifactID,
+			return
 		}
 	}
 
-	return desiredByFQDN, keepExtra, nil
+	// route (Caddy JSON) feeds only the inbound same-host fallback; the stream
+	// path uses intent. A raw intent for a file backend can't render to Caddy
+	// JSON, so fall back to the raw bytes there (the fallback never serves a
+	// file backend anyway). Read them from the intent, not storedArt: a raw
+	// intent can also come from the domain row's manual config before any
+	// artifact exists (ConfigFromDomain), where storedArt is nil.
+	route, gErr := caddygen.GenerateRoute(intent)
+	if gErr != nil {
+		if intent.IsRaw() {
+			route = json.RawMessage(intent.Raw.Content)
+		} else {
+			log.Printf("reconciler: cannot generate route for domain %d (%s): %v", dom.ID, fqdn, gErr)
+			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("route generation failed: %v", gErr)); dErr != nil {
+				log.Printf("reconciler: failed to update domain status: %v", dErr)
+			}
+			return
+		}
+	}
+
+	b.desired[fqdn] = desiredRoute{
+		domain:     dom,
+		fqdn:       fqdn,
+		route:      route,
+		intent:     intent,
+		artifactID: artifactID,
+		standby:    standby,
+	}
 }
 
 func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) error {
@@ -911,14 +912,14 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 			log.Printf("reconciler: pushing missing route for %s to agent %s", fqdn, agent.ID)
 			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 				log.Printf("reconciler: failed to push route for %s: %v", fqdn, pErr)
-				if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("route push failed: %v", pErr)); dErr != nil {
+				if dErr := r.markInboundError(desired, fmt.Sprintf("route push failed: %v", pErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
 				}
 				r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_push_failed", pErr.Error())
 				continue
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_pushed", "pushed missing route to agent")
-			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+			if dErr := r.markInboundApplied(desired, fqdn); dErr != nil {
 				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
@@ -928,7 +929,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if routesMatch(desired.route, actual) {
 			// All good — keep last_synced fresh so the dashboard reflects the
 			// most recent successful reconciliation.
-			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+			if dErr := r.markInboundApplied(desired, fqdn); dErr != nil {
 				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
@@ -946,7 +947,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		log.Printf("reconciler: fixing drift for %s on agent %s", fqdn, agent.ID)
 		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 			log.Printf("reconciler: failed to fix drift for %s: %v", fqdn, pErr)
-			if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("drift fix failed: %v", pErr)); dErr != nil {
+			if dErr := r.markInboundError(desired, fmt.Sprintf("drift fix failed: %v", pErr)); dErr != nil {
 				log.Printf("reconciler: failed to update domain status: %v", dErr)
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "drift_fix_failed", pErr.Error())
@@ -956,7 +957,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		// Route the drift-fix through the same applied path as the push/match cases so
 		// it honors the §78 degraded check (a central-TLS domain with no issued cert
 		// is marked "degraded", not a bare "active" that hides the plaintext downgrade).
-		if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+		if dErr := r.markInboundApplied(desired, fqdn); dErr != nil {
 			log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 		}
 	}
@@ -1028,16 +1029,11 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 
 	fqdn := dom.FQDN(zone.Name)
 
-	// Resolve: domain -> server -> agent -> agent.FQDN for CNAME target.
-	srv, sErr := r.db.GetServer(dom.ServerID)
-	if sErr != nil {
-		log.Printf("reconciler: cannot get server %s for domain %d: %v", dom.ServerID, dom.ID, sErr)
-		return
-	}
-
-	agent, aErr := r.db.GetAgent(srv.AgentID)
+	// Resolve the CNAME target: the primary server's agent, or with failover
+	// backups the agent the failover decision picks (#74).
+	agent, aErr := r.selectDNSTarget(dom)
 	if aErr != nil {
-		log.Printf("reconciler: cannot get agent %s for domain %d: %v", srv.AgentID, dom.ID, aErr)
+		log.Printf("reconciler: cannot resolve the DNS target for domain %d: %v", dom.ID, aErr)
 		return
 	}
 
@@ -1324,9 +1320,10 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
 	if err != nil {
 		return fmt.Errorf("resolving server for domain %d: %w", domID, err)
 	}
-	agent, err := r.db.GetAgent(srv.AgentID)
+	// The currently active agent: the primary, or a backup after a failover.
+	agent, err := r.selectDNSTarget(dom)
 	if err != nil {
-		return fmt.Errorf("resolving agent for domain %d: %w", domID, err)
+		return fmt.Errorf("resolving the DNS target for domain %d: %w", domID, err)
 	}
 	target := agent.FQDN
 
@@ -1726,6 +1723,19 @@ func (r *Reconciler) reconcileDeletions(ctx context.Context) error {
 		// agent inbound (invariant #2). Deleting the artifact below shrinks the desired
 		// set; the re-push then makes the agent prune the orphaned vhost.
 
+		// Standby routes on failover backup agents (#74) go the same way as the
+		// primary route: a tombstone where the agent renders nginx/apache, the
+		// artifact row dropped, and a re-push below. Their rows in
+		// domain_backups go with the domain row.
+		standbyAgents, sbErr := r.tearDownStandby(dom)
+		if sbErr != nil {
+			log.Printf("reconciler: cannot persist standby route deletions for domain %d, retrying next cycle: %v", dom.ID, sbErr)
+			continue
+		}
+		for _, agentID := range standbyAgents {
+			affectedAgents[agentID] = true
+		}
+
 		// Remove the domain's config artifact from the central store so no ghost
 		// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
 		// applied) is fine.
@@ -1866,6 +1876,9 @@ type desiredRoute struct {
 	// config artifact, echoed back by the agent in its apply-ACK so the rendered
 	// content round-trips into the correct store row.
 	artifactID string
+	// standby marks a failover standby route on a backup agent (#74). Its
+	// applies do not set the domain's status, which follows the primary.
+	standby bool
 }
 
 // artifactIDForDomain derives the stable artifact identity for a generated

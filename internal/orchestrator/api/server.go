@@ -321,6 +321,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/config", s.requireAuth(s.handleUpdateDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/config/reset", s.requireAuth(s.handleResetDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/dns/takeover", s.requireAuth(s.handleDomainDNSTakeover))
+	s.mux.HandleFunc("GET /api/v1/domains/{id}/failover", s.requireAuth(s.handleGetDomainFailover))
+	s.mux.HandleFunc("PUT /api/v1/domains/{id}/backups", s.requireAuth(s.handleSetDomainBackups))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/certificate", s.requireAuth(s.handleImportDomainCertificate))
 
 	// Config artifacts + drift review (auth required, §11 Phase 3)

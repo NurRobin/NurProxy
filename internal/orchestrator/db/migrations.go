@@ -843,6 +843,35 @@ var migrations = []string{
 	CREATE INDEX idx_domain_dns_cleanups_record
 		ON domain_dns_cleanups(zone_external_id, record_id);
 	`,
+
+	// Migration 36: per-domain failover to backup servers on other agents
+	// (#74). domain_backups lists the backups in priority order (lower first;
+	// the primary is domains.server_id and not stored here). domain_failover
+	// is the reconciler's decision state for a domain with backups: the server
+	// whose agent the CNAME points at, the more preferred candidate waiting out
+	// the failback delay and since when, whether every candidate was down at
+	// the last pass, and how often the target switched.
+	`
+	CREATE TABLE domain_backups (
+		domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+		server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+		priority  INTEGER NOT NULL,
+		PRIMARY KEY (domain_id, server_id)
+	);
+	CREATE INDEX idx_domain_backups_server ON domain_backups(server_id);
+	CREATE TABLE domain_failover (
+		domain_id         INTEGER PRIMARY KEY REFERENCES domains(id) ON DELETE CASCADE,
+		active_server_id  TEXT NOT NULL DEFAULT '',
+		pending_server_id TEXT NOT NULL DEFAULT '',
+		pending_since     TEXT,
+		all_down          INTEGER NOT NULL DEFAULT 0 CHECK (all_down IN (0, 1)),
+		switched_at       TEXT,
+		switches          INTEGER NOT NULL DEFAULT 0
+	);
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_grace', '30');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_failback', 'true');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_failback_delay', '300');
+	`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
