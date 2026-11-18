@@ -176,6 +176,7 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		CentralTLS:    b.certs != nil,
 		AccessLog:     true,
 		ErrorLogLevel: true,
+		PathRoutes:    true,
 		// httpd substitutes ${NAME} in every config line; apachegen refuses
 		// such header values and the orchestrator checks them on save.
 		HeaderConfigVars: true,

@@ -217,13 +217,13 @@ var tools = func() map[string]tool {
 		{
 			name:        "create_domain",
 			description: "Create a proxied domain (subdomain in a zone, pointing at a server+port).",
-			inputSchema: `{"type":"object","properties":{"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit or null to keep whatever the existing record has; true/false is enforced. true only for Cloudflare zones."},` + loggingSchemaProps + `},"required":["subdomain","zone_id","server_id","port"],"additionalProperties":false}`,
+			inputSchema: `{"type":"object","properties":{"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit or null to keep whatever the existing record has; true/false is enforced. true only for Cloudflare zones."},` + loggingSchemaProps + `,` + routesSchemaProp + `},"required":["subdomain","zone_id","server_id","port"],"additionalProperties":false}`,
 			run:         toolCreateDomain,
 		},
 		{
 			name:        "update_domain",
 			description: "Update fields of an existing domain by id. Re-queues it for reconciliation.",
-			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit to leave unchanged, null to go back to keeping the existing record state; true/false is enforced. true only for Cloudflare zones."},` + loggingSchemaProps + `},"required":["id"],"additionalProperties":false}`,
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit to leave unchanged, null to go back to keeping the existing record state; true/false is enforced. true only for Cloudflare zones."},` + loggingSchemaProps + `,` + routesSchemaProp + `},"required":["id"],"additionalProperties":false}`,
 			run:         toolUpdateDomain,
 		},
 		{
@@ -353,18 +353,23 @@ func toolListDomains(d *db.DB, args json.RawMessage) (any, error) {
 const loggingSchemaProps = `"access_log":{"type":"string","enum":["default","off"],"description":"off writes no access log for this domain; default keeps the proxy's host-wide log"},` +
 	`"error_log_level":{"type":"string","enum":["default","info","notice","warn","error","crit","alert","emerg"],"description":"minimum error log level for this domain; default keeps the host-wide level"}`
 
+// routesSchemaProp is the path routes property of the create_domain and
+// update_domain input schemas.
+const routesSchemaProp = `"routes":{"type":"array","maxItems":32,"description":"Extra path-routed upstreams. Exact beats prefix, the longest prefix wins; everything else goes to server_id/port. A prefix /api matches /api and /api/..., not /apix. Each server must be on the same agent as the domain's server. On update the list replaces the stored one; [] removes all.","items":{"type":"object","properties":{"match":{"type":"string","enum":["prefix","exact"]},"path":{"type":"string","description":"request path starting with /; letters, digits, - . _ / only; a prefix has no trailing slash"},"server_id":{"type":"string"},"port":{"type":"integer"},"upstream_scheme":{"type":"string","enum":["http","https"]},"websocket":{"type":"boolean"},"strip_prefix":{"type":"boolean","description":"remove the path before forwarding (prefix only)"}},"required":["match","path","server_id","port"],"additionalProperties":false}}`
+
 func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	var in struct {
-		Subdomain     string  `json:"subdomain"`
-		ZoneID        string  `json:"zone_id"`
-		ServerID      string  `json:"server_id"`
-		Port          int     `json:"port"`
-		WebSocket     bool    `json:"websocket"`
-		ForceHTTPS    bool    `json:"force_https"`
-		SSLMode       string  `json:"ssl_mode"`
-		Proxied       *bool   `json:"proxied"`
-		AccessLog     *string `json:"access_log"`
-		ErrorLogLevel *string `json:"error_log_level"`
+		Subdomain     string             `json:"subdomain"`
+		ZoneID        string             `json:"zone_id"`
+		ServerID      string             `json:"server_id"`
+		Port          int                `json:"port"`
+		WebSocket     bool               `json:"websocket"`
+		ForceHTTPS    bool               `json:"force_https"`
+		SSLMode       string             `json:"ssl_mode"`
+		Proxied       *bool              `json:"proxied"`
+		AccessLog     *string            `json:"access_log"`
+		ErrorLogLevel *string            `json:"error_log_level"`
+		Routes        []models.PathRoute `json:"routes"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -412,6 +417,10 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if err := d.CheckDomainBackendOptions(dom); err != nil {
 		return nil, err
 	}
+	dom.ProxyConfig.Routes = in.Routes
+	if err := d.CheckDomainRoutes(dom); err != nil {
+		return nil, err
+	}
 	if err := d.CreateDomain(dom); err != nil {
 		return nil, err
 	}
@@ -436,6 +445,7 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		Proxied       models.OptionalBool `json:"proxied"`
 		AccessLog     *string             `json:"access_log"`
 		ErrorLogLevel *string             `json:"error_log_level"`
+		Routes        *[]models.PathRoute `json:"routes"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -494,6 +504,14 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	// A rename or ssl_mode change must not leave a zone wildcard opt-in the
 	// shared cert can no longer cover.
 	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
+		return nil, err
+	}
+	if in.Routes != nil {
+		dom.ProxyConfig.Routes = *in.Routes
+	}
+	// Checked on every update: a server or zone change must keep the route
+	// servers on the domain's agent.
+	if err := d.CheckDomainRoutes(dom); err != nil {
 		return nil, err
 	}
 	dom.Status = models.DomainStatusPending // re-queue for reconciliation

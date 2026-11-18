@@ -88,9 +88,10 @@ var vhostDirectives = map[string]argRule{
 	"rewritecond":       rewriteCondRule,
 	"rewriterule":       rewriteRuleRule,
 	"proxypass":         proxyPassRule,
-	"proxypassreverse": func(a []word, _ ManagedPolicy) bool {
-		return len(a) == 2 && plainExact(a[:1], "/") && upstreamURL(a[1], false)
-	},
+	"proxypassmatch":    proxyPassMatchRule,
+	"proxypassreverse":  proxyPassReverseRule,
+	// Needed for https:// upstreams; it only enables TLS to the backend.
+	"sslproxyengine": func(a []word, _ ManagedPolicy) bool { return plainFold(a, "on") },
 	"redirect": func(a []word, p ManagedPolicy) bool {
 		return len(a) == 3 && plainFold(a[:1], "permanent", "301") && plainExact(a[1:2], "/") && plainExact(a[2:], "https://"+p.Host+"/")
 	},
@@ -294,9 +295,12 @@ func headerValue(w word) bool {
 	return len(trimmed) < 5 || !asciiEqualFold(trimmed[:5], "expr=")
 }
 
-// rewriteCondRule accepts only the WebSocket upgrade test apachegen renders
-// and its Connection-header variant.
+// rewriteCondRule accepts only the WebSocket upgrade test apachegen renders,
+// its Connection-header variant, and the path route exclusions.
 func rewriteCondRule(a []word, _ ManagedPolicy) bool {
+	if routeExclusionCond(a) {
+		return true
+	}
 	if len(a) != 2 && len(a) != 3 {
 		return false
 	}
@@ -338,18 +342,7 @@ func proxyPassRule(a []word, _ ManagedPolicy) bool {
 	if len(a) < 2 || len(a) > 4 || !plainExact(a[:1], "/") || !upstreamURL(a[1], false) {
 		return false
 	}
-	seen := map[string]bool{}
-	for _, p := range a[2:] {
-		if !plainMatch([]word{p}, secondsRe) {
-			return false
-		}
-		key, _, _ := strings.Cut(p.value, "=")
-		if seen[key] {
-			return false
-		}
-		seen[key] = true
-	}
-	return true
+	return timeoutParams(a[2:])
 }
 
 // requireRule accepts the authorization forms apachegen renders: valid-user,

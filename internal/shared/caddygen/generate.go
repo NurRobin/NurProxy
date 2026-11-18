@@ -37,10 +37,13 @@ func splitAddrPort(addr string) (string, int) {
 }
 
 // ConfigFromDomain builds a backend-neutral proxymodel.Route from a stored
-// domain, its resolved FQDN, and the upstream server address. It is the single
-// source of truth for translating a domain's proxy settings into proxy intent,
-// shared by the reconciler and the API's config preview so they never diverge.
-func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Route {
+// domain, its resolved FQDN, and the upstream server address. routeAddrs maps
+// the server IDs of the domain's path routes to their addresses; a route
+// whose server is missing gets an empty address, which Route.Validate
+// refuses. It is the single source of truth for translating a domain's proxy
+// settings into proxy intent, shared by the reconciler and the API's config
+// preview so they never diverge.
+func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string, routeAddrs map[string]string) proxymodel.Route {
 	// Upstream.Addr is host-only by contract, but a Server.Address entered as
 	// "host:port" reaches here unvalidated — and every renderer then emits
 	// "host:port:port" (proxy_pass http://10.0.0.5:8080:8080), which real
@@ -86,6 +89,16 @@ func ConfigFromDomain(d models.Domain, fqdn, upstreamAddr string) proxymodel.Rou
 	}
 	if d.ProxyConfig.ErrorLogLevel != "default" {
 		route.ErrorLogLevel = d.ProxyConfig.ErrorLogLevel
+	}
+	for _, p := range d.ProxyConfig.Routes {
+		// The same "host:port" normalization as the default upstream: the
+		// route's port wins, the address's port fills a missing one.
+		addr, addrPort := splitAddrPort(routeAddrs[p.ServerID])
+		pr := p.Intent(addr)
+		if pr.Upstream.Port == 0 {
+			pr.Upstream.Port = addrPort
+		}
+		route.PathRoutes = append(route.PathRoutes, pr)
 	}
 	if d.ProxyConfig.BasicAuth != nil {
 		route.BasicAuth = &proxymodel.BasicAuth{
@@ -157,6 +170,100 @@ func slugify(fqdn string) string {
 	return s
 }
 
+// pathRewrites returns the rewrite handlers for the route's own path rules,
+// which apply to the default upstream only.
+func pathRewrites(route proxymodel.Route) []interface{} {
+	var handlers []interface{}
+	if route.Path.StripPrefix != "" {
+		handlers = append(handlers, map[string]interface{}{
+			"handler":           "rewrite",
+			"strip_path_prefix": route.Path.StripPrefix,
+		})
+	}
+	if route.Path.Rewrite != "" {
+		handlers = append(handlers, map[string]interface{}{
+			"handler": "rewrite",
+			"uri":     route.Path.Rewrite,
+		})
+	}
+	return handlers
+}
+
+// pathMatcher returns the Caddy path matcher patterns for a path route. A
+// prefix "/api" matches "/api" and "/api/*", so it stops at a segment
+// boundary like the nginx rendering. Caddy compares paths case-insensitively,
+// unlike nginx and Apache.
+func pathMatcher(p proxymodel.PathRoute) []string {
+	if p.Match == proxymodel.PathMatchExact {
+		return []string{p.Path}
+	}
+	return []string{p.Path, p.Path + "/*"}
+}
+
+// reverseProxy builds the reverse_proxy handler for one upstream. Request
+// and response headers and timeouts come from the route, so every path of
+// the host forwards the same way.
+func reverseProxy(route proxymodel.Route, upstream proxymodel.Upstream, scheme proxymodel.Scheme, websocket bool) ReverseProxy {
+	rp := ReverseProxy{
+		Handler: "reverse_proxy",
+		Upstreams: []Upstream{
+			{Dial: fmt.Sprintf("%s:%d", upstream.Addr, upstream.Port)},
+		},
+	}
+
+	// Default forwarding headers.
+	requestHeaders := map[string][]string{
+		"X-Forwarded-Proto": {"{http.request.scheme}"},
+		"X-Real-IP":         {"{http.request.remote.host}"},
+	}
+
+	// Merge custom request headers.
+	for k, v := range route.RequestHeaders {
+		requestHeaders[k] = []string{v}
+	}
+
+	rp.Headers = &HeaderOps{
+		Request: &HeaderMod{Set: requestHeaders},
+	}
+
+	// Custom response headers.
+	if len(route.ResponseHeaders) > 0 {
+		respHeaders := make(map[string][]string, len(route.ResponseHeaders))
+		for k, v := range route.ResponseHeaders {
+			respHeaders[k] = []string{v}
+		}
+		rp.Headers.Response = &HeaderMod{Set: respHeaders}
+	}
+
+	// WebSocket support.
+	if websocket {
+		rp.FlushInterval = -1
+	}
+
+	// Upstream transport: needed when talking HTTPS to the backend or when any
+	// upstream timeout is configured.
+	httpsUpstream := scheme == proxymodel.SchemeHTTPS
+	if httpsUpstream || route.Timeouts.Read > 0 || route.Timeouts.Write > 0 || route.Timeouts.Idle > 0 {
+		t := &Transport{Protocol: "http"}
+		if httpsUpstream {
+			t.TLS = &TLS{}
+		}
+		// Map our read/write/idle timeouts onto the closest valid Caddy http
+		// transport fields.
+		if route.Timeouts.Write > 0 {
+			t.DialTimeout = fmt.Sprintf("%ds", route.Timeouts.Write)
+		}
+		if route.Timeouts.Read > 0 {
+			t.ResponseHeaderTimeout = fmt.Sprintf("%ds", route.Timeouts.Read)
+		}
+		if route.Timeouts.Idle > 0 {
+			t.KeepAlive = &KeepAlive{IdleTimeout: fmt.Sprintf("%ds", route.Timeouts.Idle)}
+		}
+		rp.Transport = t
+	}
+	return rp
+}
+
 // GenerateRoute produces a Caddy JSON route configuration from a backend-neutral
 // proxymodel.Route. The returned json.RawMessage is ready to be sent to the
 // Caddy admin API.
@@ -185,6 +292,9 @@ func GenerateRoute(route proxymodel.Route) (json.RawMessage, error) {
 	if route.Upstream.Port == 0 {
 		return nil, fmt.Errorf("upstream port is required")
 	}
+	if err := proxymodel.ValidatePathRoutes(route.PathRoutes, true); err != nil {
+		return nil, err
+	}
 
 	// Build the inner handlers for the main route (the request pipeline that
 	// runs once access-control guards have passed).
@@ -192,18 +302,7 @@ func GenerateRoute(route proxymodel.Route) (json.RawMessage, error) {
 
 	// Path manipulation (rewrite handler) runs first so downstream handlers and
 	// the upstream see the modified path.
-	if route.Path.StripPrefix != "" {
-		innerHandlers = append(innerHandlers, map[string]interface{}{
-			"handler":           "rewrite",
-			"strip_path_prefix": route.Path.StripPrefix,
-		})
-	}
-	if route.Path.Rewrite != "" {
-		innerHandlers = append(innerHandlers, map[string]interface{}{
-			"handler": "rewrite",
-			"uri":     route.Path.Rewrite,
-		})
-	}
+	innerHandlers = append(innerHandlers, pathRewrites(route)...)
 
 	// HTTP basic authentication.
 	if route.BasicAuth != nil && route.BasicAuth.Username != "" && route.BasicAuth.PasswordHash != "" {
@@ -246,66 +345,36 @@ func GenerateRoute(route proxymodel.Route) (json.RawMessage, error) {
 		})
 	}
 
-	// Build reverse_proxy handler.
-	rp := ReverseProxy{
-		Handler: "reverse_proxy",
-		Upstreams: []Upstream{
-			{Dial: fmt.Sprintf("%s:%d", route.Upstream.Addr, route.Upstream.Port)},
-		},
-	}
+	rp := reverseProxy(route, route.Upstream, route.EffectiveScheme(), route.WebSocket)
 
-	// Default forwarding headers.
-	requestHeaders := map[string][]string{
-		"X-Forwarded-Proto": {"{http.request.scheme}"},
-		"X-Real-IP":         {"{http.request.remote.host}"},
-	}
-
-	// Merge custom request headers.
-	for k, v := range route.RequestHeaders {
-		requestHeaders[k] = []string{v}
-	}
-
-	rp.Headers = &HeaderOps{
-		Request: &HeaderMod{Set: requestHeaders},
-	}
-
-	// Custom response headers.
-	if len(route.ResponseHeaders) > 0 {
-		respHeaders := make(map[string][]string, len(route.ResponseHeaders))
-		for k, v := range route.ResponseHeaders {
-			respHeaders[k] = []string{v}
+	if len(route.PathRoutes) == 0 {
+		innerHandlers = append(innerHandlers, rp)
+	} else {
+		// Path routes: the guards above (auth, rate limit, body size) run
+		// once for every request, then a nested subroute picks the upstream.
+		// Its routes are tried in order and the first match is terminal, so
+		// they are emitted most specific first; the default upstream with the
+		// domain's own path rules comes last.
+		guards := innerHandlers[len(pathRewrites(route)):]
+		var paths []Route
+		for _, p := range proxymodel.SortedPathRoutes(route.PathRoutes) {
+			var handle []interface{}
+			if p.StripPrefix {
+				handle = append(handle, map[string]interface{}{
+					"handler":           "rewrite",
+					"strip_path_prefix": p.Path,
+				})
+			}
+			handle = append(handle, reverseProxy(route, p.Upstream, p.EffectiveScheme(), p.WebSocket))
+			paths = append(paths, Route{
+				Match:    []map[string]interface{}{{"path": pathMatcher(p)}},
+				Handle:   handle,
+				Terminal: true,
+			})
 		}
-		rp.Headers.Response = &HeaderMod{Set: respHeaders}
+		paths = append(paths, Route{Handle: append(pathRewrites(route), rp)})
+		innerHandlers = append(append([]interface{}{}, guards...), Handler{Handler: "subroute", Routes: paths})
 	}
-
-	// WebSocket support.
-	if route.WebSocket {
-		rp.FlushInterval = -1
-	}
-
-	// Upstream transport: needed when talking HTTPS to the backend or when any
-	// upstream timeout is configured.
-	httpsUpstream := route.EffectiveScheme() == proxymodel.SchemeHTTPS
-	if httpsUpstream || route.Timeouts.Read > 0 || route.Timeouts.Write > 0 || route.Timeouts.Idle > 0 {
-		t := &Transport{Protocol: "http"}
-		if httpsUpstream {
-			t.TLS = &TLS{}
-		}
-		// Map our read/write/idle timeouts onto the closest valid Caddy http
-		// transport fields.
-		if route.Timeouts.Write > 0 {
-			t.DialTimeout = fmt.Sprintf("%ds", route.Timeouts.Write)
-		}
-		if route.Timeouts.Read > 0 {
-			t.ResponseHeaderTimeout = fmt.Sprintf("%ds", route.Timeouts.Read)
-		}
-		if route.Timeouts.Idle > 0 {
-			t.KeepAlive = &KeepAlive{IdleTimeout: fmt.Sprintf("%ds", route.Timeouts.Idle)}
-		}
-		rp.Transport = t
-	}
-
-	innerHandlers = append(innerHandlers, rp)
 
 	// Build the subroute's inner routes. IP allow/block guards run first as
 	// terminal routes so blocked clients never reach the proxy.

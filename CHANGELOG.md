@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Path routes: several upstreams per domain (#89).** A domain can send exact
+  paths (`= /api/world`) and path prefixes (`/media`, matching `/media` and
+  `/media/...` but not `/mediax`) to other servers on the same agent, with
+  their own port, scheme, WebSocket switch and optional prefix strip. An exact
+  route wins over any prefix and the longest prefix wins, on nginx, Apache and
+  the built-in Caddy alike; regex is not supported. Managed in the API
+  (`proxy_config.routes`), CLI (`nurproxy domain route list|add|remove`), MCP
+  (`routes` on create_domain/update_domain) and the new Paths tab of the
+  domain settings. A custom engine template opts in with `path_routes`. The
+  nginx config view imports existing `location = /p` and `location /p/` blocks
+  as path routes and lists every location it cannot carry over. A server used
+  by a path route cannot be deleted. Domains without path routes render
+  exactly as before.
 - **Per-domain access log and error log level (#150).** A domain can turn its
   access log off (`access_log: off`) and set a minimum error log level
   (`error_log_level`: info … emerg), so visitor IPs of that domain stay out of
