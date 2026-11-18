@@ -67,6 +67,7 @@ Each route is rendered with:
 | `.CertPath`, `.KeyPath` | on-disk cert + key for a central-TLS route (empty until installed — guard with `{{ if .CertPath }}`) |
 | `.ForceHTTPS`, `.WebSocket` | route options |
 | `.AccessLogOff`, `.ErrorLogLevel` | per-domain logging: no access log / error log level (`crit`, …; empty = host default). Declare `access_log` / `error_log_level` in `proxy_caps` if your template honors them |
+| `.PathRoutes` | extra path-routed upstreams, most specific first; each has `.Exact`, `.Path`, `.Scheme`, `.UpstreamAddr` (`.UpstreamHost`, `.UpstreamPort`), `.WebSocket`, `.StripPrefix`. A prefix `.Path` like `/api` matches `/api` and `/api/...`, not `/apix`; an exact one beats any prefix and the longest prefix wins. Declare `path_routes` in `proxy_caps` only if your template renders them: without it the API refuses path routes for the agent, and a route that still carries some fails to render instead of losing paths |
 | `.Route` | the full backend-neutral intent (headers, path rules, timeouts, IP rules, rate limit) |
 
 ## What NurProxy manages vs. what you own

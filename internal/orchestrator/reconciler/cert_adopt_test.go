@@ -6,9 +6,88 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
+
+func adoptableOnDisk(t *testing.T, d *db.DB, agentID string, names ...string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := d.UpdateAgentDetection(agentID, &models.ProxyDetection{DiscoveredCerts: []models.DiscoveredCert{{
+		Fingerprint: strings.Repeat("cd", 32), Names: names,
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(60 * 24 * time.Hour),
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAdoptionHold_neverBlocksWildcardIssuance: a disk certificate covering
+// wildcard-served hosts must not hold the shared "*.<zone>" order, while a
+// per-host domain in the same zone is still held.
+func TestAdoptionHold_neverBlocksWildcardIssuance(t *testing.T) {
+	registerMockProvider(t)
+	d := testDB(t)
+	wildcardScenario(t, d) // app + api opt into *.example.com, plain is per-host
+	adoptableOnDisk(t, d, "agent-1", "*.example.com")
+	store := NewCertRenewalStore(d)
+
+	targets, err := store.DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Host != testWildcardHost {
+		t.Fatalf("targets = %+v, want only the wildcard (plain is held for adoption)", targets)
+	}
+	if tg, err := store.TargetForHost(context.Background(), testWildcardHost); err != nil || tg == nil {
+		t.Fatalf("TargetForHost(%s) = %+v, %v; want a target despite the disk cert", testWildcardHost, tg, err)
+	}
+	if held := store.heldHosts(time.Now().UTC()); len(held) != 1 || !held["plain.example.com"] {
+		t.Fatalf("heldHosts = %v, want only plain.example.com", held)
+	}
+}
+
+// TestAdoptedCert_winsOverWildcardAndReachesStandby: an adopted bundle is
+// stored as imported, so for a wildcard domain it takes precedence over the
+// zone cert (#175), and it is pushed to backup agents like any stored cert.
+func TestAdoptedCert_winsOverWildcardAndReachesStandby(t *testing.T) {
+	registerMockProvider(t)
+	d := testDB(t)
+	dom, primary, backup := setupFailover(t, d)
+	dom.ProxyConfig.TLSWildcard = true
+	if err := d.UpdateDomain(dom); err != nil {
+		t.Fatal(err)
+	}
+	adoptableOnDisk(t, d, primary.ID, "app.example.com")
+	upsertCert(t, d, models.Certificate{ID: testWildcardHost, Host: testWildcardHost, Names: []string{testWildcardHost}, IsWildcard: true, CertPEM: "WILD", KeyPEM: "WK"})
+	if err := d.ImportCertificateForDomain(dom.ID, &models.Certificate{ID: "app.example.com", Host: "app.example.com", Names: []string{"app.example.com"},
+		CertPEM: "ADOPTED", KeyPEM: "AK", Source: models.CertSourceImported, ExpiresAt: time.Now().Add(60 * 24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	hub := newMockHub()
+	hub.setConnected(primary.ID, true)
+	hub.setConnected(backup.ID, true)
+	r := New(d, newMockAgentClient(), time.Minute)
+	r.SetHub(hub)
+	for _, agentID := range []string{primary.ID, backup.ID} {
+		if err := r.PushAgentRoutes(agentID); err != nil {
+			t.Fatal(err)
+		}
+		set, ok := hub.lastSet(agentID)
+		if !ok {
+			t.Fatalf("no push to %s", agentID)
+		}
+		var pem string
+		for _, b := range set.Certs {
+			if b.Host == "app.example.com" {
+				pem = b.CertPEM
+			}
+		}
+		if pem != "ADOPTED" {
+			t.Errorf("%s got app.example.com cert %q, want the adopted one (certs %+v)", agentID, pem, set.Certs)
+		}
+	}
+}
 
 // TestFirstIssuanceWaitsForAdoption checks that a new central-TLS domain whose
 // serving agent reports an adoptable certificate on disk gets no ACME order

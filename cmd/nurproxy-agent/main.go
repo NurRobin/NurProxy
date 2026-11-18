@@ -47,6 +47,10 @@ var version = "dev"
 // missed beat never flaps the agent offline.
 const heartbeatInterval = 30 * time.Second
 
+// helperCertificateDir is where the root helper materializes certificates for
+// managed vhosts.
+const helperCertificateDir = "/var/lib/nurproxy-agent/certs"
+
 var (
 	orchestratorURL = flag.String("orchestrator", "", "Orchestrator URL (required)")
 	fqdn            = flag.String("fqdn", "", "Agent FQDN (required)")
@@ -644,10 +648,12 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 func diskCertScanner(cfg *agentconfig.Config) (certdiscover.Scanner, bool) {
 	if !cfg.DryRun {
 		s := certdiscover.Default()
-		// Vhosts NurProxy rendered reference the certificates it installed under
-		// the data dir; those are not candidates for adoption.
+		// Vhosts NurProxy rendered reference the certificates it installed, per
+		// FQDN and including copies of zone wildcard certs: under the data dir,
+		// or the root helper's fixed certificate dir. Those are not candidates.
+		s.Exclude = []string{helperCertificateDir}
 		if dataDir, err := filepath.Abs(cfg.DataDir); err == nil && cfg.DataDir != "" {
-			s.Exclude = []string{dataDir}
+			s.Exclude = append(s.Exclude, dataDir)
 		}
 		return s, true
 	}
@@ -842,6 +848,8 @@ func declaredCapsFromNames(names []string) *proxy.Capabilities {
 			c.AccessLog = true
 		case "error_log_level", "errorloglevel":
 			c.ErrorLogLevel = true
+		case "path_routes", "pathroutes":
+			c.PathRoutes = true
 		}
 	}
 	return &c

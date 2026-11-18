@@ -172,7 +172,11 @@ func (s *Server) renderModelContent(domainID int64, backend string) (string, err
 		return "", fmt.Errorf("zone not found")
 	}
 
-	intent := caddygen.ConfigFromDomain(*dom, dom.FQDN(zone.Name), srv.Address)
+	routeAddrs, err := s.db.PathRouteAddrs(*dom)
+	if err != nil {
+		return "", err
+	}
+	intent := caddygen.ConfigFromDomain(*dom, dom.FQDN(zone.Name), srv.Address, routeAddrs)
 
 	switch backend {
 	case "caddy":

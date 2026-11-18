@@ -2,9 +2,11 @@ package db
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
+	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
@@ -41,7 +43,11 @@ func (d *DB) CertAdoptionSkipped(domainID int64) (bool, error) {
 // Whether a certificate is already on file is the caller's concern.
 func (d *DB) CertAdoptionHold(dom *models.Domain, host string, now time.Time) (until time.Time, cert models.DiscoveredCert, agentName string, held bool) {
 	until = dom.CreatedAt.Add(tls.AdoptionGrace)
-	if dom.CreatedAt.IsZero() || !now.Before(until) || dom.ServerID == "" {
+	// A domain served from its zone wildcard cert never orders a per-host
+	// cert, so there is nothing to hold.
+	servedByWildcard := strings.HasPrefix(host, "*.") ||
+		(dom.ProxyConfig.TLSWildcard && caddygen.ValidateTLSWildcard(*dom) == nil)
+	if servedByWildcard || dom.CreatedAt.IsZero() || !now.Before(until) || dom.ServerID == "" {
 		return time.Time{}, models.DiscoveredCert{}, "", false
 	}
 	if skipped, err := d.CertAdoptionSkipped(dom.ID); err != nil || skipped {
