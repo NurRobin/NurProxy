@@ -132,7 +132,14 @@ nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port
 nurproxy domain update <domain-id> [--subdomain s] [--port n] [--websocket] [--force-https] [--ssl-mode m] \
                     [--access-log off|default] [--error-log-level <level>|default] [--tls-wildcard[=false]]
 nurproxy domain delete <domain-id>          # marks for deletion; reconciler cleans up
+nurproxy domain backups <domain-id> [--set <server-id>,<server-id> | --clear]
+nurproxy domain failover <domain-id>        # candidates, their health, the active agent
 ```
+
+`domain backups` without flags shows the same view as `domain failover`. With
+`--set` it replaces the backup servers (most preferred first, each on its own
+agent that serves the zone); `--clear` removes them. See
+[Failover to a second agent](failover).
 
 `--access-log off` stops writing an access log for the domain, so client IPs of
 its visitors don't end up in the host-wide log. `--error-log-level` (`info`,

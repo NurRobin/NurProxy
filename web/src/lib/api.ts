@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, DiscoveryType, DiscoverySource, DiscoveryView, DiscoveryImportResult, Domain, DNSTakeoverPlan, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
+import type { Provider, Zone, Agent, Server, DiscoveryType, DiscoverySource, DiscoveryView, DiscoveryImportResult, Domain, DNSTakeoverPlan, DomainFailoverStatus, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
 import type { ProxyConfigUpdate } from './proxy-config';
 
 const BASE = '/api/v1';
@@ -195,6 +195,9 @@ export const api = {
   updateDomain: (id: number, data: Partial<Omit<Domain, 'proxy_config'>> & { proxy_config?: ProxyConfigUpdate }) =>
     request<Domain>(`/domains/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteDomain: (id: number) => request<{ message: string }>(`/domains/${id}`, { method: 'DELETE' }),
+  getDomainFailover: (id: number) => request<DomainFailoverStatus>(`/domains/${id}/failover`),
+  setDomainBackups: (id: number, serverIds: string[]) =>
+    request<DomainFailoverStatus>(`/domains/${id}/backups`, { method: 'PUT', body: JSON.stringify({ server_ids: serverIds }) }),
   getDomainConfig: (id: number) => request<DomainConfig>(`/domains/${id}/config`),
   updateDomainConfig: (id: number, config: unknown) =>
     request<{ message: string }>(`/domains/${id}/config`, { method: 'PUT', body: JSON.stringify({ config }) }),

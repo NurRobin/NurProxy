@@ -66,7 +66,11 @@ type takeoverTarget struct {
 
 // resolveTakeover loads the domain, its zone's provider and the records at its
 // name, and works out what a takeover would do. It changes nothing.
-func (r *Reconciler) resolveTakeover(ctx context.Context, domID int64) (*takeoverTarget, error) {
+//
+// With apply set the caller holds the domain's DNS lock and the failover
+// decision for the target is stored (selectDNSTarget); without it, for the
+// preview, it is only computed (decideDNSTarget).
+func (r *Reconciler) resolveTakeover(ctx context.Context, domID int64, apply bool) (*takeoverTarget, error) {
 	dom, err := r.db.GetDomain(domID)
 	if err != nil {
 		return nil, fmt.Errorf("domain %d: %w", domID, err)
@@ -98,9 +102,19 @@ func (r *Reconciler) resolveTakeover(ctx context.Context, domID int64) (*takeove
 	if err != nil {
 		return nil, fmt.Errorf("resolving server for domain %d: %w", domID, err)
 	}
-	agent, err := r.db.GetAgent(srv.AgentID)
+	// The currently active agent: the primary, or a backup after a failover
+	// (#74).
+	var agent *models.Agent
+	if apply {
+		agent, err = r.selectDNSTarget(dom)
+	} else {
+		var t *dnsTarget
+		if t, err = r.decideDNSTarget(dom); err == nil {
+			agent = t.agent
+		}
+	}
 	if err != nil {
-		return nil, fmt.Errorf("resolving agent for domain %d: %w", domID, err)
+		return nil, fmt.Errorf("resolving the DNS target for domain %d: %w", domID, err)
 	}
 	target := agent.FQDN
 
@@ -139,7 +153,7 @@ func recordInfo(rec provider.Record) models.DNSRecordInfo {
 // domain right now, in particular every record it would delete, without
 // changing anything at the provider or in the database.
 func (r *Reconciler) PreviewDomainDNSTakeover(ctx context.Context, domID int64) (*models.DNSTakeoverPlan, error) {
-	t, err := r.resolveTakeover(ctx, domID)
+	t, err := r.resolveTakeover(ctx, domID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +192,7 @@ func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64, expectD
 	lk.Lock()
 	defer lk.Unlock()
 
-	t, err := r.resolveTakeover(ctx, domID)
+	t, err := r.resolveTakeover(ctx, domID, true)
 	if err != nil {
 		return nil, err
 	}

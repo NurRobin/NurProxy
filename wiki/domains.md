@@ -182,6 +182,12 @@ and directive, for example:
 privileged managed proxy reconciliation failed: local managed apply planning refused the desired state: raw nginx config for app.example.com: line 12: nginx directive "include" is not allowed in the server block; ...
 ```
 
+## Failover
+
+A domain can have backup servers on other agents. Their agents get the route
+and certificate in advance, and the DNS record moves to a backup when the
+active agent goes offline. See [Failover to a second agent](failover).
+
 ## Status
 
 - **Pending** — being created or synced.

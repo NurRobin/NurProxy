@@ -153,11 +153,22 @@ func (r *Reconciler) agentsUsingWildcard(host string) ([]string, error) {
 			continue
 		}
 		srv, sErr := r.db.GetServer(dom.ServerID)
-		if sErr != nil || seen[srv.AgentID] {
-			continue
+		if sErr == nil && !seen[srv.AgentID] {
+			seen[srv.AgentID] = true
+			agents = append(agents, srv.AgentID)
 		}
-		seen[srv.AgentID] = true
-		agents = append(agents, srv.AgentID)
+		// Failover backup agents (#74) hold the domain as warm standby and
+		// install the same cert.
+		backups, bErr := r.db.ListDomainBackups(dom.ID)
+		if bErr != nil {
+			return nil, bErr
+		}
+		for _, b := range backups {
+			if !seen[b.AgentID] {
+				seen[b.AgentID] = true
+				agents = append(agents, b.AgentID)
+			}
+		}
 	}
 	return agents, nil
 }

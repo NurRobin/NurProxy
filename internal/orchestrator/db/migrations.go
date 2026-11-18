@@ -889,6 +889,49 @@ var migrations = []string{
 	CREATE UNIQUE INDEX idx_servers_discovery_external
 		ON servers(discovery_source_id, external_id) WHERE external_id <> '';
 	`,
+
+	// Migration 39: per-domain failover to backup servers on other agents
+	// (#74). domain_backups lists the backups in priority order (lower first;
+	// the primary is domains.server_id and not stored here). domain_failover
+	// is the reconciler's decision state for a domain with backups: the server
+	// whose agent the CNAME points at, the more preferred candidate waiting out
+	// the failback delay and since when, whether every candidate was down at
+	// the last pass, how often the target switched, when the last pass ran
+	// and since when a settle period holds the target. domain_standby_status
+	// is the last standby apply a backup agent acknowledged: ready when the
+	// route applied and the certificate it needs was in the store.
+	`
+	CREATE TABLE domain_backups (
+		domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+		server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+		priority  INTEGER NOT NULL,
+		PRIMARY KEY (domain_id, server_id)
+	);
+	CREATE INDEX idx_domain_backups_server ON domain_backups(server_id);
+	CREATE TABLE domain_failover (
+		domain_id         INTEGER PRIMARY KEY REFERENCES domains(id) ON DELETE CASCADE,
+		active_server_id  TEXT NOT NULL DEFAULT '',
+		pending_server_id TEXT NOT NULL DEFAULT '',
+		pending_since     TEXT,
+		all_down          INTEGER NOT NULL DEFAULT 0 CHECK (all_down IN (0, 1)),
+		switched_at       TEXT,
+		switches          INTEGER NOT NULL DEFAULT 0,
+		evaluated_at      TEXT,
+		settle_since      TEXT
+	);
+	CREATE TABLE domain_standby_status (
+		domain_id  INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+		agent_id   TEXT NOT NULL,
+		ready      INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0, 1)),
+		reason     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (domain_id, agent_id)
+	);
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_grace', '30');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_failback', 'true');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_failback_delay', '300');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_settle', '90');
+	`,
 }
 
 // migrationRestrictParentFKs is the placeholder text of the migration that
