@@ -71,7 +71,9 @@ var policyTestAccepted = map[string]string{
 var policyTestTuning = []string{
 	"client_max_body_size 0;",
 	"client_max_body_size 2g;",
+	"client_max_body_size 999999999g;",
 	"client_body_buffer_size 128k;",
+	"client_body_buffer_size 16m;",
 	"add_header X-Robots-Tag noindex;",
 	`add_header Content-Security-Policy "default-src 'self'" always;`,
 	"access_log off;",
@@ -83,21 +85,35 @@ var policyTestTuning = []string{
 	"proxy_read_timeout 3600;",
 	"proxy_read_timeout 500ms;",
 	"proxy_read_timeout 1h;",
+	"proxy_read_timeout 999999h;",
+	"proxy_connect_timeout 999999ms;",
 	"proxy_buffering off;",
 	"proxy_request_buffering off;",
-	"proxy_buffer_size 8k;",
-	"proxy_buffers 8 16k;",
-	"proxy_busy_buffers_size 16k;",
+	"proxy_buffer_size 16k; proxy_buffers 8 16k; proxy_busy_buffers_size 32k;",
+	"proxy_buffer_size 4k; proxy_buffers 2 4k; proxy_busy_buffers_size 4k;",
+	"proxy_buffer_size 128k; proxy_buffers 4 256k; proxy_busy_buffers_size 256k;",
+	"proxy_buffer_size 16m; proxy_buffers 64 16m; proxy_busy_buffers_size 16m;",
+	"proxy_buffer_size 1k; proxy_buffers 64 1k; proxy_busy_buffers_size 63k;",
 	"proxy_redirect off;",
 	"proxy_ssl_server_name on;",
 	"gzip on;",
 	"gzip_vary on;",
-	"gzip_comp_level 5;",
+	"gzip_comp_level 1;",
+	"gzip_comp_level 9;",
 	"gzip_min_length 1k;",
+	"gzip_min_length 1024m;",
 	"gzip_types text/css application/javascript image/svg+xml;",
 	"gzip_types *;",
 	"gzip_proxied expired no-cache no-store private auth;",
 	"gzip_proxied any;",
+	"gzip_proxied off expired no-cache no-store private no_last_modified no_etag auth any;",
+	"gzip_types " + strings.TrimSpace(strings.Repeat("text/x-a ", 32)) + ";",
+	"add_header X-A 1; add_header X-A 2;",
+	"proxy_set_header X-A 1; proxy_set_header X-B 2;",
+	"proxy_hide_header X-A; proxy_hide_header X-B;",
+	"access_log off; access_log off;",
+	"gzip_types text/css; gzip_types text/xml;",
+	"gzip_proxied any; gzip_proxied auth;",
 }
 
 // policyTestServerOnly are admitted only directly in the proxied server.
@@ -105,6 +121,8 @@ var policyTestServerOnly = []string{
 	"server_tokens off;",
 	"error_log /var/log/nginx/error.log warn;",
 	"allow 10.0.0.0/8;",
+	"allow 10.0.0.0/8; deny all;",
+	"error_log /var/log/nginx/error.log warn; error_log /var/log/nginx/error.log crit;",
 }
 
 func TestValidateManagedAdmitsTuningDirectives(t *testing.T) {
@@ -287,6 +305,39 @@ var policyTestRefused = []struct {
 	{"allow in location", policyTestInLocation("allow 10.0.0.0/8;")},
 	{"error_log in location stock path", policyTestInLocation("error_log /var/log/nginx/error.log warn;")},
 
+	// Forms nginx -t rejects: duplicates, buffer sets that break nginx's
+	// merge checks, out-of-range values.
+	{"duplicate gzip", policyTestInServer("gzip on;\n    gzip on;")},
+	{"duplicate gzip in location", policyTestInLocation("gzip on; gzip off;")},
+	{"duplicate server_tokens", policyTestInServer("server_tokens off; server_tokens on;")},
+	{"duplicate client_max_body_size", policyTestInServer("client_max_body_size 1m; client_max_body_size 2m;")},
+	{"duplicate proxy_buffering", policyTestInLocation("proxy_buffering off; proxy_buffering off;")},
+	{"duplicate http2", strings.Replace(policyTestValid, "listen 443 ssl;", "listen 443 ssl;\n    http2 on;\n    http2 on;", 1)},
+	{"duplicate proxy_read_timeout", policyTestInLocation("proxy_read_timeout 1s; proxy_read_timeout 2s;")},
+	{"proxy_buffer_size alone", policyTestInLocation("proxy_buffer_size 1m;")},
+	{"proxy_busy_buffers_size alone", policyTestInLocation("proxy_busy_buffers_size 1m;")},
+	{"proxy_buffers alone", policyTestInLocation("proxy_buffers 8 16k;")},
+	{"proxy_buffers one buffer", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 1 4k; proxy_busy_buffers_size 4k;")},
+	{"proxy_buffers 65", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 65 4k; proxy_busy_buffers_size 8k;")},
+	{"busy above buffers minus one", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 2 4k; proxy_busy_buffers_size 8k;")},
+	{"busy below buffer size", policyTestInLocation("proxy_buffer_size 8k; proxy_buffers 4 4k; proxy_busy_buffers_size 4k;")},
+	{"busy below one buffer", policyTestInLocation("proxy_buffer_size 4k; proxy_buffers 4 8k; proxy_busy_buffers_size 4k;")},
+	{"location overrides into bad set", strings.Replace(policyTestInServer("proxy_buffer_size 4k; proxy_buffers 8 4k; proxy_busy_buffers_size 8k;"), "        proxy_pass", "        proxy_buffers 2 4k;\n        proxy_pass", 1)},
+	{"buffer size above cap", policyTestInLocation("proxy_buffer_size 17m; proxy_buffers 64 17m; proxy_busy_buffers_size 17m;")},
+	{"client_body_buffer_size above cap", policyTestInServer("client_body_buffer_size 17m;")},
+	{"gzip_min_length above cap", policyTestInServer("gzip_min_length 1025m;")},
+	{"client_max_body_size ten digits", policyTestInServer("client_max_body_size 9999999999g;")},
+	{"timeout seven digits", policyTestInLocation("proxy_read_timeout 9999999h;")},
+	{"gzip_types 33", policyTestInServer("gzip_types " + strings.TrimSpace(strings.Repeat("text/x-a ", 33)) + ";")},
+
+	// Only the two rewrite forms nginxgen renders.
+	{"rewrite nested quantifier", policyTestInLocation("rewrite (a+)+$ /x break;")},
+	{"rewrite to absolute URL", policyTestInLocation("rewrite ^ http://evil.example/ break;")},
+	{"rewrite unescaped dot prefix", policyTestInLocation("rewrite ^/a.b/?(.*)$ /$1 break;")},
+	{"rewrite strip with other replacement", policyTestInLocation("rewrite ^/a/?(.*)$ /x$1 break;")},
+	{"rewrite strip relative prefix", policyTestInLocation("rewrite ^a/?(.*)$ /$1 break;")},
+	{"rewrite last", policyTestInLocation("rewrite ^.*$ /x last;")},
+
 	// Files, code and other scopes stay out.
 	{"access_log to managed-looking path", policyTestInLocation("access_log /var/log/nginx/app.example.test.access.log;")},
 	{"access_log with variable path", policyTestInServer("access_log /var/log/nginx/$host.log;")},
@@ -330,11 +381,13 @@ func TestValidateManagedNamesDirectiveAndLine(t *testing.T) {
 		{"unknown directive in location", policyTestInLocation("proxy_cache_path /etc/x keys_zone=a:1m;"), `line 9: nginx directive "proxy_cache_path" is not allowed in location /`},
 		{"bad arguments", policyTestInLocation("access_log /etc/cron.d/x;"), `line 9: nginx directive "access_log" has unsupported arguments in location /`},
 		{"lua block", policyTestInLocation("content_by_lua_block { ngx.say(1); }"), `line 9: nginx block "content_by_lua_block" is not allowed inside location /`},
-		{"second location", strings.Replace(policyTestValid, "    location / {", "    location /x {\n    }\n    location / {", 1), `line 8: nginx block "location" "/x" is not allowed in the server block`},
+		{"second location", strings.Replace(policyTestValid, "    location / {", "    location /x {\n    }\n    location / {", 1), `line 8: nginx block "location" is not allowed in the server block`},
 		{"top-level directive", "\n\nerror_log /tmp/x.log;\n" + policyTestValid, `line 3: top-level directives are not allowed`},
 		{"redirect server", policyTestInRedirect("root /;"), `line 5: nginx directive "root" is not allowed in the redirect server block`},
 		{"quoted name", policyTestInServer(`"include" /etc/x;`), `line 8: nginx directive is not in plain form`},
 		{"no proxy_pass", strings.Replace(policyTestValid, "        proxy_pass http://127.0.0.1:3000;\n", "", 1), `line 8: location / needs exactly one proxy_pass, found 0`},
+		{"duplicate", policyTestInServer("gzip on;\n    gzip on;"), `line 9: nginx directive "gzip" appears more than once in the server block`},
+		{"buffer set", policyTestInLocation("proxy_buffer_size 1m;"), `line 8: the proxy buffer settings of location / must set proxy_buffer_size, proxy_buffers and proxy_busy_buffers_size together`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -351,6 +404,30 @@ func TestValidateManagedNamesDirectiveAndLine(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// policyTestNginxRejects names refused cases that nginx -t itself rejects.
+// The Docker agreement test checks that, so these cases keep exercising the
+// nginx checks the policy mirrors.
+var policyTestNginxRejects = map[string]bool{
+	"duplicate gzip": true, "duplicate gzip in location": true, "duplicate server_tokens": true,
+	"duplicate client_max_body_size": true, "duplicate proxy_buffering": true,
+	"duplicate http2": true, "duplicate proxy_read_timeout": true,
+	"proxy_buffer_size alone": true, "proxy_busy_buffers_size alone": true, "proxy_buffers one buffer": true,
+	"busy above buffers minus one": true, "busy below buffer size": true, "busy below one buffer": true,
+	"location overrides into bad set": true,
+}
+
+func TestPolicyTestNginxRejectsNamesRefusedCases(t *testing.T) {
+	refused := map[string]bool{}
+	for _, tt := range policyTestRefused {
+		refused[tt.name] = true
+	}
+	for name := range policyTestNginxRejects {
+		if !refused[name] {
+			t.Errorf("policyTestNginxRejects names %q, which is not a refused case", name)
+		}
 	}
 }
 

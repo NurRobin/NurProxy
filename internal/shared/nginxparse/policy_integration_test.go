@@ -193,6 +193,9 @@ true`
 		if c.admitted && !nginxOK {
 			t.Errorf("%s: admitted config fails nginx -t:\n%s", c.name, c.content)
 		}
+		if policyTestNginxRejects[strings.TrimPrefix(c.name, "refused/")] && nginxOK {
+			t.Errorf("%s: nginx -t accepts a case listed as rejected by nginx:\n%s", c.name, c.content)
+		}
 		ours := tokenizerSeesLogDirective(c.content, markers[i])
 		if opened[markers[i]] != (ours && nginxOK) {
 			t.Errorf("%s: nginx opened marker = %v, tokenizer sees log directive = %v, nginx -t ok = %v:\n%s", c.name, opened[markers[i]], ours, nginxOK, c.content)

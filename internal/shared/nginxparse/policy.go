@@ -166,7 +166,7 @@ type argRule func(args []token, scope policyScope) bool
 // header text.
 var tuningDirectives = map[string]argRule{
 	"client_max_body_size":    func(a []token, _ policyScope) bool { return plainMatch(a, bodySizeRe) },
-	"client_body_buffer_size": func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
+	"client_body_buffer_size": func(a []token, _ policyScope) bool { return sizeAtMost(a, maxBufferBytes) },
 	"add_header": func(a []token, _ policyScope) bool {
 		if len(a) == 3 && !plainOneOf(a[2:], "always") {
 			return false
@@ -184,17 +184,17 @@ var tuningDirectives = map[string]argRule{
 	"proxy_read_timeout":      func(a []token, _ policyScope) bool { return plainMatch(a, durationRe) },
 	"proxy_buffering":         onOff,
 	"proxy_request_buffering": onOff,
-	"proxy_buffer_size":       func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
-	"proxy_busy_buffers_size": func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
+	"proxy_buffer_size":       func(a []token, _ policyScope) bool { return sizeAtMost(a, maxBufferBytes) },
+	"proxy_busy_buffers_size": func(a []token, _ policyScope) bool { return sizeAtMost(a, maxBufferBytes) },
 	"proxy_buffers": func(a []token, _ policyScope) bool {
-		return len(a) == 2 && plainMatch(a[:1], countRe) && plainMatch(a[1:], bufferSizeRe)
+		return len(a) == 2 && plainMatch(a[:1], countRe) && sizeAtMost(a[1:], maxBufferBytes)
 	},
 	"proxy_redirect":        func(a []token, _ policyScope) bool { return plainOneOf(a, "off") },
 	"proxy_ssl_server_name": onOff,
 	"gzip":                  onOff,
 	"gzip_vary":             onOff,
 	"gzip_comp_level":       func(a []token, _ policyScope) bool { return plainMatch(a, compLevelRe) },
-	"gzip_min_length":       func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
+	"gzip_min_length":       func(a []token, _ policyScope) bool { return sizeAtMost(a, 1<<30) },
 	"gzip_types": func(a []token, _ policyScope) bool {
 		return len(a) >= 1 && len(a) <= 32 && allPlain(a, func(v string) bool { return v == "*" || mimeTypeRe.MatchString(v) })
 	},
@@ -235,9 +235,7 @@ var proxiedServerOnly = map[string]argRule{
 // in the server block.
 var locationOnly = map[string]argRule{
 	"proxy_pass": func(a []token, _ policyScope) bool { return managedProxyPass(a) },
-	"rewrite": func(a []token, _ policyScope) bool {
-		return len(a) == 3 && rewriteArgument(a[0]) && rewriteArgument(a[1]) && plainOneOf(a[2:], "break")
-	},
+	"rewrite":    func(a []token, _ policyScope) bool { return managedRewrite(a) },
 }
 
 // proxiedServerDirectives are the only directives allowed directly in the
@@ -288,11 +286,11 @@ var redirectServerDirectives = map[string]argRule{
 var (
 	directiveNameRe    = regexp.MustCompile(`^[a-z0-9_]+$`)
 	headerNameRe       = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	bodySizeRe         = regexp.MustCompile(`^[0-9]+[kKmMgG]?$`)
+	bodySizeRe         = regexp.MustCompile(`^[0-9]{1,9}[kKmMgG]?$`)
 	addressRe          = regexp.MustCompile(`^(all|[0-9A-Fa-f:.]+(/[0-9]{1,3})?)$`)
-	bufferSizeRe       = regexp.MustCompile(`^[0-9]{1,9}[kKmM]?$`)
-	countRe            = regexp.MustCompile(`^[1-9][0-9]{0,3}$`)
-	durationRe         = regexp.MustCompile(`^[0-9]{1,9}(ms|s|m|h)?$`)
+	sizeRe             = regexp.MustCompile(`^([0-9]{1,9})([kKmM]?)$`)
+	countRe            = regexp.MustCompile(`^([2-9]|[1-5][0-9]|6[0-4])$`)
+	durationRe         = regexp.MustCompile(`^[0-9]{1,6}(ms|s|m|h)?$`)
 	compLevelRe        = regexp.MustCompile(`^[1-9]$`)
 	mimeTypeRe         = regexp.MustCompile(`^[a-z0-9][a-z0-9.+-]*/[a-z0-9*][a-z0-9.+*-]*$`)
 	burstRe            = regexp.MustCompile(`^burst=[0-9]+$`)
@@ -300,6 +298,76 @@ var (
 	rateRe             = regexp.MustCompile(`^rate=[0-9]+r/[sm]$`)
 	managedProxyPassRe = regexp.MustCompile(`^https?://([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]):([0-9]{1,5})/?$`)
 )
+
+// maxBufferBytes bounds every per-request buffer size (16m).
+const maxBufferBytes = 16 << 20
+
+// parseSize reads an nginx size ("512", "16k", "1M") as bytes.
+func parseSize(v string) (int64, bool) {
+	m := sizeRe.FindStringSubmatch(v)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	switch m[2] {
+	case "k", "K":
+		n <<= 10
+	case "m", "M":
+		n <<= 20
+	}
+	return n, true
+}
+
+// sizeAtMost accepts one plain size of at most limit bytes.
+func sizeAtMost(a []token, limit int64) bool {
+	if len(a) != 1 || a[0].quote != 0 || !plainArgument(a[0].source) {
+		return false
+	}
+	n, ok := parseSize(a[0].value)
+	return ok && n <= limit
+}
+
+// managedRewrite accepts the two rewrite forms nginxgen renders:
+// `rewrite ^<escaped prefix>/?(.*)$ /$1 break;` for a stripped prefix and
+// `rewrite ^.*$ <uri> break;` for a whole-URI rewrite. The prefix must be a
+// literal path in which every regex metacharacter is escaped, so no
+// operator-written regex reaches nginx's PCRE.
+func managedRewrite(a []token) bool {
+	if len(a) != 3 || !rewriteArgument(a[0]) || !rewriteArgument(a[1]) || !plainOneOf(a[2:], "break") {
+		return false
+	}
+	pattern, replacement := a[0].value, a[1].value
+	if pattern == "^.*$" {
+		return true
+	}
+	prefix, ok := strings.CutPrefix(pattern, "^")
+	if !ok || replacement != "/$1" {
+		return false
+	}
+	prefix, ok = strings.CutSuffix(prefix, "/?(.*)$")
+	return ok && literalPathRegexp(prefix)
+}
+
+// literalPathRegexp reports whether s is a path starting with "/" in which
+// every regex metacharacter is backslash-escaped.
+func literalPathRegexp(s string) bool {
+	if !strings.HasPrefix(s, "/") {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if strings.IndexByte(`.+*?()|[]{}^$`, s[i]) >= 0 {
+			return false
+		}
+	}
+	return true
+}
 
 // gzipProxiedValues are the gzip_proxied flags nginx knows.
 var gzipProxiedValues = map[string]bool{
@@ -362,6 +430,70 @@ func validateProxiedServer(server block, scope policyScope) error {
 	if n := countDirectives(location.directives, "proxy_pass"); n != 1 {
 		return fmt.Errorf("line %d: location / needs exactly one proxy_pass, found %d", scope.line(location.offset), n)
 	}
+	serverBuffers := readProxyBuffers(server.directives)
+	if err := serverBuffers.check(); err != nil {
+		return fmt.Errorf("line %d: the server block's proxy buffer settings %v", scope.line(server.offset), err)
+	}
+	if err := serverBuffers.inherit(readProxyBuffers(location.directives)).check(); err != nil {
+		return fmt.Errorf("line %d: the proxy buffer settings of location / %v", scope.line(location.offset), err)
+	}
+	return nil
+}
+
+// proxyBuffers are the proxy buffer directives of one block, 0 when unset.
+type proxyBuffers struct {
+	bufferSize, busySize, count, size int64
+}
+
+// readProxyBuffers reads the buffer directives of a block whose arguments
+// validateDirectives already accepted.
+func readProxyBuffers(directives []directive) proxyBuffers {
+	var b proxyBuffers
+	for _, d := range directives {
+		switch d.tokens[0].value {
+		case "proxy_buffer_size":
+			b.bufferSize, _ = parseSize(d.tokens[1].value)
+		case "proxy_busy_buffers_size":
+			b.busySize, _ = parseSize(d.tokens[1].value)
+		case "proxy_buffers":
+			b.count, _ = strconv.ParseInt(d.tokens[1].value, 10, 64)
+			b.size, _ = parseSize(d.tokens[2].value)
+		}
+	}
+	return b
+}
+
+// inherit returns the location's settings with unset values taken from the
+// server, the way nginx merges them.
+func (server proxyBuffers) inherit(location proxyBuffers) proxyBuffers {
+	if location.bufferSize == 0 {
+		location.bufferSize = server.bufferSize
+	}
+	if location.busySize == 0 {
+		location.busySize = server.busySize
+	}
+	if location.count == 0 {
+		location.count, location.size = server.count, server.size
+	}
+	return location
+}
+
+// check mirrors the proxy buffer checks nginx runs when it merges a location.
+// nginx's defaults depend on the host's page size, so the three directives
+// are only accepted together, which makes the outcome the same on every host.
+func (b proxyBuffers) check() error {
+	if b == (proxyBuffers{}) {
+		return nil
+	}
+	if b.bufferSize == 0 || b.busySize == 0 || b.count == 0 {
+		return fmt.Errorf("must set proxy_buffer_size, proxy_buffers and proxy_busy_buffers_size together")
+	}
+	if b.busySize < max(b.bufferSize, b.size) {
+		return fmt.Errorf("need proxy_busy_buffers_size of at least proxy_buffer_size and one proxy_buffers buffer")
+	}
+	if b.busySize > (b.count-1)*b.size {
+		return fmt.Errorf("need proxy_busy_buffers_size of at most the size of all proxy_buffers minus one buffer")
+	}
 	return nil
 }
 
@@ -387,7 +519,18 @@ func countDirectives(directives []directive, name string) int {
 	return n
 }
 
+// repeatableDirectives are the allowlisted directives nginx accepts more than
+// once in the same block. nginx fails `nginx -t` with "is duplicate" for a
+// repeated one of any other allowlisted directive.
+var repeatableDirectives = map[string]bool{
+	"listen": true, "server_name": true, "ssl_certificate": true, "ssl_certificate_key": true,
+	"add_header": true, "proxy_set_header": true, "proxy_hide_header": true,
+	"allow": true, "deny": true, "access_log": true, "error_log": true, "rewrite": true,
+	"gzip_types": true, "gzip_proxied": true,
+}
+
 func validateDirectives(directives []directive, allowed map[string]argRule, scope policyScope, where string) error {
+	seen := map[string]bool{}
 	for _, d := range directives {
 		if d.comment || !plainName(d.tokens[0]) {
 			return fmt.Errorf("line %d: nginx directive is not in plain form (quoted or escaped name, or a comment inside the statement)", scope.line(d.offset))
@@ -400,6 +543,10 @@ func validateDirectives(directives []directive, allowed map[string]argRule, scop
 		if !rule(d.tokens[1:], scope) {
 			return fmt.Errorf("line %d: nginx directive %s has unsupported arguments in %s", scope.line(d.offset), quoteName(name), where)
 		}
+		if seen[name] && !repeatableDirectives[name] {
+			return fmt.Errorf("line %d: nginx directive %s appears more than once in %s", scope.line(d.offset), quoteName(name), where)
+		}
+		seen[name] = true
 	}
 	return nil
 }
@@ -416,17 +563,14 @@ func quoteName(name string) string {
 	return fmt.Sprintf("%q", name)
 }
 
-// blockName names a block's kind for an error, plus the path of a location,
-// or describes it when the kind is not a plain name.
+// blockName names a block's kind for an error, or describes it when the kind
+// is not a plain name. Like directive errors, it never quotes the block's
+// arguments.
 func blockName(b block) string {
 	if len(b.tokens) == 0 || b.comment || !plainName(b.tokens[0]) {
 		return "with a non-plain name"
 	}
-	name := quoteName(b.tokens[0].value)
-	if b.tokens[0].value == "location" && len(b.tokens) == 2 && plainArgument(b.tokens[1].source) && len(b.tokens[1].value) <= maxQuotedName {
-		name = fmt.Sprintf("%s %q", name, b.tokens[1].value)
-	}
-	return name
+	return quoteName(b.tokens[0].value)
 }
 
 // header reports whether a block's header is exactly the given plain words.
