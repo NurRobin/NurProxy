@@ -37,6 +37,9 @@ type discoverySourceResponse struct {
 	models.DiscoverySource
 	TypeName string `json:"type_name"`
 	Summary  string `json:"summary"`
+	// Settings is the stored config without its secret fields, so an edit
+	// form can show the current values.
+	Settings map[string]any `json:"settings"`
 	// Candidates is the number of machines in the last result; Missing the
 	// number of imported servers the source no longer reports.
 	Candidates int `json:"candidates"`
@@ -45,11 +48,12 @@ type discoverySourceResponse struct {
 }
 
 func (s *Server) sourceResponse(src *models.DiscoverySource) discoverySourceResponse {
-	resp := discoverySourceResponse{DiscoverySource: *src, TypeName: src.Type}
+	resp := discoverySourceResponse{DiscoverySource: *src, TypeName: src.Type, Settings: map[string]any{}}
 	resp.Config = ""
 	if d, err := s.discovery.Discoverer(src.Type); err == nil {
 		resp.TypeName = d.Info().Name
 		resp.Summary = d.Summary(json.RawMessage(src.Config))
+		resp.Settings = publicSettings(json.RawMessage(src.Config), d.Info().SecretFields)
 	}
 	if v, err := s.discovery.View(src.ID); err == nil {
 		resp.Candidates = len(v.Candidates)
@@ -61,6 +65,19 @@ func (s *Server) sourceResponse(src *models.DiscoverySource) discoverySourceResp
 		}
 	}
 	return resp
+}
+
+// publicSettings returns config without the secret fields. A config that is
+// not a JSON object yields an empty map.
+func publicSettings(config json.RawMessage, secretFields []string) map[string]any {
+	out := map[string]any{}
+	if err := json.Unmarshal(config, &out); err != nil {
+		return map[string]any{}
+	}
+	for _, f := range secretFields {
+		delete(out, f)
+	}
+	return out
 }
 
 // GET /api/v1/discovery/types

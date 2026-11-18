@@ -290,7 +290,8 @@ func TestDiscoverySourceProxmoxValidationAndMasking(t *testing.T) {
 		t.Fatalf("create: %d %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	if strings.Contains(body, "very-secret-uuid") || !strings.Contains(body, "https://pve.lan:8006 as nurproxy@pve!disc") {
+	if strings.Contains(body, "very-secret-uuid") || !strings.Contains(body, "https://pve.lan:8006 as nurproxy@pve!disc") ||
+		!strings.Contains(body, `"settings":{"token_id":"nurproxy@pve!disc","url":"pve.lan"}`) {
 		t.Fatalf("create response = %s", body)
 	}
 	var created struct {

@@ -5,7 +5,8 @@
 # locally with NO external DNS or ACME calls and NO privileges.
 #
 # It starts a dry-run orchestrator + N dry-run agents, then seeds a provider
-# (dummy token), a zone, and one server + central-TLS domain per agent. The
+# (dummy token), a zone, a Proxmox discovery source (dry-run fixture), and one
+# server + central-TLS domain per agent. The
 # orchestrator simulates every DNS/ACME call; the agents simulate their reverse
 # proxy in memory (no Caddy process, no :80/:443). The result is a fully
 # populated, "live"-looking environment you can open in the dashboard.
@@ -120,6 +121,12 @@ echo "--> seeding provider (dummy token) + zone ${ZONE}"
 PROVIDER_ID=$(api POST /api/v1/providers '{"type":"cloudflare","name":"CF-dry","config":{"api_token":"dummy-dry-token"}}' | jget "d['id']")
 ZONE_ID=$(api POST /api/v1/zones "{\"provider_id\":\"$PROVIDER_ID\",\"name\":\"$ZONE\"}" | jget "d['id']")
 echo "    provider=$PROVIDER_ID zone=$ZONE_ID ($ZONE)"
+
+# --- server discovery source (dry-run returns a fixed Proxmox cluster) -------
+echo "--> seeding Proxmox discovery source (dry-run fixture)"
+SOURCE_ID=$(api POST /api/v1/discovery/sources '{"type":"proxmox","name":"pve-dry","config":{"url":"https://pve.sandbox.test:8006","token_id":"nurproxy@pve!dry","token_secret":"dummy-dry-secret","verify_tls":true}}' | jget "d['id']")
+api POST "/api/v1/discovery/sources/${SOURCE_ID}/run" >/dev/null
+echo "    discovery source=$SOURCE_ID (Servers → Discover from Proxmox VE)"
 
 # --- agents -----------------------------------------------------------------
 for n in $(seq 1 "$AGENTS"); do
