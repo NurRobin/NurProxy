@@ -102,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent that already served one never got its certificate loaded until the
   agent restarted. The apply now replaces the existing values. Found by the
   live sandbox.
+- **Built-in Caddy unloads certificates when no central domain is left.**
+  With no provided cert the TLS apply sent `load_files: null`, which Caddy
+  refuses, so the removed domain's certificate stayed loaded and the agent
+  reported an error. It now sends an empty list.
 
 - **Renaming a domain or moving it to another zone cleans up the old name
   (#151).** The DNS record of the old name is queued and deleted through the

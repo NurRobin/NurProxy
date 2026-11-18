@@ -1125,6 +1125,7 @@ func (c *apiClient) do(method, path string, body, out any) {
 func (c *apiClient) get(path string, out any)     { c.do(http.MethodGet, path, nil, out) }
 func (c *apiClient) post(path string, b, out any) { c.do(http.MethodPost, path, b, out) }
 func (c *apiClient) put(path string, b, out any)  { c.do(http.MethodPut, path, b, out) }
+func (c *apiClient) del(path string)              { c.do(http.MethodDelete, path, nil, nil) }
 
 // status sends a bodyless request and returns the response status, for
 // calls that are expected to fail.

@@ -327,6 +327,40 @@ func TestGenerateRoute_ManualOverride_WrongBackend(t *testing.T) {
 	}
 }
 
+func TestGenerateRouteWith_ForceHTTPSPort(t *testing.T) {
+	cfg := proxymodel.Route{
+		Host:       "redirect.example.com",
+		Upstream:   proxymodel.Upstream{Addr: "10.0.0.6", Port: 5000},
+		ForceHTTPS: true,
+	}
+	plain, err := GenerateRoute(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		port         int
+		wantLocation string
+	}{
+		{0, "https://{http.request.host}{http.request.uri}"},
+		{443, "https://{http.request.host}{http.request.uri}"},
+		{18443, "https://{http.request.host}:18443{http.request.uri}"},
+	}
+	for _, tt := range tests {
+		raw, err := GenerateRouteWith(cfg, RouteOptions{HTTPSPort: tt.port})
+		if err != nil {
+			t.Fatalf("port %d: %v", tt.port, err)
+		}
+		want, _ := json.Marshal(tt.wantLocation)
+		if !strings.Contains(string(raw), `"Location":[`+string(want)+`]`) {
+			t.Errorf("port %d: route lacks Location %s:\n%s", tt.port, want, raw)
+		}
+		// The standard port must render byte-identical to GenerateRoute.
+		if (tt.port == 0 || tt.port == 443) && string(raw) != string(plain) {
+			t.Errorf("port %d: output differs from GenerateRoute", tt.port)
+		}
+	}
+}
+
 func TestGenerateRoute_ForceHTTPS(t *testing.T) {
 	cfg := proxymodel.Route{
 		Host:       "redirect.example.com",

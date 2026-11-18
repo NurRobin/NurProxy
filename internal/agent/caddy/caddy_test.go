@@ -206,6 +206,8 @@ func TestClientEnsureServer_listen(t *testing.T) {
 		{name: "explicit defaults", httpPort: 80, httpsPort: 443, wantListen: []string{":443", ":80"}},
 		{name: "unprivileged loopback", host: "127.0.0.1", httpPort: 18080, httpsPort: 18443,
 			wantListen: []string{"127.0.0.1:18443", "127.0.0.1:18080"}, wantHTTPPort: float64(18080), wantHTTPSPortIn: true},
+		{name: "IPv6 host is bracketed", host: "::1",
+			wantListen: []string{"[::1]:443", "[::1]:80"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -308,6 +310,48 @@ func TestClientApplyTLS_reapplyReplacesExistingKeys(t *testing.T) {
 	}
 	if len(certs.LoadFiles) != 2 {
 		t.Errorf("load_files after re-apply = %v, want both certs", certs.LoadFiles)
+	}
+}
+
+// Caddy refuses `"load_files": null`; with no provided cert the client sends an
+// empty list, which also unloads the certs of removed domains.
+func TestClientApplyTLS_nullLoadFilesBecomesEmptyList(t *testing.T) {
+	for _, in := range []json.RawMessage{nil, json.RawMessage(`null`), json.RawMessage(` null `)} {
+		var certs string
+		mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/config/apps/tls":
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			case r.URL.Path == "/config/apps/tls/certificates":
+				certs = string(body)
+				w.WriteHeader(http.StatusOK)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		c := &Client{baseURL: mock.URL, http: mock.Client()}
+		if err := c.ApplyTLS(context.Background(), in, json.RawMessage(`{"disable":true}`), nil); err != nil {
+			t.Fatalf("ApplyTLS(%q): %v", in, err)
+		}
+		mock.Close()
+		if certs != `{"load_files":[]}` {
+			t.Errorf("ApplyTLS(%q) sent certificates %s, want an empty load_files list", in, certs)
+		}
+	}
+}
+
+func TestClientHTTPSPort(t *testing.T) {
+	var nilClient *Client
+	if got := nilClient.HTTPSPort(); got != DefaultHTTPSPort {
+		t.Errorf("nil client HTTPSPort = %d", got)
+	}
+	if got := NewMockClient().HTTPSPort(); got != DefaultHTTPSPort {
+		t.Errorf("default HTTPSPort = %d", got)
+	}
+	if got := NewMockClient().WithListen("", 0, 18443).HTTPSPort(); got != 18443 {
+		t.Errorf("HTTPSPort = %d, want 18443", got)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -171,6 +172,20 @@ func (c *Client) WithListen(host string, httpPort, httpsPort int) *Client {
 	c.httpPort = httpPort
 	c.httpsPort = httpsPort
 	return c
+}
+
+// HTTPSPort returns the port srv0 serves HTTPS on (443 unless WithListen set
+// another). Safe on a nil client.
+func (c *Client) HTTPSPort() int {
+	if c == nil {
+		return DefaultHTTPSPort
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.httpsPort == 0 {
+		return DefaultHTTPSPort
+	}
+	return c.httpsPort
 }
 
 // listen returns srv0's listener addresses, HTTPS first.
@@ -348,6 +363,11 @@ func (c *Client) EnsureServer(ctx context.Context) error {
 // uses. A nil/empty load_files set still writes automatic_https (e.g. disable for
 // a pure-provided fleet or a managed self-ACME server with no loaded files).
 func (c *Client) ApplyTLS(ctx context.Context, loadFiles json.RawMessage, automaticHTTPS json.RawMessage, connPolicies json.RawMessage) error {
+	// Caddy rejects a null load_files ("module value cannot be null"); no
+	// provided certs is an empty list, which also unloads earlier ones.
+	if s := strings.TrimSpace(string(loadFiles)); s == "" || s == "null" {
+		loadFiles = json.RawMessage(`[]`)
+	}
 	c.mu.Lock()
 	if c.mock {
 		c.mockConfig["tls_load_files"] = loadFiles
