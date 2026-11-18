@@ -28,6 +28,17 @@ traffic. A few things worth knowing.
   receive proxy and DNS configuration from the orchestrator.
 - Reject anything unexpected in the pending list.
 
+## Agent self-update
+
+- Self-update is off on a host until root runs `nurproxy-agent self-update-enable`,
+  and every upgrade needs an operator action (or the per-agent auto-upgrade
+  opt-in).
+- The agent installs only releases whose `checksums.txt` is signed by this
+  repository's release workflow for exactly that tag (cosign keyless, Fulcio CA
+  pinned in the binary) and whose archive matches the checksum. The root applier
+  verifies again and never downgrades. Details and limits:
+  [Agent upgrades](agent-upgrades#trust-model).
+
 ## Existing-mode agents (managing an installed nginx/Apache)
 
 - An agent in **Existing** mode edits proxy config files and reloads the service.
