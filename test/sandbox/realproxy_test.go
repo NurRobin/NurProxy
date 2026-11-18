@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,8 +26,8 @@ import (
 // none is, they log and skip just that check.
 //
 // Binary lookup, per proxy: the NP_SANDBOX_<PROXY> env var (a path), then PATH.
-// With NP_SANDBOX_DOCKER=1 and no local binary, nginx is run from the same image
-// the integration tests use (docker, no network).
+// With NP_SANDBOX_DOCKER=1, nginx runs from the image the nginxparse
+// integration test uses (docker, no network) instead of a local binary.
 
 // sandboxNginxImage matches the nginx image of the nginxparse integration test.
 const sandboxNginxImage = "nginx:1.29-alpine"
@@ -193,27 +195,62 @@ http {
 }
 `
 
+// privilegedListen matches the port of a `listen` directive below 1024.
+var privilegedListen = regexp.MustCompile(`(?m)^(\s*listen\s+(?:\S*:)?)([1-9]\d{0,2})\b`)
+
+// unprivilegedCopies copies the managed vhosts of confDir into dir with every
+// listen port below 1024 moved to a free high port. `nginx -t` binds the
+// listen sockets, which an unprivileged user cannot do on :80/:443 in the host
+// network namespace; nothing else in the files changes.
+func unprivilegedCopies(t *testing.T, confDir, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(confDir, "nurproxy-*.conf"))
+	mapped := map[string]string{}
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read vhost: %v", err)
+		}
+		out := privilegedListen.ReplaceAllStringFunc(string(b), func(m string) string {
+			sub := privilegedListen.FindStringSubmatch(m)
+			if _, ok := mapped[sub[2]]; !ok {
+				mapped[sub[2]] = strconv.Itoa(freePort(t))
+			}
+			return sub[1] + mapped[sub[2]]
+		})
+		if err := os.WriteFile(filepath.Join(dir, filepath.Base(f)), []byte(out), 0o644); err != nil {
+			t.Fatalf("write vhost copy: %v", err)
+		}
+	}
+}
+
 // validateNginxVhosts runs `nginx -t` over the managed vhosts in confDir with
-// a real nginx: a local binary, or the integration-test image when
-// NP_SANDBOX_DOCKER=1. mounts are host dirs the vhosts reference (the agent's
-// cert store), bind-mounted read-only at the same path for docker.
+// a real nginx: the integration-test image when NP_SANDBOX_DOCKER=1 (its own
+// network namespace lets it bind :80/:443 unprivileged, so the files are
+// checked unchanged), else a local binary (as non-root on copies whose
+// privileged listen ports are moved, see unprivilegedCopies). mounts are host
+// dirs the vhosts reference (the agent's cert store), bind-mounted read-only
+// at the same path for docker.
 func validateNginxVhosts(t *testing.T, confDir string, mounts ...string) {
 	t.Helper()
 	prefix := t.TempDir()
 	conf := filepath.Join(prefix, "nginx.conf")
-	if err := os.WriteFile(conf, []byte(fmt.Sprintf(nginxTestConf, prefix, confDir)), 0o644); err != nil {
-		t.Fatalf("write nginx test conf: %v", err)
+	writeConf := func(vhostDir string) {
+		if err := os.WriteFile(conf, []byte(fmt.Sprintf(nginxTestConf, prefix, vhostDir)), 0o644); err != nil {
+			t.Fatalf("write nginx test conf: %v", err)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	var cmd *exec.Cmd
 	var via string
-	if bin := lookupProxyBinary("NP_SANDBOX_NGINX", "nginx"); bin != "" {
-		cmd = exec.CommandContext(ctx, bin, "-t", "-p", prefix+"/", "-e", filepath.Join(prefix, "error.log"), "-c", conf)
-		via = bin
-	} else if dockerOptIn() {
-		// Run as the invoking user, like a local unprivileged nginx -t would.
+	if dockerOptIn() {
+		writeConf(confDir)
+		// Run as the invoking user so the files need no extra permissions.
 		args := []string{"run", "--rm", "--network", "none", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 			"-v", prefix + ":" + prefix, "-v", confDir + ":" + confDir + ":ro"}
 		for _, m := range mounts {
@@ -222,6 +259,16 @@ func validateNginxVhosts(t *testing.T, confDir string, mounts ...string) {
 		args = append(args, sandboxNginxImage, "nginx", "-t", "-p", prefix+"/", "-e", filepath.Join(prefix, "error.log"), "-c", conf)
 		cmd = exec.CommandContext(ctx, "docker", args...)
 		via = "docker " + sandboxNginxImage
+	} else if bin := lookupProxyBinary("NP_SANDBOX_NGINX", "nginx"); bin != "" {
+		vhostDir := confDir
+		via = bin
+		if os.Geteuid() != 0 {
+			vhostDir = filepath.Join(prefix, "vhosts")
+			unprivilegedCopies(t, confDir, vhostDir)
+			via += ", listen ports < 1024 moved"
+		}
+		writeConf(vhostDir)
+		cmd = exec.CommandContext(ctx, bin, "-t", "-p", prefix+"/", "-e", filepath.Join(prefix, "error.log"), "-c", conf)
 	} else {
 		t.Log("real-proxy validation: nginx not found (set NP_SANDBOX_NGINX, put nginx on PATH, or NP_SANDBOX_DOCKER=1); skipped")
 		return

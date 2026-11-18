@@ -108,9 +108,10 @@ checks (with a log line) when not:
   + TLS strategy go through `caddy validate`, and `TestSandboxLiveTraffic` serves
   real HTTPS/HTTP through Caddy (cert = the dry-issued one, force_https redirect,
   live updates, a second domain's cert loading on a running Caddy).
-- **nginx** (`NP_SANDBOX_NGINX` or PATH, else `NP_SANDBOX_DOCKER=1` runs
-  `nginx:1.29-alpine` as your uid): the existing-mode agent's rendered vhosts get
-  `nginx -t` with their real cert paths.
+- **nginx** (`NP_SANDBOX_DOCKER=1` runs `nginx:1.29-alpine` as your uid on the
+  unchanged files; otherwise `NP_SANDBOX_NGINX` or PATH, and as non-root on copies
+  whose `listen` ports below 1024 are moved, because `nginx -t` binds them): the
+  existing-mode agent's rendered vhosts get `nginx -t` with their real cert paths.
 CI installs a pinned, checksummed Caddy and sets `NP_SANDBOX_DOCKER=1`, so all of
 these run on every push/PR.
 
