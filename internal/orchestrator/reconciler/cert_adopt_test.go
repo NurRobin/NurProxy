@@ -60,6 +60,53 @@ func TestFirstIssuanceWaitsForAdoption(t *testing.T) {
 	}
 }
 
+// TestWatchAdoptionHolds_issuesWhenHoldEnds checks that a held host is issued
+// as soon as its hold ends, here because the operator skipped adoption,
+// rather than at the next periodic renewal scan.
+func TestWatchAdoptionHolds_issuesWhenHoldEnds(t *testing.T) {
+	registerMockProvider(t)
+	d := testDB(t)
+	_, _, _, _, dom := setupScenario(t, d)
+	now := time.Now().UTC()
+	if err := d.UpdateAgentDetection("agent-1", &models.ProxyDetection{DiscoveredCerts: []models.DiscoveredCert{{
+		Fingerprint: strings.Repeat("ab", 32), Names: []string{"app.example.com"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(60 * 24 * time.Hour),
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	store := NewCertRenewalStore(d)
+	if held := store.heldHosts(now); !held["app.example.com"] {
+		t.Fatalf("heldHosts = %v, want app.example.com", held)
+	}
+
+	issued := make(chan string, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go store.WatchAdoptionHolds(ctx, 20*time.Millisecond, func(_ context.Context, host string) error {
+		issued <- host
+		return nil
+	})
+	select {
+	case host := <-issued:
+		t.Fatalf("issued %q while still held", host)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := d.SkipCertAdoption(dom.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case host := <-issued:
+		if host != "app.example.com" {
+			t.Errorf("issued %q", host)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no issuance after the hold ended")
+	}
+	if held := store.heldHosts(time.Now().UTC()); len(held) != 0 {
+		t.Errorf("skipped domain still held: %v", held)
+	}
+}
+
 // TestAwaitingAdoption_graceEnds checks the hold is bounded by the domain's age.
 func TestAwaitingAdoption_graceEnds(t *testing.T) {
 	registerMockProvider(t)

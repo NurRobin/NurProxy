@@ -217,33 +217,87 @@ func (s *CertRenewalStore) TargetForHost(_ context.Context, host string) (*tls.R
 	return &t, nil
 }
 
-// awaitingAdoption reports whether first issuance for host should wait: the
-// domain is younger than tls.AdoptionGrace and its serving agent reports an
-// adoptable certificate for host on disk (#80). Ordering now would spend a CA
-// order (and the duplicate-certificate quota) on a host the operator is
-// probably about to adopt a certificate for. Lookup errors never hold
-// issuance back.
+// awaitingAdoption reports whether first issuance for host should wait under
+// the adoption hold (#80, db.CertAdoptionHold): ordering now would spend a CA
+// order, and duplicate-certificate quota, on a host the operator is probably
+// about to adopt a certificate for.
 func (s *CertRenewalStore) awaitingAdoption(dom *models.Domain, host string, now time.Time) bool {
-	until := dom.CreatedAt.Add(tls.AdoptionGrace)
-	if dom.CreatedAt.IsZero() || !now.Before(until) || dom.ServerID == "" {
-		return false
+	until, dc, agentName, held := s.db.CertAdoptionHold(dom, host, now)
+	if held {
+		log.Printf("reconciler: first-issuance for %q waits until %s: agent %s has an adoptable certificate on disk (%s)",
+			host, until.Format(time.RFC3339), agentName, dc.CertPath)
 	}
-	srv, err := s.db.GetServer(dom.ServerID)
+	return held
+}
+
+// heldHosts returns the hosts of central-TLS domains without a certificate
+// whose first issuance is currently held for adoption.
+func (s *CertRenewalStore) heldHosts(now time.Time) map[string]bool {
+	zones, err := s.db.ListZones()
 	if err != nil {
-		return false
+		return nil
 	}
-	agent, err := s.db.GetAgent(srv.AgentID)
-	if err != nil || agent.ProxyDetection == nil {
-		return false
+	domains, err := s.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return nil
 	}
-	for _, dc := range agent.ProxyDetection.DiscoveredCerts {
-		if ok, _ := tls.AdoptableFor(dc, host, now); ok {
-			log.Printf("reconciler: first-issuance for %q waits until %s: agent %s has an adoptable certificate on disk (%s)",
-				host, until.UTC().Format(time.RFC3339), agent.Name, dc.CertPath)
-			return true
+	zoneNames := make(map[string]string, len(zones))
+	for i := range zones {
+		zoneNames[zones[i].ID] = zones[i].Name
+	}
+	held := map[string]bool{}
+	for i := range domains {
+		dom := &domains[i]
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok || dom.Status == models.DomainStatusDeleting || caddygen.TLSPolicyForDomain(*dom) != proxymodel.TLSPolicyCentral {
+			continue
+		}
+		host := dom.FQDN(zoneName)
+		if _, err := s.db.GetCertificate(host); err == nil {
+			continue
+		}
+		if _, _, _, ok := s.db.CertAdoptionHold(dom, host, now); ok {
+			held[host] = true
 		}
 	}
-	return false
+	return held
+}
+
+// WatchAdoptionHolds issues a certificate as soon as a host's adoption hold
+// ends (grace elapsed, operator skipped adoption, or the agent stopped
+// reporting the certificate) instead of leaving it to the next periodic
+// renewal scan, which may be hours away. It polls every interval until ctx is
+// done. Hosts held when the orchestrator starts are tracked from the first
+// poll, so a restart during a hold still issues when it ends; a hold that
+// ended while the orchestrator was down is covered by the renewer's startup
+// scan. ensure is the renewer's EnsureCertForHost, a no-op once a certificate
+// is on file (for example after an adoption).
+func (s *CertRenewalStore) WatchAdoptionHolds(ctx context.Context, interval time.Duration, ensure func(context.Context, string) error) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	prev := s.heldHosts(time.Now().UTC())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		cur := s.heldHosts(time.Now().UTC())
+		for host := range prev {
+			if cur[host] {
+				continue
+			}
+			log.Printf("reconciler: adoption hold for %q ended; issuing", host)
+			go func(host string) {
+				ictx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				defer cancel()
+				if err := ensure(ictx, host); err != nil {
+					log.Printf("reconciler: issuance for %q after adoption hold failed (renewal scan will retry): %v", host, err)
+				}
+			}(host)
+		}
+		prev = cur
+	}
 }
 
 // domainForHost returns the non-deleting central-TLS domain whose FQDN is

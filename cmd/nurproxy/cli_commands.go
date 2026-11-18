@@ -565,25 +565,23 @@ func cmdDomain(args []string) {
 		}
 
 	case "adopt-cert":
-		var fingerprint, agentID string
+		var fingerprint, fromAgent string
 		c, _, id := parseClient("domain adopt-cert", rest, "domain id", func(fs *flag.FlagSet) {
-			fs.StringVar(&fingerprint, "fingerprint", "", "SHA-256 fingerprint from 'domain cert-candidates' (optional when exactly one certificate is adoptable)")
-			fs.StringVar(&agentID, "agent", "", "Agent ID holding the certificate (default: the agent reporting the fingerprint, serving agent first)")
+			fs.StringVar(&fingerprint, "fingerprint", "", "SHA-256 fingerprint from 'domain cert-candidates' (optional when the serving agent has exactly one adoptable certificate)")
+			fs.StringVar(&fromAgent, "from-agent", "", "Agent ID to take the certificate from when it is not the serving agent (requires --fingerprint)")
 		})
+		if fromAgent != "" && fingerprint == "" {
+			fatalf("domain adopt-cert: --from-agent requires --fingerprint")
+		}
 		if fingerprint == "" {
-			var adoptable []certCandidateRow
-			for _, cand := range fetchCertCandidates(c, id).Candidates {
-				if cand.Adoptable && (agentID == "" || cand.AgentID == agentID) {
-					adoptable = append(adoptable, cand)
-				}
+			fp, err := pickServingCandidate(fetchCertCandidates(c, id).Candidates, id)
+			if err != nil {
+				fatalf("domain adopt-cert: %v", err)
 			}
-			if len(adoptable) != 1 {
-				fatalf("domain adopt-cert: %d adoptable certificates found; pick one with --fingerprint (see 'domain cert-candidates %s')", len(adoptable), id)
-			}
-			fingerprint, agentID = adoptable[0].Fingerprint, adoptable[0].AgentID
+			fingerprint = fp
 		}
 		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/certificate/adopt", map[string]string{
-			"fingerprint": fingerprint, "agent_id": agentID,
+			"fingerprint": fingerprint, "agent_id": fromAgent,
 		})
 		if err != nil {
 			fatalf("%v", err)
@@ -594,9 +592,17 @@ func cmdDomain(args []string) {
 		}
 		c.emit(raw, msg)
 
+	case "issue-cert":
+		c, _, id := parseClient("domain issue-cert", rest, "domain id", nil)
+		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/certificate/issue-now", nil)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		c.emit(raw, gjson(raw, "message"))
+
 	default:
 		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE",
-			"cert-candidates <id>", "adopt-cert <id> [--fingerprint FP] [--agent ID]")
+			"cert-candidates <id>", "adopt-cert <id> [--fingerprint FP [--from-agent ID]]", "issue-cert <id>")
 	}
 }
 
@@ -605,8 +611,26 @@ type certCandidateRow struct {
 	models.DiscoveredCert
 	AgentID   string `json:"agent_id"`
 	AgentName string `json:"agent_name"`
+	Serving   bool   `json:"serving"`
 	Adoptable bool   `json:"adoptable"`
 	Reason    string `json:"reason"`
+}
+
+// pickServingCandidate returns the fingerprint of the one adoptable
+// certificate on the domain's serving agent. Certificates on other agents are
+// never picked implicitly: taking a key from another host needs --fingerprint
+// and --from-agent.
+func pickServingCandidate(cands []certCandidateRow, domainID string) (string, error) {
+	var picked []certCandidateRow
+	for _, cand := range cands {
+		if cand.Adoptable && cand.Serving {
+			picked = append(picked, cand)
+		}
+	}
+	if len(picked) != 1 {
+		return "", fmt.Errorf("the serving agent has %d adoptable certificates; pick one with --fingerprint (see 'domain cert-candidates %s')", len(picked), domainID)
+	}
+	return picked[0].Fingerprint, nil
 }
 
 type certCandidates struct {

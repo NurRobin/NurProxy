@@ -138,7 +138,6 @@ func (s *Server) handleDomainCertificateCandidates(w http.ResponseWriter, r *htt
 
 	candidates := []certCandidate{}
 	hints := []certScanHint{}
-	servingAdoptable := false
 	for _, a := range agents {
 		if a.ProxyDetection == nil {
 			continue
@@ -154,9 +153,6 @@ func (s *Server) handleDomainCertificateCandidates(w http.ResponseWriter, r *htt
 				continue
 			}
 			adoptable, reason := tls.AdoptableFor(dc, host, now)
-			if adoptable && a.ID == serving {
-				servingAdoptable = true
-			}
 			candidates = append(candidates, certCandidate{
 				DiscoveredCert: dc,
 				AgentID:        a.ID,
@@ -185,10 +181,38 @@ func (s *Server) handleDomainCertificateCandidates(w http.ResponseWriter, r *htt
 	}
 	if _, err := s.db.GetCertificate(host); err == nil {
 		resp["certificate_on_file"] = true
-	} else if until := dom.CreatedAt.Add(tls.AdoptionGrace); servingAdoptable && until.After(now) {
-		resp["issuance_deferred_until"] = until.UTC()
+	} else if until, _, _, held := s.db.CertAdoptionHold(dom, host, now); held {
+		resp["issuance_deferred_until"] = until
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// POST /api/v1/domains/{id}/certificate/issue-now
+//
+// Ends the adoption hold (#80) for the domain: the operator does not want any
+// of the certificates found on disk, so NurProxy orders a new one right away
+// instead of waiting for the hold to expire.
+func (s *Server) handleIssueDomainCertificateNow(w http.ResponseWriter, r *http.Request) {
+	dom, host, ok := s.certificateDomain(w, r)
+	if !ok {
+		return
+	}
+	if err := s.db.SkipCertAdoption(dom.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update domain")
+		return
+	}
+	s.audit(r, "certificate", host, "cert_adoption_skipped",
+		fmt.Sprintf("domain %d: operator chose a new certificate over adopting one from disk", dom.ID))
+	_, err := s.db.GetCertificate(host)
+	onFile := err == nil
+	if !onFile {
+		s.triggerCertIssuance(dom)
+	}
+	msg := "adoption hold ended; issuing a new certificate"
+	if onFile {
+		msg = "adoption hold ended; a certificate is already on file"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"host": host, "certificate_on_file": onFile, "message": msg})
 }
 
 // POST /api/v1/domains/{id}/certificate/adopt   body {"fingerprint": "...", "agent_id": "..."}
@@ -198,9 +222,9 @@ func (s *Server) handleDomainCertificateCandidates(w http.ResponseWriter, r *htt
 // given fingerprint; the agent answers only from the bundles it discovered
 // itself. The upload is then validated and stored exactly like a manual
 // import: names must cover the host, the key must match, the key is encrypted
-// at rest, and central renewal takes over near expiry. agent_id is optional;
-// without it the serving agent is tried first, then any agent reporting the
-// fingerprint.
+// at rest, and central renewal takes over near expiry. agent_id defaults to
+// the serving agent; a certificate from any other agent (a host being
+// migrated away from) must name that agent explicitly.
 func (s *Server) handleAdoptDomainCertificate(w http.ResponseWriter, r *http.Request) {
 	dom, host, ok := s.certificateDomain(w, r)
 	if !ok {
@@ -286,18 +310,24 @@ func (s *Server) handleAdoptDomainCertificate(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// findDiscoveredCert finds the agent reporting fingerprint fp: agentID when
-// given, otherwise the domain's serving agent first and then any other.
+// findDiscoveredCert finds the agent reporting fingerprint fp. Without
+// agentID only the domain's serving agent is searched: copying a key from
+// another host is a deliberate migration step, so the operator must name that
+// agent.
 func (s *Server) findDiscoveredCert(dom *models.Domain, agentID, fp string) (*models.Agent, models.DiscoveredCert, error) {
+	if agentID == "" {
+		agentID = s.servingAgentID(dom)
+		if agentID == "" {
+			return nil, models.DiscoveredCert{}, nil
+		}
+	}
 	agents, err := s.db.ListAgents()
 	if err != nil {
 		return nil, models.DiscoveredCert{}, err
 	}
-	serving := s.servingAgentID(dom)
-	sort.SliceStable(agents, func(i, j int) bool { return agents[i].ID == serving && agents[j].ID != serving })
 	for i := range agents {
 		a := &agents[i]
-		if agentID != "" && a.ID != agentID {
+		if a.ID != agentID {
 			continue
 		}
 		if a.ProxyDetection == nil {

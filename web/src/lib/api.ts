@@ -185,6 +185,8 @@ export const api = {
   resetDomainConfig: (id: number) =>
     request<{ message: string }>(`/domains/${id}/config/reset`, { method: 'POST' }),
   getCertCandidates: (id: number) => request<CertCandidates>(`/domains/${id}/certificate/candidates`),
+  issueCertificateNow: (id: number) =>
+    request<{ message: string }>(`/domains/${id}/certificate/issue-now`, { method: 'POST' }),
   adoptCertificate: (id: number, fingerprint: string, agentId: string) =>
     request<{ message: string; expires_at: string; source_path?: string; warning?: string }>(`/domains/${id}/certificate/adopt`, {
       method: 'POST', body: JSON.stringify({ fingerprint, agent_id: agentId }),

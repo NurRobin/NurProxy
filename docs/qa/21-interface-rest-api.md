@@ -127,7 +127,8 @@
   | POST | `/api/v1/domains/{id}/config/reset` | auth | clear manual override | — |
   | PUT | `/api/v1/domains/{id}/certificate` | auth | import an operator certificate (central TLS only; see 06-tls-acme §16) | `{"cert_pem","key_pem"}` |
   | GET | `/api/v1/domains/{id}/certificate/candidates` | auth | certificates agents found on disk for the host (see 06-tls-acme §17) | — |
-  | POST | `/api/v1/domains/{id}/certificate/adopt` | auth | adopt one of them; the agent uploads it over its stream | `{"fingerprint","agent_id"?}` |
+  | POST | `/api/v1/domains/{id}/certificate/adopt` | auth | adopt one of them; the agent uploads it over its stream (`agent_id` defaults to the serving agent) | `{"fingerprint","agent_id"?}` |
+  | POST | `/api/v1/domains/{id}/certificate/issue-now` | auth | end the adoption hold and issue a new certificate now | — |
 
   **Config artifacts + drift (§11/§6)**
   | Method | Path | Auth | Purpose | Body |

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -196,6 +197,9 @@ func TestAdoptDomainCertificate(t *testing.T) {
 		{name: "reported with error", connected: true, edit: func(d *models.DiscoveredCert) { d.Error = "private key not readable by the agent: permission denied" }, wantStatus: http.StatusConflict},
 		{name: "inside the renew window", connected: true, edit: func(d *models.DiscoveredCert) { d.NotAfter = time.Now().Add(5 * 24 * time.Hour) }, wantStatus: http.StatusConflict},
 		{name: "wrong names", connected: true, edit: func(d *models.DiscoveredCert) { d.Names = []string{"other.example.com"} }, wantStatus: http.StatusConflict},
+		{name: "another agent's cert needs agent_id", reportOn: "agent-2", connected: true, wantStatus: http.StatusNotFound},
+		{name: "another agent's cert with agent_id is looked up", reportOn: "agent-2", connected: false,
+			body: func(fp string) map[string]string { return map[string]string{"fingerprint": fp, "agent_id": "agent-2"} }, wantStatus: http.StatusConflict},
 		{name: "explicit agent without the cert", connected: true, body: func(fp string) map[string]string { return map[string]string{"fingerprint": fp, "agent_id": "agent-2"} }, wantStatus: http.StatusNotFound},
 	}
 	for _, tc := range tests {
@@ -264,6 +268,58 @@ func TestAdoptDomainCertificate(t *testing.T) {
 				t.Error("no cert_adopted audit entry")
 			}
 		})
+	}
+}
+
+// recordingIssuer records on-demand issuance requests.
+type recordingIssuer struct {
+	lockingIssuer
+	hosts chan string
+}
+
+func (r *recordingIssuer) EnsureCertForHost(_ context.Context, host string) error {
+	r.hosts <- host
+	return nil
+}
+
+func TestIssueDomainCertificateNow(t *testing.T) {
+	f := newAdoptFixture(t)
+	issuer := &recordingIssuer{hosts: make(chan string, 1)}
+	f.srv.SetCertIssuer(issuer)
+	appCert, _ := selfSignedPEM(t, time.Now().Add(60*24*time.Hour), "app.example.com")
+	f.report(t, "agent-1", discovered(t, appCert, "app.example.com"))
+
+	deferred := func() bool {
+		w := doRequest(t, f.handler, "GET", "/api/v1/domains/"+f.domainID+"/certificate/candidates", nil, f.cookie)
+		var resp map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		_, ok := resp["issuance_deferred_until"]
+		return ok
+	}
+	if !deferred() {
+		t.Fatal("hold not reported before issue-now")
+	}
+	w := doRequest(t, f.handler, "POST", "/api/v1/domains/"+f.domainID+"/certificate/issue-now", nil, f.cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("issue-now = %d %s", w.Code, w.Body.String())
+	}
+	select {
+	case host := <-issuer.hosts:
+		if host != "app.example.com" {
+			t.Errorf("issued for %q", host)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("issue-now did not trigger issuance")
+	}
+	if deferred() {
+		t.Error("hold still reported after issue-now")
+	}
+	id, _ := strconv.ParseInt(f.domainID, 10, 64)
+	if skipped, err := f.db.CertAdoptionSkipped(id); err != nil || !skipped {
+		t.Errorf("skip not persisted: %v %v", skipped, err)
+	}
+	if w := doRequest(t, f.handler, "POST", "/api/v1/domains/999/certificate/issue-now", nil, f.cookie); w.Code != http.StatusNotFound {
+		t.Errorf("unknown domain = %d", w.Code)
 	}
 }
 

@@ -156,6 +156,29 @@ func TestScan(t *testing.T) {
 	}
 }
 
+func TestScan_excludesAgentOwnCerts(t *testing.T) {
+	root := t.TempDir()
+	c := mintCert(t, time.Now().Add(60*24*time.Hour), "*.example.com")
+	dataDir := filepath.Join(root, "agent")
+	own := filepath.Join(dataDir, "certs", "app.example.com.crt")
+	ownKey := filepath.Join(dataDir, "certs", "app.example.com.key.plain")
+	write(t, own, c.certPEM, 0o644)
+	write(t, ownKey, c.keyPEM, 0o600)
+	// A symlink outside the data dir pointing into it is excluded as well.
+	link := filepath.Join(root, "link.crt")
+	if err := os.Symlink(own, link); err != nil {
+		t.Fatal(err)
+	}
+	refs := []Pair{{CertPath: own, KeyPath: ownKey, Source: SourceNginx}, {CertPath: link, KeyPath: ownKey, Source: SourceNginx}}
+
+	if got := (Scanner{Refs: refs, Exclude: []string{dataDir}}).Scan(); len(got) != 0 {
+		t.Errorf("agent's own certificates reported: %+v", got)
+	}
+	if got := (Scanner{Refs: refs, Exclude: []string{dataDir + "-other"}}).Scan(); len(got) != 1 {
+		t.Errorf("a sibling directory with a shared prefix must not exclude: %+v", got)
+	}
+}
+
 func TestScan_unreadable(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads files regardless of mode")

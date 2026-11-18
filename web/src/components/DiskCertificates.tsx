@@ -21,6 +21,7 @@ export default function DiskCertificates({ domainId }: { domainId: number }) {
   const toast = useToast();
   const [data, setData] = useState<CertCandidates | null>(null);
   const [adopting, setAdopting] = useState('');
+  const [issuing, setIssuing] = useState(false);
 
   const load = useCallback(() => {
     api.getCertCandidates(domainId).then(setData).catch(() => setData(null));
@@ -43,6 +44,19 @@ export default function DiskCertificates({ domainId }: { domainId: number }) {
     }
   };
 
+  const issueNow = async () => {
+    setIssuing(true);
+    try {
+      await api.issueCertificateNow(domainId);
+      toast.success(t('domains.diskCertIssuing'));
+      load();
+    } catch (err) {
+      toast.error(errMessage(err, t('domains.diskCertIssueFailed')));
+    } finally {
+      setIssuing(false);
+    }
+  };
+
   return (
     <div className="space-y-3 rounded-lg border border-border p-3.5">
       <div>
@@ -50,7 +64,12 @@ export default function DiskCertificates({ domainId }: { domainId: number }) {
         <p className="text-xs text-fg-faint">{t('domains.diskCertIntro')}</p>
       </div>
       {data.issuance_deferred_until && !data.certificate_on_file && (
-        <Callout tone="info">{t('domains.diskCertDeferred', { time: new Date(data.issuance_deferred_until).toLocaleTimeString() })}</Callout>
+        <Callout tone="info">
+          <p>{t('domains.diskCertDeferred', { time: new Date(data.issuance_deferred_until).toLocaleTimeString() })}</p>
+          <Button size="sm" variant="secondary" className="mt-2" loading={issuing} disabled={adopting !== ''} onClick={issueNow}>
+            {t('domains.diskCertIssueNow')}
+          </Button>
+        </Callout>
       )}
       {data.candidates.map((c) => (
         <div key={`${c.agent_id}-${c.fingerprint}`} className="flex flex-wrap items-start justify-between gap-3 border-t border-border pt-3 first:border-t-0 first:pt-0">

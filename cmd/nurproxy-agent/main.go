@@ -643,7 +643,13 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 // dir, populated for the names in NP_DRY_RUN_DISK_CERTS (comma-separated).
 func diskCertScanner(cfg *agentconfig.Config) (certdiscover.Scanner, bool) {
 	if !cfg.DryRun {
-		return certdiscover.Default(), true
+		s := certdiscover.Default()
+		// Vhosts NurProxy rendered reference the certificates it installed under
+		// the data dir; those are not candidates for adoption.
+		if dataDir, err := filepath.Abs(cfg.DataDir); err == nil && cfg.DataDir != "" {
+			s.Exclude = []string{dataDir}
+		}
+		return s, true
 	}
 	names := strings.Split(os.Getenv("NP_DRY_RUN_DISK_CERTS"), ",")
 	live, err := certdiscover.WriteSimulated(filepath.Join(cfg.DataDir, "dryrun-disk-certs"), names, time.Now())

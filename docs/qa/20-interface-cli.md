@@ -60,7 +60,8 @@ the same calls regardless of dry/real; only the orchestrator behind it differs.
 - [ ] `domain delete <id>`
 - [ ] `domain set-cert <id> --cert FILE --key FILE` (import an existing certificate; see 06-tls-acme §16)
 - [ ] `domain cert-candidates <id>` (certificates agents found on disk for the host; see 06-tls-acme §17)
-- [ ] `domain adopt-cert <id> [--fingerprint FP] [--agent ID]` (adopt one; the fingerprint may be omitted when exactly one is adoptable)
+- [ ] `domain adopt-cert <id> [--fingerprint FP [--from-agent ID]]` (adopt one; the fingerprint may be omitted when the serving agent has exactly one adoptable cert; another agent's cert needs both flags)
+- [ ] `domain issue-cert <id>` (skip the adoption hold and order a new certificate now)
 - [ ] `apikey show`
 - [ ] `apikey create`
 - [ ] `apikey revoke`

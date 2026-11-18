@@ -329,6 +329,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/certificate", s.requireAuth(s.handleImportDomainCertificate))
 	s.mux.HandleFunc("GET /api/v1/domains/{id}/certificate/candidates", s.requireAuth(s.handleDomainCertificateCandidates))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/certificate/adopt", s.requireAuth(s.handleAdoptDomainCertificate))
+	s.mux.HandleFunc("POST /api/v1/domains/{id}/certificate/issue-now", s.requireAuth(s.handleIssueDomainCertificateNow))
 
 	// Config artifacts + drift review (auth required, §11 Phase 3)
 	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAuth(s.handleListArtifacts))

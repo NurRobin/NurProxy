@@ -63,6 +63,10 @@ type Scanner struct {
 	AcmeShHomes []string
 	// Refs are pairs the host proxy's configuration references.
 	Refs []Pair
+	// Exclude lists directories whose files are never reported as Refs: the
+	// agent's own data dir, where the vhosts NurProxy renders point at the
+	// certificates it installed itself.
+	Exclude []string
 	// LiveSource overrides the source reported for CertbotLive entries; the
 	// dry-run agent uses it to label its simulated bundles.
 	LiveSource string
@@ -208,7 +212,7 @@ func (s Scanner) pairs() ([]Pair, []models.DiscoveredCert) {
 		}
 	}
 	for _, r := range s.Refs {
-		if r.CertPath == "" {
+		if r.CertPath == "" || s.excluded(r.CertPath) {
 			continue
 		}
 		if r.KeyPath == "" {
@@ -218,6 +222,32 @@ func (s Scanner) pairs() ([]Pair, []models.DiscoveredCert) {
 		pairs = append(pairs, r)
 	}
 	return pairs, dirErrs
+}
+
+// excluded reports whether path lies in one of the Exclude directories,
+// comparing both the literal and the symlink-resolved forms.
+func (s Scanner) excluded(path string) bool {
+	forms := []string{filepath.Clean(path)}
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		forms = append(forms, real)
+	}
+	for _, dir := range s.Exclude {
+		if dir == "" {
+			continue
+		}
+		dirs := []string{filepath.Clean(dir)}
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			dirs = append(dirs, real)
+		}
+		for _, p := range forms {
+			for _, d := range dirs {
+				if rel, err := filepath.Rel(d, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func isDirEntry(parent string, e fs.DirEntry) bool {
