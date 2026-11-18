@@ -117,9 +117,8 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
 
-	// Refuse while domains still reference this server: the ON DELETE CASCADE would
-	// orphan their DNS records/certs ahead of the reconciler teardown (see
-	// guardChildDomains).
+	// Refuse while domains still reference this server; they must be torn down
+	// through the reconciler first (see guardChildDomains).
 	if cascadeRequested(r) {
 		s.cascadeDeleteParent(w, r, "server", id, db.DomainFilter{ServerID: id})
 		return
@@ -129,7 +128,7 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.DeleteServer(id); err != nil {
-		writeError(w, http.StatusNotFound, "server not found")
+		writeParentDeleteError(w, "server", err)
 		return
 	}
 
