@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -76,6 +77,13 @@ func publicSettings(config json.RawMessage, secretFields []string) map[string]an
 	}
 	for _, f := range secretFields {
 		delete(out, f)
+	}
+	// A password embedded in a URL is a secret too.
+	if raw, ok := out["url"].(string); ok {
+		if u, err := url.Parse(raw); err == nil && u.User != nil {
+			u.User = nil
+			out["url"] = u.String()
+		}
 	}
 	return out
 }
@@ -250,7 +258,7 @@ func (s *Server) handleUpdateDiscoverySource(w http.ResponseWriter, r *http.Requ
 // DELETE /api/v1/discovery/sources/{id}
 func (s *Server) handleDeleteDiscoverySource(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
-	if err := s.db.DeleteDiscoverySource(id); err != nil {
+	if err := s.discovery.Delete(id); err != nil {
 		if errors.Is(err, db.ErrDiscoverySourceNotFound) {
 			writeError(w, http.StatusNotFound, "discovery source not found")
 			return

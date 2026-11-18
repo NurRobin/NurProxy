@@ -174,15 +174,36 @@ func TestDiscoveryRunImportAndResync(t *testing.T) {
 		t.Fatalf("edit imported server: %d %s", w.code, w.body)
 	}
 
-	// Re-sync: web moved to node n2 (same machine), desktop is gone, a new VM
-	// appeared. Node n3 could not be listed, so nothing under it is gone.
+	// Re-sync where node n3 could not be listed: desktop may have migrated
+	// there, so nothing is marked gone.
+	fakeDisc.set(discovery.Result{
+		Candidates: []discovery.Candidate{
+			cand("pve/n2/qemu/101", "web", "192.168.1.21"),
+			cand("pve/n1/qemu/102", "db", "192.168.1.22"),
+		},
+		Incomplete: []string{"pve/n3/"},
+	})
+	w = call("POST", "/api/v1/discovery/sources/"+src.ID+"/run", nil)
+	if v := decode[discoverysvc.View](t, w); w.code != http.StatusOK || len(v.Missing) != 0 {
+		t.Fatalf("partial run: %d, missing %+v; want nothing marked gone", w.code, v.Missing)
+	}
+
+	// A run that sees no machine at all while servers are imported is a
+	// visibility problem, not every machine gone.
+	fakeDisc.set(discovery.Result{Candidates: []discovery.Candidate{}})
+	w = call("POST", "/api/v1/discovery/sources/"+src.ID+"/run", nil)
+	if v := decode[discoverysvc.View](t, w); len(v.Missing) != 0 || len(v.Warnings) != 1 || !strings.Contains(v.Warnings[0], "permissions") {
+		t.Fatalf("empty run: missing %+v, warnings %q; want none gone and a permissions warning", v.Missing, v.Warnings)
+	}
+
+	// Full re-sync: web moved to node n2 (same machine), desktop is gone, a
+	// new VM appeared.
 	fakeDisc.set(discovery.Result{
 		Candidates: []discovery.Candidate{
 			cand("pve/n2/qemu/101", "web", "192.168.1.21"),
 			cand("pve/n1/qemu/102", "db", "192.168.1.22"),
 			cand("pve/n1/qemu/104", "new-vm", "192.168.1.24"),
 		},
-		Incomplete: []string{"pve/n3/"},
 	})
 	w = call("POST", "/api/v1/discovery/sources/"+src.ID+"/run", nil)
 	if w.code != http.StatusOK {
@@ -383,5 +404,12 @@ func TestDiscoveryDryRunFixture(t *testing.T) {
 	w = doRequest(t, handler, "GET", "/api/v1/health", nil)
 	if !strings.Contains(w.Body.String(), `"discovery_dry_run":true`) {
 		t.Fatalf("health = %s", w.Body.String())
+	}
+}
+
+func TestPublicSettingsHidesSecrets(t *testing.T) {
+	got := publicSettings(json.RawMessage(`{"url":"https://root:pw@pve.lan:8006","token_id":"a@pve!b","token_secret":"s"}`), []string{"token_secret"})
+	if got["url"] != "https://pve.lan:8006" || got["token_secret"] != nil || got["token_id"] != "a@pve!b" {
+		t.Fatalf("publicSettings = %v", got)
 	}
 }

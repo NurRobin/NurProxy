@@ -113,8 +113,13 @@ func (c *Config) baseURL() (*url.URL, error) {
 	if err != nil || u.Host == "" {
 		return nil, fmt.Errorf("url %q is not a valid URL", c.URL)
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
+	// The token travels in a header on every request, so plain http would
+	// send it in clear text.
+	if u.Scheme != "https" {
 		return nil, fmt.Errorf("url scheme must be https, got %q", u.Scheme)
+	}
+	if u.User != nil {
+		return nil, errors.New("url must not contain a user name or password; use token_id and token_secret")
 	}
 	if u.Port() == "" {
 		u.Host = net.JoinHostPort(u.Hostname(), "8006")
@@ -170,8 +175,15 @@ func (c *Config) httpClient(timeout time.Duration) (*http.Client, error) {
 		TLSClientConfig:     tlsCfg,
 		TLSHandshakeTimeout: 10 * time.Second,
 		MaxIdleConnsPerHost: maxParallel,
+		IdleConnTimeout:     30 * time.Second,
 	}
-	return &http.Client{Timeout: timeout, Transport: transport}, nil
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		// A redirect would carry the Authorization header to wherever the
+		// Location points; PVE's API never redirects.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}, nil
 }
 
 func equalBytes(a, b []byte) bool {

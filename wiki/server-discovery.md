@@ -48,7 +48,8 @@ The token ID you enter in NurProxy is the full `nurproxy@pve!discovery`.
 **Settings → Server discovery → Add source**:
 
 - **API URL**: any cluster node, e.g. `https://pve1.lan:8006`. Without a port,
-  8006 is used.
+  8006 is used. Only `https` is accepted, since the token goes along with
+  every request, and NurProxy does not follow redirects.
 - **Token ID** and **Token secret**.
 - **TLS**: Proxmox nodes ship a self-signed certificate. Either paste the
   node's **SHA-256 fingerprint** (Node → System → Certificates), which then is
@@ -57,7 +58,8 @@ The token ID you enter in NurProxy is the full `nurproxy@pve!discovery`.
   off without a fingerprint lets anyone on the path read the token.
 - **Re-sync**: only on demand, or every 15 minutes to 24 hours.
 
-**Test connection** checks the token and that it can list the nodes. If the
+**Test connection** checks the token, that it can list the nodes, and that it
+holds VM.Audit somewhere (otherwise every guest list comes back empty). If the
 cluster is not reachable yet, tick *Save without testing the connection*.
 
 The token secret is stored encrypted (AES-256-GCM, like DNS provider tokens)
@@ -88,10 +90,15 @@ lands in the audit log (`discovery_missing`, and `discovery_found` when it comes
 back). NurProxy does not delete such a server on its own: its domains keep
 working until you decide.
 
-A machine is only marked gone when the run actually covered it. If a node is
-offline, its guests are skipped with a warning and nothing on it is marked
-gone. A VM that migrates to another node keeps its server: the VMID identifies
-it within the cluster.
+A machine is only marked gone after a run that saw the whole cluster. Proxmox
+hides guests a token may not audit instead of refusing the request, so a run
+counts as complete only when the token holds VM.Audit on `/` or `/vms`. With
+VM.Audit only on a pool or on single guests, discovery still lists what it
+sees, but nothing is marked gone. The same holds when a node is offline or
+cannot be listed (its guests are skipped with a warning, and a VM may have
+migrated there), and when a run returns no machine at all although servers
+were imported from the source. A VM that migrates to another node keeps its
+server: the VMID identifies it within the cluster.
 
 Deleting a source keeps every server imported from it as a normal server.
 

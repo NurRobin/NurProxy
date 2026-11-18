@@ -94,6 +94,7 @@ func (*Discoverer) Test(ctx context.Context, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	defer c.close()
 	var v struct {
 		Version string `json:"version"`
 	}
@@ -112,7 +113,48 @@ func (*Discoverer) Test(ctx context.Context, raw json.RawMessage) error {
 	if len(nodes) == 0 {
 		return errors.New("token works, but it sees no nodes: grant it Sys.Audit and VM.Audit (e.g. the PVEAuditor role on /)")
 	}
+	// PVE hides guests the token may not audit instead of answering 403, so
+	// a token without VM.Audit would list an empty cluster.
+	scope, err := vmAuditScope(ctx, c)
+	if err != nil {
+		return fmt.Errorf("token works, but reading its permissions failed: %w", err)
+	}
+	if scope == scopeNone {
+		return errNoVMAudit
+	}
 	return nil
+}
+
+var errNoVMAudit = errors.New("token works, but it may not see any VM or container: grant it VM.Audit (e.g. the PVEAuditor role on /)")
+
+// VM.Audit scopes of a token.
+const (
+	scopeAll     = "all"     // on / or /vms: every guest is visible
+	scopePartial = "partial" // only on single guests or pools
+	scopeNone    = "none"
+)
+
+// vmAuditScope reads the token's effective permissions
+// (GET /access/permissions answers {"data":{"<path>":{"<priv>":1,...}}}) and
+// reports where it holds VM.Audit.
+func vmAuditScope(ctx context.Context, c *client) (string, error) {
+	var perms map[string]map[string]flexInt
+	if err := c.get(ctx, "access/permissions", &perms); err != nil {
+		return "", err
+	}
+	scope := scopeNone
+	for path, privs := range perms {
+		if privs["VM.Audit"] != 1 {
+			continue
+		}
+		if path == "/" || path == "/vms" {
+			return scopeAll, nil
+		}
+		if strings.HasPrefix(path, "/vms/") || strings.HasPrefix(path, "/pool/") {
+			scope = scopePartial
+		}
+	}
+	return scope, nil
 }
 
 type node struct {
@@ -137,6 +179,7 @@ func (*Discoverer) Discover(ctx context.Context, raw json.RawMessage) (*discover
 	if err != nil {
 		return nil, err
 	}
+	defer c.close()
 	var nodes []node
 	if err := c.get(ctx, "nodes", &nodes); err != nil {
 		return nil, err
@@ -144,6 +187,22 @@ func (*Discoverer) Discover(ctx context.Context, raw json.RawMessage) (*discover
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Node < nodes[j].Node })
 
 	res := &discovery.Result{Candidates: []discovery.Candidate{}}
+	// An empty or short guest list is only trustworthy when the token may
+	// audit every guest; otherwise PVE silently filters the lists.
+	scope, err := vmAuditScope(ctx, c)
+	switch {
+	case err != nil:
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		res.Warnings = append(res.Warnings, fmt.Sprintf("reading the token's permissions failed (%v); missing machines are not marked gone", err))
+		res.Incomplete = append(res.Incomplete, "pve/")
+	case scope == scopeNone:
+		return nil, errNoVMAudit
+	case scope == scopePartial:
+		res.Warnings = append(res.Warnings, "the token may only see some guests (VM.Audit is not granted on / or /vms); missing machines are not marked gone")
+		res.Incomplete = append(res.Incomplete, "pve/")
+	}
 	type job struct {
 		node  string
 		kind  string
