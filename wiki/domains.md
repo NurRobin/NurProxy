@@ -26,6 +26,12 @@ the automatic config entirely. It's an expert escape hatch — the editor valida
 the JSON before saving and tells you if it's malformed. Use **Reset to automatic**
 to drop your overrides and go back to the generated config.
 
+## Failover
+
+A domain can have backup servers on other agents. Their agents get the route
+and certificate in advance, and the DNS record moves to a backup when the
+active agent goes offline. See [Failover to a second agent](failover).
+
 ## Status
 
 - **Pending** — being created or synced.

@@ -3,6 +3,7 @@ import cloudflareToken from '../../../wiki/cloudflare-token.md?raw';
 import agentReachability from '../../../wiki/agent-reachability.md?raw';
 import dnsModes from '../../../wiki/dns-modes.md?raw';
 import domainsDoc from '../../../wiki/domains.md?raw';
+import failoverDoc from '../../../wiki/failover.md?raw';
 import agentsDoc from '../../../wiki/agents.md?raw';
 import existingProxies from '../../../wiki/existing-proxies.md?raw';
 import existingProxyPermissions from '../../../wiki/existing-proxy-permissions.md?raw';
@@ -26,6 +27,7 @@ export const TOPICS: Topic[] = [
   { slug: 'agents', title: 'Agents', blurb: 'Register, approve, and manage edge servers.', content: agentsDoc },
   { slug: 'servers', title: 'Servers', blurb: 'Backends an agent forwards to, and config suggestions.', content: serversDoc },
   { slug: 'domains', title: 'Domains', blurb: 'Proxy a subdomain to a server, plus advanced config.', content: domainsDoc },
+  { slug: 'failover', title: 'Failover', blurb: 'Move a domain to a backup agent when its agent goes down.', content: failoverDoc },
   { slug: 'existing-proxies', title: 'Managing existing proxies', blurb: 'Built-in vs Existing, and the apply-code flow.', content: existingProxies },
   { slug: 'existing-proxy-permissions', title: 'Existing-mode permissions', blurb: 'Least-privilege grants for nginx/Apache, no blanket sudo.', content: existingProxyPermissions },
   { slug: 'dns-modes', title: 'DNS modes', blurb: 'Static vs DDNS — which to choose.', content: dnsModes },
