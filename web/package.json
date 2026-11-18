@@ -7,9 +7,10 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "test": "npm run test:recovery && npm run test:proxy-config && npm run test:discovery",
+    "test": "npm run test:recovery && npm run test:proxy-config && npm run test:discovery && npm run test:upgrade",
     "test:recovery": "node --experimental-strip-types --test test/recovery-ui.test.ts",
     "test:proxy-config": "node --experimental-strip-types --test test/proxy-config.test.ts",
+    "test:upgrade": "node --experimental-strip-types --test test/upgrade.test.ts",
     "test:discovery": "node --experimental-strip-types --test test/discovery.test.ts",
     "preview": "vite preview"
   },

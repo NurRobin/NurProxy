@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/NurRobin/NurProxy/internal/shared/helperprotocol"
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
@@ -46,6 +47,9 @@ const (
 	// EventCertUploadRequest asks the agent to upload a certificate bundle it
 	// discovered on its host (#80). The payload is a proxymodel.CertUploadRequest.
 	EventCertUploadRequest = "cert_upload_request"
+	// EventUpgrade asks the agent to upgrade itself (#73). The payload is a
+	// models.UpgradeCommand; progress comes back on the upgrade report endpoint.
+	EventUpgrade = "upgrade"
 )
 
 // maxStreamsPerAgent caps how many concurrent SSE streams a single agent may
@@ -197,6 +201,19 @@ func (h *Hub) PublishIntentSet(agentID string, set proxymodel.IntentSet) bool {
 		return false
 	}
 	return h.Publish(agentID, Event{Type: EventRoutes, Data: data})
+}
+
+// PublishUpgrade pushes a self-update command. It reports whether a live
+// stream accepted it.
+func (h *Hub) PublishUpgrade(agentID string, cmd models.UpgradeCommand) bool {
+	if cmd.Validate() != nil {
+		return false
+	}
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return false
+	}
+	return h.Publish(agentID, Event{Type: EventUpgrade, Data: data})
 }
 
 func (h *Hub) PublishRecoveryPolicy(agentID string, enabled bool) bool {

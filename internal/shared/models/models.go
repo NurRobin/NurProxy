@@ -353,8 +353,16 @@ type Agent struct {
 	SafeAutoRepairOverride  *bool                     `json:"safe_auto_repair_override"`
 	SafeAutoRepairEffective bool                      `json:"safe_auto_repair_effective"`
 	RecoveryCapability      *recoverymodel.Capability `json:"recovery_capability,omitempty"`
-	CreatedAt               time.Time                 `json:"created_at"`
-	UpdatedAt               time.Time                 `json:"updated_at"`
+	// AutoUpgrade is the per-agent opt-in to be upgraded to the orchestrator's
+	// version without an operator click. Off by default. Like SelfUpdate and
+	// Upgrade it lives outside the agents table and is attached by the API.
+	AutoUpgrade bool `json:"auto_upgrade"`
+	// SelfUpdate is the agent's last report on whether it can self-update.
+	SelfUpdate *SelfUpdateStatus `json:"self_update,omitempty"`
+	// Upgrade is the latest upgrade attempt for this agent.
+	Upgrade   *AgentUpgrade `json:"upgrade,omitempty"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.

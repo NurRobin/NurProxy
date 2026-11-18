@@ -158,6 +158,20 @@ type Client struct {
 	managedApplyMu sync.RWMutex
 	managedApply   ManagedApplier
 	certLoader     CertLoader
+	upgrades       UpgradeHandler
+}
+
+// UpgradeHandler acts on an operator-requested self-update pushed down the
+// stream. Handle must not block the stream.
+type UpgradeHandler interface {
+	Handle(ctx context.Context, cmd models.UpgradeCommand)
+}
+
+// WithUpgrades wires the self-update handler. Without one, upgrade events are
+// ignored and the orchestrator times the request out.
+func (c *Client) WithUpgrades(h UpgradeHandler) *Client {
+	c.upgrades = h
+	return c
 }
 
 // CertLoader returns the on-disk certificate bundle with the given leaf
@@ -442,6 +456,17 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			log.Printf("Stream: rejected repair request %q: %v", envelope.Request.OperationID, err)
 		}
 		c.syncRecoveryHealth()
+	case "upgrade":
+		if c.upgrades == nil {
+			log.Printf("Stream: ignoring upgrade request (self-update not wired)")
+			return
+		}
+		var cmd models.UpgradeCommand
+		if err := json.Unmarshal([]byte(data), &cmd); err != nil || cmd.Validate() != nil {
+			log.Printf("Stream: bad upgrade payload")
+			return
+		}
+		c.upgrades.Handle(ctx, cmd)
 	default:
 		log.Printf("Stream: ignoring unknown event %q", eventType)
 	}

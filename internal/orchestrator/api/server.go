@@ -95,8 +95,21 @@ type Server struct {
 	// from the tls.CAProber. Nil (never wired, or ACME dry-run) omits the check.
 	caStatus func() tls.CAStatus
 
+	// upgrades coordinates agent self-updates (#73); lifetime outlives single
+	// requests so a rollout started by one keeps running.
+	upgrades *upgradeCoordinator
+	lifetime context.Context
+
 	// discovery runs server discovery sources (#25).
 	discovery *discoverysvc.Service
+}
+
+// lifetimeContext is the server's lifetime context (set by StartUpgradeLoop).
+func (s *Server) lifetimeContext() context.Context {
+	if s.lifetime != nil {
+		return s.lifetime
+	}
+	return context.Background()
 }
 
 // SetDryRun records whether the orchestrator is running in DNS/ACME sandbox mode
@@ -161,6 +174,7 @@ func NewServer(database *db.DB, version string) *Server {
 	// that window. Doing it once (rather than on every auth call) also removes the
 	// concurrent unsynchronized writes to sm.ttl/sm.version that raced with the
 	// requireAuth Verify reads.
+	s.upgrades = newUpgradeCoordinator(s)
 	s.sessions.WithTTLFunc(s.sessionDuration)
 	s.sessions.WithVersion(func() int { return s.currentSessionVersion() })
 
@@ -308,6 +322,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/applies/{operationId}/receipt", s.requireAgentAuth(s.handleSubmitManagedApplyReceipt))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs/{opId}/ack", s.requireAgentAuth(s.handleRepairAck))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/safe-auto-repair", s.requireAuth(s.handleSetSafeAutoRepair))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/upgrade", s.requireAuth(s.handleUpgradeAgent))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/upgrades", s.requireAuth(s.handleListAgentUpgrades))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/auto-upgrade", s.requireAuth(s.handleSetAutoUpgrade))
+	s.mux.HandleFunc("POST /api/v1/agents/upgrade-outdated", s.requireAuth(s.handleUpgradeOutdated))
+	s.mux.HandleFunc("GET /api/v1/agents/upgrade-rollout", s.requireAuth(s.handleGetUpgradeRollout))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/upgrade/report", s.requireAgentAuth(s.handleAgentUpgradeReport))
 	// Live push channel: the agent dials out and holds this open; the
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))
