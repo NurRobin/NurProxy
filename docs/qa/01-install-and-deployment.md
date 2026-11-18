@@ -15,7 +15,7 @@
 - [ ] Build targets: `build`, `build-agent`, `build-headless`, `build-all`, `test`, `test-integration`, `test-e2e`, `test-sandbox`, `test-cover`, `lint`, `lint-fix`, `dev-sandbox`, `dev`, `web-build`, `web-install`, `clean`, `help`.
 - [ ] Orchestrator run mode + flags: `-port`, `-data-dir`, `-dry-run`.
 - [ ] Orchestrator subcommands: `install`, `uninstall`, `version`, `backup`, `restore` (and the management CLI dispatch: `provider|zone|agent|server|domain|apikey|auth`).
-- [ ] Agent run mode + ALL flags: `-orchestrator`, `-fqdn`, `-data-dir`, `-api-port`, `-caddy-admin-port`, `-version`, `-dry-run`, `-proxy-mode`, `-proxy-type`, `-proxy-binary`, `-proxy-config-dir`, `-proxy-reload-cmd`, `-proxy-test-cmd`, `-proxy-log-paths`, `-proxy-service`.
+- [ ] Agent run mode + ALL flags: `-orchestrator`, `-fqdn`, `-data-dir`, `-api-port`, `-caddy-admin-port`, `-caddy-http-port`, `-caddy-https-port`, `-caddy-listen-host`, `-version`, `-dry-run`, `-proxy-mode`, `-proxy-type`, `-proxy-binary`, `-proxy-config-dir`, `-proxy-reload-cmd`, `-proxy-test-cmd`, `-proxy-log-paths`, `-proxy-service`.
 - [ ] Agent subcommands: `install`, `setup`, `uninstall`, `apply`, `version`.
 - [ ] Config precedence (flags > env > config file > defaults) and the complete `NP_*` env var table for both binaries.
 - [ ] systemd unit contents (hardening, `ReadWritePaths`, `AmbientCapabilities`, `User`, `EnvironmentFile`).
@@ -136,6 +136,9 @@
   | `-data-dir` | `/var/lib/nurproxy-agent` | Data directory |
   | `-api-port` | `8780` | Agent local API port |
   | `-caddy-admin-port` | `2019` | Bundled Caddy admin API port (localhost) |
+  | `-caddy-http-port` | `0` → 80 | Port the bundled Caddy serves plain HTTP on |
+  | `-caddy-https-port` | `0` → 443 | Port the bundled Caddy serves HTTPS on |
+  | `-caddy-listen-host` | "" → all interfaces | Address the bundled Caddy's HTTP/HTTPS listeners bind |
   | `-version` | false | Print version and exit |
   | `-dry-run` | false | Sandbox: proxy simulated in-memory, no Caddy, no :80/:443, unprivileged |
   | `-proxy-mode` | "" → `built-in` | `built-in` (bundled Caddy) or `existing` |
@@ -209,6 +212,9 @@
   | `NP_ORCHESTRATOR` | agent | `-orchestrator` | "" (required) | `config.go:223` |
   | `NP_FQDN` | agent | `-fqdn` | "" (required) | `config.go:226` |
   | `NP_API_PORT` | agent | `-api-port` | `8780` | `config.go:232` |
+  | `NP_CADDY_HTTP_PORT` | agent | `-caddy-http-port` | `80` | `internal/agent/config/config.go` (`mergeEnv`) |
+  | `NP_CADDY_HTTPS_PORT` | agent | `-caddy-https-port` | `443` | `internal/agent/config/config.go` (`mergeEnv`) |
+  | `NP_CADDY_LISTEN_HOST` | agent | `-caddy-listen-host` | "" (all interfaces) | `internal/agent/config/config.go` (`mergeEnv`) |
   | `NP_PROXY_MODE` | agent | `-proxy-mode` | `built-in` | `config.go:237` |
   | `NP_PROXY_TYPE` | agent | `-proxy-type` | "" | `config.go:240` |
   | `NP_PROXY_BINARY` | agent | `-proxy-binary` | "" | `config.go:243` |
@@ -220,7 +226,7 @@
   | `NP_LOG_LEVEL` | both | (none) | `info` | `internal/shared/logging/logging.go:30,54` |
   | `NP_LOG_FORMAT` | both | (none) | `text` | `logging.go:33` |
 
-  Note: there is **no** `NP_CADDY_ADMIN_PORT` env var — `-caddy-admin-port` is flag-only on the agent (`config.go:222-264` reads no such key; settable in `agent.yaml` as `caddy_admin_port`). `NP_API_URL`/`NP_API_KEY`/`NP_API_PASSWORD` only seed flag defaults for the **management CLI** subcommands (`provider|zone|agent|server|domain|apikey|auth`), not the run-mode server. A grep of `os.Getenv("NP_`/`LookupEnv("NP_` across the two cmd trees + `internal/agent/config` + `internal/shared/logging` yields exactly the rows above.
+  Note: there is **no** `NP_CADDY_ADMIN_PORT` env var (unlike the three `NP_CADDY_*` listener vars above) — `-caddy-admin-port` is flag-only on the agent (`config.go:222-264` reads no such key; settable in `agent.yaml` as `caddy_admin_port`). `NP_API_URL`/`NP_API_KEY`/`NP_API_PASSWORD` only seed flag defaults for the **management CLI** subcommands (`provider|zone|agent|server|domain|apikey|auth`), not the run-mode server. A grep of `os.Getenv("NP_`/`LookupEnv("NP_` across the two cmd trees + `internal/agent/config` + `internal/shared/logging` yields exactly the rows above.
 - **Steps:**
   ```bash
   # Agent: flag beats env. This runs with FQDN=flag.example.com despite the env.

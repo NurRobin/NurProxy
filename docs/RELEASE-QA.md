@@ -16,7 +16,8 @@ run**, the **pass criteria**, and the **pitfalls** that have actually bitten us.
 
 | Env | What it is | Covers | Does NOT cover |
 |---|---|---|---|
-| **Dry / sandbox** | `make dev-sandbox` or `NP_DRY_RUN=true` binaries. Mocks DNS + ACME + the agent proxy. | Whole control plane: API/CLI/dashboard, DNS state machine, TLS issuance/renewal-window logic, agent protocol (register/adopt/heartbeat/stream/ack), route rendering, migrations, security hardening, backup/restore of a dry DB. | Real serving, real LE chain, resolvable DNS, real nginx/apache/caddy apply+reload. |
+| **Dry / sandbox** | `make dev-sandbox` or `NP_DRY_RUN=true` binaries. Mocks DNS + ACME + the agent proxy. | Whole control plane: API/CLI/dashboard, DNS state machine, TLS issuance/renewal-window logic, agent protocol (register/adopt/heartbeat/stream/ack), route rendering, migrations, security hardening, backup/restore of a dry DB. With caddy/nginx present: `caddy validate` / `nginx -t` on the rendered config. | Real serving, real LE chain, resolvable DNS, real nginx/apache/caddy apply+reload. |
+| **Live sandbox** | `PROFILE=live make dev-sandbox` / `make test-sandbox-live`. Dry orchestrator, agent runs a real Caddy on `127.0.0.1:18080/18443` in front of a fake upstream. | Built-in Caddy apply through the admin API, real HTTP/TLS serving with the pushed cert, force_https redirect, live re-apply. | Real LE chain, resolvable DNS, `:80`/`:443`, IPv6, nginx/apache serving. |
 | **Single real host** | One real agent (built-in Caddy or existing nginx) + a real orchestrator + a real zone. | Real DNS-01 issuance, real serving on `:443`, proxy directives, the chosen backend's apply/reload. | Multi-agent, cross-host topology, platform matrix. |
 | **Homelab (multi-host)** | apps-vm orchestrator + durox (existing-nginx) + optional extra agents. | In-place upgrades, multi-agent, real traffic continuity, IPv6 reachability. | Non-Linux platforms (macOS/FreeBSD), bundled-Caddy on a fresh public host. |
 
@@ -210,7 +211,10 @@ Legend: **D** = coverable in dry, **R** = needs a real run.
 Run before tagging a final release (and ideally per RC):
 
 **Dry (every RC):**
-- [ ] `make test` + `make test-sandbox` green.
+- [ ] `make test` + `make test-sandbox` green (CI runs the sandbox with a real
+      Caddy, so the real-proxy checks and the live test are included there).
+- [ ] `PROFILE=live KEEP=0 AGENTS=2 make dev-sandbox` exits 0 (both agents serve
+      real HTTPS through Caddy).
 - [ ] Security battery: login lockout, register ratelimit, body cap, session
       revocation, token separation (§2.8).
 - [ ] Backup → restore → dry-boot round-trip; key checksums match (§2.9).
