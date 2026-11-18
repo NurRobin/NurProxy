@@ -250,6 +250,8 @@ func main() {
 	srv := api.NewServer(database, version)
 	srv.SetRecoveryAuthority(recoveryAuthority)
 	srv.SetAgentHub(hub, rec)
+	// Agent self-update (#73): fail stalled upgrades, run opt-in auto-upgrades.
+	srv.StartUpgradeLoop(rootCtx)
 	// Wire the DNS-takeover override so an operator can migrate an existing domain
 	// whose public DNS predates NurProxy (overwrite a conflicting foreign record
 	// with the desired CNAME, using the provider's own stored credentials).

@@ -298,8 +298,143 @@ func cmdAgent(args []string) {
 		}
 		c.emit(raw, "agent deleted: "+id)
 
+	case "upgrade":
+		cmdAgentUpgrade(rest)
+
+	case "upgrades":
+		c, _, id := parseClient("agent upgrades", rest, "agent id", nil)
+		var ups []models.AgentUpgrade
+		if err := c.getInto("/api/v1/agents/"+id+"/upgrades", &ups); err != nil {
+			fatalf("%v", err)
+		}
+		if c.asJSON {
+			c.emit(mustJSON(ups), "")
+			return
+		}
+		rows := make([][]string, len(ups))
+		for i, u := range ups {
+			rows[i] = []string{u.ID, u.CreatedAt.Local().Format("2006-01-02 15:04"), dash(u.FromVersion), u.TargetVersion, string(u.State), u.Trigger, dash(u.Error)}
+		}
+		printTable([]string{"ID", "STARTED", "FROM", "TO", "STATE", "TRIGGER", "ERROR"}, rows)
+
+	case "auto-upgrade":
+		var enabled *bool
+		c, _, id := parseClient("agent auto-upgrade", rest, "agent id", func(fs *flag.FlagSet) {
+			enabled = fs.Bool("enabled", false, "upgrade this agent to the orchestrator's version automatically (off by default)")
+		})
+		raw, err := c.do(http.MethodPut, "/api/v1/agents/"+id+"/auto-upgrade", map[string]bool{"enabled": *enabled})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		c.emit(raw, fmt.Sprintf("agent %s auto-upgrade: %t", id, *enabled))
+
 	default:
-		usage("agent", "list", "status <id>", "adopt <id>", "update <id>", "reject <id>", "delete <id> [--cascade]")
+		usage("agent", "list", "status <id>", "adopt <id>", "update <id>", "reject <id>", "delete <id> [--cascade]",
+			"upgrade <id> [--version X] [--allow-prerelease] [--wait]", "upgrade --all-outdated [--version X] [--allow-prerelease] [--wait]", "upgrades <id>", "auto-upgrade <id> --enabled=true|false")
+	}
+}
+
+// cmdAgentUpgrade handles `agent upgrade <id>` and `agent upgrade
+// --all-outdated`. The target defaults to the orchestrator's own version.
+func cmdAgentUpgrade(args []string) {
+	all := false
+	for _, a := range args {
+		if a == "--all-outdated" || a == "-all-outdated" || a == "--all-outdated=true" {
+			all = true
+		}
+	}
+	var version string
+	var wait, allowPrerelease *bool
+	setup := func(fs *flag.FlagSet) {
+		fs.StringVar(&version, "version", "", "target release (default: the orchestrator's version)")
+		wait = fs.Bool("wait", false, "wait until the upgrade (or rollout) finishes")
+		allowPrerelease = fs.Bool("allow-prerelease", false, "allow a pre-release target (-rc, -beta); refused otherwise")
+		fs.Bool("all-outdated", false, "upgrade every outdated agent, one at a time, stopping at the first failure")
+	}
+	body := map[string]any{}
+	if all {
+		c, _, _ := parseClient("agent upgrade", args, "", setup)
+		if version != "" {
+			body["version"] = version
+		}
+		if *allowPrerelease {
+			body["allow_prerelease"] = true
+		}
+		raw, err := c.do(http.MethodPost, "/api/v1/agents/upgrade-outdated", body)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		if !*wait {
+			c.emit(raw, fmt.Sprintf("rollout %s to %s started", gjson(raw, "id"), gjson(raw, "target_version")))
+			return
+		}
+		for {
+			time.Sleep(3 * time.Second)
+			var resp struct {
+				Rollout *struct {
+					State  string `json:"state"`
+					Error  string `json:"error"`
+					Agents []struct {
+						Name  string `json:"name"`
+						State string `json:"state"`
+						Error string `json:"error"`
+					} `json:"agents"`
+				} `json:"rollout"`
+			}
+			if err := c.getInto("/api/v1/agents/upgrade-rollout", &resp); err != nil {
+				fatalf("%v", err)
+			}
+			if resp.Rollout == nil || resp.Rollout.State == "running" {
+				continue
+			}
+			for _, a := range resp.Rollout.Agents {
+				fmt.Printf("%-30s %-10s %s\n", a.Name, a.State, a.Error)
+			}
+			if resp.Rollout.State != "done" {
+				fatalf("rollout %s: %s", resp.Rollout.State, resp.Rollout.Error)
+			}
+			fmt.Println("rollout done")
+			return
+		}
+	}
+	c, _, id := parseClient("agent upgrade", args, "agent id", setup)
+	if version != "" {
+		body["version"] = version
+	}
+	if *allowPrerelease {
+		body["allow_prerelease"] = true
+	}
+	raw, err := c.do(http.MethodPost, "/api/v1/agents/"+id+"/upgrade", body)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if !*wait {
+		c.emit(raw, fmt.Sprintf("upgrade %s of agent %s to %s requested", gjson(raw, "id"), id, gjson(raw, "target_version")))
+		return
+	}
+	upgradeID := gjson(raw, "id")
+	last := ""
+	for {
+		var ups []models.AgentUpgrade
+		if err := c.getInto("/api/v1/agents/"+id+"/upgrades", &ups); err != nil {
+			fatalf("%v", err)
+		}
+		for _, u := range ups {
+			if u.ID != upgradeID {
+				continue
+			}
+			if string(u.State) != last {
+				last = string(u.State)
+				fmt.Println(last)
+			}
+			if u.State.Terminal() {
+				if u.State != models.UpgradeDone {
+					fatalf("upgrade %s: %s", u.State, u.Error)
+				}
+				return
+			}
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 

@@ -933,8 +933,39 @@ var migrations = []string{
 	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_settle', '90');
 	`,
 
-	// Migration 40 (41 once #179 lands): certificate bundles the agent found
-	// on its host (#80), as a JSON array of models.DiscoveredCert. Metadata only, never key material;
+	// Migration 40: agent self-update (#73). agent_upgrades records every
+	// operator-requested upgrade and its progress; the partial unique index
+	// keeps at most one unfinished upgrade per agent. agent_self_update holds
+	// the per-agent auto-upgrade opt-in (off by default) and the agent's last
+	// self-update capability report. Both live beside the agents table so the
+	// hot agent row and its scanner stay unchanged; rows go with the agent.
+	`
+	CREATE TABLE agent_upgrades (
+		id             TEXT PRIMARY KEY,
+		agent_id       TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		from_version   TEXT NOT NULL DEFAULT '',
+		target_version TEXT NOT NULL,
+		state          TEXT NOT NULL CHECK (state IN ('requested', 'downloading', 'installed', 'restarting', 'done', 'failed', 'rolled_back')),
+		error          TEXT NOT NULL DEFAULT '',
+		triggered_by   TEXT NOT NULL DEFAULT 'manual' CHECK (triggered_by IN ('manual', 'rollout', 'auto')),
+		rollout_id     TEXT NOT NULL DEFAULT '',
+		requested_by   TEXT NOT NULL DEFAULT '',
+		created_at     TEXT NOT NULL,
+		updated_at     TEXT NOT NULL
+	);
+	CREATE INDEX idx_agent_upgrades_agent ON agent_upgrades(agent_id, created_at);
+	CREATE UNIQUE INDEX idx_agent_upgrades_active ON agent_upgrades(agent_id)
+		WHERE state IN ('requested', 'downloading', 'installed', 'restarting');
+	CREATE TABLE agent_self_update (
+		agent_id     TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+		auto_upgrade INTEGER NOT NULL DEFAULT 0 CHECK (auto_upgrade IN (0, 1)),
+		capability   TEXT,
+		updated_at   TEXT NOT NULL
+	);
+	`,
+
+	// Migration 41: certificate bundles the agent found on its host (#80), as
+	// a JSON array of models.DiscoveredCert. Metadata only, never key material;
 	// the operator adopts one explicitly and only then the agent uploads it.
 	// domains.cert_adoption_skipped records that the operator chose to issue a
 	// new certificate instead of adopting one, which ends the issuance hold.
