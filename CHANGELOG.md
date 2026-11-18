@@ -40,7 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<VirtualHost *:80|*:443>` sections at most, the domain's own `ServerName`,
   the helper's certificate and htpasswd paths, `ProxyPass` and `RewriteRule
   [P]` to http(s)/ws(s) upstreams, literal `Header`/`RequestHeader` values,
-  `<Location />` with `Require`, `CustomLog /dev/null` and `LogLevel`.
+  `<Location />` with `Require` and the generated `AuthName "Restricted: <host>"`
+  (httpd evaluates AuthName as an expression), `CustomLog /dev/null` and
+  `LogLevel`. Line continuations are refused, also at the end of comments.
   `LoadModule`, `Include`, piped or file logs, `Define`/`SetEnv`,
   `<Directory>`, `RewriteMap`, `ScriptAlias`, handler flags and everything
   else are refused. A config outside the policy is still kept when exactly

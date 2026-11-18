@@ -82,14 +82,17 @@ func parse(content string) ([]directive, []section, error) {
 			return nil, nil, refuse(lineNo, "", "line is longer than %d bytes", MaxLineBytes)
 		}
 		line := strings.Trim(raw, " \t\r")
+		// httpd joins a line ending in a backslash with the next one before
+		// it looks for comments, so "# note \" would swallow the following
+		// directive. Continuations are refused everywhere, comments included.
+		if strings.HasSuffix(line, `\`) {
+			return nil, nil, refuse(lineNo, "", "line continuations are not allowed (also not in comments)")
+		}
 		if line == "" || line[0] == '#' {
 			continue
 		}
 		if strings.ContainsRune(line, '\r') {
 			return nil, nil, refuse(lineNo, "", "line contains a carriage return")
-		}
-		if strings.HasSuffix(line, `\`) {
-			return nil, nil, refuse(lineNo, "", "line continuations are not allowed")
 		}
 		if strings.Contains(line, "${") {
 			return nil, nil, refuse(lineNo, "", "\"${\" is not allowed: Apache replaces it with an environment variable or Define value")

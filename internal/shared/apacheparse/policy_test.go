@@ -92,8 +92,13 @@ const proxiedVHost = `<VirtualHost *:443>
 </VirtualHost>
 `
 
-func TestValidateManagedAdmitsBoundedRawConfig(t *testing.T) {
-	tests := []struct {
+// boundedRawConfigs are raw configs the policy admits. The integration test
+// runs them through a real httpd as well.
+func boundedRawConfigs() []struct {
+	name    string
+	content string
+} {
+	return []struct {
 		name    string
 		content string
 	}{
@@ -105,9 +110,12 @@ func TestValidateManagedAdmitsBoundedRawConfig(t *testing.T) {
 		{"unset header", fmt.Sprintf(proxiedVHost, `    Header unset Server`)},
 		{"literal percent and backslash", fmt.Sprintf(proxiedVHost, `    Header always set X-A "100%% \\\\ done"`)},
 		{"websocket connection cond", fmt.Sprintf(proxiedVHost, "    RewriteEngine On\n    RewriteCond %{HTTP:Connection} upgrade [NC]\n    RewriteRule ^/?(.*)$ ws://10.0.0.4:8080/$1 [P,L]")},
-		{"location with auth and ip", fmt.Sprintf(proxiedVHost, "    <Location />\n        AuthType Basic\n        AuthName \"Restricted\"\n        AuthUserFile "+testAuth+"\n        <RequireAll>\n            Require ip 10.0.0.0/8\n            Require valid-user\n        </RequireAll>\n    </Location>")},
+		{"location with auth and ip", fmt.Sprintf(proxiedVHost, "    <Location />\n        AuthType Basic\n        AuthName \"Restricted: app.example.com\"\n        AuthUserFile "+testAuth+"\n        <RequireAll>\n            Require ip 10.0.0.0/8\n            Require valid-user\n        </RequireAll>\n    </Location>")},
 	}
-	for _, tt := range tests {
+}
+
+func TestValidateManagedAdmitsBoundedRawConfig(t *testing.T) {
+	for _, tt := range boundedRawConfigs() {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := ValidateManaged(tt.content, testPolicy); err != nil {
 				t.Fatalf("bounded raw config refused: %v\n%s", err, tt.content)
@@ -165,6 +173,19 @@ func TestValidateManagedRefusesUnboundedRawConfig(t *testing.T) {
 		{"control character", inVHost("    Header always set X-A b\x00"), "control"},
 		{"redirect elsewhere", "<VirtualHost *:80>\n    ServerName app.example.com\n    Redirect permanent / https://evil.example/\n</VirtualHost>\n" + inVHost(""), "Redirect"},
 		{"empty", "", "no <VirtualHost>"},
+		// httpd evaluates AuthName as an expression and sends the result to
+		// unauthenticated clients in WWW-Authenticate.
+		{"auth name reads a file", inVHost(fmt.Sprintf("    <Location />\n        AuthType Basic\n        AuthName %s\n        AuthUserFile "+testAuth+"\n        Require valid-user\n    </Location>", `"%{base64:%{file:/etc/apache2/nurproxy-auth/other.htpasswd}}"`)), "AuthName"},
+		{"auth name reads env", inVHost(fmt.Sprintf("    <Location />\n        AuthType Basic\n        AuthName %s\n        AuthUserFile "+testAuth+"\n        Require valid-user\n    </Location>", `"%{ENV:HOME}"`)), "AuthName"},
+		{"auth name other realm", inVHost(fmt.Sprintf("    <Location />\n        AuthType Basic\n        AuthName %s\n        AuthUserFile "+testAuth+"\n        Require valid-user\n    </Location>", `"Restricted"`)), "AuthName"},
+		{"auth name unquoted", inVHost(fmt.Sprintf("    <Location />\n        AuthType Basic\n        AuthName %s\n        AuthUserFile "+testAuth+"\n        Require valid-user\n    </Location>", `Restricted:app.example.com`)), "AuthName"},
+		// httpd applies line continuation before it skips comments.
+		{"comment continuation hides server name", strings.Replace(inVHost(""), "    ServerName app.example.com\n", "    # hidden \\\n    ServerName app.example.com\n", 1), "continuation"},
+		{"comment continuation hides sslengine", strings.Replace(inVHost(""), "    SSLEngine on\n", "    # note \\\n    SSLEngine on\n", 1), "continuation"},
+		{"top comment continuation", "# x \\\n" + inVHost(""), "continuation"},
+		// httpd compares keywords with ASCII strcasecmp only.
+		{"unicode folded keyword", inVHost("    Header always \u017fet X-A b"), "Header"},
+		{"unicode folded section", strings.ReplaceAll(inVHost(""), "VirtualHost", "VirtualHo\u017ft"), "not allowed at the top level"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

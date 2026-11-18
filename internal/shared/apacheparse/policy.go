@@ -45,7 +45,7 @@ func ValidateManaged(content string, policy ManagedPolicy) error {
 	}
 	proxied := 0
 	for _, vhost := range sections {
-		if !strings.EqualFold(vhost.name, "VirtualHost") {
+		if !asciiEqualFold(vhost.name, "VirtualHost") {
 			return refuse(vhost.line, "<"+vhost.name+">", "%s", notAllowedReason("<"+vhost.name+">", "at the top level"))
 		}
 		redirect, err := validateVirtualHost(vhost, policy)
@@ -99,7 +99,13 @@ var vhostDirectives = map[string]argRule{
 // locationDirectives are the only directives allowed in <Location />.
 var locationDirectives = map[string]argRule{
 	"authtype": func(a []word, _ ManagedPolicy) bool { return plainFold(a, "basic") },
-	"authname": func(a []word, _ ManagedPolicy) bool { return len(a) == 1 && quotedOrPlain(a[0]) && a[0].value != "" },
+	// httpd evaluates AuthName as an ap_expr string, so "%{file:...}" or
+	// "%{ENV:...}" would send a file or variable to unauthenticated clients
+	// in WWW-Authenticate. Only the realm apachegen renders is allowed.
+	"authname": func(a []word, p ManagedPolicy) bool {
+		want := "Restricted: " + p.Host
+		return len(a) == 1 && a[0].quote == '"' && a[0].source == `"`+want+`"`
+	},
 	"authuserfile": func(a []word, p ManagedPolicy) bool {
 		return p.AuthPath != "" && plainExact(a, p.AuthPath)
 	},
@@ -199,7 +205,7 @@ func validateVirtualHost(vhost section, policy ManagedPolicy) (bool, error) {
 
 func validateLocation(location section, policy ManagedPolicy) error {
 	name := "<" + location.name + ">"
-	if !strings.EqualFold(location.name, "Location") {
+	if !asciiEqualFold(location.name, "Location") {
 		return refuse(location.line, name, "%s", notAllowedReason(name, "in <VirtualHost>"))
 	}
 	if len(location.args) != 1 || !plainExact(location.args, "/") {
@@ -213,7 +219,7 @@ func validateLocation(location section, policy ManagedPolicy) error {
 	}
 	for _, s := range location.sections {
 		inner := "<" + s.name + ">"
-		if !strings.EqualFold(s.name, "RequireAll") || len(s.args) != 0 {
+		if !asciiEqualFold(s.name, "RequireAll") || len(s.args) != 0 {
 			return refuse(s.line, inner, "%s", notAllowedReason(inner, "in <Location />"))
 		}
 		if len(s.sections) != 0 {
@@ -285,7 +291,7 @@ func headerValue(w word) bool {
 		}
 	}
 	trimmed := strings.TrimLeft(v, ` "'`)
-	return len(trimmed) < 5 || !strings.EqualFold(trimmed[:5], "expr=")
+	return len(trimmed) < 5 || !asciiEqualFold(trimmed[:5], "expr=")
 }
 
 // rewriteCondRule accepts only the WebSocket upgrade test apachegen renders
@@ -472,7 +478,7 @@ func plainFold(args []word, options ...string) bool {
 		return false
 	}
 	for _, o := range options {
-		if strings.EqualFold(args[0].value, o) {
+		if asciiEqualFold(args[0].value, o) {
 			return true
 		}
 	}
@@ -481,4 +487,25 @@ func plainFold(args []word, options ...string) bool {
 
 func plainMatch(args []word, re *regexp.Regexp) bool {
 	return len(args) == 1 && plain(args[0]) && re.MatchString(args[0].value)
+}
+
+// asciiEqualFold compares like httpd's strcasecmp: ASCII letters only, so a
+// Unicode case folding (such as "ſ" for "s") never makes two words equal.
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
