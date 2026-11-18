@@ -281,56 +281,51 @@ func Render(in Input) (Result, error) {
 		}
 	}
 
-	// The location block: path rules + reverse proxy + websocket + forwarded
-	// headers + custom request headers + timeouts.
-	b.WriteString("\n    location / {\n")
+	// Path routes: nginx picks an exact location before any prefix and the
+	// longest prefix among prefixes, whatever their order in the file, which
+	// is exactly the PathRoute precedence. A prefix "/api" is rendered as
+	// `location = /api` plus `location /api/`, so it matches on a segment
+	// boundary ("/apix" stays on the default upstream) and "/api" itself is
+	// proxied instead of answered with nginx's automatic 301 to "/api/". The
+	// `=` companion is left out when an exact route for the same path exists,
+	// since that one wins anyway.
+	exact := map[string]bool{}
+	for _, p := range route.PathRoutes {
+		if p.Match == proxymodel.PathMatchExact {
+			exact[p.Path] = true
+		}
+	}
+	for _, p := range proxymodel.SortedPathRoutes(route.PathRoutes) {
+		var rewrites []string
+		if p.StripPrefix {
+			rewrites = append(rewrites, stripRewrite(p.Path))
+		}
+		loc := locationProxy{upstream: p.Upstream, scheme: p.EffectiveScheme(), websocket: p.WebSocket, rewrites: rewrites}
+		if p.Match == proxymodel.PathMatchExact {
+			writeLocation(&b, "= "+p.Path, loc, route)
+			continue
+		}
+		if !exact[p.Path] {
+			writeLocation(&b, "= "+p.Path, loc, route)
+		}
+		writeLocation(&b, p.Path+"/", loc, route)
+	}
 
-	// Path strip: nginx strips a prefix by including a trailing slash on both the
-	// location and the proxy_pass URI. We approximate StripPrefix by rewriting the
-	// URI before proxy_pass so the upstream sees the path without the prefix.
+	// The default location: path rules + reverse proxy + websocket +
+	// forwarded headers + custom request headers + timeouts.
+	//
+	// Path strip: nginx strips a prefix by including a trailing slash on both
+	// the location and the proxy_pass URI. We approximate StripPrefix by
+	// rewriting the URI before proxy_pass so the upstream sees the path
+	// without the prefix.
+	var rewrites []string
 	if route.Path.StripPrefix != "" {
-		prefix := "/" + strings.Trim(route.Path.StripPrefix, "/")
-		fmt.Fprintf(&b, "        rewrite ^%s/?(.*)$ /$1 break;\n", regexpEscape(prefix))
+		rewrites = append(rewrites, stripRewrite("/"+strings.Trim(route.Path.StripPrefix, "/")))
 	}
 	if route.Path.Rewrite != "" {
-		fmt.Fprintf(&b, "        rewrite ^.*$ %s break;\n", route.Path.Rewrite)
+		rewrites = append(rewrites, fmt.Sprintf("rewrite ^.*$ %s break;", route.Path.Rewrite))
 	}
-
-	scheme := "http"
-	if route.EffectiveScheme() == proxymodel.SchemeHTTPS {
-		scheme = "https"
-	}
-	fmt.Fprintf(&b, "        proxy_pass %s://%s;\n", scheme, proxymodel.UpstreamHostPort(route.Upstream.Addr, route.Upstream.Port))
-
-	// Standard forwarding headers (mirrors caddy's defaults).
-	fmt.Fprintf(&b, "        proxy_set_header Host $host;\n")
-	fmt.Fprintf(&b, "        proxy_set_header X-Real-IP $remote_addr;\n")
-	fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
-	fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-Proto $scheme;\n")
-
-	// WebSocket / connection upgrade passthrough.
-	if route.WebSocket {
-		fmt.Fprintf(&b, "        proxy_http_version 1.1;\n")
-		fmt.Fprintf(&b, "        proxy_set_header Upgrade $http_upgrade;\n")
-		fmt.Fprintf(&b, "        proxy_set_header Connection \"upgrade\";\n")
-	}
-
-	// Custom request headers (deterministic order).
-	for _, k := range sortedKeys(route.RequestHeaders) {
-		fmt.Fprintf(&b, "        proxy_set_header %s %s;\n", k, quoteHeaderValue(route.RequestHeaders[k]))
-	}
-
-	// Upstream timeouts. Map our read/write/idle intent onto nginx's proxy
-	// timeout directives (seconds).
-	if route.Timeouts.Write > 0 {
-		fmt.Fprintf(&b, "        proxy_connect_timeout %ds;\n", route.Timeouts.Write)
-		fmt.Fprintf(&b, "        proxy_send_timeout %ds;\n", route.Timeouts.Write)
-	}
-	if route.Timeouts.Read > 0 {
-		fmt.Fprintf(&b, "        proxy_read_timeout %ds;\n", route.Timeouts.Read)
-	}
-
-	b.WriteString("    }\n")
+	writeLocation(&b, "/", locationProxy{upstream: route.Upstream, scheme: route.EffectiveScheme(), websocket: route.WebSocket, rewrites: rewrites}, route)
 	b.WriteString("}\n")
 
 	return Result{
@@ -338,6 +333,66 @@ func Render(in Input) (Result, error) {
 		Server:       b.String(),
 		Warnings:     warnings,
 	}, nil
+}
+
+// locationProxy is what differs between the location blocks of one server:
+// the upstream and the per-location path handling.
+type locationProxy struct {
+	upstream  proxymodel.Upstream
+	scheme    proxymodel.Scheme
+	websocket bool
+	rewrites  []string
+}
+
+// writeLocation renders one proxying `location <match> {}` block. Request
+// headers and timeouts come from the route, so every location of the host
+// forwards the same way.
+func writeLocation(b *strings.Builder, match string, loc locationProxy, route proxymodel.Route) {
+	fmt.Fprintf(b, "\n    location %s {\n", match)
+	for _, rw := range loc.rewrites {
+		fmt.Fprintf(b, "        %s\n", rw)
+	}
+
+	scheme := "http"
+	if loc.scheme == proxymodel.SchemeHTTPS {
+		scheme = "https"
+	}
+	fmt.Fprintf(b, "        proxy_pass %s://%s;\n", scheme, proxymodel.UpstreamHostPort(loc.upstream.Addr, loc.upstream.Port))
+
+	// Standard forwarding headers (mirrors caddy's defaults).
+	b.WriteString("        proxy_set_header Host $host;\n")
+	b.WriteString("        proxy_set_header X-Real-IP $remote_addr;\n")
+	b.WriteString("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
+	b.WriteString("        proxy_set_header X-Forwarded-Proto $scheme;\n")
+
+	// WebSocket / connection upgrade passthrough.
+	if loc.websocket {
+		b.WriteString("        proxy_http_version 1.1;\n")
+		b.WriteString("        proxy_set_header Upgrade $http_upgrade;\n")
+		b.WriteString("        proxy_set_header Connection \"upgrade\";\n")
+	}
+
+	// Custom request headers (deterministic order).
+	for _, k := range sortedKeys(route.RequestHeaders) {
+		fmt.Fprintf(b, "        proxy_set_header %s %s;\n", k, quoteHeaderValue(route.RequestHeaders[k]))
+	}
+
+	// Upstream timeouts. Map our read/write/idle intent onto nginx's proxy
+	// timeout directives (seconds).
+	if route.Timeouts.Write > 0 {
+		fmt.Fprintf(b, "        proxy_connect_timeout %ds;\n", route.Timeouts.Write)
+		fmt.Fprintf(b, "        proxy_send_timeout %ds;\n", route.Timeouts.Write)
+	}
+	if route.Timeouts.Read > 0 {
+		fmt.Fprintf(b, "        proxy_read_timeout %ds;\n", route.Timeouts.Read)
+	}
+	b.WriteString("    }\n")
+}
+
+// stripRewrite renders the rewrite that removes a literal path prefix,
+// leaving at least "/".
+func stripRewrite(prefix string) string {
+	return fmt.Sprintf("rewrite ^%s/?(.*)$ /$1 break;", regexpEscape(prefix))
 }
 
 // writeLogDirectives emits the per-route logging overrides. It writes nothing

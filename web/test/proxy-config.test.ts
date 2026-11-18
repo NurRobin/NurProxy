@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { proxyConfigChanges, wildcardEligible, type ProxyConfigFormEdits } from '../src/lib/proxy-config.ts';
+import { pathRouteEdit, proxyConfigChanges, wildcardEligible, type ProxyConfigFormEdits } from '../src/lib/proxy-config.ts';
 import type { ProxyConfig } from '../src/lib/types.ts';
 
 const stored = {
@@ -50,6 +50,24 @@ test('logging settings are sent when changed and cleared back to the host defaul
   const quiet = { ...stored, access_log: 'off', error_log_level: 'crit' } as ProxyConfig;
   assert.equal(proxyConfigChanges(quiet, { ...unchanged, access_log: 'off', error_log_level: 'crit' }), undefined);
   assert.deepEqual(proxyConfigChanges(quiet, unchanged), { access_log: null, error_log_level: null });
+});
+
+test('path routes are sent whole when changed and cleared with null (#89)', () => {
+  const routes = [
+    { match: 'exact', path: '/api/world', server_id: 's2', port: 80 },
+    { match: 'prefix', path: '/media', server_id: 's3', port: 9000, strip_prefix: true },
+  ] as NonNullable<ProxyConfig['routes']>;
+  const withRoutes = { ...stored, routes } as ProxyConfig;
+  const rows = routes.map(pathRouteEdit);
+  assert.equal(proxyConfigChanges(withRoutes, { ...unchanged, routes: rows }), undefined);
+  assert.equal(proxyConfigChanges(withRoutes, unchanged), undefined, 'a form without the routes tab leaves them alone');
+
+  const added = { match: 'exact' as const, path: ' /x ', server_id: 's2', port: '81', upstream_scheme: 'https', websocket: true, strip_prefix: true };
+  assert.deepEqual(proxyConfigChanges(withRoutes, { ...unchanged, routes: [...rows, added] }), {
+    routes: [...routes, { match: 'exact', path: '/x', server_id: 's2', port: 81, upstream_scheme: 'https', websocket: true }],
+  });
+  assert.deepEqual(proxyConfigChanges(withRoutes, { ...unchanged, routes: [] }), { routes: null });
+  assert.equal(proxyConfigChanges(stored, { ...unchanged, routes: [{ ...added, path: '' }] }), undefined, 'rows without a path are ignored');
 });
 
 test('works without a stored config', () => {

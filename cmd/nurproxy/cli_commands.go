@@ -630,8 +630,12 @@ func cmdDomain(args []string) {
 		c, _, id := parseClient("domain failover", rest, "domain id", nil)
 		printFailover(c, id)
 
+	case "route":
+		cmdDomainRoute(rest)
+
 	default:
 		usage("domain", "list", "get <id>", "add", "update <id>", "delete <id>", "dns-takeover [--dry-run] <id>", "set-cert <id> --cert FILE --key FILE",
+			"route list <id>", "route add <id> --path P --server S --port N [--match prefix|exact]", "route remove <id> --path P [--match prefix|exact]",
 			"backups <id> [--set srv-a,srv-b | --clear]", "failover <id>")
 	}
 }
@@ -683,6 +687,129 @@ func printFailoverStatus(raw []byte) {
 	if st.PendingServerID != "" && st.PendingSince != nil {
 		fmt.Printf("failback to %s pending since %s\n", st.PendingServerID, st.PendingSince.Format(time.RFC3339))
 	}
+}
+
+// cmdDomainRoute manages a domain's path routes. Each change reads the
+// stored list, edits it and writes the whole list back as
+// proxy_config.routes; the orchestrator validates the result.
+func cmdDomainRoute(args []string) {
+	action, rest := shift(args)
+	switch action {
+	case "list":
+		c, _, id := parseClient("domain route list", rest, "domain id", nil)
+		dom := getDomainForRoutes(c, id)
+		if c.asJSON {
+			c.emit(mustJSON(dom.ProxyConfig.Routes), "")
+			return
+		}
+		rows := make([][]string, len(dom.ProxyConfig.Routes))
+		for i, p := range dom.ProxyConfig.Routes {
+			scheme := p.UpstreamScheme
+			if scheme == "" {
+				scheme = "http"
+			}
+			rows[i] = []string{p.Match, p.Path, p.ServerID, strconv.Itoa(p.Port), scheme, boolStr(p.WebSocket), boolStr(p.StripPrefix)}
+		}
+		printTable([]string{"MATCH", "PATH", "SERVER", "PORT", "SCHEME", "WEBSOCKET", "STRIP"}, rows)
+
+	case "add":
+		var route models.PathRoute
+		c, _, id := parseClient("domain route add", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&route.Match, "match", "prefix", `"prefix" (the path and everything below it) or "exact"`)
+			fs.StringVar(&route.Path, "path", "", "Request path, e.g. /api")
+			fs.StringVar(&route.ServerID, "server", "", "Server ID (must be on the same agent as the domain's server)")
+			fs.IntVar(&route.Port, "port", 0, "Upstream port")
+			fs.StringVar(&route.UpstreamScheme, "scheme", "", `Upstream scheme: "http" (default) or "https"`)
+			fs.BoolVar(&route.WebSocket, "websocket", false, "Enable WebSocket support on this path")
+			fs.BoolVar(&route.StripPrefix, "strip-prefix", false, "Remove the path before forwarding (prefix only)")
+		})
+		if route.Path == "" || route.ServerID == "" || route.Port == 0 {
+			fatalf("domain route add: --path, --server and --port are required")
+		}
+		dom := getDomainForRoutes(c, id)
+		routes, err := addPathRoute(dom.ProxyConfig.Routes, route)
+		if err != nil {
+			fatalf("domain route add: %v", err)
+		}
+		raw := putDomainRoutes(c, id, routes)
+		c.emit(raw, fmt.Sprintf("path route %s (%s) added to domain %s", route.Path, route.Match, id))
+
+	case "remove":
+		var match, path string
+		c, _, id := parseClient("domain route remove", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&match, "match", "", `Only remove the "prefix" or "exact" route for the path (needed when both exist)`)
+			fs.StringVar(&path, "path", "", "Request path of the route to remove")
+		})
+		if path == "" {
+			fatalf("domain route remove: --path is required")
+		}
+		dom := getDomainForRoutes(c, id)
+		routes, err := removePathRoute(dom.ProxyConfig.Routes, match, path)
+		if err != nil {
+			fatalf("domain route remove: %v", err)
+		}
+		raw := putDomainRoutes(c, id, routes)
+		c.emit(raw, fmt.Sprintf("path route %s removed from domain %s", path, id))
+
+	default:
+		usage("domain route", "list <domain id>",
+			"add <domain id> --path P --server S --port N [--match prefix|exact] [--scheme https] [--websocket] [--strip-prefix]",
+			"remove <domain id> --path P [--match prefix|exact]")
+	}
+}
+
+func getDomainForRoutes(c *client, id string) models.Domain {
+	var dom models.Domain
+	if err := c.getInto("/api/v1/domains/"+id, &dom); err != nil {
+		fatalf("%v", err)
+	}
+	return dom
+}
+
+func putDomainRoutes(c *client, id string, routes []models.PathRoute) []byte {
+	if routes == nil {
+		routes = []models.PathRoute{}
+	}
+	raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id, map[string]interface{}{
+		"proxy_config": map[string]interface{}{"routes": routes},
+	})
+	if err != nil {
+		fatalf("%v", err)
+	}
+	return raw
+}
+
+// addPathRoute appends route, refusing a second route with the same match
+// and path.
+func addPathRoute(routes []models.PathRoute, route models.PathRoute) ([]models.PathRoute, error) {
+	for _, p := range routes {
+		if p.Match == route.Match && p.Path == route.Path {
+			return nil, fmt.Errorf("the domain already has a %s route for %s; remove it first", route.Match, route.Path)
+		}
+	}
+	return append(append([]models.PathRoute(nil), routes...), route), nil
+}
+
+// removePathRoute removes the route for path (and match, when given). It
+// refuses an ambiguous removal when a prefix and an exact route share the
+// path and no match was given.
+func removePathRoute(routes []models.PathRoute, match, path string) ([]models.PathRoute, error) {
+	var kept []models.PathRoute
+	removed := 0
+	for _, p := range routes {
+		if p.Path == path && (match == "" || p.Match == match) {
+			removed++
+			continue
+		}
+		kept = append(kept, p)
+	}
+	switch {
+	case removed == 0:
+		return nil, fmt.Errorf("the domain has no route for %s", path)
+	case removed > 1:
+		return nil, fmt.Errorf("both a prefix and an exact route exist for %s; pass --match", path)
+	}
+	return kept, nil
 }
 
 // --- apikey --------------------------------------------------------------

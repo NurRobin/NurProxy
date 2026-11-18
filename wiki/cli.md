@@ -154,6 +154,19 @@ OpenResty keep their own log. The built-in Caddy writes no access log anyway
 and has no per-domain error level. The orchestrator refuses a setting the
 domain's agent doesn't offer.
 
+Path routes send some request paths to other servers of the same agent (see
+[Domains](domains.md#path-routes) for the matching rules):
+
+```bash
+nurproxy domain route list   <domain-id>
+nurproxy domain route add    <domain-id> --path /api/world --server <server-id> --port 80 --match exact
+nurproxy domain route add    <domain-id> --path /media --server <server-id> --port 9000 \
+                             [--match prefix] [--scheme https] [--websocket] [--strip-prefix]
+nurproxy domain route remove <domain-id> --path /media [--match prefix|exact]
+```
+
+`--match` defaults to `prefix`. `remove` needs `--match` only when a prefix and
+an exact route share the path.
 `--tls-wildcard` serves the domain from its zone's shared `*.<zone>`
 certificate instead of a per-host one; `--tls-wildcard=false` on `update` turns
 it off again. Only a single label directly below the zone with central TLS can

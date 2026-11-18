@@ -117,3 +117,12 @@ func TestDeclaredCapsFromNamesLogging(t *testing.T) {
 		t.Fatalf("logging must not be advertised by default: %+v", defaults)
 	}
 }
+
+func TestDeclaredCapsFromNamesPathRoutes(t *testing.T) {
+	if caps := declaredCapsFromNames([]string{"path_routes"}); !caps.PathRoutes {
+		t.Fatalf("declared path_routes not mapped: %+v", caps)
+	}
+	if defaults := declaredCapsFromNames(nil); defaults.PathRoutes {
+		t.Fatalf("path routes must not be advertised by default: %+v", defaults)
+	}
+}

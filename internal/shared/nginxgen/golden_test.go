@@ -47,6 +47,10 @@ func goldenCases() []struct {
 	fullTLS.AuthFile = "/etc/nginx/nurproxy-auth/app.example.com.htpasswd"
 	oldNginx := tlsInput(baseRoute())
 	oldNginx.NginxVersion = "1.18.0"
+	withPaths := func(in Input) Input {
+		in.Route.PathRoutes = samplePathRoutes()
+		return in
+	}
 
 	return []struct {
 		name  string
@@ -59,6 +63,21 @@ func goldenCases() []struct {
 		{"plain_access_off", withLogging(Input{Route: baseRoute()}, proxymodel.AccessLogOff, "")},
 		{"plain_error_crit", withLogging(Input{Route: baseRoute()}, proxymodel.AccessLogDefault, "crit")},
 		{"full_tls_access_off_error_crit", withLogging(fullTLS, proxymodel.AccessLogOff, "crit")},
+		{"plain_path_routes", withPaths(Input{Route: baseRoute()})},
+		{"full_tls_path_routes", withPaths(fullTLS)},
+	}
+}
+
+// samplePathRoutes covers every path route form: an exact route, a prefix
+// route, a stripping prefix route to an HTTPS WebSocket upstream, and an
+// exact route that shadows the `=` half of a prefix route for the same path.
+func samplePathRoutes() []proxymodel.PathRoute {
+	return []proxymodel.PathRoute{
+		{Match: proxymodel.PathMatchPrefix, Path: "/media", Upstream: proxymodel.Upstream{Addr: "10.0.0.7", Port: 9000}},
+		{Match: proxymodel.PathMatchExact, Path: "/api/world", Upstream: proxymodel.Upstream{Addr: "192.168.178.210", Port: 80}},
+		{Match: proxymodel.PathMatchPrefix, Path: "/ws", StripPrefix: true, WebSocket: true, Upstream: proxymodel.Upstream{Addr: "fd00::5", Port: 8443, Scheme: proxymodel.SchemeHTTPS}},
+		{Match: proxymodel.PathMatchPrefix, Path: "/admin", Upstream: proxymodel.Upstream{Addr: "10.0.0.8", Port: 8081}},
+		{Match: proxymodel.PathMatchExact, Path: "/admin", Upstream: proxymodel.Upstream{Addr: "10.0.0.9", Port: 8082}},
 	}
 }
 

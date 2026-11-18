@@ -134,6 +134,8 @@ export interface ProxyCapabilities {
   /** Absent on agents that predate per-domain logging control. */
   access_log?: boolean;
   error_log_level?: boolean;
+  /** Absent on agents that predate path routes. */
+  path_routes?: boolean;
   /** True when the backend replaces ${NAME} in header values at config load (Apache). */
   header_config_vars?: boolean;
 }
@@ -514,6 +516,23 @@ export interface ProxyConfig {
   access_log?: string;
   /** Minimum error log level (e.g. "crit"); unset keeps the host default. */
   error_log_level?: string;
+  /** Extra path-routed upstreams; everything else goes to the domain's server and port. */
+  routes?: PathRoute[];
+}
+
+/**
+ * One path-routed upstream of a domain. An exact route beats any prefix and
+ * the longest prefix wins; a prefix "/api" matches "/api" and "/api/...", not
+ * "/apix". The server must be on the same agent as the domain's server.
+ */
+export interface PathRoute {
+  match: 'prefix' | 'exact';
+  path: string;
+  server_id: string;
+  port: number;
+  upstream_scheme?: string;
+  websocket?: boolean;
+  strip_prefix?: boolean;
 }
 
 export interface AuditLogEntry {
@@ -616,6 +635,13 @@ export interface ProxyRoute {
   TLS?: { Policy?: string; Wildcard?: boolean };
   AccessLog?: string;
   ErrorLogLevel?: string;
+  PathRoutes?: Array<{
+    Match: 'prefix' | 'exact';
+    Path: string;
+    Upstream?: { Addr?: string; Port?: number; Scheme?: string };
+    WebSocket?: boolean;
+    StripPrefix?: boolean;
+  }>;
 }
 
 /**
