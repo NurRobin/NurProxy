@@ -24,6 +24,16 @@ func (e *RemoteError) Error() string {
 	return fmt.Sprintf("root helper request failed (%s): %s", e.Code, e.Message)
 }
 
+// HelperMessage returns the helper's own bounded error message. The helper
+// only puts fixed texts and operator-facing policy refusals there, so the
+// agent may forward it to the orchestrator.
+func (e *RemoteError) HelperMessage() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
 type Pin struct {
 	HelperInstanceID     string `json:"helper_instance_id"`
 	AttestationKeyID     string `json:"attestation_key_id"`

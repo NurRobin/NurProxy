@@ -52,6 +52,10 @@ type managedCompiledFile struct {
 	Delete     bool   `json:"delete"`
 	Preserve   bool   `json:"preserve"`
 	Content    []byte `json:"-"`
+	// Refusal is why the policy refused to write this raw vhost. It is set
+	// only on a preserved raw vhost and becomes the operator-facing reason
+	// when the exact bytes are not already live.
+	Refusal string `json:"-"`
 }
 
 type managedCompiledLink struct {
@@ -347,10 +351,11 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 			authPath = managedAuthFilePath(authDir, route.Host)
 		}
 		available := filepath.Join(a.layout.AvailableDir, managedFileName(a.target.Kind, route.Host))
-		var content string
+		var content, refusal string
 		preserve := false
 		if route.IsRaw() {
-			content, preserve, err = a.admitRawRoute(route, certPath, keyPath, authPath)
+			content, refusal, err = a.admitRawRoute(route, certPath, keyPath, authPath)
+			preserve = refusal != ""
 		} else {
 			content, err = a.renderRoute(route, certPath, keyPath, authPath)
 		}
@@ -384,6 +389,7 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 		file := compiledFile(available, compiledContent, 0o644, "vhost")
 		file.ResourceID = routeIntent.ArtifactID
 		file.Preserve = preserve
+		file.Refusal = refusal
 		compilation.Files = append(compilation.Files, file)
 		// The auth/ file is only written when the vhost actually uses it, so a
 		// preserved legacy vhost with its own sidecar needs no worker group.
@@ -551,31 +557,36 @@ func (a *managedApplyAction) compile(intent helperprotocol.ApplyIntent) (managed
 // for this route with the old path, it is re-rendered with the auth/ path;
 // any other raw config still on the old path is refused with an error that
 // names both paths.
-func (a *managedApplyAction) admitRawRoute(route proxymodel.Route, certPath, keyPath, authPath string) (string, bool, error) {
+//
+// The returned refusal is empty when the content is written. Otherwise the
+// content is kept only if it is already live byte for byte, and the refusal
+// is the operator-facing reason reported when it is not.
+func (a *managedApplyAction) admitRawRoute(route proxymodel.Route, certPath, keyPath, authPath string) (string, string, error) {
 	content := route.Raw.Content
 	if a.target.Kind != "nginx" {
-		return content, true, nil
+		return content, fmt.Sprintf("raw %s config for %s: the root helper does not write raw %s configs", a.target.Kind, route.Host, a.target.Kind), nil
 	}
-	if nginxparse.ValidateManaged(content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath}) == nil {
-		return content, false, nil
+	policyErr := nginxparse.ValidateManaged(content, nginxparse.ManagedPolicy{Host: route.Host, CertPath: certPath, KeyPath: keyPath, AuthPath: authPath})
+	if policyErr == nil {
+		return content, "", nil
 	}
 	legacy := legacyManagedAuthFilePath(a.layout.CertificateDir, route.Host)
 	if !strings.Contains(content, legacy) {
-		return content, true, nil
+		return content, fmt.Sprintf("raw nginx config for %s: %v", route.Host, policyErr), nil
 	}
 	if route.BasicAuth != nil {
 		structured := route
 		structured.Raw = proxymodel.RawConfig{}
 		legacyRender, err := a.renderRoute(structured, certPath, keyPath, legacy)
 		if err != nil {
-			return "", false, err
+			return "", "", err
 		}
 		if proxy.StampManagedArtifact(content) == proxy.StampManagedArtifact(legacyRender) {
 			current, err := a.renderRoute(structured, certPath, keyPath, authPath)
-			return current, false, err
+			return current, "", err
 		}
 	}
-	return "", false, fmt.Errorf("raw nginx config for %s uses auth_basic_user_file %s, which the %s worker cannot read; change it to %s", route.Host, legacy, a.target.Kind, authPath)
+	return "", "", &managedRefusal{reason: fmt.Sprintf("raw nginx config for %s uses auth_basic_user_file %s, which the %s worker cannot read; change it to %s", route.Host, legacy, a.target.Kind, authPath)}
 }
 
 func exactUnmarkedManagedFile(path string, desired []byte, ownerUID uint32) (bool, error) {
@@ -818,11 +829,13 @@ func (a *managedApplyAction) fingerprint(ctx context.Context, compilation manage
 		return "", err
 	}
 	current := make([]managedFileSnapshot, 0, len(compilation.Files)+len(compilation.Links))
+	refusals := map[string]string{}
 	for _, file := range compilation.Files {
 		var item managedFileSnapshot
 		var err error
 		if file.Preserve {
 			item, err = inspectPreservedManagedFile(file, a.ownerUID)
+			refusals[file.Path] = file.Refusal
 		} else {
 			item, err = inspectManagedPath(file.Path, file.Class, "", a.ownerUID)
 		}
@@ -837,6 +850,9 @@ func (a *managedApplyAction) fingerprint(ctx context.Context, compilation manage
 			return "", err
 		}
 		if link.Preserve && !item.Exists {
+			if refusal := refusals[link.Target]; refusal != "" {
+				return "", &managedRefusal{reason: refusal + "; the helper keeps a config outside its policy only when it is already live and enabled"}
+			}
 			return "", fmt.Errorf("policy-foreign raw configuration has no exact live activation link")
 		}
 		current = append(current, item)
@@ -975,6 +991,14 @@ func (a *managedApplyAction) attestManagedArtifacts(compilation managedCompilati
 }
 
 func inspectPreservedManagedFile(file managedCompiledFile, ownerUID uint32) (managedFileSnapshot, error) {
+	item, err := inspectPreservedManagedFileContent(file, ownerUID)
+	if err != nil && file.Refusal != "" {
+		return item, &managedRefusal{reason: file.Refusal + "; the helper keeps a config outside its policy only when it is already live byte for byte", cause: err}
+	}
+	return item, err
+}
+
+func inspectPreservedManagedFileContent(file managedCompiledFile, ownerUID uint32) (managedFileSnapshot, error) {
 	item := managedFileSnapshot{Path: file.Path, Content: []byte{}}
 	info, err := os.Lstat(file.Path)
 	if err != nil {

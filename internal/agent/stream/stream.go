@@ -388,6 +388,21 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 	}
 }
 
+// managedApplyFailure is the error reported for a failed privileged apply.
+// When the root helper refused the request, its message (for a policy
+// refusal: the route, directive and line) is appended so the domain's error
+// shows the reason and not only the agent log.
+func managedApplyFailure(err error) string {
+	const message = "privileged managed proxy reconciliation failed"
+	var remote interface{ HelperMessage() string }
+	if errors.As(err, &remote) {
+		if detail := strings.TrimSpace(remote.HelperMessage()); detail != "" {
+			return message + ": " + detail
+		}
+	}
+	return message
+}
+
 func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotocol.ManagedIntentSetEnvelope) {
 	c.managedApplyMu.RLock()
 	applier := c.managedApply
@@ -410,10 +425,11 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 			c.syncRecoveryHealth()
 		}
 		log.Printf("Stream: privileged managed apply failed: %v", err)
+		message := managedApplyFailure(err)
 		if c.health != nil {
-			c.health.SetError("privileged managed proxy reconciliation failed")
+			c.health.SetError(message)
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed", nil)
+		c.sendManagedAck(ctx, envelope.IntentSet, message, nil)
 		return
 	}
 	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
