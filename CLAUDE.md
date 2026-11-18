@@ -37,6 +37,7 @@ make dev-sandbox                 # orchestrator + 1 agent, seeded topology, dash
 make dev-sandbox AGENTS=3        # multiple agents on one box (no port conflicts)
 PORT=9000 make dev-sandbox       # orchestrator on :9000
 KEEP=0 make dev-sandbox          # seed then tear down (smoke check)
+PROFILE=live make dev-sandbox    # agents run a REAL Caddy on 127.0.0.1:18080/18443 (needs caddy)
 ```
 This builds both binaries, starts a dry orchestrator + N dry agents, and seeds a
 provider (dummy token), zone, adopted agents, servers and central-TLS domains —
@@ -80,16 +81,53 @@ created with a dummy token works end-to-end.
    with zero external deps. It also runs in CI on every push/PR targeting
    `main`, `dev`, or a `release/**` branch.
 
+### Live profile: real traffic through a real Caddy
+`PROFILE=live make dev-sandbox` keeps the orchestrator dry (no external DNS or
+ACME, no root) but runs each agent WITHOUT `-dry-run`: the agent starts a real
+built-in Caddy bound to `127.0.0.1` on unprivileged ports and proxies to a small
+fake upstream (`test/sandbox/fakeupstream`, started by the script):
+```bash
+PROFILE=live make dev-sandbox                    # needs caddy on PATH (or CADDY_BIN=...)
+curl -k --resolve app1.sandbox.test:18443:127.0.0.1 https://app1.sandbox.test:18443/
+PROFILE=live KEEP=0 AGENTS=2 make dev-sandbox    # smoke: exits non-zero unless every app<n> serves
+make test-sandbox-live                           # scripted e2e (skips without caddy)
+```
+Knobs: `HTTP_PORT` (18080), `HTTPS_PORT` (18443), `ADMIN_PORT` (12019),
+`UPSTREAM_PORT` (18081), `LISTEN_HOST` (127.0.0.1); agent n adds `10*(n-1)` to
+each Caddy port. The agent side of this is three agent knobs, default unchanged:
+`-caddy-http-port`, `-caddy-https-port`, `-caddy-listen-host` (env
+`NP_CADDY_HTTP_PORT`/`NP_CADDY_HTTPS_PORT`/`NP_CADDY_LISTEN_HOST`, yaml
+`caddy_http_port`/`caddy_https_port`/`caddy_listen_host`). Non-default ports are
+also written to Caddy's `http_port`/`https_port`, which Caddy needs to know which
+listener stays plaintext.
+
+### Real-proxy checks in the sandbox tests
+`test/sandbox` uses real proxy binaries when it finds them and skips those
+checks (with a log line) when not:
+- **caddy** (`NP_SANDBOX_CADDY` or PATH): the dry built-in agent's recorded routes
+  + TLS strategy go through `caddy validate`, and `TestSandboxLiveTraffic` serves
+  real HTTPS/HTTP through Caddy (cert = the dry-issued one, force_https redirect,
+  live updates, a second domain's cert loading on a running Caddy).
+- **nginx** (`NP_SANDBOX_NGINX` or PATH, else `NP_SANDBOX_DOCKER=1` runs
+  `nginx:1.29-alpine` as your uid): the existing-mode agent's rendered vhosts get
+  `nginx -t` with their real cert paths.
+CI installs a pinned, checksummed Caddy and sets `NP_SANDBOX_DOCKER=1`, so all of
+these run on every push/PR.
+
 ### What it covers vs. what it doesn't
 - **Covered (develop exactly like prod):** orchestrator/API/CLI/dashboard, the DNS
   state machine (create/adopt/drift/delete), TLS issuance + renewal-window logic,
   the agent protocol (register/adopt/heartbeat/stream/ACK), route rendering
   (real `caddygen` — artifacts identical to prod built-in Caddy), and multi-agent.
-- **Not covered (still needs a real Caddy/agent):** serving real traffic — the dry
-  agent does not bind a listener or proxy real requests; certs are self-signed
-  (no real chain) and DNS records are in-memory (not resolvable); nginx/apache
-  existing-mode apply/reload is not exercised. See issue #96 (low-prio nice-to-have)
-  for the optional live-traffic harness.
+  With caddy installed also: Caddy accepting the rendered config, and real
+  HTTP/TLS serving through the built-in Caddy (live profile). With nginx (or
+  docker) also: `nginx -t` on the rendered vhosts.
+- **Not covered:** certs are self-signed (no real chain) and DNS records are
+  in-memory (not resolvable); the live profile serves loopback only, on
+  non-standard ports; nginx/apache existing-mode reload and serving are not
+  exercised (the existing-mode agent's nginx is a fixture, only `nginx -t` is
+  real), and Apache output is not validated by the sandbox (the
+  `-tags=integration` tests cover it against `httpd:alpine`).
 
 ## Conventions
 - Go 1.25+, standard library preferred
