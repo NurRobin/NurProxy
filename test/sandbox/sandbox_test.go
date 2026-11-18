@@ -361,6 +361,51 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Fatalf("resolved stale-temp diagnostic %q disappeared from history", staleDiagnosticID)
 	}
 
+	// Path routes (#89): a domain with an exact and a prefix route to a second
+	// server of the same agent converges to active, and its vhost carries the
+	// locations in the shape the helper's nginx policy admits. It runs after
+	// the stale-temp check, which expects exactly one repair: installing the
+	// new domain's certificate brings automatic repairs of its own.
+	var apiServer struct {
+		ID string `json:"id"`
+	}
+	api.post("/api/v1/agents/"+agentID+"/servers", map[string]string{
+		"name": "api", "address": "10.0.0.6",
+	}, &apiServer)
+	var routed struct {
+		ID int `json:"id"`
+	}
+	api.post("/api/v1/domains", map[string]any{
+		"subdomain": "paths", "zone_id": zone.ID, "server_id": server.ID,
+		"port": 2412, "ssl_mode": "central",
+		"proxy_config": map[string]any{"routes": []map[string]any{
+			{"match": "exact", "path": "/api/world", "server_id": apiServer.ID, "port": 80},
+			{"match": "prefix", "path": "/media", "server_id": apiServer.ID, "port": 9000, "strip_prefix": true},
+		}},
+	}, &routed)
+	routedPath := filepath.Join(proxyConfigDir, "nurproxy-paths.sandbox.test.conf")
+	var routedStatus, routedError string
+	waitFor(t, 90*time.Second, func() bool {
+		var d struct {
+			Status   string `json:"status"`
+			ErrorMsg string `json:"error_msg"`
+		}
+		api.get(fmt.Sprintf("/api/v1/domains/%d", routed.ID), &d)
+		routedStatus, routedError = d.Status, d.ErrorMsg
+		content, err := os.ReadFile(routedPath)
+		return d.Status == "active" && err == nil &&
+			bytes.Contains(content, []byte("    location = /api/world {\n        proxy_pass http://10.0.0.6:80;\n")) &&
+			bytes.Contains(content, []byte("    location /media/ {\n        rewrite ^/media/?(.*)$ /$1 break;\n        proxy_pass http://10.0.0.6:9000;\n")) &&
+			bytes.Contains(content, []byte("    location / {\n        proxy_pass http://10.0.0.5:2412;\n"))
+	})
+	if routedStatus != "active" {
+		t.Fatalf("domain with path routes never became active (status %q, error %q)", routedStatus, routedError)
+	}
+	// The route server cannot be deleted while the route uses it.
+	if code := api.status(http.MethodDelete, "/api/v1/servers/"+apiServer.ID); code != http.StatusConflict {
+		t.Fatalf("deleting a server used by a path route: status %d, want 409", code)
+	}
+
 	// Rename the apex domain to www (#151): the new name gets its own record
 	// and certificate, the old record (NurProxy-created) is deleted once the new
 	// one exists, and the old vhost file leaves the agent.
@@ -723,6 +768,23 @@ func (c *apiClient) do(method, path string, body, out any) {
 func (c *apiClient) get(path string, out any)     { c.do(http.MethodGet, path, nil, out) }
 func (c *apiClient) post(path string, b, out any) { c.do(http.MethodPost, path, b, out) }
 func (c *apiClient) put(path string, b, out any)  { c.do(http.MethodPut, path, b, out) }
+
+// status sends a bodyless request and returns the response status, for
+// calls that are expected to fail.
+func (c *apiClient) status(method, path string) int {
+	c.t.Helper()
+	req, err := http.NewRequest(method, c.base+path, nil)
+	if err != nil {
+		c.t.Fatalf("new request %s %s: %v", method, path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
 
 // sandboxServerCert mints a self-signed server certificate for host, standing
 // in for an operator's existing bundle.
