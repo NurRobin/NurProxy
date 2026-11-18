@@ -33,6 +33,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -45,59 +46,10 @@ const adminPassword = "sandbox-e2e-pass"
 func TestSandboxEndToEnd(t *testing.T) {
 	repoRoot := repoRoot(t)
 	bin := buildBinaries(t, repoRoot)
-
-	orchPort := freePort(t)
 	dataRoot := t.TempDir()
-	base := fmt.Sprintf("http://127.0.0.1:%d", orchPort)
 
-	// --- start the dry-run orchestrator --------------------------------------
-	orch := startProcess(t, bin.orch, []string{
-		"-port", fmt.Sprintf("%d", orchPort),
-		"-data-dir", filepath.Join(dataRoot, "orch"),
-	}, "NP_DRY_RUN=true")
-	defer orch.stop()
-
-	// A fresh-DB cold boot must run every migration and a single WAL fsync
-	// before the API serves /health; on slow/loaded CI disks that can take tens
-	// of seconds, so allow a generous readiness window (the convergence wait
-	// below uses 75s for a full reconciler cycle).
-	waitFor(t, 60*time.Second, func() bool { return httpOK(base + "/api/v1/health") })
-
-	// Health must advertise the sandbox so the dashboard banner lights up.
-	var health map[string]any
-	mustGetJSON(t, &http.Client{}, base+"/api/v1/health", &health)
-	if health["dry_run"] != true || health["dns_dry_run"] != true || health["acme_dry_run"] != true || health["discovery_dry_run"] != true {
-		t.Fatalf("health did not report dry-run: %v", health)
-	}
-
-	// --- bootstrap auth + API key (cookie session) ---------------------------
-	jar, _ := cookiejar.New(nil)
-	cli := &http.Client{Jar: jar}
-	postJSON(t, cli, base+"/api/v1/auth/setup", map[string]string{"password": adminPassword}, nil)
-	var keyResp struct {
-		APIKey string `json:"api_key"`
-	}
-	postJSON(t, cli, base+"/api/v1/api-key", map[string]string{}, &keyResp)
-	if keyResp.APIKey == "" {
-		t.Fatal("no API key returned")
-	}
-	api := &apiClient{base: base, key: keyResp.APIKey, t: t}
-
-	// --- provider (dummy creds) + zone ---------------------------------------
-	var prov struct {
-		ID string `json:"id"`
-	}
-	api.post("/api/v1/providers", map[string]any{
-		"type": "cloudflare", "name": "CF-dry",
-		"config": map[string]string{"api_token": "dummy-dry-token"},
-	}, &prov)
-	if prov.ID == "" {
-		t.Fatal("provider not created (dry-run validation should accept a dummy token)")
-	}
-	var zone struct {
-		ID string `json:"id"`
-	}
-	api.post("/api/v1/zones", map[string]string{"provider_id": prov.ID, "name": "sandbox.test"}, &zone)
+	stack := startDryOrchestrator(t, bin, dataRoot)
+	base, api, zone := stack.base, stack.api, stack.zone
 
 	// --- start the hermetic existing-nginx agent ------------------------------
 	agentPort := freePort(t)
@@ -123,25 +75,23 @@ func TestSandboxEndToEnd(t *testing.T) {
 	}, "NURPROXY_NO_SUDO=1", "PATH="+filepath.Dir(bin.proxy)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	defer agent.stop()
 
-	// --- adopt the agent once it registers -----------------------------------
-	var agentID string
-	waitFor(t, 15*time.Second, func() bool {
-		var agents []struct {
-			ID   string `json:"id"`
-			FQDN string `json:"fqdn"`
-		}
-		api.get("/api/v1/agents", &agents)
-		for _, a := range agents {
-			if a.FQDN == "edge1.sandbox.test" {
-				agentID = a.ID
-				return true
-			}
-		}
-		return false
+	// A dry built-in agent next to it: its Caddy is simulated in memory, but the
+	// routes and TLS strategy it records are what a real Caddy would be given,
+	// so they can be checked against a real caddy binary below.
+	caddyAgentPort := freePort(t)
+	caddyAgentDataDir := filepath.Join(dataRoot, "agent2")
+	caddyAgent := startProcess(t, bin.agent, []string{
+		"-dry-run",
+		"-orchestrator", base,
+		"-fqdn", "edge2.sandbox.test",
+		"-api-port", fmt.Sprintf("%d", caddyAgentPort),
+		"-data-dir", caddyAgentDataDir,
 	})
-	api.put("/api/v1/agents/"+agentID+"/adopt", map[string]any{
-		"name": "edge1", "zone_ids": []string{zone.ID},
-	}, nil)
+	defer caddyAgent.stop()
+
+	// --- adopt the agents once they register ---------------------------------
+	agentID := stack.adoptAgent(t, "edge1.sandbox.test", "edge1")
+	caddyAgentID := stack.adoptAgent(t, "edge2.sandbox.test", "edge2")
 
 	// --- server + central-TLS domain (triggers simulated issuance) -----------
 	var server struct {
@@ -188,6 +138,31 @@ func TestSandboxEndToEnd(t *testing.T) {
 		}, &wd)
 		wildcardIDs = append(wildcardIDs, wd.ID)
 	}
+	// A domain on the Caddy agent that turns on most structured proxy options,
+	// so the real-caddy check below covers more of caddygen than a bare proxy.
+	var caddyServer struct {
+		ID string `json:"id"`
+	}
+	api.post("/api/v1/agents/"+caddyAgentID+"/servers", map[string]string{
+		"name": "api", "address": "10.0.0.6",
+	}, &caddyServer)
+	var caddyDomain struct {
+		ID int `json:"id"`
+	}
+	api.post("/api/v1/domains", map[string]any{
+		"subdomain": "api", "zone_id": zone.ID, "server_id": caddyServer.ID,
+		"port": 9000, "ssl_mode": "central",
+		"proxy_config": map[string]any{
+			"force_https":             true,
+			"websocket":               true,
+			"custom_request_headers":  map[string]string{"X-Sandbox": "1"},
+			"custom_response_headers": map[string]string{"X-Frame-Options": "DENY"},
+			"path_strip":              "/v1",
+			"timeout_read":            30,
+			"timeout_idle":            60,
+			"ip_allowlist":            []string{"10.0.0.0/8", "127.0.0.1"},
+		},
+	}, &caddyDomain)
 
 	// --- assert convergence ---------------------------------------------------
 	// The CNAME (which flips the domain to active) is written on a reconciler
@@ -279,6 +254,10 @@ func TestSandboxEndToEnd(t *testing.T) {
 	if issued != 1 {
 		t.Fatalf("*.sandbox.test issued %d times, want exactly once", issued)
 	}
+	// The Caddy agent's domain converges in the same cycle; then its recorded
+	// config goes through a real caddy when one is available (#96).
+	stack.waitDomainActive(t, caddyDomain.ID)
+	validateDryCaddyAgent(t, caddyAgentPort, caddyAgentDataDir, 1)
 
 	// The DNS record must be a simulated one (dryrun-* ID from the in-memory store).
 	var dom struct {
@@ -367,6 +346,10 @@ func TestSandboxEndToEnd(t *testing.T) {
 	if got, err := os.ReadFile(apexVhostPath); err != nil || !bytes.Equal(got, apexVhostBefore) {
 		t.Fatalf("logging change on one domain rewrote another domain's vhost: err=%v", err)
 	}
+
+	// The agent's nginx is a fixture that accepts anything; a real nginx must
+	// accept the rendered vhosts too, with their real cert paths (#96).
+	validateNginxVhosts(t, proxyConfigDir, agentDataDir)
 
 	stalePath := filepath.Join(proxyConfigDir, "nurproxy-stale.sandbox.test.conf.nurproxy-tmp")
 	if err := os.WriteFile(stalePath, []byte(agentproxy.ManagedArtifactMarker+"\n# stale sandbox temp\n"), 0o644); err != nil {
@@ -800,7 +783,119 @@ func assertDiscoveryImport(t *testing.T, api *apiClient, agentID string) {
 // helpers
 // ---------------------------------------------------------------------------
 
-type binaries struct{ orch, agent, proxy string }
+type binaries struct{ orch, agent, proxy, upstream string }
+
+// sandboxStack is a running dry-run orchestrator with an API key and a seeded
+// provider (dummy token) and zone (sandbox.test).
+type sandboxStack struct {
+	base string
+	api  *apiClient
+	zone struct {
+		ID string `json:"id"`
+	}
+}
+
+// startDryOrchestrator boots a dry-run orchestrator, bootstraps auth and an API
+// key, and seeds a provider and the sandbox.test zone. The process is stopped
+// via t.Cleanup.
+func startDryOrchestrator(t *testing.T, bin binaries, dataRoot string) *sandboxStack {
+	t.Helper()
+	orchPort := freePort(t)
+	base := fmt.Sprintf("http://127.0.0.1:%d", orchPort)
+	orch := startProcess(t, bin.orch, []string{
+		"-port", fmt.Sprintf("%d", orchPort),
+		"-data-dir", filepath.Join(dataRoot, "orch"),
+	}, "NP_DRY_RUN=true")
+	t.Cleanup(orch.stop)
+
+	// A fresh-DB cold boot must run every migration and a single WAL fsync
+	// before the API serves /health; on slow/loaded CI disks that can take tens
+	// of seconds, so allow a generous readiness window (the convergence wait
+	// uses 75s for a full reconciler cycle).
+	waitFor(t, 60*time.Second, func() bool { return httpOK(base + "/api/v1/health") })
+
+	// Health must advertise the sandbox so the dashboard banner lights up.
+	var health map[string]any
+	mustGetJSON(t, &http.Client{}, base+"/api/v1/health", &health)
+	if health["dry_run"] != true || health["dns_dry_run"] != true || health["acme_dry_run"] != true || health["discovery_dry_run"] != true {
+		t.Fatalf("health did not report dry-run: %v", health)
+	}
+
+	// --- bootstrap auth + API key (cookie session) ---------------------------
+	jar, _ := cookiejar.New(nil)
+	cli := &http.Client{Jar: jar}
+	postJSON(t, cli, base+"/api/v1/auth/setup", map[string]string{"password": adminPassword}, nil)
+	var keyResp struct {
+		APIKey string `json:"api_key"`
+	}
+	postJSON(t, cli, base+"/api/v1/api-key", map[string]string{}, &keyResp)
+	if keyResp.APIKey == "" {
+		t.Fatal("no API key returned")
+	}
+	s := &sandboxStack{base: base, api: &apiClient{base: base, key: keyResp.APIKey, t: t}}
+
+	// --- provider (dummy creds) + zone ---------------------------------------
+	var prov struct {
+		ID string `json:"id"`
+	}
+	s.api.post("/api/v1/providers", map[string]any{
+		"type": "cloudflare", "name": "CF-dry",
+		"config": map[string]string{"api_token": "dummy-dry-token"},
+	}, &prov)
+	if prov.ID == "" {
+		t.Fatal("provider not created (dry-run validation should accept a dummy token)")
+	}
+	s.api.post("/api/v1/zones", map[string]string{"provider_id": prov.ID, "name": "sandbox.test"}, &s.zone)
+	return s
+}
+
+// adoptAgent waits for the agent with fqdn to register and adopts it onto the
+// stack's zone, returning its ID.
+func (s *sandboxStack) adoptAgent(t *testing.T, fqdn, name string) string {
+	t.Helper()
+	var agentID string
+	waitFor(t, 15*time.Second, func() bool {
+		var agents []struct {
+			ID   string `json:"id"`
+			FQDN string `json:"fqdn"`
+		}
+		s.api.get("/api/v1/agents", &agents)
+		for _, a := range agents {
+			if a.FQDN == fqdn {
+				agentID = a.ID
+				return true
+			}
+		}
+		return false
+	})
+	s.api.put("/api/v1/agents/"+agentID+"/adopt", map[string]any{
+		"name": name, "zone_ids": []string{s.zone.ID},
+	}, nil)
+	return agentID
+}
+
+// waitDomainActive waits one reconciler cycle plus margin for the domain to be
+// active with a managed DNS record.
+func (s *sandboxStack) waitDomainActive(t *testing.T, id int) {
+	t.Helper()
+	var last string
+	deadline := time.Now().Add(75 * time.Second)
+	for time.Now().Before(deadline) {
+		var d struct {
+			Status      string `json:"status"`
+			ErrorMsg    string `json:"error_msg"`
+			DNSManaged  bool   `json:"dns_managed"`
+			DNSRecordID string `json:"dns_record_id"`
+		}
+		s.api.get(fmt.Sprintf("/api/v1/domains/%d", id), &d)
+		if d.Status == "active" && d.DNSManaged && d.DNSRecordID != "" {
+			return
+		}
+		last = d.Status + " " + d.ErrorMsg
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("domain %d never became active (last: %s)", id, last)
+}
 
 func repoRoot(t *testing.T) string {
 	// test/sandbox -> repo root is two levels up.
@@ -817,7 +912,12 @@ func repoRoot(t *testing.T) string {
 func buildBinaries(t *testing.T, root string) binaries {
 	t.Helper()
 	out := t.TempDir()
-	b := binaries{orch: filepath.Join(out, "nurproxy-orch"), agent: filepath.Join(out, "nurproxy-agent"), proxy: filepath.Join(out, "nginx")}
+	b := binaries{
+		orch:     filepath.Join(out, "nurproxy-orch"),
+		agent:    filepath.Join(out, "nurproxy-agent"),
+		proxy:    filepath.Join(out, "nginx"),
+		upstream: filepath.Join(out, "fakeupstream"),
+	}
 	build := func(bin, tags, pkg string) {
 		args := []string{"build"}
 		if tags != "" {
@@ -833,12 +933,15 @@ func buildBinaries(t *testing.T, root string) binaries {
 	build(b.orch, "headless", "./cmd/nurproxy")
 	build(b.agent, "", "./cmd/nurproxy-agent")
 	build(b.proxy, "sandbox", "./test/sandbox/proxyfixture")
+	build(b.upstream, "sandbox", "./test/sandbox/fakeupstream")
 	return b
 }
 
 type process struct {
-	cmd *exec.Cmd
-	t   *testing.T
+	cmd     *exec.Cmd
+	t       *testing.T
+	logPath string
+	stopped bool
 }
 
 func startProcess(t *testing.T, bin string, args []string, env ...string) *process {
@@ -850,21 +953,63 @@ func startProcess(t *testing.T, bin string, args []string, env ...string) *proce
 			cmd.Env = append(cmd.Env, value)
 		}
 	}
+	p := &process{cmd: cmd, t: t}
 	logf, err := os.Create(filepath.Join(t.TempDir(), filepath.Base(bin)+".log"))
 	if err == nil {
 		cmd.Stdout, cmd.Stderr = logf, logf
+		p.logPath = logf.Name()
 	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("starting %s: %v", bin, err)
 	}
-	return &process{cmd: cmd, t: t}
+	return p
 }
 
 func (p *process) stop() {
+	if p.stopped {
+		return
+	}
+	p.stopped = true
 	if p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
 		_, _ = p.cmd.Process.Wait()
 	}
+}
+
+// terminate asks the process to shut down with SIGTERM, so it can stop its own
+// children (the agent stops its Caddy), and kills it after a grace period.
+func (p *process) terminate(grace time.Duration) {
+	if p.stopped || p.cmd.Process == nil {
+		return
+	}
+	p.stopped = true
+	_ = p.cmd.Process.Signal(syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		_, _ = p.cmd.Process.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(grace):
+		_ = p.cmd.Process.Kill()
+		<-done
+	}
+}
+
+// logTail returns the last n bytes of the process log, for failure messages.
+func (p *process) logTail(n int) string {
+	if p.logPath == "" {
+		return ""
+	}
+	b, err := os.ReadFile(p.logPath)
+	if err != nil {
+		return ""
+	}
+	if len(b) > n {
+		b = b[len(b)-n:]
+	}
+	return string(b)
 }
 
 func freePort(t *testing.T) int {
