@@ -10,6 +10,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/discoverysvc"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
@@ -39,8 +40,14 @@ type RoutePusher interface {
 // CNAME using the zone provider's stored credentials — the explicit admin override
 // of the default "never touch a record we didn't create" stance, used to migrate an
 // existing domain whose DNS predates NurProxy. The reconciler implements it.
+//
+// The takeover transfers ownership: the record is stored as managed, so a later
+// domain delete removes it at the provider, even when it was an operator-created
+// CNAME that already matched. PreviewDomainDNSTakeover returns the same plan
+// (the records that would be deleted) without changing anything.
 type DNSTakeover interface {
-	TakeoverDomainDNS(ctx context.Context, domID int64) error
+	TakeoverDomainDNS(ctx context.Context, domID int64, expectDelete []string) (*models.DNSTakeoverPlan, error)
+	PreviewDomainDNSTakeover(ctx context.Context, domID int64) (*models.DNSTakeoverPlan, error)
 }
 
 // CertIssuer obtains a central TLS certificate for a host on demand (the §7
@@ -87,6 +94,9 @@ type Server struct {
 	// caStatus reports the latest ACME-CA reachability observation (#91), wired
 	// from the tls.CAProber. Nil (never wired, or ACME dry-run) omits the check.
 	caStatus func() tls.CAStatus
+
+	// discovery runs server discovery sources (#25).
+	discovery *discoverysvc.Service
 }
 
 // SetDryRun records whether the orchestrator is running in DNS/ACME sandbox mode
@@ -138,6 +148,7 @@ func NewServer(database *db.DB, version string) *Server {
 		certUploads: newCertUploadBroker(),
 		// 5 failed logins per IP within 15 min → locked out for 15 min.
 		loginLimiter: ratelimit.New(5, 15*time.Minute, 15*time.Minute),
+		discovery:    discoverysvc.New(database, false),
 	}
 
 	// Wire the session TTL and the server-side revocation-version provider ONCE,
@@ -247,6 +258,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/v1/providers/{id}", s.requireAuth(s.handleDeleteProvider))
 	s.mux.HandleFunc("GET /api/v1/providers/{id}/zones", s.requireAuth(s.handleListProviderZones))
 
+	// Server discovery sources (#25)
+	s.mux.HandleFunc("GET /api/v1/discovery/types", s.requireAuth(s.handleListDiscoveryTypes))
+	s.mux.HandleFunc("GET /api/v1/discovery/sources", s.requireAuth(s.handleListDiscoverySources))
+	s.mux.HandleFunc("POST /api/v1/discovery/sources", s.requireAuth(s.handleCreateDiscoverySource))
+	s.mux.HandleFunc("POST /api/v1/discovery/test", s.requireAuth(s.handleTestDiscoverySource))
+	s.mux.HandleFunc("GET /api/v1/discovery/sources/{id}", s.requireAuth(s.handleGetDiscoverySource))
+	s.mux.HandleFunc("PUT /api/v1/discovery/sources/{id}", s.requireAuth(s.handleUpdateDiscoverySource))
+	s.mux.HandleFunc("DELETE /api/v1/discovery/sources/{id}", s.requireAuth(s.handleDeleteDiscoverySource))
+	s.mux.HandleFunc("POST /api/v1/discovery/sources/{id}/run", s.requireAuth(s.handleRunDiscovery))
+	s.mux.HandleFunc("GET /api/v1/discovery/sources/{id}/candidates", s.requireAuth(s.handleDiscoveryCandidates))
+
 	// Zones (auth required)
 	s.mux.HandleFunc("GET /api/v1/zones", s.requireAuth(s.handleListAllZones))
 	s.mux.HandleFunc("POST /api/v1/zones", s.requireAuth(s.handleCreateZone))
@@ -313,6 +335,7 @@ func (s *Server) registerRoutes() {
 	// Servers (auth required)
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/servers", s.requireAuth(s.handleListServers))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/servers", s.requireAuth(s.handleCreateServer))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/servers/import", s.requireAuth(s.handleImportServers))
 	s.mux.HandleFunc("PUT /api/v1/servers/{id}", s.requireAuth(s.handleUpdateServer))
 	s.mux.HandleFunc("DELETE /api/v1/servers/{id}", s.requireAuth(s.handleDeleteServer))
 
@@ -326,6 +349,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/config", s.requireAuth(s.handleUpdateDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/config/reset", s.requireAuth(s.handleResetDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/dns/takeover", s.requireAuth(s.handleDomainDNSTakeover))
+	s.mux.HandleFunc("GET /api/v1/domains/{id}/failover", s.requireAuth(s.handleGetDomainFailover))
+	s.mux.HandleFunc("PUT /api/v1/domains/{id}/backups", s.requireAuth(s.handleSetDomainBackups))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/certificate", s.requireAuth(s.handleImportDomainCertificate))
 	s.mux.HandleFunc("GET /api/v1/domains/{id}/certificate/candidates", s.requireAuth(s.handleDomainCertificateCandidates))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/certificate/adopt", s.requireAuth(s.handleAdoptDomainCertificate))

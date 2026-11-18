@@ -118,6 +118,9 @@ type DomainRename struct {
 	// agent is covered by the DomainMove tombstone instead.
 	AgentID   string
 	Tombstone *helperprotocol.ManagedDeletion
+	// Standby holds the deletions persisted for the old host's standby vhosts
+	// on nginx/apache backup agents (#74), keyed by agent id.
+	Standby map[string]helperprotocol.ManagedDeletion
 }
 
 // renamedRouteResourceID names the tombstone of a vhost a domain left behind by
@@ -156,6 +159,10 @@ func (d *DB) BeginDomainRename(before, after *models.Domain, at time.Time) (*Dom
 		helperprotocol.ManagedVhostKey(rename.OldHost) == helperprotocol.ManagedVhostKey(rename.NewHost) {
 		return rename, nil
 	}
+	if err := d.tombstoneRenamedStandby(before, rename, at); err != nil {
+		d.AbortDomainRename(rename)
+		return nil, err
+	}
 	oldSrv, err := d.GetServer(before.ServerID)
 	if err != nil {
 		return rename, nil
@@ -189,10 +196,54 @@ func (d *DB) BeginDomainRename(before, after *models.Domain, at time.Time) (*Dom
 // AbortDomainRename removes the tombstone BeginDomainRename persisted, for when
 // the domain row update itself failed. Best-effort.
 func (d *DB) AbortDomainRename(rename *DomainRename) {
-	if rename == nil || rename.Tombstone == nil {
+	if rename == nil {
+		return
+	}
+	for agentID, deletion := range rename.Standby {
+		_ = d.DeleteManagedRouteTombstones(agentID, []helperprotocol.ManagedDeletion{deletion})
+	}
+	if rename.Tombstone == nil {
 		return
 	}
 	_ = d.DeleteManagedRouteTombstones(rename.AgentID, []helperprotocol.ManagedDeletion{*rename.Tombstone})
+}
+
+// tombstoneRenamedStandby persists a deletion of the old host's standby vhost
+// on every nginx/apache backup agent of the domain. The standby resource
+// itself stays rendered under the new host, so the tombstone gets its own
+// identity, as on the primary.
+func (d *DB) tombstoneRenamedStandby(before *models.Domain, rename *DomainRename, at time.Time) error {
+	backups, err := d.ListDomainBackups(before.ID)
+	if err != nil {
+		return err
+	}
+	for _, b := range backups {
+		agent, err := d.GetAgent(b.AgentID)
+		if err != nil {
+			continue
+		}
+		backend := managedBackendForAgent(agent)
+		if backend != "nginx" && backend != "apache" {
+			continue
+		}
+		deletion := helperprotocol.ManagedDeletion{
+			ResourceID: standbyRenamedResourceID(before.ID, agent.ID, rename.OldHost),
+			Host:       rename.OldHost, Backend: backend,
+		}
+		if err := d.UpsertManagedRouteTombstone(agent.ID, deletion, at); err != nil {
+			return err
+		}
+		if rename.Standby == nil {
+			rename.Standby = make(map[string]helperprotocol.ManagedDeletion)
+		}
+		rename.Standby[agent.ID] = deletion
+	}
+	// The standby routes are rendered again under the new host; until each
+	// backup acknowledges that, it is not ready to take over.
+	if _, err := d.sql.Exec(`DELETE FROM domain_standby_status WHERE domain_id = ?`, before.ID); err != nil {
+		return fmt.Errorf("clearing standby status of domain %d: %w", before.ID, err)
+	}
+	return nil
 }
 
 // FinishDomainRename runs after the renamed row is stored. It deletes the

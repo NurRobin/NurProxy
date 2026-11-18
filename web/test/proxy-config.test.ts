@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { proxyConfigChanges, type ProxyConfigFormEdits } from '../src/lib/proxy-config.ts';
+import { pathRouteEdit, proxyConfigChanges, wildcardEligible, type ProxyConfigFormEdits } from '../src/lib/proxy-config.ts';
 import type { ProxyConfig } from '../src/lib/types.ts';
 
 const stored = {
@@ -19,6 +19,7 @@ const unchanged: ProxyConfigFormEdits = {
   max_body_size: '10m',
   access_log: '',
   error_log_level: '',
+  tls_wildcard: false,
   custom_request_headers: [{ key: 'X-B', value: '2' }, { key: 'X-A', value: '1' }],
 };
 
@@ -51,8 +52,44 @@ test('logging settings are sent when changed and cleared back to the host defaul
   assert.deepEqual(proxyConfigChanges(quiet, unchanged), { access_log: null, error_log_level: null });
 });
 
+test('path routes are sent whole when changed and cleared with null (#89)', () => {
+  const routes = [
+    { match: 'exact', path: '/api/world', server_id: 's2', port: 80 },
+    { match: 'prefix', path: '/media', server_id: 's3', port: 9000, strip_prefix: true },
+  ] as NonNullable<ProxyConfig['routes']>;
+  const withRoutes = { ...stored, routes } as ProxyConfig;
+  const rows = routes.map(pathRouteEdit);
+  assert.equal(proxyConfigChanges(withRoutes, { ...unchanged, routes: rows }), undefined);
+  assert.equal(proxyConfigChanges(withRoutes, unchanged), undefined, 'a form without the routes tab leaves them alone');
+
+  const added = { match: 'exact' as const, path: ' /x ', server_id: 's2', port: '81', upstream_scheme: 'https', websocket: true, strip_prefix: true };
+  assert.deepEqual(proxyConfigChanges(withRoutes, { ...unchanged, routes: [...rows, added] }), {
+    routes: [...routes, { match: 'exact', path: '/x', server_id: 's2', port: 81, upstream_scheme: 'https', websocket: true }],
+  });
+  assert.deepEqual(proxyConfigChanges(withRoutes, { ...unchanged, routes: [] }), { routes: null });
+  assert.equal(proxyConfigChanges(stored, { ...unchanged, routes: [{ ...added, path: '' }] }), undefined, 'rows without a path are ignored');
+});
+
 test('works without a stored config', () => {
-  const empty: ProxyConfigFormEdits = { websocket: false, force_https: false, max_body_size: '', access_log: '', error_log_level: '', custom_request_headers: [] };
+  const empty: ProxyConfigFormEdits = { websocket: false, force_https: false, max_body_size: '', access_log: '', error_log_level: '', tls_wildcard: false, custom_request_headers: [] };
   assert.equal(proxyConfigChanges(undefined, empty), undefined);
   assert.deepEqual(proxyConfigChanges(undefined, { ...empty, websocket: true }), { websocket: true });
+});
+
+test('the zone wildcard opt-in is sent when toggled either way (#69)', () => {
+  assert.deepEqual(proxyConfigChanges(stored, { ...unchanged, tls_wildcard: true }), { tls_wildcard: true });
+  const wild = { ...stored, tls_wildcard: true } as ProxyConfig;
+  assert.equal(proxyConfigChanges(wild, { ...unchanged, tls_wildcard: true }), undefined);
+  assert.deepEqual(proxyConfigChanges(wild, unchanged), { tls_wildcard: false });
+});
+
+test('wildcard eligibility mirrors the orchestrator rules (#69)', () => {
+  assert.equal(wildcardEligible('app'), true);
+  assert.equal(wildcardEligible('app', 'auto', 'central'), true);
+  assert.equal(wildcardEligible('@'), false);
+  assert.equal(wildcardEligible(''), false);
+  assert.equal(wildcardEligible('app.sub'), false);
+  assert.equal(wildcardEligible('app', 'off'), false);
+  assert.equal(wildcardEligible('app', 'off', 'central'), true);
+  assert.equal(wildcardEligible('app', 'auto', 'self-acme'), false);
 });

@@ -501,10 +501,12 @@ func (d *DB) UpdateAgent(a *models.Agent) error {
 	return nil
 }
 
-// DeleteAgent removes an agent by ID. Cascades to servers and their domains.
-// The agent's anchor records are released into agent_anchor_cleanups in the
-// same transaction, so the reconciler deletes the owned ones at the provider
-// after the row is gone.
+// DeleteAgent removes an agent and its servers. Domains are never removed
+// here: while any server of the agent still has one, the RESTRICT foreign key
+// fails the delete with ErrParentInUse and nothing changes. The agent's
+// anchor records are released into agent_anchor_cleanups in the same
+// transaction, so the reconciler deletes the owned ones at the provider after
+// the row is gone.
 func (d *DB) DeleteAgent(id string) error {
 	tx, err := d.sql.Begin()
 	if err != nil {
@@ -520,9 +522,12 @@ func (d *DB) DeleteAgent(id string) error {
 	if err := releaseAgentAnchorsTx(tx, id, "delete"); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("DELETE FROM servers WHERE agent_id = ?", id); err != nil {
+		return parentDeleteError("agent servers", id, err)
+	}
 	res, err := tx.Exec("DELETE FROM agents WHERE id = ?", id)
 	if err != nil {
-		return fmt.Errorf("deleting agent: %w", err)
+		return parentDeleteError("agent", id, err)
 	}
 
 	n, _ := res.RowsAffected()

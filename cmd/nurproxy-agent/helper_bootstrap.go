@@ -192,7 +192,7 @@ func buildRootHelperConfig(input helperBootstrapConfigInput) (helper.RootConfig,
 		PackageTarget: helper.PackageTargetConfig{Manager: "/usr/bin/apt-get", Package: pkg},
 		ManagedApply: &helper.ManagedApplyTargetConfig{
 			StagingDir: "/var/lib/nurproxy-agent/helper-staging", AvailableDir: available, EnabledDir: enabled,
-			CertificateDir: "/var/lib/nurproxy-agent/certs", CustomPolicyVersion: input.ProxyKind + "-managed-v1", ProxyVersion: input.ProxyVersion,
+			CertificateDir: helperCertificateDir, CustomPolicyVersion: input.ProxyKind + "-managed-v1", ProxyVersion: input.ProxyVersion,
 		},
 	}
 	if err := config.Validate(); err != nil {

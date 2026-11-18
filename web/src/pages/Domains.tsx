@@ -5,8 +5,8 @@ import { usePolling } from '../lib/usePolling';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
-import { proxyConfigChanges } from '../lib/proxy-config';
-import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities } from '../lib/types';
+import { proxyConfigChanges, wildcardEligible, pathRouteEdit, type PathRouteEdit } from '../lib/proxy-config';
+import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities, DNSTakeoverPlan } from '../lib/types';
 import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
@@ -16,6 +16,7 @@ import Button from '../components/Button';
 import Callout from '../components/Callout';
 import DiskCertificates from '../components/DiskCertificates';
 import HelpTip from '../components/HelpTip';
+import DomainFailoverPanel from '../components/DomainFailoverPanel';
 import { Field, Input, Select, Textarea, Checkbox } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
 import { useUndoableDelete } from '../lib/undo';
@@ -28,7 +29,7 @@ interface ServerWithAgent extends Server {
   agentName: string;
 }
 
-type EditTab = 'general' | 'headers' | 'advanced';
+type EditTab = 'general' | 'headers' | 'routes' | 'failover' | 'advanced';
 type ProxiedChoice = 'keep' | 'on' | 'off';
 
 function proxiedChoice(p: boolean | null | undefined): ProxiedChoice {
@@ -70,6 +71,7 @@ export default function Domains() {
   const [createForceHttps, setCreateForceHttps] = useState(true);
   const [createCertOnly, setCreateCertOnly] = useState(false);
   const [createProxied, setCreateProxied] = useState<ProxiedChoice>('keep');
+  const [createWildcard, setCreateWildcard] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState('');
 
@@ -88,12 +90,17 @@ export default function Domains() {
   const [editProxied, setEditProxied] = useState<ProxiedChoice>('keep');
   const [editAccessLog, setEditAccessLog] = useState('');
   const [editErrorLogLevel, setEditErrorLogLevel] = useState('');
+  const [editWildcard, setEditWildcard] = useState(false);
   const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
+  const [editRoutes, setEditRoutes] = useState<PathRouteEdit[]>([]);
   const [editRawConfig, setEditRawConfig] = useState('');
   const [editConfigBackend, setEditConfigBackend] = useState('caddy');
   const [configManual, setConfigManual] = useState(false);
   const [advancedError, setAdvancedError] = useState('');
   const [editLoading, setEditLoading] = useState(false);
+  const [takeoverPlan, setTakeoverPlan] = useState<DNSTakeoverPlan | null>(null);
+  const [takeoverLoading, setTakeoverLoading] = useState(false);
+  const [takeoverError, setTakeoverError] = useState('');
 
   const undoableDelete = useUndoableDelete();
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -157,6 +164,10 @@ export default function Domains() {
     : '';
   const unsupportedHint = (key: keyof ProxyCapabilities) =>
     supports(key) ? undefined : t('domains.capUnsupported', { backend: backendName });
+  // Path routes are proxied by the domain's agent, so only its servers qualify.
+  const routeServers = detailAgent ? allServers.filter((s) => s.agent_id === detailAgent.id) : allServers;
+  const updateRoute = (i: number, patch: Partial<PathRouteEdit>) =>
+    setEditRoutes(editRoutes.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 
   const filtered = domains.filter((d) => {
     if (statusFilter !== 'all' && d.status !== statusFilter) return false;
@@ -179,11 +190,13 @@ export default function Domains() {
         ...(!createCertOnly && zoneSupportsProxy(createZone) && createProxied !== 'keep'
           ? { proxied: proxiedValue(createProxied) }
           : {}),
+        ...(createWildcard && wildcardEligible(createSub) ? { proxy_config: { tls_wildcard: true } } : {}),
       });
       toast.success(t('domains.created', { fqdn: domainFqdn(createSub, getZoneName(createZone)) }));
       setShowCreate(false);
       setCreateSub(''); setCreateZone(''); setCreateServer(''); setCreatePort('80');
       setCreateWebsocket(false); setCreateForceHttps(true); setCreateCertOnly(false); setCreateProxied('keep');
+      setCreateWildcard(false);
       fetchData();
     } catch (err) {
       setCreateError(errMessage(err, t('domains.createFailed')));
@@ -201,13 +214,59 @@ export default function Domains() {
     setEditProxied(proxiedChoice(d.proxied));
     setEditAccessLog(d.proxy_config?.access_log ?? '');
     setEditErrorLogLevel(d.proxy_config?.error_log_level ?? '');
+    setEditWildcard(d.proxy_config?.tls_wildcard ?? false);
     setEditHeaders(d.proxy_config?.custom_request_headers
       ? Object.entries(d.proxy_config.custom_request_headers).map(([key, value]) => ({ key, value }))
       : []);
+    setEditRoutes((d.proxy_config?.routes ?? []).map(pathRouteEdit));
     setEditRawConfig('');
     setEditConfigBackend('caddy');
     setConfigManual(false);
     setAdvancedError('');
+    setTakeoverPlan(null);
+    setTakeoverError('');
+  }
+
+  // The takeover deletes every record at the name, so the dashboard first
+  // fetches the dry run and shows those records; only the confirm button
+  // makes the destructive call.
+  async function previewTakeover() {
+    if (!detailDomain) return;
+    setTakeoverLoading(true);
+    setTakeoverError('');
+    try {
+      const res = await api.previewDnsTakeover(detailDomain.id);
+      setTakeoverPlan(res.plan);
+    } catch (err) {
+      setTakeoverError(errMessage(err, t('domains.takeoverFailed')));
+    } finally {
+      setTakeoverLoading(false);
+    }
+  }
+
+  async function confirmTakeover() {
+    if (!detailDomain || !takeoverPlan) return;
+    setTakeoverLoading(true);
+    setTakeoverError('');
+    try {
+      const res = await api.dnsTakeover(detailDomain.id, takeoverPlan.delete.map((rec) => rec.id));
+      toast.success(res.message);
+      setTakeoverPlan(null);
+      fetchData();
+    } catch (err) {
+      // A changed record set (409) leaves nothing changed; drop the stale
+      // list so the operator previews again.
+      setTakeoverPlan(null);
+      setTakeoverError(errMessage(err, t('domains.takeoverFailed')));
+      fetchData();
+    } finally {
+      setTakeoverLoading(false);
+    }
+  }
+
+  function dnsOwner(d: Domain) {
+    if (!d.dns_record_id) return t('domains.dnsNone');
+    return d.dns_managed ? t('domains.dnsManaged') : t('domains.dnsAdopted');
   }
 
   async function handleSaveDetail() {
@@ -223,6 +282,8 @@ export default function Domains() {
           websocket: editWebsocket, force_https: editForceHttps,
           max_body_size: editMaxBody, custom_request_headers: editHeaders,
           access_log: editAccessLog, error_log_level: editErrorLogLevel,
+          routes: detailDomain.cert_only ? undefined : editRoutes,
+          tls_wildcard: editWildcard,
         }),
       });
       toast.success(t('domains.updated'));
@@ -422,6 +483,11 @@ export default function Domains() {
               {filtered.map((d) => {
                 const zone = getZoneName(d.zone_id);
                 const srv = getServerInfo(d.server_id);
+                // With failover backups the record may point at another
+                // agent than the primary's (#74).
+                const activeSrv = d.active_server_id ? getServerInfo(d.active_server_id) : srv;
+                const onBackup = !!d.active_server_id && d.active_server_id !== d.server_id;
+                const backupCount = d.backup_server_ids?.length ?? 0;
                 return (
                   <tr key={d.id} className={`transition-colors ${selected.has(d.id) ? 'bg-accent-soft/50' : 'hover:bg-surface-2'}`}>
                     <td className="px-4 py-3">
@@ -442,7 +508,17 @@ export default function Domains() {
                       )}
                     </td>
                     <td className="px-4 py-3 font-mono text-xs text-fg-muted">{srv ? `${srv.address}:${d.port}` : `:${d.port}`}</td>
-                    <td className="px-4 py-3 text-fg-muted">{srv?.agentName ?? '—'}</td>
+                    <td className="px-4 py-3 text-fg-muted">
+                      {activeSrv?.agentName ?? srv?.agentName ?? '—'}
+                      {onBackup && (
+                        <span title={t('failover.onBackupTitle')} className="ml-2 inline-flex items-center rounded-full bg-warning-soft px-2 py-0.5 align-middle text-[11px] font-medium text-warning-fg">
+                          {t('failover.onBackup')}
+                        </span>
+                      )}
+                      {!onBackup && backupCount > 0 && (
+                        <span className="ml-2 align-middle text-[11px] text-fg-faint">{t('failover.backupCount', { count: backupCount })}</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3"><StatusBadge status={d.status} /></td>
                     <td className="px-4 py-3 text-xs text-fg-faint">{seen(d.last_synced)}</td>
                     <td className="px-4 py-3">
@@ -504,6 +580,15 @@ export default function Domains() {
           {!createCertOnly && zoneSupportsProxy(createZone) && createProxied === 'on' && (
             <Callout tone="info">{t('domains.proxiedHelp')}</Callout>
           )}
+          {wildcardEligible(createSub) && createZone && (
+            <div>
+              <Checkbox label={t('domains.tlsWildcard')} checked={createWildcard} onChange={(e) => setCreateWildcard(e.target.checked)} />
+              <p className="mt-1.5 text-xs text-fg-faint">{t('domains.tlsWildcardHint', { zone: getZoneName(createZone) })}</p>
+            </div>
+          )}
+          {createWildcard && wildcardEligible(createSub) && (
+            <Callout tone="warning">{t('domains.tlsWildcardWarning')}</Callout>
+          )}
           {createCertOnly && (
             <Callout tone="info">
               {t('domains.certOnlyHelp')}
@@ -531,14 +616,48 @@ export default function Domains() {
 
             {liveDomain.error_msg && <Callout tone="danger">{liveDomain.error_msg}</Callout>}
 
+            {!liveDomain.cert_only && (
+              <div className="space-y-3 rounded-lg border border-border p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm text-fg-muted">{dnsOwner(liveDomain)}</span>
+                  {!takeoverPlan && (
+                    <Button variant="secondary" size="sm" onClick={previewTakeover} loading={takeoverLoading}>{t('domains.takeoverPreview')}</Button>
+                  )}
+                </div>
+                {takeoverError && <Callout tone="danger">{takeoverError}</Callout>}
+                {takeoverPlan && (
+                  <div className="space-y-3">
+                    {takeoverPlan.delete.length > 0 ? (
+                      <Callout tone="warning" title={t('domains.takeoverDeletes', { count: takeoverPlan.delete.length, fqdn: takeoverPlan.fqdn })}>
+                        <ul className="mt-1 space-y-0.5 font-mono text-xs">
+                          {takeoverPlan.delete.map((rec) => (
+                            <li key={rec.id}>{rec.type} {rec.name} → {rec.content}{rec.proxied ? ` (${t('domains.takeoverProxied')})` : ''}</li>
+                          ))}
+                        </ul>
+                      </Callout>
+                    ) : (
+                      <Callout tone="info">{takeoverPlan.action === 'adopt' ? t('domains.takeoverAdopt', { fqdn: takeoverPlan.fqdn, target: takeoverPlan.target }) : t('domains.takeoverCreate', { fqdn: takeoverPlan.fqdn, target: takeoverPlan.target })}</Callout>
+                    )}
+                    <p className="text-xs text-fg-faint">{t('domains.takeoverOwnership', { target: takeoverPlan.target })}</p>
+                    <div className="flex justify-end gap-3">
+                      <Button variant="secondary" size="sm" onClick={() => setTakeoverPlan(null)}>{t('common.cancel')}</Button>
+                      <Button variant={takeoverPlan.delete.length > 0 ? 'danger' : 'primary'} size="sm" onClick={confirmTakeover} loading={takeoverLoading}>
+                        {takeoverPlan.delete.length > 0 ? t('domains.takeoverConfirmDelete', { count: takeoverPlan.delete.length }) : t('domains.takeoverConfirm')}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Tabs */}
             <div className="flex gap-1 border-b border-border">
-              {(['general', 'headers', 'advanced'] as EditTab[]).map((tab) => (
+              {((liveDomain.cert_only ? ['general', 'headers', 'advanced'] : ['general', 'headers', 'routes', 'failover', 'advanced']) as EditTab[]).map((tab) => (
                 <button key={tab} onClick={() => (tab === 'advanced' ? openAdvanced() : setEditTab(tab))}
                   className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium capitalize transition-colors ${
                     editTab === tab ? 'border-accent text-accent' : 'border-transparent text-fg-muted hover:text-fg'
                   }`}>
-                  {tab === 'general' ? t('domains.tabGeneral') : tab === 'headers' ? t('domains.tabHeaders') : t('domains.tabAdvanced')}
+                  {tab === 'general' ? t('domains.tabGeneral') : tab === 'headers' ? t('domains.tabHeaders') : tab === 'routes' ? t('domains.tabRoutes') : tab === 'failover' ? t('failover.tab') : t('domains.tabAdvanced')}
                 </button>
               ))}
             </div>
@@ -561,6 +680,21 @@ export default function Domains() {
                     {editProxied === 'on' && <Callout tone="info">{t('domains.proxiedHelp')}</Callout>}
                   </>
                 )}
+                {(() => {
+                  const eligible = wildcardEligible(liveDomain.subdomain, liveDomain.ssl_mode, liveDomain.proxy_config?.tls_policy);
+                  return (
+                    <>
+                      <div>
+                        {/* Stays editable while set, so an opt-in that no longer fits can be cleared. */}
+                        <Checkbox label={t('domains.tlsWildcard')} checked={editWildcard} disabled={!eligible && !editWildcard} onChange={(e) => setEditWildcard(e.target.checked)} />
+                        <p className="mt-1.5 text-xs text-fg-faint">
+                          {eligible ? t('domains.tlsWildcardHint', { zone: getZoneName(liveDomain.zone_id) }) : t('domains.tlsWildcardUnavailable')}
+                        </p>
+                      </div>
+                      {editWildcard && <Callout tone="warning">{t('domains.tlsWildcardWarning')}</Callout>}
+                    </>
+                  );
+                })()}
                 <Field label={t('domains.maxBodySize')} help="max-body-size" hint={supports('reverse_proxy') ? t('domains.maxBodyHint') : unsupportedHint('reverse_proxy')}>
                   <Input value={editMaxBody} onChange={(e) => setEditMaxBody(e.target.value)} placeholder={t('domains.maxBodyPh')} />
                 </Field>
@@ -605,6 +739,71 @@ export default function Domains() {
                     <button onClick={() => setEditHeaders(editHeaders.filter((_, j) => j !== i))} aria-label="Remove header" className="flex-shrink-0 rounded-lg px-2 text-fg-faint hover:text-danger-fg">
                       <X className="h-4 w-4" />
                     </button>
+                  </div>
+                ))}
+                <div className="flex justify-end pt-1">
+                  <Button onClick={handleSaveDetail} loading={editLoading}>{t('common.save')}</Button>
+                </div>
+              </div>
+            )}
+
+            {editTab === 'failover' && (
+              <DomainFailoverPanel domain={liveDomain} servers={allServers} agents={agents} onSaved={fetchData} />
+              )}
+
+            {editTab === 'routes' && (
+              <div className="space-y-4">
+                {/* Unsupported routes stay removable, so a list saved for
+                    another backend can still be cleared. */}
+                {!supports('path_routes') && (
+                  <Callout tone="warning">{t('domains.routesUnsupported', { backend: backendName })}</Callout>
+                )}
+                <p className="text-sm text-fg-muted">{t('domains.routesHint')}</p>
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium text-fg">{t('domains.routes')}</p>
+                  <button
+                    onClick={() => setEditRoutes([...editRoutes, { match: 'prefix', path: '', server_id: liveDomain.server_id, port: '', upstream_scheme: '', websocket: false, strip_prefix: false }])}
+                    disabled={!supports('path_routes') || editRoutes.length >= 32}
+                    className="text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:no-underline">
+                    {t('domains.addRoute')}
+                  </button>
+                </div>
+                {editRoutes.length === 0 && <p className="text-sm text-fg-faint">{t('domains.noRoutes')}</p>}
+                {editRoutes.map((r, i) => (
+                  <div key={i} className="space-y-2 rounded-lg border border-border p-3">
+                    <div className="flex flex-wrap gap-2">
+                      <Select aria-label={t('domains.routeMatch')} value={r.match} className="w-auto" onChange={(e) => updateRoute(i, { match: e.target.value as PathRouteEdit['match'] })}>
+                        <option value="prefix">{t('domains.routePrefix')}</option>
+                        <option value="exact">{t('domains.routeExact')}</option>
+                      </Select>
+                      <div className="min-w-40 flex-1">
+                        <Input aria-label={t('domains.routePath')} value={r.path} onChange={(e) => updateRoute(i, { path: e.target.value })} placeholder="/api" className="font-mono" />
+                      </div>
+                      <button onClick={() => setEditRoutes(editRoutes.filter((_, j) => j !== i))} aria-label={t('domains.removeRoute')} className="flex-shrink-0 rounded-lg px-2 text-fg-faint hover:text-danger-fg">
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <div className="min-w-40 flex-1">
+                        <Select aria-label={t('domains.routeServer')} value={r.server_id} onChange={(e) => updateRoute(i, { server_id: e.target.value })}>
+                          {!routeServers.some((s) => s.id === r.server_id) && <option value={r.server_id}>{r.server_id || '—'}</option>}
+                          {routeServers.map((s) => <option key={s.id} value={s.id}>{s.name} ({s.address})</option>)}
+                        </Select>
+                      </div>
+                      <div className="w-24">
+                        <Input aria-label={t('domains.routePort')} value={r.port} inputMode="numeric" onChange={(e) => updateRoute(i, { port: e.target.value })} placeholder={t('domains.routePort')} />
+                      </div>
+                      <Select aria-label={t('domains.routeScheme')} value={r.upstream_scheme} className="w-auto" onChange={(e) => updateRoute(i, { upstream_scheme: e.target.value })}>
+                        <option value="">http</option>
+                        <option value="https">https</option>
+                      </Select>
+                    </div>
+                    <div className="flex flex-wrap gap-6">
+                      <Checkbox label={t('domains.websocket')} checked={r.websocket} onChange={(e) => updateRoute(i, { websocket: e.target.checked })} />
+                      {r.match === 'prefix' && (
+                        <Checkbox label={t('domains.routeStrip')} checked={r.strip_prefix} onChange={(e) => updateRoute(i, { strip_prefix: e.target.checked })} />
+                      )}
+                    </div>
                   </div>
                 ))}
                 <div className="flex justify-end pt-1">

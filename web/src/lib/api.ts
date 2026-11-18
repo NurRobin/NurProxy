@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus, CertCandidates } from './types';
+import type { Provider, Zone, Agent, Server, DiscoveryType, DiscoverySource, DiscoveryView, DiscoveryImportResult, Domain, DNSTakeoverPlan, DomainFailoverStatus, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus, CertCandidates } from './types';
 import type { ProxyConfigUpdate } from './proxy-config';
 
 const BASE = '/api/v1';
@@ -79,6 +79,7 @@ export interface HealthResponse {
   dry_run?: boolean;
   dns_dry_run?: boolean;
   acme_dry_run?: boolean;
+  discovery_dry_run?: boolean;
   // checks carries subsystem states; "acme_ca" is "ok" or an unreachable
   // detail when the orchestrator cannot reach the ACME CA (#91).
   checks?: Record<string, string>;
@@ -167,6 +168,21 @@ export const api = {
   updateServer: (id: string, data: Partial<Server>) =>
     request<Server>(`/servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteServer: (id: string, cascade = false) => request<{ message: string }>(`/servers/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
+  importServers: (agentId: string, data: { source_id: string; items: { external_id: string; name?: string; address?: string; notes?: string }[] }) =>
+    request<DiscoveryImportResult>(`/agents/${agentId}/servers/import`, { method: 'POST', body: JSON.stringify(data) }),
+
+  // Server discovery (#25)
+  listDiscoveryTypes: () => request<DiscoveryType[]>('/discovery/types'),
+  listDiscoverySources: () => request<DiscoverySource[]>('/discovery/sources'),
+  createDiscoverySource: (data: { type: string; name: string; config: Record<string, unknown>; sync_interval: number; skip_test?: boolean }) =>
+    request<DiscoverySource>('/discovery/sources', { method: 'POST', body: JSON.stringify(data) }),
+  updateDiscoverySource: (id: string, data: { name?: string; config?: Record<string, unknown>; sync_interval?: number; skip_test?: boolean }) =>
+    request<DiscoverySource>(`/discovery/sources/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteDiscoverySource: (id: string) => request<{ message: string }>(`/discovery/sources/${id}`, { method: 'DELETE' }),
+  testDiscoverySource: (data: { type?: string; config?: Record<string, unknown>; source_id?: string }) =>
+    request<{ valid: boolean; message: string }>('/discovery/test', { method: 'POST', body: JSON.stringify(data) }),
+  runDiscovery: (id: string) => request<DiscoveryView>(`/discovery/sources/${id}/run`, { method: 'POST' }),
+  getDiscoveryCandidates: (id: string) => request<DiscoveryView>(`/discovery/sources/${id}/candidates`),
 
   // Domains
   listDomains: (params?: Record<string, string>) => {
@@ -179,6 +195,9 @@ export const api = {
   updateDomain: (id: number, data: Partial<Omit<Domain, 'proxy_config'>> & { proxy_config?: ProxyConfigUpdate }) =>
     request<Domain>(`/domains/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteDomain: (id: number) => request<{ message: string }>(`/domains/${id}`, { method: 'DELETE' }),
+  getDomainFailover: (id: number) => request<DomainFailoverStatus>(`/domains/${id}/failover`),
+  setDomainBackups: (id: number, serverIds: string[]) =>
+    request<DomainFailoverStatus>(`/domains/${id}/backups`, { method: 'PUT', body: JSON.stringify({ server_ids: serverIds }) }),
   getDomainConfig: (id: number) => request<DomainConfig>(`/domains/${id}/config`),
   updateDomainConfig: (id: number, config: unknown) =>
     request<{ message: string }>(`/domains/${id}/config`, { method: 'PUT', body: JSON.stringify({ config }) }),
@@ -191,6 +210,13 @@ export const api = {
     request<{ message: string; expires_at: string; source_path?: string; warning?: string }>(`/domains/${id}/certificate/adopt`, {
       method: 'POST', body: JSON.stringify({ fingerprint, agent_id: agentId }),
     }),
+  /** Lists the records a DNS takeover would delete; changes nothing. */
+  previewDnsTakeover: (id: number) =>
+    request<{ message: string; plan: DNSTakeoverPlan; dry_run: boolean }>(`/domains/${id}/dns/takeover?dry_run=true`, { method: 'POST' }),
+  /** expectDelete: the record ids from the preview; the server refuses (409)
+   *  when the records at the name changed since. */
+  dnsTakeover: (id: number, expectDelete: string[]) =>
+    request<{ message: string; plan: DNSTakeoverPlan }>(`/domains/${id}/dns/takeover`, { method: 'POST', body: JSON.stringify({ expect_delete: expectDelete }) }),
 
   // Config artifacts + drift review (§11, Phase 3)
   listArtifacts: (params?: Record<string, string>) => {

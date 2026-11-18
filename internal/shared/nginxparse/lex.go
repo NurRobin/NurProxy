@@ -49,6 +49,8 @@ type directive struct {
 	tokens []token
 	// comment reports that a comment appeared between the statement's words.
 	comment bool
+	// offset is the source offset of the statement's first word.
+	offset int
 }
 
 // block is a `name [args] { ... }` construct (server, location, http, ...). It
@@ -71,6 +73,8 @@ type block struct {
 	tokens []token
 	// comment reports that a comment appeared between the header's words.
 	comment bool
+	// offset is the source offset of the header's first word.
+	offset int
 }
 
 // statementEnd says how nginx's tokenizer finished a statement.
@@ -358,6 +362,7 @@ func parseStatement(s string, i, depth int) ([]block, []directive, int, bool, er
 			raw:     strings.TrimSpace(s[st.start:st.stop]),
 			tokens:  st.tokens,
 			comment: st.comment,
+			offset:  st.start,
 		}}, st.next, false, nil
 	}
 	// Block: parse the body up to the matching '}'.
@@ -367,6 +372,7 @@ func parseStatement(s string, i, depth int) ([]block, []directive, int, bool, er
 		args:    strings.TrimSpace(s[st.start+len(kind) : st.stop]),
 		tokens:  st.tokens,
 		comment: st.comment,
+		offset:  st.start,
 	}
 	j := st.next
 	for {

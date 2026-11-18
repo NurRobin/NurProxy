@@ -126,6 +126,7 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		// no per-host level.
 		AccessLog:     true,
 		ErrorLogLevel: false,
+		PathRoutes:    true,
 	}
 }
 

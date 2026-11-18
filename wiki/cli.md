@@ -102,18 +102,44 @@ nurproxy server update <server-id> [--name n] [--address a] [--notes "..."]
 nurproxy server delete <server-id>
 ```
 
+### discovery
+
+Server discovery sources (Proxmox VE). Runs on the orchestrator; imported
+machines become ordinary servers under the agent you name. See
+[Server discovery](server-discovery) for the token setup.
+
+```bash
+nurproxy discovery types
+nurproxy discovery list
+nurproxy discovery add --name homelab --config '{"url":"https://pve1.lan:8006","token_id":"nurproxy@pve!discovery","token_secret":"...","fingerprint":"AB:CD:..."}' \
+                       [--sync-interval 3600] [--skip-test]
+nurproxy discovery update <source-id> [--name n] [--config '{"verify_tls":true}'] [--sync-interval s]
+nurproxy discovery run <source-id>          # query the cluster now and print the machines
+nurproxy discovery candidates <source-id>   # last stored result
+nurproxy discovery import <source-id> --agent <agent-id> (--id <external-id> ... | --all) \
+                       [--address <external-id>=<address> ...]
+nurproxy discovery delete <source-id>       # imported servers are kept
+```
+
 ### domain
 
 ```bash
 nurproxy domain list [--agent <id>] [--server <id>] [--status <s>]
 nurproxy domain add --subdomain api --zone <zone-id> --server <server-id> --port 8080 \
                     [--websocket] [--force-https] [--ssl-mode auto] \
-                    [--access-log off] [--error-log-level crit] \
+                    [--access-log off] [--error-log-level crit] [--tls-wildcard] \
                     [--proxy-config-file ./proxy.json]
 nurproxy domain update <domain-id> [--subdomain s] [--port n] [--websocket] [--force-https] [--ssl-mode m] \
-                    [--access-log off|default] [--error-log-level <level>|default]
+                    [--access-log off|default] [--error-log-level <level>|default] [--tls-wildcard[=false]]
 nurproxy domain delete <domain-id>          # marks for deletion; reconciler cleans up
+nurproxy domain backups <domain-id> [--set <server-id>,<server-id> | --clear]
+nurproxy domain failover <domain-id>        # candidates, their health, the active agent
 ```
+
+`domain backups` without flags shows the same view as `domain failover`. With
+`--set` it replaces the backup servers (most preferred first, each on its own
+agent that serves the zone); `--clear` removes them. See
+[Failover to a second agent](failover).
 
 `--access-log off` stops writing an access log for the domain, so client IPs of
 its visitors don't end up in the host-wide log. `--error-log-level` (`info`,
@@ -127,6 +153,25 @@ of the main nginx.conf, and otherwise doesn't offer it, so source builds and
 OpenResty keep their own log. The built-in Caddy writes no access log anyway
 and has no per-domain error level. The orchestrator refuses a setting the
 domain's agent doesn't offer.
+
+Path routes send some request paths to other servers of the same agent (see
+[Domains](domains.md#path-routes) for the matching rules):
+
+```bash
+nurproxy domain route list   <domain-id>
+nurproxy domain route add    <domain-id> --path /api/world --server <server-id> --port 80 --match exact
+nurproxy domain route add    <domain-id> --path /media --server <server-id> --port 9000 \
+                             [--match prefix] [--scheme https] [--websocket] [--strip-prefix]
+nurproxy domain route remove <domain-id> --path /media [--match prefix|exact]
+```
+
+`--match` defaults to `prefix`. `remove` needs `--match` only when a prefix and
+an exact route share the path.
+`--tls-wildcard` serves the domain from its zone's shared `*.<zone>`
+certificate instead of a per-host one; `--tls-wildcard=false` on `update` turns
+it off again. Only a single label directly below the zone with central TLS can
+use it, and the private key is then shared by every agent serving a wildcard
+domain of the zone. See [Domains](domains.md#zone-wildcard-certificate).
 
 For advanced per-domain proxy options (custom headers, timeouts, basic auth, IP
 allow/block lists, path rewriting), pass a `ProxyConfig` JSON document via

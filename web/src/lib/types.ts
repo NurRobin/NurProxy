@@ -166,6 +166,10 @@ export interface ProxyCapabilities {
   /** Absent on agents that predate per-domain logging control. */
   access_log?: boolean;
   error_log_level?: boolean;
+  /** Absent on agents that predate path routes. */
+  path_routes?: boolean;
+  /** True when the backend replaces ${NAME} in header values at config load (Apache). */
+  header_config_vars?: boolean;
 }
 
 export interface Agent {
@@ -371,6 +375,77 @@ export interface Server {
   address: string;
   notes?: string;
   created_at: string;
+  /** Set on servers imported from a discovery source (#25). */
+  discovery_source_id?: string;
+  external_id?: string;
+  /** Set while the source no longer reports the machine. */
+  discovery_missing_since?: string;
+}
+
+export interface DiscoveryType {
+  id: string;
+  name: string;
+  description: string;
+  secret_fields: string[];
+}
+
+export interface DiscoverySource {
+  id: string;
+  type: string;
+  type_name: string;
+  name: string;
+  /** Endpoint and token ID; never the secret. */
+  summary: string;
+  /** The stored config without its secret fields. */
+  settings: Record<string, unknown>;
+  /** Seconds; 0 = only on demand. */
+  sync_interval: number;
+  last_run_at?: string;
+  last_error?: string;
+  created_at: string;
+  candidates: number;
+  imported: number;
+  missing: number;
+}
+
+export type DiscoveredAddressKind = 'private' | 'shared' | 'public' | 'container-bridge' | 'link-local' | 'loopback';
+
+export interface DiscoveredAddress {
+  ip: string;
+  prefix?: number;
+  interface?: string;
+  kind: DiscoveredAddressKind;
+}
+
+export interface DiscoveryCandidate {
+  external_id: string;
+  name: string;
+  kind?: string;
+  location?: string;
+  status?: string;
+  addresses: DiscoveredAddress[];
+  suggested_address?: string;
+  address_source?: string;
+  notes?: string;
+  /** Set when the machine is already imported. */
+  server_id?: string;
+  server_name?: string;
+  agent_id?: string;
+}
+
+export interface DiscoveryView {
+  source_id: string;
+  last_run_at?: string;
+  last_error?: string;
+  has_result: boolean;
+  candidates: DiscoveryCandidate[];
+  warnings?: string[];
+  missing: Server[];
+}
+
+export interface DiscoveryImportResult {
+  created: Server[];
+  skipped: { external_id: string; server_id?: string; reason: string }[];
 }
 
 export interface Domain {
@@ -391,11 +466,70 @@ export interface Domain {
    *  live record has; true/false is enforced. Only Cloudflare zones accept true. */
   proxied?: boolean | null;
   dns_record_id?: string;
+  /** Failover backup servers on other agents, most preferred first (#74). */
+  backup_server_ids?: string[];
+  /** The server whose agent the domain's CNAME points at: the primary
+   *  (server_id) unless the reconciler failed over to a backup. */
+  active_server_id?: string;
+  /** true: NurProxy created or took over the record and deletes it with the
+   *  domain; false with a record id: an existing record it uses but leaves. */
+  dns_managed?: boolean;
   status: 'pending' | 'active' | 'error' | 'deleting' | 'degraded';
   error_msg?: string;
+  /** Why the last DNS pass could not create, adopt or correct the record. */
+  dns_error?: string;
   last_synced?: string;
   created_at: string;
   updated_at: string;
+}
+
+/** One server that may serve a domain, with its agent's health (#74). */
+export interface FailoverCandidate {
+  server_id: string;
+  server_name: string;
+  agent_id: string;
+  agent_name: string;
+  agent_fqdn: string;
+  primary: boolean;
+  priority: number;
+  eligible: boolean;
+  healthy: boolean;
+  active: boolean;
+  last_seen?: string;
+  reason?: string;
+}
+
+export interface DomainFailoverStatus {
+  domain_id: number;
+  active_server_id: string;
+  pending_server_id?: string;
+  pending_since?: string;
+  all_down: boolean;
+  switched_at?: string;
+  switches: number;
+  evaluated_at?: string;
+  settle_since?: string;
+  /** A down target is held while agents report in after a restart or outage. */
+  settling: boolean;
+  candidates: FailoverCandidate[];
+}
+
+export interface DNSRecordInfo {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+  proxied: boolean;
+}
+
+/** What a DNS takeover does at the domain's name (dry run or carried out). */
+export interface DNSTakeoverPlan {
+  domain_id: number;
+  fqdn: string;
+  target: string;
+  action: 'adopt' | 'replace' | 'create';
+  delete: DNSRecordInfo[];
+  proxied: boolean;
 }
 
 export interface ProxyConfig {
@@ -408,10 +542,29 @@ export interface ProxyConfig {
   // tls_policy selects how the public-listener cert is provisioned:
   // "central" (DNS-01 provided cert, the default), "self-acme", or "off".
   tls_policy?: string;
+  /** Serve the domain from its zone's shared *.<zone> certificate. */
+  tls_wildcard?: boolean;
   /** "off" writes no access log for the domain; unset keeps the host-wide log. */
   access_log?: string;
   /** Minimum error log level (e.g. "crit"); unset keeps the host default. */
   error_log_level?: string;
+  /** Extra path-routed upstreams; everything else goes to the domain's server and port. */
+  routes?: PathRoute[];
+}
+
+/**
+ * One path-routed upstream of a domain. An exact route beats any prefix and
+ * the longest prefix wins; a prefix "/api" matches "/api" and "/api/...", not
+ * "/apix". The server must be on the same agent as the domain's server.
+ */
+export interface PathRoute {
+  match: 'prefix' | 'exact';
+  path: string;
+  server_id: string;
+  port: number;
+  upstream_scheme?: string;
+  websocket?: boolean;
+  strip_prefix?: boolean;
 }
 
 export interface AuditLogEntry {
@@ -514,6 +667,13 @@ export interface ProxyRoute {
   TLS?: { Policy?: string; Wildcard?: boolean };
   AccessLog?: string;
   ErrorLogLevel?: string;
+  PathRoutes?: Array<{
+    Match: 'prefix' | 'exact';
+    Path: string;
+    Upstream?: { Addr?: string; Port?: number; Scheme?: string };
+    WebSocket?: boolean;
+    StripPrefix?: boolean;
+  }>;
 }
 
 /**

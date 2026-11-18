@@ -57,3 +57,6 @@ coverage.html
 # Build artifacts + local dev sandbox state
 /nurproxy-agent-*
 /.dev-sandbox/
+
+# Local ghosttree projection (generated per machine, never committed)
+.ghosttree/

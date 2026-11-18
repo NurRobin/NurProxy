@@ -66,7 +66,7 @@ func TestSandboxEndToEnd(t *testing.T) {
 	// Health must advertise the sandbox so the dashboard banner lights up.
 	var health map[string]any
 	mustGetJSON(t, &http.Client{}, base+"/api/v1/health", &health)
-	if health["dry_run"] != true || health["dns_dry_run"] != true || health["acme_dry_run"] != true {
+	if health["dry_run"] != true || health["dns_dry_run"] != true || health["acme_dry_run"] != true || health["discovery_dry_run"] != true {
 		t.Fatalf("health did not report dry-run: %v", health)
 	}
 
@@ -169,6 +169,8 @@ func TestSandboxEndToEnd(t *testing.T) {
 	api.post("/api/v1/agents/"+agentID+"/servers", map[string]string{
 		"name": "app", "address": "10.0.0.5:8080",
 	}, &server)
+	assertDiscoveryImport(t, api, agentID)
+
 	var domain struct {
 		ID int `json:"id"`
 	}
@@ -200,6 +202,21 @@ func TestSandboxEndToEnd(t *testing.T) {
 		"subdomain": "legacy", "zone_id": zone.ID, "server_id": server.ID,
 		"port": 8080, "ssl_mode": "central",
 	}, &legacy)
+
+	// Two domains opted into the zone wildcard certificate (#69). Created now so
+	// they converge in the same cycle; both must end up on ONE shared
+	// "*.sandbox.test" cert, issued once.
+	wildcardIDs := make([]int, 0, 2)
+	for _, sub := range []string{"w1", "w2"} {
+		var wd struct {
+			ID int `json:"id"`
+		}
+		api.post("/api/v1/domains", map[string]any{
+			"subdomain": sub, "zone_id": zone.ID, "server_id": server.ID,
+			"port": 8080, "ssl_mode": "central", "tls_wildcard": true,
+		}, &wd)
+		wildcardIDs = append(wildcardIDs, wd.ID)
+	}
 
 	// --- assert convergence ---------------------------------------------------
 	// The CNAME (which flips the domain to active) is written on a reconciler
@@ -234,6 +251,62 @@ func TestSandboxEndToEnd(t *testing.T) {
 	})
 	if apexFinal != "active" {
 		t.Fatalf("apex (@) domain never became active (last status %q)", apexFinal)
+	}
+
+	// Both wildcard domains converge to active on the same self-signed
+	// "*.sandbox.test" cert, installed on the agent once per FQDN.
+	for _, id := range wildcardIDs {
+		var status string
+		waitFor(t, 75*time.Second, func() bool {
+			var d struct {
+				Status string `json:"status"`
+			}
+			api.get(fmt.Sprintf("/api/v1/domains/%d", id), &d)
+			status = d.Status
+			return d.Status == "active"
+		})
+		if status != "active" {
+			t.Fatalf("wildcard domain %d never became active (last status %q)", id, status)
+		}
+	}
+	var w1Cert, w2Cert string
+	waitFor(t, 30*time.Second, func() bool {
+		w1Cert = readFileNamed(agentDataDir, "w1.sandbox.test.crt")
+		w2Cert = readFileNamed(agentDataDir, "w2.sandbox.test.crt")
+		return w1Cert != "" && w1Cert == w2Cert
+	})
+	if w1Cert == "" || w1Cert != w2Cert {
+		t.Fatal("wildcard domains did not receive the same certificate on the agent")
+	}
+	block, _ := pem.Decode([]byte(w1Cert))
+	if block == nil {
+		t.Fatal("wildcard certificate on the agent is not PEM")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse wildcard certificate: %v", err)
+	}
+	if len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != "*.sandbox.test" || leaf.Issuer.String() != leaf.Subject.String() {
+		t.Fatalf("wildcard certificate names=%v issuer=%q subject=%q, want one self-signed *.sandbox.test", leaf.DNSNames, leaf.Issuer, leaf.Subject)
+	}
+	var wildAudit struct {
+		Entries []struct {
+			EntityID string `json:"entity_id"`
+			Action   string `json:"action"`
+		} `json:"entries"`
+	}
+	api.get("/api/v1/audit-log?limit=200", &wildAudit)
+	issued := 0
+	for _, e := range wildAudit.Entries {
+		if e.Action == "renewed" && e.EntityID == "*.sandbox.test" {
+			issued++
+		}
+		if e.Action == "renewed" && (e.EntityID == "w1.sandbox.test" || e.EntityID == "w2.sandbox.test") {
+			t.Fatalf("wildcard domain got a per-host certificate: %+v", e)
+		}
+	}
+	if issued != 1 {
+		t.Fatalf("*.sandbox.test issued %d times, want exactly once", issued)
 	}
 
 	// The DNS record must be a simulated one (dryrun-* ID from the in-memory store).
@@ -446,6 +519,51 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Fatalf("resolved stale-temp diagnostic %q disappeared from history", staleDiagnosticID)
 	}
 
+	// Path routes (#89): a domain with an exact and a prefix route to a second
+	// server of the same agent converges to active, and its vhost carries the
+	// locations in the shape the helper's nginx policy admits. It runs after
+	// the stale-temp check, which expects exactly one repair: installing the
+	// new domain's certificate brings automatic repairs of its own.
+	var apiServer struct {
+		ID string `json:"id"`
+	}
+	api.post("/api/v1/agents/"+agentID+"/servers", map[string]string{
+		"name": "api", "address": "10.0.0.6",
+	}, &apiServer)
+	var routed struct {
+		ID int `json:"id"`
+	}
+	api.post("/api/v1/domains", map[string]any{
+		"subdomain": "paths", "zone_id": zone.ID, "server_id": server.ID,
+		"port": 2412, "ssl_mode": "central",
+		"proxy_config": map[string]any{"routes": []map[string]any{
+			{"match": "exact", "path": "/api/world", "server_id": apiServer.ID, "port": 80},
+			{"match": "prefix", "path": "/media", "server_id": apiServer.ID, "port": 9000, "strip_prefix": true},
+		}},
+	}, &routed)
+	routedPath := filepath.Join(proxyConfigDir, "nurproxy-paths.sandbox.test.conf")
+	var routedStatus, routedError string
+	waitFor(t, 90*time.Second, func() bool {
+		var d struct {
+			Status   string `json:"status"`
+			ErrorMsg string `json:"error_msg"`
+		}
+		api.get(fmt.Sprintf("/api/v1/domains/%d", routed.ID), &d)
+		routedStatus, routedError = d.Status, d.ErrorMsg
+		content, err := os.ReadFile(routedPath)
+		return d.Status == "active" && err == nil &&
+			bytes.Contains(content, []byte("    location = /api/world {\n        proxy_pass http://10.0.0.6:80;\n")) &&
+			bytes.Contains(content, []byte("    location /media/ {\n        rewrite ^/media/?(.*)$ /$1 break;\n        proxy_pass http://10.0.0.6:9000;\n")) &&
+			bytes.Contains(content, []byte("    location / {\n        proxy_pass http://10.0.0.5:2412;\n"))
+	})
+	if routedStatus != "active" {
+		t.Fatalf("domain with path routes never became active (status %q, error %q)", routedStatus, routedError)
+	}
+	// The route server cannot be deleted while the route uses it.
+	if code := api.status(http.MethodDelete, "/api/v1/servers/"+apiServer.ID); code != http.StatusConflict {
+		t.Fatalf("deleting a server used by a path route: status %d, want 409", code)
+	}
+
 	// Rename the apex domain to www (#151): the new name gets its own record
 	// and certificate, the old record (NurProxy-created) is deleted once the new
 	// one exists, and the old vhost file leaves the agent.
@@ -621,7 +739,146 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Fatalf("apex proxied setting = %v, want false", apexAfter.Proxied)
 	}
 
+	// --- DNS takeover preview (#128) -------------------------------------------
+	// The dry run reports the plan and changes nothing: the apex's record is
+	// already the desired CNAME, so it would only be taken over, with no deletes.
+	takeoversBefore := len(auditFor(apex.ID, "dns_takeover"))
+	var preview struct {
+		DryRun bool `json:"dry_run"`
+		Plan   struct {
+			Action string            `json:"action"`
+			Delete []json.RawMessage `json:"delete"`
+		} `json:"plan"`
+	}
+	api.post(fmt.Sprintf("/api/v1/domains/%d/dns/takeover?dry_run=true", apex.ID), map[string]any{}, &preview)
+	if !preview.DryRun || preview.Plan.Action != "adopt" || len(preview.Plan.Delete) != 0 {
+		t.Fatalf("takeover preview = %+v, want a dry-run adopt without deletes", preview)
+	}
+	if n := len(auditFor(apex.ID, "dns_takeover")); n != takeoversBefore {
+		t.Fatalf("takeover preview wrote %d dns_takeover audit entries", n-takeoversBefore)
+	}
+	var apexDNS struct {
+		DNSManaged bool   `json:"dns_managed"`
+		DNSError   string `json:"dns_error"`
+	}
+	api.get(fmt.Sprintf("/api/v1/domains/%d", apex.ID), &apexDNS)
+	if !apexDNS.DNSManaged || apexDNS.DNSError != "" {
+		t.Fatalf("apex after takeover: dns_managed=%v dns_error=%q, want managed without error", apexDNS.DNSManaged, apexDNS.DNSError)
+	}
+
+	// --- opt-in cascade delete of the agent (#104) ------------------------------
+	// The foreign keys are ON DELETE RESTRICT, so the agent, its servers and its
+	// domains only disappear once the reconciler has torn the domains down and
+	// finalized the deferred parent delete, children before parents. The agent
+	// must be able to apply the route removals, so the injected validation
+	// failure from above is switched off first.
+	if err := os.Remove(failValidation); err != nil {
+		t.Fatalf("disable sandbox validation failure: %v", err)
+	}
+	// Teardown and finalize can take two reconciler cycles; shorten the
+	// interval so they fit the wait (it applies once the running timer fires).
+	api.put("/api/v1/settings/reconciler_interval", map[string]string{"value": "5"}, nil)
+	api.do(http.MethodDelete, "/api/v1/agents/"+agentID+"?cascade=true", nil, nil)
+	waitFor(t, 90*time.Second, func() bool {
+		var doms []struct {
+			ID int `json:"id"`
+		}
+		api.get("/api/v1/domains", &doms)
+		if len(doms) != 0 {
+			return false
+		}
+		var agents []struct {
+			ID string `json:"id"`
+		}
+		api.get("/api/v1/agents", &agents)
+		for _, a := range agents {
+			if a.ID == agentID {
+				return false
+			}
+		}
+		return true
+	})
+	var cascadeAudit struct {
+		Entries []struct {
+			EntityType string `json:"entity_type"`
+			EntityID   string `json:"entity_id"`
+			Action     string `json:"action"`
+			Details    string `json:"details"`
+		} `json:"entries"`
+	}
+	api.get("/api/v1/audit-log?limit=500", &cascadeAudit)
+	sawFinalized := false
+	for _, e := range cascadeAudit.Entries {
+		if e.EntityType == "agent" && e.EntityID == agentID && e.Action == "delete" && strings.Contains(e.Details, "cascade finalized") {
+			sawFinalized = true
+		}
+	}
+	if !sawFinalized {
+		t.Fatal("agent cascade delete was not finalized by the reconciler")
+	}
+
 	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; stale managed temp auto-healed and an unclassified validation failure remained diagnosis-only (validator/reload are hermetic fixtures, not native nginx proof)", dom.DNSRecordID)
+}
+
+// assertDiscoveryImport drives server discovery (#25) through the dry stack:
+// a Proxmox source with dummy credentials (the connection test is simulated),
+// a run that returns the dry-run fixture, an import of two machines (one with
+// a detected address, one with an operator-supplied address), and a re-run
+// plus re-import that must not duplicate anything.
+func assertDiscoveryImport(t *testing.T, api *apiClient, agentID string) {
+	t.Helper()
+	var src struct {
+		ID string `json:"id"`
+	}
+	api.post("/api/v1/discovery/sources", map[string]any{
+		"type": "proxmox", "name": "pve-dry",
+		"config": map[string]any{"url": "https://pve.sandbox.test:8006", "token_id": "nurproxy@pve!dry", "token_secret": "dummy-dry-secret"},
+	}, &src)
+	type candidate struct {
+		ExternalID       string `json:"external_id"`
+		SuggestedAddress string `json:"suggested_address"`
+		ServerID         string `json:"server_id"`
+	}
+	type view struct {
+		Candidates []candidate `json:"candidates"`
+		Warnings   []string    `json:"warnings"`
+		Missing    []any       `json:"missing"`
+	}
+	var v view
+	api.post("/api/v1/discovery/sources/"+src.ID+"/run", nil, &v)
+	if len(v.Candidates) != 4 || len(v.Warnings) != 1 {
+		t.Fatalf("dry discovery run = %+v, want the 4-machine fixture with one offline-node warning", v)
+	}
+	var imp struct {
+		Created []struct {
+			Address    string `json:"address"`
+			ExternalID string `json:"external_id"`
+		} `json:"created"`
+		Skipped []any `json:"skipped"`
+	}
+	items := []map[string]string{
+		{"external_id": "pve/pve1/qemu/101"},
+		{"external_id": "pve/pve1/qemu/103", "address": "192.168.10.23"},
+	}
+	api.post("/api/v1/agents/"+agentID+"/servers/import", map[string]any{"source_id": src.ID, "items": items}, &imp)
+	if len(imp.Created) != 2 || imp.Created[0].Address != "192.168.10.21" || imp.Created[1].Address != "192.168.10.23" {
+		t.Fatalf("discovery import = %+v", imp)
+	}
+	api.post("/api/v1/discovery/sources/"+src.ID+"/run", nil, &v)
+	imported := 0
+	for _, c := range v.Candidates {
+		if c.ServerID != "" {
+			imported++
+		}
+	}
+	if imported != 2 || len(v.Missing) != 0 {
+		t.Fatalf("re-run after import = %+v, want 2 imported and none missing", v)
+	}
+	imp.Created, imp.Skipped = nil, nil
+	api.post("/api/v1/agents/"+agentID+"/servers/import", map[string]any{"source_id": src.ID, "items": items}, &imp)
+	if len(imp.Created) != 0 || len(imp.Skipped) != 2 {
+		t.Fatalf("re-import = %+v, want both skipped", imp)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +1066,23 @@ func (c *apiClient) get(path string, out any)     { c.do(http.MethodGet, path, n
 func (c *apiClient) post(path string, b, out any) { c.do(http.MethodPost, path, b, out) }
 func (c *apiClient) put(path string, b, out any)  { c.do(http.MethodPut, path, b, out) }
 
+// status sends a bodyless request and returns the response status, for
+// calls that are expected to fail.
+func (c *apiClient) status(method, path string) int {
+	c.t.Helper()
+	req, err := http.NewRequest(method, c.base+path, nil)
+	if err != nil {
+		c.t.Fatalf("new request %s %s: %v", method, path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
 // sandboxServerCert mints a self-signed server certificate for host, standing
 // in for an operator's existing bundle.
 func sandboxServerCert(t *testing.T, host string) (certPEM, keyPEM string) {
@@ -835,6 +1109,23 @@ func sandboxServerCert(t *testing.T, host string) (certPEM, keyPEM string) {
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
 		string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+}
+
+// readFileNamed returns the content of the first file named name below root,
+// or "" when there is none (yet).
+func readFileNamed(root, name string) string {
+	found := ""
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != name {
+			return nil
+		}
+		if got, rErr := os.ReadFile(path); rErr == nil {
+			found = string(got)
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // findFileWithContent returns the path of a file named name below root whose
