@@ -294,6 +294,9 @@ func TestValidateConfig(t *testing.T) {
 		{"bad fingerprint", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","fingerprint":"zz"}`, true},
 		{"bad ca", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","ca_pem":"nope"}`, true},
 		{"secret with newline", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"a\nb"}`, true},
+		{"key in other case", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","Fingerprint":"AA"}`, true},
+		{"duplicate url in other case", `{"url":"pve.lan","URL":"evil.example","token_id":"root@pam!np","token_secret":"abc"}`, true},
+		{"unknown key", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","proxy":"x"}`, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
