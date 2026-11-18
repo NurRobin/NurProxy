@@ -51,13 +51,8 @@ func (r *Reconciler) ReconcileDomainDNSNow(domainID int64) {
 	defer r.dnsMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), immediateDNSPassTimeout)
 	defer cancel()
-	dom, err := r.db.GetDomain(domainID)
-	if err != nil {
-		log.Printf("reconciler: immediate DNS pass for domain %d: %v", domainID, err)
-		return
-	}
 	r.snapshotDomainDNSCleanups(ctx, domainID)
-	r.reconcileDomainDNS(ctx, dom)
+	r.reconcileDomainDNSByID(ctx, domainID)
 	if err := r.cleanupDomainDNS(ctx, domainID); err != nil {
 		log.Printf("reconciler: immediate DNS cleanup for domain %d failed: %v", domainID, err)
 	}

@@ -854,6 +854,14 @@ var migrations = []string{
 	// rebuildParentFKsRestrict) from their live schema, which keeps every
 	// column, CHECK, index and trigger later migrations added.
 	migrationRestrictParentFKs,
+
+	// Migration 37: dns_error holds the reason the domain's public DNS record
+	// could not be created, adopted or corrected, separately from error_msg.
+	// A route apply rewrites status and error_msg; while dns_error is set it
+	// keeps the domain in error with that reason instead of reporting it
+	// active or degraded for an unrelated cause. Empty means the last DNS pass
+	// worked.
+	`ALTER TABLE domains ADD COLUMN dns_error TEXT NOT NULL DEFAULT '';`,
 }
 
 // migrationRestrictParentFKs is the placeholder text of the migration that

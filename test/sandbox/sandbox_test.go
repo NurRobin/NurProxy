@@ -607,6 +607,33 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Fatalf("apex proxied setting = %v, want false", apexAfter.Proxied)
 	}
 
+	// --- DNS takeover preview (#128) -------------------------------------------
+	// The dry run reports the plan and changes nothing: the apex's record is
+	// already the desired CNAME, so it would only be taken over, with no deletes.
+	takeoversBefore := len(auditFor(apex.ID, "dns_takeover"))
+	var preview struct {
+		DryRun bool `json:"dry_run"`
+		Plan   struct {
+			Action string            `json:"action"`
+			Delete []json.RawMessage `json:"delete"`
+		} `json:"plan"`
+	}
+	api.post(fmt.Sprintf("/api/v1/domains/%d/dns/takeover?dry_run=true", apex.ID), map[string]any{}, &preview)
+	if !preview.DryRun || preview.Plan.Action != "adopt" || len(preview.Plan.Delete) != 0 {
+		t.Fatalf("takeover preview = %+v, want a dry-run adopt without deletes", preview)
+	}
+	if n := len(auditFor(apex.ID, "dns_takeover")); n != takeoversBefore {
+		t.Fatalf("takeover preview wrote %d dns_takeover audit entries", n-takeoversBefore)
+	}
+	var apexDNS struct {
+		DNSManaged bool   `json:"dns_managed"`
+		DNSError   string `json:"dns_error"`
+	}
+	api.get(fmt.Sprintf("/api/v1/domains/%d", apex.ID), &apexDNS)
+	if !apexDNS.DNSManaged || apexDNS.DNSError != "" {
+		t.Fatalf("apex after takeover: dns_managed=%v dns_error=%q, want managed without error", apexDNS.DNSManaged, apexDNS.DNSError)
+	}
+
 	// --- opt-in cascade delete of the agent (#104) ------------------------------
 	// The foreign keys are ON DELETE RESTRICT, so the agent, its servers and its
 	// domains only disappear once the reconciler has torn the domains down and
