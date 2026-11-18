@@ -217,6 +217,34 @@ func (d *DB) DeleteCertificate(host string) error {
 	return nil
 }
 
+// DeleteWildcardCertIfUnused removes the certificate stored under host
+// ("*.<zone>") unless a domain of zoneID that is not being deleted still uses
+// it. Two kinds of domains use that one cert: a catch-all domain whose
+// subdomain is "*" (its FQDN is "*.<zone>") and any domain opted into the zone
+// wildcard cert. Check and delete are one statement, so a domain that starts
+// using the cert concurrently either keeps the row or finds it gone and
+// triggers a fresh issuance; the row is never removed from under a committed
+// user. It reports whether a row was deleted.
+func (d *DB) DeleteWildcardCertIfUnused(host, zoneID string) (bool, error) {
+	res, err := d.sql.Exec(`
+		DELETE FROM certificates
+		WHERE host = ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM domains
+			WHERE zone_id = ? AND status != ?
+			  AND (subdomain = '*' OR json_extract(proxy_config, '$.tls_wildcard') = 1)
+		  )`,
+		host, zoneID, string(models.DomainStatusDeleting))
+	if err != nil {
+		return false, fmt.Errorf("deleting unused wildcard certificate %s: %w", host, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("deleting unused wildcard certificate %s: %w", host, err)
+	}
+	return n > 0, nil
+}
+
 // scanner abstracts *sql.Row and *sql.Rows for shared scanning.
 type scanner interface {
 	Scan(dest ...any) error
