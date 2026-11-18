@@ -111,6 +111,25 @@ func TestSandboxEndToEnd(t *testing.T) {
 	if err := os.WriteFile(operatorPath, operatorBytes, 0o644); err != nil {
 		t.Fatalf("write operator fixture: %v", err)
 	}
+	// A certificate the host already serves (#80): the operator's nginx points
+	// at it with http-level ssl_certificate directives, as a migrated host
+	// would. The agent must discover it so it can be adopted instead of issued.
+	legacyCert, legacyKey := sandboxServerCert(t, "legacy.sandbox.test")
+	legacyDir := filepath.Join(dataRoot, "legacy-tls")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("create legacy cert dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "fullchain.pem"), []byte(legacyCert), 0o644); err != nil {
+		t.Fatalf("write legacy cert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "privkey.pem"), []byte(legacyKey), 0o600); err != nil {
+		t.Fatalf("write legacy key: %v", err)
+	}
+	legacyConf := fmt.Sprintf("# operator TLS defaults\nssl_certificate %s;\nssl_certificate_key %s;\n",
+		filepath.Join(legacyDir, "fullchain.pem"), filepath.Join(legacyDir, "privkey.pem"))
+	if err := os.WriteFile(filepath.Join(proxyConfigDir, "tls-defaults.conf"), []byte(legacyConf), 0o644); err != nil {
+		t.Fatalf("write legacy tls config: %v", err)
+	}
 	agent := startProcess(t, bin.agent, []string{
 		"-orchestrator", base,
 		"-fqdn", "edge1.sandbox.test",
@@ -173,6 +192,16 @@ func TestSandboxEndToEnd(t *testing.T) {
 		"subdomain": "@", "zone_id": zone.ID, "server_id": server.ID,
 		"port": 8080, "ssl_mode": "central", "proxied": true,
 	}, &apex)
+
+	// A domain for the host whose certificate the agent found on disk (#80).
+	// Its first issuance waits for the operator to adopt that certificate.
+	var legacy struct {
+		ID int `json:"id"`
+	}
+	api.post("/api/v1/domains", map[string]any{
+		"subdomain": "legacy", "zone_id": zone.ID, "server_id": server.ID,
+		"port": 8080, "ssl_mode": "central",
+	}, &legacy)
 
 	// Two domains opted into the zone wildcard certificate (#69). Created now so
 	// they converge in the same cycle; both must end up on ONE shared
@@ -333,6 +362,53 @@ func TestSandboxEndToEnd(t *testing.T) {
 	})
 	t.Logf("imported certificate installed on the agent at %s", agentCertPath)
 
+	// Adopting an on-disk certificate (#80). By now a reconciler cycle has run
+	// for the legacy domain too, and its issuance must have been held back.
+	var cands struct {
+		Candidates []struct {
+			Fingerprint string `json:"fingerprint"`
+			Source      string `json:"source"`
+			CertPath    string `json:"cert_path"`
+			Serving     bool   `json:"serving"`
+			Adoptable   bool   `json:"adoptable"`
+			Reason      string `json:"reason"`
+		} `json:"candidates"`
+		OnFile   bool       `json:"certificate_on_file"`
+		Deferred *time.Time `json:"issuance_deferred_until"`
+	}
+	api.get(fmt.Sprintf("/api/v1/domains/%d/certificate/candidates", legacy.ID), &cands)
+	if len(cands.Candidates) == 0 || !cands.Candidates[0].Adoptable || !cands.Candidates[0].Serving ||
+		cands.Candidates[0].CertPath != filepath.Join(legacyDir, "fullchain.pem") {
+		t.Fatalf("legacy certificate not offered for adoption: %+v", cands)
+	}
+	if cands.OnFile || cands.Deferred == nil {
+		t.Fatalf("legacy domain issuance was not held for adoption: on_file=%v deferred=%v", cands.OnFile, cands.Deferred)
+	}
+	var adopted struct {
+		Host       string `json:"host"`
+		Source     string `json:"source"`
+		SourcePath string `json:"source_path"`
+	}
+	api.post(fmt.Sprintf("/api/v1/domains/%d/certificate/adopt", legacy.ID), map[string]string{
+		"fingerprint": cands.Candidates[0].Fingerprint,
+	}, &adopted)
+	if adopted.Host != "legacy.sandbox.test" || adopted.Source != "imported" || adopted.SourcePath != filepath.Join(legacyDir, "fullchain.pem") {
+		t.Fatalf("adoption response = %+v", adopted)
+	}
+	waitFor(t, 20*time.Second, func() bool {
+		return findFileWithContent(agentDataDir, "legacy.sandbox.test.crt", legacyCert) != ""
+	})
+	api.get("/api/v1/audit-log?limit=100", &audit)
+	var sawAdoption bool
+	for _, e := range audit.Entries {
+		if e.Action == "cert_adopted" {
+			sawAdoption = true
+		}
+	}
+	if !sawAdoption {
+		t.Error("no cert_adopted audit entry")
+	}
+
 	// Per-domain logging (#150): the nginx agent advertises access log control,
 	// and turning the access log off for one domain re-renders only that
 	// domain's vhost. The error log level is not exercised: the agent offers it
@@ -374,12 +450,21 @@ func TestSandboxEndToEnd(t *testing.T) {
 	}
 	api.post(fmt.Sprintf("/api/v1/domains/%d/config/reset", domain.ID), map[string]any{}, nil)
 
+	// Only the stale-temp repair is under test here; other automatic repairs
+	// (e.g. re-materializing the adopted legacy bundle) may be listed too.
 	var repairs []recoverymodel.OperationReport
 	waitFor(t, 15*time.Second, func() bool {
 		if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
 			return false
 		}
-		api.get("/api/v1/agents/"+agentID+"/repairs", &repairs)
+		var all []recoverymodel.OperationReport
+		api.get("/api/v1/agents/"+agentID+"/repairs", &all)
+		repairs = repairs[:0]
+		for _, r := range all {
+			if r.Action == recoverymodel.ActionRemoveManagedTemp {
+				repairs = append(repairs, r)
+			}
+		}
 		return len(repairs) == 1 && repairs[0].Action == recoverymodel.ActionRemoveManagedTemp &&
 			repairs[0].Source == recoverymodel.RequestSourceAutomatic && repairs[0].State == recoverymodel.OperationStateSucceeded
 	})

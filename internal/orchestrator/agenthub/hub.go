@@ -44,6 +44,9 @@ const (
 	EventRecoveryPolicy = "recovery_policy"
 	EventRepairRequest  = "repair_request"
 	EventManagedRoutes  = "managed_routes"
+	// EventCertUploadRequest asks the agent to upload a certificate bundle it
+	// discovered on its host (#80). The payload is a proxymodel.CertUploadRequest.
+	EventCertUploadRequest = "cert_upload_request"
 	// EventUpgrade asks the agent to upgrade itself (#73). The payload is a
 	// models.UpgradeCommand; progress comes back on the upgrade report endpoint.
 	EventUpgrade = "upgrade"

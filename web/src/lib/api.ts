@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, DiscoveryType, DiscoverySource, DiscoveryView, DiscoveryImportResult, Domain, DNSTakeoverPlan, DomainFailoverStatus, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus, AgentUpgrade, UpgradeRollout } from './types';
+import type { Provider, Zone, Agent, Server, DiscoveryType, DiscoverySource, DiscoveryView, DiscoveryImportResult, Domain, DNSTakeoverPlan, DomainFailoverStatus, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus, AgentUpgrade, UpgradeRollout, CertCandidates } from './types';
 import type { ProxyConfigUpdate } from './proxy-config';
 
 const BASE = '/api/v1';
@@ -218,6 +218,13 @@ export const api = {
     request<{ message: string }>(`/domains/${id}/config`, { method: 'PUT', body: JSON.stringify({ config }) }),
   resetDomainConfig: (id: number) =>
     request<{ message: string }>(`/domains/${id}/config/reset`, { method: 'POST' }),
+  getCertCandidates: (id: number) => request<CertCandidates>(`/domains/${id}/certificate/candidates`),
+  issueCertificateNow: (id: number) =>
+    request<{ message: string }>(`/domains/${id}/certificate/issue-now`, { method: 'POST' }),
+  adoptCertificate: (id: number, fingerprint: string, agentId: string) =>
+    request<{ message: string; expires_at: string; source_path?: string; warning?: string }>(`/domains/${id}/certificate/adopt`, {
+      method: 'POST', body: JSON.stringify({ fingerprint, agent_id: agentId }),
+    }),
   /** Lists the records a DNS takeover would delete; changes nothing. */
   previewDnsTakeover: (id: number) =>
     request<{ message: string; plan: DNSTakeoverPlan; dry_run: boolean }>(`/domains/${id}/dns/takeover?dry_run=true`, { method: 'POST' }),

@@ -729,6 +729,63 @@ func cmdDomain(args []string) {
 		}
 		c.emit(raw, msg)
 
+	case "cert-candidates":
+		c, _, id := parseClient("domain cert-candidates", rest, "domain id", nil)
+		cands := fetchCertCandidates(c, id)
+		if c.asJSON {
+			c.emit(mustJSON(cands), "")
+			return
+		}
+		rows := make([][]string, 0, len(cands.Candidates))
+		for _, cand := range cands.Candidates {
+			state := "yes"
+			if !cand.Adoptable {
+				state = "no: " + cand.Reason
+			}
+			rows = append(rows, []string{cand.AgentName, cand.Fingerprint, strings.Join(cand.Names, ","),
+				cand.NotAfter.Format("2006-01-02"), cand.Source, cand.CertPath, state})
+		}
+		printTable([]string{"AGENT", "FINGERPRINT", "NAMES", "EXPIRES", "SOURCE", "PATH", "ADOPTABLE"}, rows)
+		for _, h := range cands.Hints {
+			fmt.Fprintf(os.Stderr, "note: agent %s cannot scan %s: %s\n", h.AgentName, h.Path, h.Error)
+		}
+
+	case "adopt-cert":
+		var fingerprint, fromAgent string
+		c, _, id := parseClient("domain adopt-cert", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&fingerprint, "fingerprint", "", "SHA-256 fingerprint from 'domain cert-candidates' (optional when the serving agent has exactly one adoptable certificate)")
+			fs.StringVar(&fromAgent, "from-agent", "", "Agent ID to take the certificate from when it is not the serving agent (requires --fingerprint)")
+		})
+		if fromAgent != "" && fingerprint == "" {
+			fatalf("domain adopt-cert: --from-agent requires --fingerprint")
+		}
+		if fingerprint == "" {
+			fp, err := pickServingCandidate(fetchCertCandidates(c, id).Candidates, id)
+			if err != nil {
+				fatalf("domain adopt-cert: %v", err)
+			}
+			fingerprint = fp
+		}
+		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/certificate/adopt", map[string]string{
+			"fingerprint": fingerprint, "agent_id": fromAgent,
+		})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		msg := "certificate adopted for domain " + id + " from " + gjson(raw, "source_path") + ", expires " + gjson(raw, "expires_at")
+		if warning := gjson(raw, "warning"); warning != "" {
+			msg += "\nwarning: " + warning
+		}
+		c.emit(raw, msg)
+
+	case "issue-cert":
+		c, _, id := parseClient("domain issue-cert", rest, "domain id", nil)
+		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/certificate/issue-now", nil)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		c.emit(raw, gjson(raw, "message"))
+
 	case "backups":
 		var set string
 		var clear bool
@@ -771,8 +828,54 @@ func cmdDomain(args []string) {
 	default:
 		usage("domain", "list", "get <id>", "add", "update <id>", "delete <id>", "dns-takeover [--dry-run] <id>", "set-cert <id> --cert FILE --key FILE",
 			"route list <id>", "route add <id> --path P --server S --port N [--match prefix|exact]", "route remove <id> --path P [--match prefix|exact]",
-			"backups <id> [--set srv-a,srv-b | --clear]", "failover <id>")
+			"backups <id> [--set srv-a,srv-b | --clear]", "failover <id>",
+			"cert-candidates <id>", "adopt-cert <id> [--fingerprint FP [--from-agent ID]]", "issue-cert <id>")
 	}
+}
+
+// certCandidateRow mirrors one entry of GET /api/v1/domains/{id}/certificate/candidates.
+type certCandidateRow struct {
+	models.DiscoveredCert
+	AgentID   string `json:"agent_id"`
+	AgentName string `json:"agent_name"`
+	Serving   bool   `json:"serving"`
+	Adoptable bool   `json:"adoptable"`
+	Reason    string `json:"reason"`
+}
+
+// pickServingCandidate returns the fingerprint of the one adoptable
+// certificate on the domain's serving agent. Certificates on other agents are
+// never picked implicitly: taking a key from another host needs --fingerprint
+// and --from-agent.
+func pickServingCandidate(cands []certCandidateRow, domainID string) (string, error) {
+	var picked []certCandidateRow
+	for _, cand := range cands {
+		if cand.Adoptable && cand.Serving {
+			picked = append(picked, cand)
+		}
+	}
+	if len(picked) != 1 {
+		return "", fmt.Errorf("the serving agent has %d adoptable certificates; pick one with --fingerprint (see 'domain cert-candidates %s')", len(picked), domainID)
+	}
+	return picked[0].Fingerprint, nil
+}
+
+type certCandidates struct {
+	Host       string             `json:"host"`
+	Candidates []certCandidateRow `json:"candidates"`
+	Hints      []struct {
+		AgentName string `json:"agent_name"`
+		Path      string `json:"path"`
+		Error     string `json:"error"`
+	} `json:"hints"`
+}
+
+func fetchCertCandidates(c *client, domainID string) certCandidates {
+	var out certCandidates
+	if err := c.getInto("/api/v1/domains/"+domainID+"/certificate/candidates", &out); err != nil {
+		fatalf("%v", err)
+	}
+	return out
 }
 
 // printFailover shows which servers may serve a domain and where its DNS

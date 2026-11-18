@@ -451,6 +451,7 @@ func startRenewer(ctx context.Context, database *db.DB, rec *reconciler.Reconcil
 	})
 
 	go renewer.Start(ctx)
+	go store.WatchAdoptionHolds(ctx, 30*time.Second, renewer.EnsureCertForHost)
 	log.Printf("tls: central renewal + first-issuance loop started (window %s)", orchtls.DefaultRenewWindow)
 	return renewer
 }

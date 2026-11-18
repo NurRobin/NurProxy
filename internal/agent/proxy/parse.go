@@ -120,8 +120,29 @@ var gatherNginxConfig = func(configDir string) string {
 		}
 	}
 	dirs = append(dirs, "/etc/nginx/conf.d")
-	files := []string{"/etc/nginx/nginx.conf"}
+	return readConfigTree(dirs, []string{"/etc/nginx/nginx.conf"})
+}
 
+// gatherApacheConfig reads the Apache config files that can define TLS
+// virtual hosts: the resolved config dir (preferring sites-enabled over
+// sites-available, as for nginx), the Debian and RHEL vhost directories, and
+// the main config file. A package variable so tests can stub it.
+var gatherApacheConfig = func(configDir string) string {
+	dirs := []string{configDir}
+	if filepath.Base(configDir) == "sites-available" {
+		enabled := filepath.Join(filepath.Dir(configDir), "sites-enabled")
+		if dirHasActiveConfig(enabled) {
+			dirs = []string{enabled}
+		}
+	}
+	dirs = append(dirs, "/etc/apache2/sites-enabled", "/etc/httpd/conf.d")
+	return readConfigTree(dirs, []string{"/etc/apache2/apache2.conf", "/etc/httpd/conf/httpd.conf"})
+}
+
+// readConfigTree concatenates the active config files in dirs plus files,
+// each real file once, up to maxConfigBytes in total. Unreadable entries are
+// skipped.
+func readConfigTree(dirs, files []string) string {
 	seen := map[string]struct{}{}
 	var b strings.Builder
 	add := func(path string) {

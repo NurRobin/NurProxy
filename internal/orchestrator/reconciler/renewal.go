@@ -182,6 +182,11 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		if inBackoff(fqdn) {
 			continue
 		}
+		// The adoption hold (#80) applies to per-host certificates only; a zone
+		// wildcard cert is shared by many domains and never adopted from disk.
+		if !isWildcard && s.awaitingAdoption(dom, fqdn, time.Now().UTC()) {
+			continue
+		}
 		t, ok := s.resolveTarget(fqdn, []string{fqdn}, isWildcard, zones)
 		if !ok {
 			log.Printf("reconciler: first-issuance: cannot resolve zone/provider for %q, skipping", fqdn)
@@ -236,11 +241,124 @@ func (s *CertRenewalStore) TargetForHost(_ context.Context, host string) (*tls.R
 			return nil, nil // the zone wildcard cert serves this host; no per-host order
 		}
 	}
+	if dom := s.domainForHost(host, zones); !isWildcard && dom != nil && s.awaitingAdoption(dom, host, time.Now().UTC()) {
+		return nil, nil
+	}
 	t, ok := s.resolveTarget(host, []string{host}, isWildcard, zones)
 	if !ok {
 		return nil, nil // no zone/provider covers this host — nothing to issue against
 	}
 	return &t, nil
+}
+
+// awaitingAdoption reports whether first issuance for host should wait under
+// the adoption hold (#80, db.CertAdoptionHold): ordering now would spend a CA
+// order, and duplicate-certificate quota, on a host the operator is probably
+// about to adopt a certificate for.
+func (s *CertRenewalStore) awaitingAdoption(dom *models.Domain, host string, now time.Time) bool {
+	until, dc, agentName, held := s.db.CertAdoptionHold(dom, host, now)
+	if held {
+		log.Printf("reconciler: first-issuance for %q waits until %s: agent %s has an adoptable certificate on disk (%s)",
+			host, until.Format(time.RFC3339), agentName, dc.CertPath)
+	}
+	return held
+}
+
+// heldHosts returns the hosts of central-TLS domains without a certificate
+// whose first issuance is currently held for adoption.
+func (s *CertRenewalStore) heldHosts(now time.Time) map[string]bool {
+	zones, err := s.db.ListZones()
+	if err != nil {
+		return nil
+	}
+	domains, err := s.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return nil
+	}
+	zoneNames := make(map[string]string, len(zones))
+	for i := range zones {
+		zoneNames[zones[i].ID] = zones[i].Name
+	}
+	held := map[string]bool{}
+	for i := range domains {
+		dom := &domains[i]
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok || dom.Status == models.DomainStatusDeleting || caddygen.TLSPolicyForDomain(*dom) != proxymodel.TLSPolicyCentral {
+			continue
+		}
+		host := dom.FQDN(zoneName)
+		if strings.HasPrefix(host, "*.") || caddygen.WildcardCertHost(*dom, zoneName) != "" {
+			continue // served from the zone wildcard cert, never held
+		}
+		if _, err := s.db.GetCertificate(host); err == nil {
+			continue
+		}
+		if _, _, _, ok := s.db.CertAdoptionHold(dom, host, now); ok {
+			held[host] = true
+		}
+	}
+	return held
+}
+
+// WatchAdoptionHolds issues a certificate as soon as a host's adoption hold
+// ends (grace elapsed, operator skipped adoption, or the agent stopped
+// reporting the certificate) instead of leaving it to the next periodic
+// renewal scan, which may be hours away. It polls every interval until ctx is
+// done. Hosts held when the orchestrator starts are tracked from the first
+// poll, so a restart during a hold still issues when it ends; a hold that
+// ended while the orchestrator was down is covered by the renewer's startup
+// scan. ensure is the renewer's EnsureCertForHost, a no-op once a certificate
+// is on file (for example after an adoption).
+func (s *CertRenewalStore) WatchAdoptionHolds(ctx context.Context, interval time.Duration, ensure func(context.Context, string) error) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	prev := s.heldHosts(time.Now().UTC())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		cur := s.heldHosts(time.Now().UTC())
+		for host := range prev {
+			if cur[host] {
+				continue
+			}
+			log.Printf("reconciler: adoption hold for %q ended; issuing", host)
+			go func(host string) {
+				ictx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				defer cancel()
+				if err := ensure(ictx, host); err != nil {
+					log.Printf("reconciler: issuance for %q after adoption hold failed (renewal scan will retry): %v", host, err)
+				}
+			}(host)
+		}
+		prev = cur
+	}
+}
+
+// domainForHost returns the non-deleting central-TLS domain whose FQDN is
+// host, or nil.
+func (s *CertRenewalStore) domainForHost(host string, zones []models.Zone) *models.Domain {
+	domains, err := s.db.ListDomains(db.DomainFilter{})
+	if err != nil {
+		return nil
+	}
+	zoneNames := make(map[string]string, len(zones))
+	for i := range zones {
+		zoneNames[zones[i].ID] = zones[i].Name
+	}
+	for i := range domains {
+		dom := &domains[i]
+		zoneName, ok := zoneNames[dom.ZoneID]
+		if !ok || dom.Status == models.DomainStatusDeleting || dom.FQDN(zoneName) != host {
+			continue
+		}
+		if caddygen.TLSPolicyForDomain(*dom) == proxymodel.TLSPolicyCentral {
+			return dom
+		}
+	}
+	return nil
 }
 
 // coveredOnlyByWildcard reports whether host has at least one live domain and

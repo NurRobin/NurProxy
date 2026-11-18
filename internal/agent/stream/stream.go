@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/agent/certdiscover"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/logtail"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
@@ -156,6 +157,7 @@ type Client struct {
 	recovery       *recovery.Coordinator
 	managedApplyMu sync.RWMutex
 	managedApply   ManagedApplier
+	certLoader     CertLoader
 	upgrades       UpgradeHandler
 }
 
@@ -170,6 +172,56 @@ type UpgradeHandler interface {
 func (c *Client) WithUpgrades(h UpgradeHandler) *Client {
 	c.upgrades = h
 	return c
+}
+
+// CertLoader returns the on-disk certificate bundle with the given leaf
+// fingerprint, chosen only among bundles the agent discovered itself.
+type CertLoader func(fingerprint string) (*certdiscover.Bundle, error)
+
+// WithCertLoader enables uploads of discovered certificates the operator
+// adopts (#80). Without it every upload request is answered with an error.
+func (c *Client) WithCertLoader(load CertLoader) *Client {
+	c.certLoader = load
+	return c
+}
+
+// uploadCert answers a cert_upload_request: it loads the requested bundle and
+// POSTs it, or the reason it cannot, over the agent-authenticated control
+// plane. The key material is never logged.
+func (c *Client) uploadCert(ctx context.Context, req proxymodel.CertUploadRequest) {
+	up := proxymodel.CertUpload{RequestID: req.RequestID, Fingerprint: req.Fingerprint}
+	if c.certLoader == nil {
+		up.Error = "certificate discovery is not enabled on this agent"
+	} else if b, err := c.certLoader(req.Fingerprint); err != nil {
+		up.Error = err.Error()
+	} else {
+		up.CertPEM, up.KeyPEM, up.SourcePath = string(b.CertPEM), string(b.KeyPEM), b.Pair.CertPath
+	}
+	if up.Error != "" {
+		log.Printf("Stream: cannot upload certificate %s: %s", req.Fingerprint, up.Error)
+	} else {
+		log.Printf("Stream: uploading certificate %s from %s for adoption", req.Fingerprint, up.SourcePath)
+	}
+	body, err := json.Marshal(up)
+	if err != nil {
+		return
+	}
+	url := fmt.Sprintf("%s/api/v1/agents/%s/certificates/upload", c.orchestratorURL, c.agentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(httpReq)
+	if err != nil {
+		log.Printf("Stream: certificate upload failed: %v", err)
+		return
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Stream: certificate upload rejected with status %d", resp.StatusCode)
+	}
 }
 
 func (c *Client) WithRecovery(coordinator *recovery.Coordinator) *Client {
@@ -354,6 +406,13 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			return
 		}
 		c.applyManagedIntents(ctx, envelope)
+	case "cert_upload_request":
+		var req proxymodel.CertUploadRequest
+		if err := json.Unmarshal([]byte(data), &req); err != nil || req.RequestID == "" {
+			log.Printf("Stream: bad cert_upload_request payload")
+			return
+		}
+		go c.uploadCert(ctx, req)
 	case "ping":
 		// Liveness only — nothing to do.
 	case "log_tail":

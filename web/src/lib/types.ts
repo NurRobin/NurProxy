@@ -32,6 +32,38 @@ export interface ProxyDetection {
   port_conflicts?: ProxyPortConflict[];
   discovered_upstreams?: DiscoveredUpstream[];
   networks?: DiscoveredNetwork[];
+  discovered_certs?: DiscoveredCert[];
+}
+
+/** A certificate bundle the agent found on its host (certbot, acme.sh, a
+ *  vhost's ssl_certificate) that can be adopted for a domain (#80). */
+export interface DiscoveredCert {
+  fingerprint?: string;
+  names?: string[];
+  issuer?: string;
+  not_before: string;
+  not_after: string;
+  source: string;
+  cert_path: string;
+  key_path?: string;
+  error?: string;
+}
+
+export interface CertCandidate extends DiscoveredCert {
+  agent_id: string;
+  agent_name: string;
+  serving: boolean;
+  adoptable: boolean;
+  reason?: string;
+}
+
+export interface CertCandidates {
+  host: string;
+  serving_agent_id: string;
+  candidates: CertCandidate[];
+  hints: { agent_id: string; agent_name: string; path: string; error: string }[];
+  certificate_on_file?: boolean;
+  issuance_deferred_until?: string;
 }
 
 /** An IP subnet attached to the agent host — a CIDR suggestion for the Server

@@ -70,6 +70,9 @@ type Server struct {
 	takeover DNSTakeover
 	issuer   CertIssuer
 	logs     *logbroker.Broker
+	// certUploads pairs operator adoption requests with the bundle the agent
+	// uploads in answer (#80).
+	certUploads *certUploadBroker
 	// loginLimiter blunts online password guessing: too many failed logins from
 	// one IP trip a temporary lockout.
 	loginLimiter *ratelimit.Limiter
@@ -150,11 +153,12 @@ func (s *Server) SetCertIssuer(issuer CertIssuer) {
 // NewServer creates a new API server and registers all routes.
 func NewServer(database *db.DB, version string) *Server {
 	s := &Server{
-		db:       database,
-		version:  version,
-		mux:      http.NewServeMux(),
-		sessions: auth.NewSessionManager(loadOrCreateSessionKey(database)),
-		logs:     logbroker.New(),
+		db:          database,
+		version:     version,
+		mux:         http.NewServeMux(),
+		sessions:    auth.NewSessionManager(loadOrCreateSessionKey(database)),
+		logs:        logbroker.New(),
+		certUploads: newCertUploadBroker(),
 		// 5 failed logins per IP within 15 min → locked out for 15 min.
 		loginLimiter: ratelimit.New(5, 15*time.Minute, 15*time.Minute),
 		discovery:    discoverysvc.New(database, false),
@@ -335,6 +339,7 @@ func (s *Server) registerRoutes() {
 	// (agent auth); the dashboard starts/polls/stops a tail (user auth). The tail
 	// request rides the agent's existing stream — never an inbound probe.
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/chunk", s.requireAgentAuth(s.handleAgentLogChunk))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/certificates/upload", s.requireAgentAuth(s.handleAgentCertUpload))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/tail", s.requireAuth(s.handleStartLogTail))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handlePollLogTail))
 	s.mux.HandleFunc("DELETE /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handleStopLogTail))
@@ -367,6 +372,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/domains/{id}/failover", s.requireAuth(s.handleGetDomainFailover))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/backups", s.requireAuth(s.handleSetDomainBackups))
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/certificate", s.requireAuth(s.handleImportDomainCertificate))
+	s.mux.HandleFunc("GET /api/v1/domains/{id}/certificate/candidates", s.requireAuth(s.handleDomainCertificateCandidates))
+	s.mux.HandleFunc("POST /api/v1/domains/{id}/certificate/adopt", s.requireAuth(s.handleAdoptDomainCertificate))
+	s.mux.HandleFunc("POST /api/v1/domains/{id}/certificate/issue-now", s.requireAuth(s.handleIssueDomainCertificateNow))
 
 	// Config artifacts + drift review (auth required, §11 Phase 3)
 	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAuth(s.handleListArtifacts))

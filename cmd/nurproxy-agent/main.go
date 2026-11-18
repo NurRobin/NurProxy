@@ -15,6 +15,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/adoption"
 	"github.com/NurRobin/NurProxy/internal/agent/api"
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
+	"github.com/NurRobin/NurProxy/internal/agent/certdiscover"
 	agentconfig "github.com/NurRobin/NurProxy/internal/agent/config"
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
@@ -46,6 +47,10 @@ var version = "dev"
 // below the orchestrator's agent_offline_timeout (default 90s) so a single
 // missed beat never flaps the agent offline.
 const heartbeatInterval = 30 * time.Second
+
+// helperCertificateDir is where the root helper materializes certificates for
+// managed vhosts.
+const helperCertificateDir = "/var/lib/nurproxy-agent/certs"
 
 var (
 	orchestratorURL = flag.String("orchestrator", "", "Orchestrator URL (required)")
@@ -182,7 +187,13 @@ func main() {
 	// which proxy is installed (+ version/paths) and which process holds :80/:443.
 	// The result rides the agent-initiated adoption + heartbeat payloads (the
 	// agent always dials out; the orchestrator never probes it inbound).
-	rawDetection, detection := detectProxy(ctx, cfg.ProxyConfigDir)
+	// newDetector applies the operator's proxy-config-dir override (empty = §9
+	// OS default) and the certificate scan (#80) to every detection run.
+	certScanner, certConfigRefs := diskCertScanner(cfg)
+	newDetector := func() *proxy.Detector {
+		return proxy.NewDetector().WithConfigDir(cfg.ProxyConfigDir).WithCertScanner(certScanner, certConfigRefs)
+	}
+	rawDetection, detection := detectProxy(ctx, newDetector())
 	if detection != nil {
 		log.Printf("Proxy detection: installed=%t kind=%q version=%q config_dir=%q",
 			detection.Installed, detection.Kind, detection.Version, detection.ConfigDir)
@@ -448,7 +459,11 @@ func main() {
 	// drift detection (§11).
 	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), holder, hs).
 		WithLogPaths(cfg.ProxyLogPaths).
-		WithCertStore(certStore)
+		WithCertStore(certStore).
+		WithCertLoader(func(fingerprint string) (*certdiscover.Bundle, error) {
+			s, _ := newDetector().CertScanner()
+			return s.Load(fingerprint)
+		})
 
 	// Self-update (#73): operator-requested upgrades arrive on the stream. The
 	// agent downloads and verifies the release and hands it to the privileged
@@ -543,7 +558,7 @@ func main() {
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
 	// host changes (e.g. a previously-conflicting proxy releasing :443).
-	hb.SetDetectionFn(func() *models.ProxyDetection { _, m := detectProxy(ctx, cfg.ProxyConfigDir); return m })
+	hb.SetDetectionFn(func() *models.ProxyDetection { _, m := detectProxy(ctx, newDetector()); return m })
 	// Re-report the capability matrix on each beat so module changes (e.g.
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
@@ -659,13 +674,40 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 	}
 }
 
+// diskCertScanner picks where the agent looks for adoptable certificates
+// (#80) and whether the host proxy's vhosts are followed. A real agent scans
+// certbot, acme.sh and the proxy config. A dry-run agent never reads the
+// host's certificates: it scans only a simulated certbot directory in its data
+// dir, populated for the names in NP_DRY_RUN_DISK_CERTS (comma-separated).
+func diskCertScanner(cfg *agentconfig.Config) (certdiscover.Scanner, bool) {
+	if !cfg.DryRun {
+		s := certdiscover.Default()
+		// Vhosts NurProxy rendered reference the certificates it installed, per
+		// FQDN and including copies of zone wildcard certs: under the data dir,
+		// or the root helper's fixed certificate dir. Those are not candidates.
+		s.Exclude = []string{helperCertificateDir}
+		if dataDir, err := filepath.Abs(cfg.DataDir); err == nil && cfg.DataDir != "" {
+			s.Exclude = append(s.Exclude, dataDir)
+		}
+		return s, true
+	}
+	names := strings.Split(os.Getenv("NP_DRY_RUN_DISK_CERTS"), ",")
+	live, err := certdiscover.WriteSimulated(filepath.Join(cfg.DataDir, "dryrun-disk-certs"), names, time.Now())
+	if err != nil {
+		if strings.TrimSpace(os.Getenv("NP_DRY_RUN_DISK_CERTS")) != "" {
+			log.Printf("WARNING: dry-run: cannot simulate on-disk certificates: %v", err)
+		}
+		return certdiscover.Scanner{}, false
+	}
+	log.Printf("Dry-run: simulating on-disk certificates for %s", os.Getenv("NP_DRY_RUN_DISK_CERTS"))
+	return certdiscover.Scanner{CertbotLive: []string{live}, LiveSource: certdiscover.SourceDryRun}, false
+}
+
 // detectProxy runs read-only proxy detection and converts it to the shared wire
 // model. It never mutates host state; a detection error is logged and reported
-// as nil (the orchestrator keeps any prior value), never fatal. configDir is the
-// operator's optional proxy-config-dir override (empty = §9 OS default), applied
-// to both the reported config dir and upstream discovery.
-func detectProxy(ctx context.Context, configDir string) (*proxy.Detection, *models.ProxyDetection) {
-	det, err := proxy.NewDetector().WithConfigDir(configDir).Detect(ctx)
+// as nil (the orchestrator keeps any prior value), never fatal.
+func detectProxy(ctx context.Context, d *proxy.Detector) (*proxy.Detection, *models.ProxyDetection) {
+	det, err := d.Detect(ctx)
 	if err != nil {
 		log.Printf("Proxy detection failed: %v", err)
 		return nil, nil

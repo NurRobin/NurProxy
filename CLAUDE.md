@@ -55,6 +55,9 @@ NP_ACME_DRY_RUN=true NP_DRY_RUN_FAIL=ratelimit ./nurproxy   # inject ACME failur
 NP_DRY_RUN=true ./nurproxy-agent -orchestrator http://localhost:8080 -fqdn edge1.example.com
                                            # (or pass -dry-run). Data dir auto-relocates
                                            # to a per-FQDN temp dir; run many agents at once.
+NP_DRY_RUN=true NP_DRY_RUN_DISK_CERTS=legacy.example.com ./nurproxy-agent ...
+                                           # also report a simulated on-disk certbot bundle
+                                           # for those names, to exercise cert adoption (#80)
 ```
 Provider setup (validate + list-zones) is mocked too, so a Cloudflare provider
 created with a dummy token works end-to-end.

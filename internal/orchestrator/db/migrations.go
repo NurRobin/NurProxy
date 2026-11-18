@@ -963,6 +963,17 @@ var migrations = []string{
 		updated_at   TEXT NOT NULL
 	);
 	`,
+
+	// Migration 41: certificate bundles the agent found on its host (#80), as
+	// a JSON array of models.DiscoveredCert. Metadata only, never key material;
+	// the operator adopts one explicitly and only then the agent uploads it.
+	// domains.cert_adoption_skipped records that the operator chose to issue a
+	// new certificate instead of adopting one, which ends the issuance hold.
+	`
+	ALTER TABLE agents ADD COLUMN detected_certs TEXT NOT NULL DEFAULT '';
+	ALTER TABLE domains ADD COLUMN cert_adoption_skipped INTEGER NOT NULL DEFAULT 0
+		CHECK (cert_adoption_skipped IN (0, 1));
+	`,
 }
 
 // migrationRestrictParentFKs is the placeholder text of the migration that
