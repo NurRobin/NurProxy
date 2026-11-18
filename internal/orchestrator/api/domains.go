@@ -39,6 +39,7 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 	if domains == nil {
 		domains = []models.Domain{}
 	}
+	s.fillFailover(domains)
 	writeJSON(w, http.StatusOK, domains)
 }
 
@@ -47,7 +48,7 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 // with the same rules the agent's helper applies, so a value the helper would
 // refuse is rejected when it is saved.
 func validateProxyOptions(dom models.Domain) error {
-	return caddygen.ConfigFromDomain(dom, "", "").ValidateOptions()
+	return caddygen.ConfigFromDomain(dom, "", "", nil).ValidateOptions()
 }
 
 // POST /api/v1/domains
@@ -158,6 +159,10 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := s.db.CheckDomainRoutes(dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if err := s.db.CreateDomain(dom); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create domain")
@@ -244,8 +249,10 @@ func (s *Server) handleGetDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
 	}
+	one := []models.Domain{*dom}
+	s.fillFailover(one)
 
-	writeJSON(w, http.StatusOK, dom)
+	writeJSON(w, http.StatusOK, one[0])
 }
 
 // PUT /api/v1/domains/{id}
@@ -309,6 +316,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "server not found")
 			return
 		}
+		if err := s.db.CheckPrimaryServer(dom.ID, *req.ServerID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		dom.ServerID = *req.ServerID
 	}
 	if req.Port != nil {
@@ -357,6 +368,10 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	// Checked against the final subdomain, zone and TLS policy, so a rename to a
 	// deeper name or a switch away from central TLS cannot leave a stale opt-in.
 	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.db.CheckDomainRoutes(dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -584,6 +599,14 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Standby routes on failover backup agents (#74) get their tombstones
+	// before any push leaves them out, like the primary's above. A failure is
+	// only logged: the reconciler teardown writes them again before it pushes.
+	standbyAgents, standbyErr := s.db.TombstoneStandbyRoutes(dom, time.Now().UTC())
+	if standbyErr != nil {
+		log.Printf("delete: standby route deletions for domain %d: %v", id, standbyErr)
+	}
+
 	// Set status to "deleting" — reconciler handles actual cleanup
 	if err := s.db.UpdateDomainStatus(id, models.DomainStatusDeleting, ""); err != nil {
 		if tombstone != nil {
@@ -597,6 +620,9 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	// A full-sync push now excludes the deleting domain, so a connected agent
 	// drops the route at once; DNS record + row cleanup follow in the reconciler.
 	s.triggerAgentPush(dom.ServerID)
+	for _, agentID := range standbyAgents {
+		s.pushAgent(agentID)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "domain marked for deletion"})
 }
@@ -695,7 +721,11 @@ func (s *Server) handleGetDomainConfig(w http.ResponseWriter, r *http.Request) {
 // agent's conventional cert-store paths so a TLS route previews its real
 // listener; the operator adjusts them if their agent uses a custom cert dir.
 func (s *Server) renderDomainPreview(dom *models.Domain, srv *models.Server, fqdn string) (backend string, config interface{}, err error) {
-	route := caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+	routeAddrs, err := s.db.PathRouteAddrs(*dom)
+	if err != nil {
+		return s.backendForDomain(srv), nil, err
+	}
+	route := caddygen.ConfigFromDomain(*dom, fqdn, srv.Address, routeAddrs)
 	backend = s.backendForDomain(srv)
 	certPath, keyPath := previewCertPaths(fqdn)
 

@@ -201,6 +201,8 @@ type Capabilities struct {
 	// ErrorLogLevel reports that the backend can set a per-route error log
 	// level.
 	ErrorLogLevel bool `json:"error_log_level"`
+	// PathRoutes reports that the backend renders Route.PathRoutes.
+	PathRoutes bool `json:"path_routes"`
 	// HeaderConfigVars reports that the backend replaces "${NAME}" in header
 	// values with an environment variable or Define value when it loads the
 	// config (Apache). The orchestrator then refuses such header values.
@@ -225,6 +227,7 @@ func (c Capabilities) ToModel() *models.ProxyCapabilities {
 		AccessLog:        c.AccessLog,
 		ErrorLogLevel:    c.ErrorLogLevel,
 		HeaderConfigVars: c.HeaderConfigVars,
+		PathRoutes:       c.PathRoutes,
 	}
 }
 

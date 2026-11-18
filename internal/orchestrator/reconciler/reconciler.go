@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/failover"
 	"github.com/NurRobin/NurProxy/internal/provider"
 	"github.com/NurRobin/NurProxy/internal/provider/dryrun"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
@@ -80,6 +81,12 @@ type Reconciler struct {
 	applyAuthority interface {
 		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
 	}
+
+	// clock is the time failover decisions are made at; tests replace it.
+	clock func() time.Time
+	// startedAt starts the failover settle period: right after a start no
+	// agent had a chance to heartbeat yet.
+	startedAt time.Time
 }
 
 func (r *Reconciler) SetApplyAuthority(authority interface {
@@ -97,6 +104,8 @@ func New(database *db.DB, agentClient AgentClient, interval time.Duration) *Reco
 		anchorRenameGrace: defaultAnchorRenameGrace,
 
 		domainDNSCleanupMaxWait: defaultDomainDNSCleanupMaxWait,
+		clock:                   time.Now,
+		startedAt:               time.Now().UTC(),
 	}
 }
 
@@ -361,6 +370,7 @@ func (r *Reconciler) liveCertificateKeep(agent *models.Agent) []string {
 		}
 		hosts = append(hosts, domain.FQDN(zoneName))
 	}
+	hosts = append(hosts, r.standbyHosts(agent)...)
 	sort.Strings(hosts)
 	return hosts
 }
@@ -402,14 +412,16 @@ func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertB
 	return bundles
 }
 
-// RepushCertForHost re-pushes the config + cert bundle for the agent serving
-// host (an FQDN), so a centrally-renewed certificate reaches that agent and is
-// reloaded. It is the post-renewal hook the TLS Renewer calls (§7): it resolves
-// host -> domain -> server -> agent, then re-runs the agent's instant push,
-// which gathers the now-renewed cert from the store and rides it down the
-// agent-initiated stream ahead of the intents (preflight ordering). It satisfies
-// tls.Reloader. Best-effort by contract: if the agent is offline PushAgentRoutes
-// is a no-op and the agent re-syncs (with the fresh cert) on reconnect.
+// RepushCertForHost re-pushes the config + cert bundle to every agent serving
+// host (an FQDN): the primary agent and, for a domain with failover backups,
+// each standby agent (#74), so a centrally-renewed certificate reaches all of
+// them and is reloaded. It is the post-renewal hook the TLS Renewer calls (§7):
+// it resolves host -> domain -> servers -> agents, then re-runs each agent's
+// instant push, which gathers the now-renewed cert from the store and rides it
+// down the agent-initiated stream ahead of the intents (preflight ordering). It
+// satisfies tls.Reloader. Best-effort by contract: if an agent is offline
+// PushAgentRoutes is a no-op and the agent re-syncs (with the fresh cert) on
+// reconnect; the first push error is returned after all agents were tried.
 func (r *Reconciler) RepushCertForHost(_ context.Context, host string) error {
 	if strings.HasPrefix(host, "*.") {
 		// A zone wildcard cert is installed on every agent serving one of its
@@ -426,42 +438,19 @@ func (r *Reconciler) RepushCertForHost(_ context.Context, host string) error {
 		}
 		return firstErr
 	}
-	agentID, err := r.agentServingHost(host)
+	agentIDs, err := r.agentsServingHost(host)
 	if err != nil {
 		return err
 	}
-	if agentID == "" {
-		// No domain matches this host (e.g. it was deleted). Nothing to push; the
-		// stored cert simply has no current consumer.
-		return nil
-	}
-	return r.PushAgentRoutes(agentID)
-}
-
-// agentServingHost resolves an FQDN to the id of the agent currently serving it,
-// by matching the host against each domain's computed FQDN and following
-// domain -> server -> agent. Returns "" (no error) when no domain matches.
-func (r *Reconciler) agentServingHost(host string) (string, error) {
-	domains, err := r.db.ListDomains(db.DomainFilter{})
-	if err != nil {
-		return "", fmt.Errorf("listing domains to resolve host %q: %w", host, err)
-	}
-	for i := range domains {
-		dom := &domains[i]
-		zone, zErr := r.db.GetZone(dom.ZoneID)
-		if zErr != nil {
-			continue
+	// No domain matching this host (e.g. it was deleted) means nothing to push;
+	// the stored cert simply has no current consumer.
+	var first error
+	for _, agentID := range agentIDs {
+		if pErr := r.PushAgentRoutes(agentID); pErr != nil && first == nil {
+			first = pErr
 		}
-		if dom.FQDN(zone.Name) != host {
-			continue
-		}
-		srv, sErr := r.db.GetServer(dom.ServerID)
-		if sErr != nil {
-			return "", fmt.Errorf("resolving server for host %q: %w", host, sErr)
-		}
-		return srv.AgentID, nil
 	}
-	return "", nil
+	return first
 }
 
 // gatherCerts collects the cert bundles for the FQDNs in the desired route set, so
@@ -717,18 +706,7 @@ func (r *Reconciler) reconcileAgents(_ context.Context) error {
 // considered offline. It reads the agent_offline_timeout setting (seconds),
 // clamped to a sane floor so a misconfiguration can't make agents flap.
 func (r *Reconciler) offlineTimeout() time.Duration {
-	const def = 90 * time.Second
-	const floor = 15 * time.Second
-	if v, err := r.db.GetSetting("agent_offline_timeout"); err == nil && v != "" {
-		if secs, err := strconv.Atoi(v); err == nil {
-			d := time.Duration(secs) * time.Second
-			if d < floor {
-				return floor
-			}
-			return d
-		}
-	}
-	return def
+	return failover.OfflineTimeout(r.db)
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +723,22 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 		return nil, nil, fmt.Errorf("listing domains for agent %s: %w", agent.ID, err)
 	}
 
+	// Domains this agent holds as warm standby for failover (#74): the same
+	// route, proxied to the backup server on this agent, under its own
+	// artifact identity.
+	standby, err := r.db.ListStandbyDomains(agent.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing standby domains for agent %s: %w", agent.ID, err)
+	}
+	sources := make([]desiredSource, 0, len(domains)+len(standby))
+	for i := range domains {
+		sources = append(sources, desiredSource{domain: &domains[i], serverID: domains[i].ServerID, artifactID: artifactIDForDomain(domains[i].ID)})
+	}
+	for i := range standby {
+		sd := &standby[i]
+		sources = append(sources, desiredSource{domain: &sd.Domain, serverID: sd.Server.ID, artifactID: db.StandbyArtifactID(sd.Domain.ID, agent.ID), standby: true})
+	}
+
 	zoneNames := make(map[string]string) // zoneID -> name
 
 	// keepExtra holds generated artifact paths the agent must RETAIN even though
@@ -754,8 +748,8 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 	var keepExtra []string
 
 	desiredByFQDN := make(map[string]desiredRoute)
-	for i := range domains {
-		dom := &domains[i]
+	for _, src := range sources {
+		dom := src.domain
 
 		// Domains being deleted are handled by reconcileDeletions; do not
 		// (re-)push routes for them here.
@@ -784,13 +778,13 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 		fqdn := dom.FQDN(zoneName)
 
 		// Resolve server address.
-		srv, sErr := r.db.GetServer(dom.ServerID)
+		srv, sErr := r.db.GetServer(src.serverID)
 		if sErr != nil {
-			log.Printf("reconciler: cannot resolve server %s for domain %d: %v", dom.ServerID, dom.ID, sErr)
+			log.Printf("reconciler: cannot resolve server %s for domain %d: %v", src.serverID, dom.ID, sErr)
 			continue
 		}
 
-		artifactID := artifactIDForDomain(dom.ID)
+		artifactID := src.artifactID
 		storedArt, artErr := r.db.GetConfigArtifact(artifactID)
 
 		// Drift = review, not bulldoze (§11, invariant #3): if this domain's
@@ -824,13 +818,23 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 				Raw:  proxymodel.RawConfig{Backend: backendForAgent(agent), Content: storedArt.Content},
 			}
 		} else {
-			intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address)
+			routeAddrs, rErr := r.db.PathRouteAddrs(*dom)
+			intent = caddygen.ConfigFromDomain(*dom, fqdn, srv.Address, routeAddrs)
 			// The agent's helper refuses the whole apply batch when one route
 			// fails validation. Hold back only this route, keep its current
 			// file on the agent (like a drifted artifact) and show the reason
 			// on the domain, so one bad stored value neither blocks the other
-			// domains nor goes unnoticed.
-			if vErr := intent.Validate(); vErr != nil {
+			// domains nor goes unnoticed. Path routes the agent's backend
+			// cannot render are held back the same way: an older agent would
+			// drop them without a word.
+			vErr := rErr
+			if vErr == nil {
+				vErr = intent.Validate()
+			}
+			if vErr == nil && len(intent.PathRoutes) > 0 {
+				vErr = dom.ProxyConfig.CheckRoutesSupported(agent.ProxyCapabilities, backendForAgent(agent))
+			}
+			if vErr != nil {
 				log.Printf("reconciler: not pushing domain %d (%s): stored proxy settings are invalid: %v", dom.ID, fqdn, vErr)
 				if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("proxy settings are invalid, fix them to apply this domain again: %v", vErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
@@ -868,10 +872,21 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			route:      route,
 			intent:     intent,
 			artifactID: artifactID,
+			standby:    src.standby,
 		}
 	}
 
 	return desiredByFQDN, keepExtra, nil
+}
+
+// desiredSource is one route an agent should serve: a domain whose primary
+// server is on the agent, or a standby copy for a domain with a backup server
+// on it (#74).
+type desiredSource struct {
+	domain     *models.Domain
+	serverID   string
+	artifactID string
+	standby    bool
 }
 
 func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) error {
@@ -936,14 +951,14 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 			log.Printf("reconciler: pushing missing route for %s to agent %s", fqdn, agent.ID)
 			if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 				log.Printf("reconciler: failed to push route for %s: %v", fqdn, pErr)
-				if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("route push failed: %v", pErr)); dErr != nil {
+				if dErr := r.markInboundError(desired, fmt.Sprintf("route push failed: %v", pErr)); dErr != nil {
 					log.Printf("reconciler: failed to update domain status: %v", dErr)
 				}
 				r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_push_failed", pErr.Error())
 				continue
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_pushed", "pushed missing route to agent")
-			if dErr := r.markDomainApplied(desired, fqdn); dErr != nil {
+			if dErr := r.markInboundApplied(desired, fqdn); dErr != nil {
 				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
@@ -953,7 +968,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if routesMatch(desired.route, actual) {
 			// All good — keep last_synced fresh so the dashboard reflects the
 			// most recent successful reconciliation.
-			if dErr := r.markDomainApplied(desired, fqdn); dErr != nil {
+			if dErr := r.markInboundApplied(desired, fqdn); dErr != nil {
 				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
@@ -971,7 +986,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		log.Printf("reconciler: fixing drift for %s on agent %s", fqdn, agent.ID)
 		if pErr := r.agentClient.PushRoute(ctx, agent.APIURL, agentToken, desired.route); pErr != nil {
 			log.Printf("reconciler: failed to fix drift for %s: %v", fqdn, pErr)
-			if dErr := r.db.UpdateDomainStatus(desired.domain.ID, models.DomainStatusError, fmt.Sprintf("drift fix failed: %v", pErr)); dErr != nil {
+			if dErr := r.markInboundError(desired, fmt.Sprintf("drift fix failed: %v", pErr)); dErr != nil {
 				log.Printf("reconciler: failed to update domain status: %v", dErr)
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "drift_fix_failed", pErr.Error())
@@ -981,7 +996,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		// Route the drift-fix through the same applied path as the push/match cases so
 		// it honors the §78 degraded check (a central-TLS domain with no issued cert
 		// is marked "degraded", not a bare "active" that hides the plaintext downgrade).
-		if dErr := r.markDomainApplied(desired, fqdn); dErr != nil {
+		if dErr := r.markInboundApplied(desired, fqdn); dErr != nil {
 			log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 		}
 	}
@@ -1097,16 +1112,11 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 
 	fqdn := dom.FQDN(zone.Name)
 
-	// Resolve: domain -> server -> agent -> agent.FQDN for CNAME target.
-	srv, sErr := r.db.GetServer(dom.ServerID)
-	if sErr != nil {
-		r.failDomainDNS(dom, fmt.Sprintf("DNS record for %s not created: cannot read server %s: %v", fqdn, dom.ServerID, sErr), "")
-		return
-	}
-
-	agent, aErr := r.db.GetAgent(srv.AgentID)
+	// Resolve the CNAME target: the primary server's agent, or with failover
+	// backups the agent the failover decision picks (#74).
+	agent, aErr := r.selectDNSTarget(dom)
 	if aErr != nil {
-		r.failDomainDNS(dom, fmt.Sprintf("DNS record for %s not created: cannot read agent %s: %v", fqdn, srv.AgentID, aErr), "")
+		r.failDomainDNS(dom, fmt.Sprintf("DNS record for %s not created: cannot resolve the failover target: %v", fqdn, aErr), "")
 		return
 	}
 
@@ -1739,6 +1749,19 @@ func (r *Reconciler) teardownDomain(ctx context.Context, dom *models.Domain, aff
 	// agent inbound (invariant #2). Deleting the artifact below shrinks the desired
 	// set; the re-push then makes the agent prune the orphaned vhost.
 
+	// Standby routes on failover backup agents (#74) go the same way as the
+	// primary route: a tombstone where the agent renders nginx/apache, the
+	// artifact row dropped, and a re-push. Their rows in domain_backups go
+	// with the domain row.
+	standbyAgents, sbErr := r.tearDownStandby(dom)
+	if sbErr != nil {
+		log.Printf("reconciler: cannot persist standby route deletions for domain %d, retrying next cycle: %v", dom.ID, sbErr)
+		return
+	}
+	for _, agentID := range standbyAgents {
+		affectedAgents[agentID] = true
+	}
+
 	// Remove the domain's config artifact from the central store so no ghost
 	// vhost/artifact lingers (§3). Best-effort: a missing artifact (never
 	// applied) is fine.
@@ -1882,6 +1905,9 @@ type desiredRoute struct {
 	// config artifact, echoed back by the agent in its apply-ACK so the rendered
 	// content round-trips into the correct store row.
 	artifactID string
+	// standby marks a failover standby route on a backup agent (#74). Its
+	// applies do not set the domain's status, which follows the primary.
+	standby bool
 }
 
 // artifactIDForDomain derives the stable artifact identity for a generated
@@ -1997,6 +2023,15 @@ func (r *Reconciler) finalizePendingParentDeletions() {
 		}
 		if len(doms) > 0 {
 			continue // teardown still in flight; try again next cycle
+		}
+		if p.EntityType == "server" {
+			// A path route added after the cascade request still needs the
+			// server; it has no foreign key to stop the delete.
+			refs, err := r.db.ListDomains(db.DomainFilter{RouteServerID: p.EntityID})
+			if err != nil || len(refs) > 0 {
+				log.Printf("reconciler: pending delete of server %s waits: %d domain(s) still route paths to it (err=%v)", p.EntityID, len(refs), err)
+				continue
+			}
 		}
 
 		var delErr error

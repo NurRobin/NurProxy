@@ -35,7 +35,7 @@ func TestValidateTLSWildcardAndHost(t *testing.T) {
 			// The shared cert reaches the agent as an ordinary per-host bundle;
 			// the route must not carry the wildcard flag, which the file
 			// backends report as a dropped option and mark the domain degraded.
-			if ConfigFromDomain(tt.dom, "app.example.com", "10.0.0.1").TLS.Wildcard {
+			if ConfigFromDomain(tt.dom, "app.example.com", "10.0.0.1", nil).TLS.Wildcard {
 				t.Fatal("route TLS.Wildcard set")
 			}
 		})

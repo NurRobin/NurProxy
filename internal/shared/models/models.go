@@ -105,6 +105,9 @@ type ProxyCapabilities struct {
 	// ErrorLogLevel reports that the backend can set a per-domain error log
 	// level.
 	ErrorLogLevel bool `json:"error_log_level"`
+	// PathRoutes reports that the backend can route request paths of one
+	// domain to different upstreams.
+	PathRoutes bool `json:"path_routes"`
 	// HeaderConfigVars reports that the backend replaces "${NAME}" in header
 	// values with an environment variable or Define value when it loads the
 	// config (Apache), so such values are refused.
@@ -430,6 +433,52 @@ type ProxyConfig struct {
 	// ErrorLogLevel raises the domain's error log threshold to one of
 	// proxymodel.ErrorLogLevels (e.g. "crit"). Empty keeps the host default.
 	ErrorLogLevel string `json:"error_log_level,omitempty"`
+	// Routes send matching request paths to other upstreams; everything else
+	// goes to the domain's server and port. See proxymodel.PathRoute for the
+	// matching rules.
+	Routes []PathRoute `json:"routes,omitempty"`
+}
+
+// PathRoute is one extra path-routed upstream of a domain. ServerID must
+// belong to the same agent as the domain's server, since that agent proxies
+// the request.
+type PathRoute struct {
+	// Match is "prefix" or "exact".
+	Match string `json:"match"`
+	// Path is the request path, starting with "/".
+	Path     string `json:"path"`
+	ServerID string `json:"server_id"`
+	Port     int    `json:"port"`
+	// UpstreamScheme is "http" (default) or "https".
+	UpstreamScheme string `json:"upstream_scheme,omitempty"`
+	WebSocket      bool   `json:"websocket,omitempty"`
+	// StripPrefix removes Path from the forwarded request path (prefix
+	// routes only).
+	StripPrefix bool `json:"strip_prefix,omitempty"`
+}
+
+// Intent converts the stored route into the backend-neutral form with the
+// given upstream address.
+func (p PathRoute) Intent(addr string) proxymodel.PathRoute {
+	return proxymodel.PathRoute{
+		Match:       proxymodel.PathMatch(p.Match),
+		Path:        p.Path,
+		Upstream:    proxymodel.Upstream{Addr: addr, Port: p.Port, Scheme: proxymodel.Scheme(p.UpstreamScheme)},
+		WebSocket:   p.WebSocket,
+		StripPrefix: p.StripPrefix,
+	}
+}
+
+// CheckRoutesSupported refuses path routes when the serving agent reported a
+// backend that cannot render them. A nil matrix is not checked.
+func (pc ProxyConfig) CheckRoutesSupported(caps *ProxyCapabilities, backend string) error {
+	if caps == nil || len(pc.Routes) == 0 || caps.PathRoutes {
+		return nil
+	}
+	if backend == "" {
+		backend = "the agent's proxy"
+	}
+	return fmt.Errorf("%s cannot render path routes", backend)
 }
 
 // NormalizeLogging canonicalizes the logging settings ("default" becomes
@@ -563,9 +612,16 @@ type Domain struct {
 	// proxy state the live record already has (a new record starts DNS-only).
 	// true / false are enforced by the reconciler as desired state. Only zones
 	// whose provider supports proxying accept true.
-	Proxied  *bool        `json:"proxied"`
-	Status   DomainStatus `json:"status"`
-	ErrorMsg string       `json:"error_msg,omitempty"`
+	Proxied *bool `json:"proxied"`
+	// BackupServerIDs are the domain's failover servers on other agents, most
+	// preferred first (#74). ActiveServerID is the server whose agent the
+	// domain's CNAME points at: the primary (ServerID) unless the reconciler
+	// failed over. Both live outside the domains row and are filled in by the
+	// API (db.FillDomainFailover); a bare row read leaves them empty.
+	BackupServerIDs []string     `json:"backup_server_ids,omitempty"`
+	ActiveServerID  string       `json:"active_server_id,omitempty"`
+	Status          DomainStatus `json:"status"`
+	ErrorMsg        string       `json:"error_msg,omitempty"`
 	// DNSError is why the domain's public DNS record could not be created,
 	// adopted or corrected in the last DNS pass. While it is set the domain
 	// stays in error with this reason, whatever the route apply reports.
@@ -573,6 +629,53 @@ type Domain struct {
 	LastSynced *time.Time `json:"last_synced,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// DomainFailoverState is the reconciler's stored failover decision for a domain
+// with backup servers (#74). ActiveServerID is where the CNAME points;
+// PendingServerID is a more preferred candidate that is healthy again and
+// waits out the failback delay since PendingSince. AllDown is set while no
+// candidate is healthy (the record then stays on the last active agent).
+// EvaluatedAt is the last pass that decided; SettleSince starts a settle
+// period in which a down target is held (after a late pass or all-down).
+type DomainFailoverState struct {
+	DomainID        int64      `json:"domain_id"`
+	ActiveServerID  string     `json:"active_server_id"`
+	PendingServerID string     `json:"pending_server_id,omitempty"`
+	PendingSince    *time.Time `json:"pending_since,omitempty"`
+	AllDown         bool       `json:"all_down"`
+	SwitchedAt      *time.Time `json:"switched_at,omitempty"`
+	Switches        int        `json:"switches"`
+	EvaluatedAt     *time.Time `json:"evaluated_at,omitempty"`
+	SettleSince     *time.Time `json:"settle_since,omitempty"`
+}
+
+// FailoverCandidate is one server that may serve a domain: the primary
+// (Priority 0) or a backup, with its agent's current health as the reconciler
+// judges it.
+type FailoverCandidate struct {
+	ServerID   string     `json:"server_id"`
+	ServerName string     `json:"server_name"`
+	AgentID    string     `json:"agent_id"`
+	AgentName  string     `json:"agent_name"`
+	AgentFQDN  string     `json:"agent_fqdn"`
+	Primary    bool       `json:"primary"`
+	Priority   int        `json:"priority"`
+	Eligible   bool       `json:"eligible"`
+	Healthy    bool       `json:"healthy"`
+	Active     bool       `json:"active"`
+	LastSeen   *time.Time `json:"last_seen,omitempty"`
+	Reason     string     `json:"reason,omitempty"`
+}
+
+// DomainFailoverStatus is the failover view of one domain for the API, CLI,
+// MCP and dashboard.
+type DomainFailoverStatus struct {
+	DomainFailoverState
+	Candidates []FailoverCandidate `json:"candidates"`
+	// Settling: a down target is held while agents report in (see
+	// failover.Policy.Settle).
+	Settling bool `json:"settling"`
 }
 
 // OptionalBool is a PATCH-style JSON field for a tri-state bool: Set is false
