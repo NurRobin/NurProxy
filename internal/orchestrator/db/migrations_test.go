@@ -181,8 +181,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 35 {
-		t.Fatalf("this test pins the schema target at 35 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 36 {
+		t.Fatalf("this test pins the schema target at 36 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -307,6 +307,22 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if _, err := d.sql.Exec("UPDATE certificates SET source='manual' WHERE host='app.example.com'"); err == nil {
 			t.Error("certificates.source accepted a value outside acme|imported")
+		}
+	})
+
+	// migration 36: a server that existed before discovery is a plain,
+	// unlinked server, and the discovery sources table starts empty.
+	t.Run("server_discovery_defaults", func(t *testing.T) {
+		srv, err := d.GetServer("srv1")
+		if err != nil {
+			t.Fatalf("GetServer: %v", err)
+		}
+		if srv.DiscoverySourceID != "" || srv.ExternalID != "" || srv.DiscoveryMissingSince != nil {
+			t.Errorf("pre-existing server = %+v, want no discovery link", srv)
+		}
+		sources, err := d.ListDiscoverySources()
+		if err != nil || len(sources) != 0 {
+			t.Errorf("discovery sources = %v, %v; want empty", sources, err)
 		}
 	})
 

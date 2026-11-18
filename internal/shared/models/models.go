@@ -331,6 +331,28 @@ type Server struct {
 	Address   string    `json:"address"`
 	Notes     string    `json:"notes,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	// DiscoverySourceID and ExternalID link a server imported from a
+	// discovery source to the machine it came from (#25).
+	DiscoverySourceID string `json:"discovery_source_id,omitempty"`
+	ExternalID        string `json:"external_id,omitempty"`
+	// DiscoveryMissingSince is set while the source no longer reports the
+	// machine.
+	DiscoveryMissingSince *time.Time `json:"discovery_missing_since,omitempty"`
+}
+
+// DiscoverySource is a configured server discovery source (#25), e.g. a
+// Proxmox VE cluster.
+type DiscoverySource struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Name   string `json:"name"`
+	Config string `json:"-"` // encrypted at rest, never in API responses
+	// SyncInterval is the periodic re-sync interval in seconds; 0 = only on
+	// demand.
+	SyncInterval int        `json:"sync_interval"`
+	LastRunAt    *time.Time `json:"last_run_at,omitempty"`
+	LastError    string     `json:"last_error,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
 }
 
 // BasicAuthConfig holds credentials for HTTP basic authentication.
