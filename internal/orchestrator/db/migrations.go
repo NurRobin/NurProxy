@@ -863,7 +863,34 @@ var migrations = []string{
 	// worked.
 	`ALTER TABLE domains ADD COLUMN dns_error TEXT NOT NULL DEFAULT '';`,
 
-	// Migration 38: per-domain failover to backup servers on other agents
+	// Migration 38: server discovery sources (#25). config is the source's
+	// credentials, AES-256-GCM encrypted like providers.config. last_result is
+	// the JSON result of the last successful run (machines and addresses, no
+	// secrets); sync_interval is in seconds, 0 = run only on demand. An
+	// imported server remembers its source and the machine's external_id; the
+	// partial unique index keeps one server per machine.
+	// discovery_missing_since is set while a re-sync no longer finds the
+	// machine ('' = present).
+	`
+	CREATE TABLE discovery_sources (
+		id            TEXT PRIMARY KEY,
+		type          TEXT NOT NULL,
+		name          TEXT NOT NULL,
+		config        TEXT NOT NULL,
+		sync_interval INTEGER NOT NULL DEFAULT 0,
+		last_run_at   TEXT NOT NULL DEFAULT '',
+		last_error    TEXT NOT NULL DEFAULT '',
+		last_result   TEXT NOT NULL DEFAULT '',
+		created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+	ALTER TABLE servers ADD COLUMN discovery_source_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE servers ADD COLUMN external_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE servers ADD COLUMN discovery_missing_since TEXT NOT NULL DEFAULT '';
+	CREATE UNIQUE INDEX idx_servers_discovery_external
+		ON servers(discovery_source_id, external_id) WHERE external_id <> '';
+	`,
+
+	// Migration 39: per-domain failover to backup servers on other agents
 	// (#74). domain_backups lists the backups in priority order (lower first;
 	// the primary is domains.server_id and not stored here). domain_failover
 	// is the reconciler's decision state for a domain with backups: the server

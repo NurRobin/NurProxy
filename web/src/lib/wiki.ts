@@ -10,6 +10,7 @@ import existingProxyPermissions from '../../../wiki/existing-proxy-permissions.m
 import security from '../../../wiki/security.md?raw';
 import glossary from '../../../wiki/glossary.md?raw';
 import serversDoc from '../../../wiki/servers.md?raw';
+import serverDiscovery from '../../../wiki/server-discovery.md?raw';
 import troubleshooting from '../../../wiki/troubleshooting.md?raw';
 import cli from '../../../wiki/cli.md?raw';
 
@@ -26,6 +27,7 @@ export const TOPICS: Topic[] = [
   { slug: 'agent-reachability', title: 'Agent can’t connect', blurb: 'Fix the #1 setup snag: the orchestrator URL.', content: agentReachability },
   { slug: 'agents', title: 'Agents', blurb: 'Register, approve, and manage edge servers.', content: agentsDoc },
   { slug: 'servers', title: 'Servers', blurb: 'Backends an agent forwards to, and config suggestions.', content: serversDoc },
+  { slug: 'server-discovery', title: 'Server discovery (Proxmox)', blurb: 'Import VMs and containers from Proxmox VE as servers.', content: serverDiscovery },
   { slug: 'domains', title: 'Domains', blurb: 'Proxy a subdomain to a server, plus advanced config.', content: domainsDoc },
   { slug: 'failover', title: 'Failover', blurb: 'Move a domain to a backup agent when its agent goes down.', content: failoverDoc },
   { slug: 'existing-proxies', title: 'Managing existing proxies', blurb: 'Built-in vs Existing, and the apply-code flow.', content: existingProxies },

@@ -66,7 +66,7 @@ func TestSandboxEndToEnd(t *testing.T) {
 	// Health must advertise the sandbox so the dashboard banner lights up.
 	var health map[string]any
 	mustGetJSON(t, &http.Client{}, base+"/api/v1/health", &health)
-	if health["dry_run"] != true || health["dns_dry_run"] != true || health["acme_dry_run"] != true {
+	if health["dry_run"] != true || health["dns_dry_run"] != true || health["acme_dry_run"] != true || health["discovery_dry_run"] != true {
 		t.Fatalf("health did not report dry-run: %v", health)
 	}
 
@@ -150,6 +150,8 @@ func TestSandboxEndToEnd(t *testing.T) {
 	api.post("/api/v1/agents/"+agentID+"/servers", map[string]string{
 		"name": "app", "address": "10.0.0.5:8080",
 	}, &server)
+	assertDiscoveryImport(t, api, agentID)
+
 	var domain struct {
 		ID int `json:"id"`
 	}
@@ -686,6 +688,67 @@ func TestSandboxEndToEnd(t *testing.T) {
 	}
 
 	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; stale managed temp auto-healed and an unclassified validation failure remained diagnosis-only (validator/reload are hermetic fixtures, not native nginx proof)", dom.DNSRecordID)
+}
+
+// assertDiscoveryImport drives server discovery (#25) through the dry stack:
+// a Proxmox source with dummy credentials (the connection test is simulated),
+// a run that returns the dry-run fixture, an import of two machines (one with
+// a detected address, one with an operator-supplied address), and a re-run
+// plus re-import that must not duplicate anything.
+func assertDiscoveryImport(t *testing.T, api *apiClient, agentID string) {
+	t.Helper()
+	var src struct {
+		ID string `json:"id"`
+	}
+	api.post("/api/v1/discovery/sources", map[string]any{
+		"type": "proxmox", "name": "pve-dry",
+		"config": map[string]any{"url": "https://pve.sandbox.test:8006", "token_id": "nurproxy@pve!dry", "token_secret": "dummy-dry-secret"},
+	}, &src)
+	type candidate struct {
+		ExternalID       string `json:"external_id"`
+		SuggestedAddress string `json:"suggested_address"`
+		ServerID         string `json:"server_id"`
+	}
+	type view struct {
+		Candidates []candidate `json:"candidates"`
+		Warnings   []string    `json:"warnings"`
+		Missing    []any       `json:"missing"`
+	}
+	var v view
+	api.post("/api/v1/discovery/sources/"+src.ID+"/run", nil, &v)
+	if len(v.Candidates) != 4 || len(v.Warnings) != 1 {
+		t.Fatalf("dry discovery run = %+v, want the 4-machine fixture with one offline-node warning", v)
+	}
+	var imp struct {
+		Created []struct {
+			Address    string `json:"address"`
+			ExternalID string `json:"external_id"`
+		} `json:"created"`
+		Skipped []any `json:"skipped"`
+	}
+	items := []map[string]string{
+		{"external_id": "pve/pve1/qemu/101"},
+		{"external_id": "pve/pve1/qemu/103", "address": "192.168.10.23"},
+	}
+	api.post("/api/v1/agents/"+agentID+"/servers/import", map[string]any{"source_id": src.ID, "items": items}, &imp)
+	if len(imp.Created) != 2 || imp.Created[0].Address != "192.168.10.21" || imp.Created[1].Address != "192.168.10.23" {
+		t.Fatalf("discovery import = %+v", imp)
+	}
+	api.post("/api/v1/discovery/sources/"+src.ID+"/run", nil, &v)
+	imported := 0
+	for _, c := range v.Candidates {
+		if c.ServerID != "" {
+			imported++
+		}
+	}
+	if imported != 2 || len(v.Missing) != 0 {
+		t.Fatalf("re-run after import = %+v, want 2 imported and none missing", v)
+	}
+	imp.Created, imp.Skipped = nil, nil
+	api.post("/api/v1/agents/"+agentID+"/servers/import", map[string]any{"source_id": src.ID, "items": items}, &imp)
+	if len(imp.Created) != 0 || len(imp.Skipped) != 2 {
+		t.Fatalf("re-import = %+v, want both skipped", imp)
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -53,9 +53,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":       "ok",
 		"version":      s.version,
 		"checks":       checks,
-		"dry_run":      s.dnsDryRun || s.acmeDryRun,
+		"dry_run":      s.dnsDryRun || s.acmeDryRun || (s.discovery != nil && s.discovery.DryRun()),
 		"dns_dry_run":  s.dnsDryRun,
 		"acme_dry_run": s.acmeDryRun,
+		// discovery_dry_run: discovery sources return a fixed sandbox set.
+		"discovery_dry_run": s.discovery != nil && s.discovery.DryRun(),
 	}
 	if err := s.db.Ping(ctx); err != nil {
 		// Log the raw error for operators, but never reflect the database
