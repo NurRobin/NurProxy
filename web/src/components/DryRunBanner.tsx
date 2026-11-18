@@ -7,7 +7,7 @@ import { api } from '../lib/api';
 // dry-run instance — where DNS/ACME calls are simulated — for a live one. It
 // stays out of the way (and renders nothing) on a normal instance.
 export default function DryRunBanner() {
-  const [health, setHealth] = useState<{ dns_dry_run?: boolean; acme_dry_run?: boolean; checks?: Record<string, string> } | null>(null);
+  const [health, setHealth] = useState<{ dns_dry_run?: boolean; acme_dry_run?: boolean; discovery_dry_run?: boolean; checks?: Record<string, string> } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -31,10 +31,11 @@ export default function DryRunBanner() {
     </div>
   ) : null;
 
-  const dryRun = health.dns_dry_run || health.acme_dry_run;
+  const dryRun = health.dns_dry_run || health.acme_dry_run || health.discovery_dry_run;
   const parts: string[] = [];
   if (health.dns_dry_run) parts.push('DNS');
   if (health.acme_dry_run) parts.push('ACME');
+  if (health.discovery_dry_run) parts.push('discovery');
   const scope = parts.join(' + ');
 
   return (

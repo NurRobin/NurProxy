@@ -34,7 +34,7 @@ Active/passive failover by switching the domain's single CNAME.
   adoption and with takeover, because the record shape does not change.
 - Cost: no load sharing between healthy agents. That is a non-goal here.
 
-## Data model (migration 38)
+## Data model (migration 39)
 
 - `domain_backups(domain_id, server_id, priority)`, PK `(domain_id, server_id)`,
   FK cascade on both sides. Lower priority value = preferred. The primary is

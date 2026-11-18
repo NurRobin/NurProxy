@@ -1,4 +1,4 @@
-import type { Provider, Zone, Agent, Server, Domain, DNSTakeoverPlan, DomainFailoverStatus, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
+import type { Provider, Zone, Agent, Server, DiscoveryType, DiscoverySource, DiscoveryView, DiscoveryImportResult, Domain, DNSTakeoverPlan, DomainFailoverStatus, AuditLogEntry, Setting, ConfigArtifact, ConfigArtifactVersion, ArtifactMask, LogTailPoll, AdminOpType, PreparedAdminOp, AdminOpView, RecoveryAction, RecoveryDiagnostic, RecoveryOperation, HardRecoveryPlan, RecoveryHelperInstance, RecoveryHelperStatus } from './types';
 import type { ProxyConfigUpdate } from './proxy-config';
 
 const BASE = '/api/v1';
@@ -79,6 +79,7 @@ export interface HealthResponse {
   dry_run?: boolean;
   dns_dry_run?: boolean;
   acme_dry_run?: boolean;
+  discovery_dry_run?: boolean;
   // checks carries subsystem states; "acme_ca" is "ok" or an unreachable
   // detail when the orchestrator cannot reach the ACME CA (#91).
   checks?: Record<string, string>;
@@ -167,6 +168,21 @@ export const api = {
   updateServer: (id: string, data: Partial<Server>) =>
     request<Server>(`/servers/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteServer: (id: string, cascade = false) => request<{ message: string }>(`/servers/${id}${cascade ? '?cascade=true' : ''}`, { method: 'DELETE' }),
+  importServers: (agentId: string, data: { source_id: string; items: { external_id: string; name?: string; address?: string; notes?: string }[] }) =>
+    request<DiscoveryImportResult>(`/agents/${agentId}/servers/import`, { method: 'POST', body: JSON.stringify(data) }),
+
+  // Server discovery (#25)
+  listDiscoveryTypes: () => request<DiscoveryType[]>('/discovery/types'),
+  listDiscoverySources: () => request<DiscoverySource[]>('/discovery/sources'),
+  createDiscoverySource: (data: { type: string; name: string; config: Record<string, unknown>; sync_interval: number; skip_test?: boolean }) =>
+    request<DiscoverySource>('/discovery/sources', { method: 'POST', body: JSON.stringify(data) }),
+  updateDiscoverySource: (id: string, data: { name?: string; config?: Record<string, unknown>; sync_interval?: number; skip_test?: boolean }) =>
+    request<DiscoverySource>(`/discovery/sources/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteDiscoverySource: (id: string) => request<{ message: string }>(`/discovery/sources/${id}`, { method: 'DELETE' }),
+  testDiscoverySource: (data: { type?: string; config?: Record<string, unknown>; source_id?: string }) =>
+    request<{ valid: boolean; message: string }>('/discovery/test', { method: 'POST', body: JSON.stringify(data) }),
+  runDiscovery: (id: string) => request<DiscoveryView>(`/discovery/sources/${id}/run`, { method: 'POST' }),
+  getDiscoveryCandidates: (id: string) => request<DiscoveryView>(`/discovery/sources/${id}/candidates`),
 
   // Domains
   listDomains: (params?: Record<string, string>) => {
