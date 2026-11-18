@@ -181,8 +181,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 36 {
-		t.Fatalf("this test pins the schema target at 36 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 37 {
+		t.Fatalf("this test pins the schema target at 37 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -244,7 +244,7 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 	})
 
-	// migration 36: domains.dns_error is empty on pre-existing rows.
+	// migration 37: domains.dns_error is empty on pre-existing rows.
 	t.Run("domain_dns_error_default", func(t *testing.T) {
 		var dnsErr string
 		if err := d.sql.QueryRow("SELECT dns_error FROM domains WHERE id=1").Scan(&dnsErr); err != nil {

@@ -201,6 +201,10 @@ type Capabilities struct {
 	// ErrorLogLevel reports that the backend can set a per-route error log
 	// level.
 	ErrorLogLevel bool `json:"error_log_level"`
+	// HeaderConfigVars reports that the backend replaces "${NAME}" in header
+	// values with an environment variable or Define value when it loads the
+	// config (Apache). The orchestrator then refuses such header values.
+	HeaderConfigVars bool `json:"header_config_vars"`
 }
 
 // ToModel converts the agent-side Capabilities into the shared wire/storage
@@ -209,17 +213,18 @@ type Capabilities struct {
 // read-only so the dashboard can grey out unsupported options per backend.
 func (c Capabilities) ToModel() *models.ProxyCapabilities {
 	return &models.ProxyCapabilities{
-		ReverseProxy:  c.ReverseProxy,
-		WebSocket:     c.WebSocket,
-		ForceHTTPS:    c.ForceHTTPS,
-		CustomHeaders: c.CustomHeaders,
-		PathRewrite:   c.PathRewrite,
-		BasicAuth:     c.BasicAuth,
-		IPFilter:      c.IPFilter,
-		RateLimit:     c.RateLimit,
-		CentralTLS:    c.CentralTLS,
-		AccessLog:     c.AccessLog,
-		ErrorLogLevel: c.ErrorLogLevel,
+		ReverseProxy:     c.ReverseProxy,
+		WebSocket:        c.WebSocket,
+		ForceHTTPS:       c.ForceHTTPS,
+		CustomHeaders:    c.CustomHeaders,
+		PathRewrite:      c.PathRewrite,
+		BasicAuth:        c.BasicAuth,
+		IPFilter:         c.IPFilter,
+		RateLimit:        c.RateLimit,
+		CentralTLS:       c.CentralTLS,
+		AccessLog:        c.AccessLog,
+		ErrorLogLevel:    c.ErrorLogLevel,
+		HeaderConfigVars: c.HeaderConfigVars,
 	}
 }
 

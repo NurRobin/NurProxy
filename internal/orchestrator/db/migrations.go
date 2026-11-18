@@ -1,8 +1,10 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -843,12 +845,36 @@ var migrations = []string{
 	CREATE INDEX idx_domain_dns_cleanups_record
 		ON domain_dns_cleanups(zone_external_id, record_id);
 	`,
-	// dns_error holds the reason the domain's public DNS record could not be
-	// created, adopted or corrected, separately from error_msg. A route apply
-	// rewrites status and error_msg; while dns_error is set it keeps the
-	// domain in error with that reason instead of reporting it active or
-	// degraded for an unrelated cause. Empty means the last DNS pass worked.
+
+	// Migration 36: domains.server_id, domains.zone_id and servers.agent_id
+	// become ON DELETE RESTRICT (#104). A parent with children can then only
+	// be removed after its domains went through the reconciler teardown; no
+	// raw DB cascade can skip the DNS/cert/artifact cleanup. SQLite cannot
+	// alter a constraint, so the tables are rebuilt in Go (see
+	// rebuildParentFKsRestrict) from their live schema, which keeps every
+	// column, CHECK, index and trigger later migrations added.
+	migrationRestrictParentFKs,
+
+	// Migration 37: dns_error holds the reason the domain's public DNS record
+	// could not be created, adopted or corrected, separately from error_msg.
+	// A route apply rewrites status and error_msg; while dns_error is set it
+	// keeps the domain in error with that reason instead of reporting it
+	// active or degraded for an unrelated cause. Empty means the last DNS pass
+	// worked.
 	`ALTER TABLE domains ADD COLUMN dns_error TEXT NOT NULL DEFAULT '';`,
+}
+
+// migrationRestrictParentFKs is the placeholder text of the migration that
+// rebuilds servers and domains with RESTRICT foreign keys. It is a plain SQL
+// comment, so executing it as text is a no-op; migrate runs the Go step from
+// goMigrations instead.
+const migrationRestrictParentFKs = "-- migration 36: rebuildParentFKsRestrict (Go)"
+
+// goMigrations maps a migration's placeholder text to the Go step that
+// performs it. Keyed by text, not by version, so renumbering on a rebase
+// cannot attach a step to the wrong migration.
+var goMigrations = map[string]func(ctx context.Context, tx *sql.Tx) error{
+	migrationRestrictParentFKs: rebuildParentFKsRestrict,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
@@ -863,9 +889,20 @@ var migrations = []string{
 // schema is never left at a partially-migrated version. Idempotency is
 // preserved — only versions strictly greater than the recorded maximum are
 // applied, so a second call with nothing pending opens no transaction at all.
+//
+// The batch runs with foreign key enforcement OFF on a pinned connection, the
+// procedure SQLite prescribes for table rebuilds: with enforcement on, DROP
+// TABLE runs an implicit DELETE that fires ON DELETE actions in other tables
+// (CASCADE, SET NULL) and would wipe or detach rows the rebuild is about to
+// copy back. PRAGMA foreign_keys is a no-op inside a transaction, so it is
+// switched before BEGIN and restored after COMMIT. Before committing,
+// PRAGMA foreign_key_check must not report any violation that was not already
+// there before the batch.
 func (d *DB) migrate() error {
+	ctx := context.Background()
+
 	// Ensure the version tracking table exists.
-	if _, err := d.sql.Exec(`
+	if _, err := d.sql.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_version (
 			version INTEGER NOT NULL
 		)
@@ -874,7 +911,7 @@ func (d *DB) migrate() error {
 	}
 
 	var current int
-	row := d.sql.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+	row := d.sql.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_version")
 	if err := row.Scan(&current); err != nil {
 		return fmt.Errorf("reading schema version: %w", err)
 	}
@@ -884,28 +921,122 @@ func (d *DB) migrate() error {
 		return nil
 	}
 
-	tx, err := d.sql.Begin()
+	conn, err := d.sql.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("pinning migration connection: %w", err)
+	}
+	defer conn.Close()
+
+	if err := setForeignKeys(ctx, conn, false); err != nil {
+		return err
+	}
+	migErr := applyMigrations(ctx, conn, current)
+	// Restore enforcement even when the batch failed: the connection goes back
+	// to the pool. If restoring fails, Open fails and closes the pool anyway.
+	if err := setForeignKeys(ctx, conn, true); err != nil && migErr == nil {
+		migErr = err
+	}
+	return migErr
+}
+
+// applyMigrations runs every migration after version current in one
+// transaction on conn and commits only if no new foreign key violation
+// appeared.
+func applyMigrations(ctx context.Context, conn *sql.Conn, current int) error {
+	before, err := foreignKeyViolations(ctx, conn)
+	if err != nil {
+		return err
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("beginning migrations: %w", err)
 	}
+	defer tx.Rollback()
 
 	for i := current; i < len(migrations); i++ {
-		if _, err := tx.Exec(migrations[i]); err != nil {
-			tx.Rollback()
+		if step, ok := goMigrations[migrations[i]]; ok {
+			err = step(ctx, tx)
+		} else {
+			_, err = tx.ExecContext(ctx, migrations[i])
+		}
+		if err != nil {
 			return fmt.Errorf("executing migration %d: %w", i+1, err)
 		}
 
-		if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", i+1); err != nil {
-			tx.Rollback()
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_version (version) VALUES (?)", i+1); err != nil {
 			return fmt.Errorf("recording migration %d: %w", i+1, err)
 		}
+	}
+
+	after, err := foreignKeyViolations(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var added []string
+	for edge, n := range after {
+		if n > before[edge] {
+			added = append(added, fmt.Sprintf("%s (%d new)", edge, n-before[edge]))
+		}
+	}
+	if len(added) > 0 {
+		sort.Strings(added)
+		return fmt.Errorf("migrations would introduce foreign key violations: %s", strings.Join(added, ", "))
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing migrations: %w", err)
 	}
-
 	return nil
+}
+
+// setForeignKeys switches foreign key enforcement on conn and reads it back,
+// because SQLite silently ignores the pragma inside an open transaction.
+func setForeignKeys(ctx context.Context, conn *sql.Conn, on bool) error {
+	want := 0
+	if on {
+		want = 1
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA foreign_keys = %d", want)); err != nil {
+		return fmt.Errorf("setting foreign_keys=%d: %w", want, err)
+	}
+	var got int
+	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&got); err != nil {
+		return fmt.Errorf("reading foreign_keys: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("foreign_keys is %d after setting it to %d", got, want)
+	}
+	return nil
+}
+
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// foreignKeyViolations counts PRAGMA foreign_key_check rows per
+// "child -> parent" edge. Counting per edge rather than per rowid keeps the
+// comparison stable across a table rebuild.
+func foreignKeyViolations(ctx context.Context, q queryer) (map[string]int, error) {
+	rows, err := q.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return nil, fmt.Errorf("checking foreign keys: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var table, parent string
+		var rowid sql.NullInt64
+		var fkid int
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			return nil, fmt.Errorf("scanning foreign key check: %w", err)
+		}
+		out[table+" -> "+parent]++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("checking foreign keys: %w", err)
+	}
+	return out, nil
 }
 
 // SchemaVersion reports the applied schema version of the database at dbPath

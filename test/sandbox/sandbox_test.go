@@ -563,6 +563,57 @@ func TestSandboxEndToEnd(t *testing.T) {
 		t.Fatalf("apex after takeover: dns_managed=%v dns_error=%q, want managed without error", apexDNS.DNSManaged, apexDNS.DNSError)
 	}
 
+	// --- opt-in cascade delete of the agent (#104) ------------------------------
+	// The foreign keys are ON DELETE RESTRICT, so the agent, its servers and its
+	// domains only disappear once the reconciler has torn the domains down and
+	// finalized the deferred parent delete, children before parents. The agent
+	// must be able to apply the route removals, so the injected validation
+	// failure from above is switched off first.
+	if err := os.Remove(failValidation); err != nil {
+		t.Fatalf("disable sandbox validation failure: %v", err)
+	}
+	// Teardown and finalize can take two reconciler cycles; shorten the
+	// interval so they fit the wait (it applies once the running timer fires).
+	api.put("/api/v1/settings/reconciler_interval", map[string]string{"value": "5"}, nil)
+	api.do(http.MethodDelete, "/api/v1/agents/"+agentID+"?cascade=true", nil, nil)
+	waitFor(t, 90*time.Second, func() bool {
+		var doms []struct {
+			ID int `json:"id"`
+		}
+		api.get("/api/v1/domains", &doms)
+		if len(doms) != 0 {
+			return false
+		}
+		var agents []struct {
+			ID string `json:"id"`
+		}
+		api.get("/api/v1/agents", &agents)
+		for _, a := range agents {
+			if a.ID == agentID {
+				return false
+			}
+		}
+		return true
+	})
+	var cascadeAudit struct {
+		Entries []struct {
+			EntityType string `json:"entity_type"`
+			EntityID   string `json:"entity_id"`
+			Action     string `json:"action"`
+			Details    string `json:"details"`
+		} `json:"entries"`
+	}
+	api.get("/api/v1/audit-log?limit=500", &cascadeAudit)
+	sawFinalized := false
+	for _, e := range cascadeAudit.Entries {
+		if e.EntityType == "agent" && e.EntityID == agentID && e.Action == "delete" && strings.Contains(e.Details, "cascade finalized") {
+			sawFinalized = true
+		}
+	}
+	if !sawFinalized {
+		t.Fatal("agent cascade delete was not finalized by the reconciler")
+	}
+
 	t.Logf("sandbox converged: domain active, DNS record %s, audit tagged dryrun; stale managed temp auto-healed and an unclassified validation failure remained diagnosis-only (validator/reload are hermetic fixtures, not native nginx proof)", dom.DNSRecordID)
 }
 

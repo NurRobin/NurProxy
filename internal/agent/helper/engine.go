@@ -199,7 +199,7 @@ func (e *Engine) PlanManagedApply(ctx context.Context, request helperprotocol.Pl
 	material, err := e.managedApply.Plan(ctx, intent)
 	if err != nil {
 		slog.Error("managed apply planning refused by local host policy", "operation_id", intent.OperationID, "error", err)
-		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, "local managed apply planning refused the desired state", false)
+		return helperprotocol.Signed[helperprotocol.ManagedApplyPlan]{}, protocolFailure(helperprotocol.ErrorAmbiguousLocalTarget, managedPlanRefusedMessage(err), false)
 	}
 	if err := validateManagedApplyMaterial(material); err != nil {
 		slog.Error("managed apply planning produced invalid local material", "operation_id", intent.OperationID, "error", err)
