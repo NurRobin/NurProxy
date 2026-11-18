@@ -228,7 +228,7 @@ func (s *Server) handleUpdateDiscoverySource(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "unknown discovery type: "+src.Type)
 			return
 		}
-		merged, err := discovery.MergeConfig(json.RawMessage(src.Config), *req.Config, d.Info().SecretFields)
+		merged, err := discovery.MergeConfig(json.RawMessage(src.Config), *req.Config, d.Info())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -290,7 +290,7 @@ func (s *Server) handleTestDiscoverySource(w http.ResponseWriter, r *http.Reques
 				writeError(w, http.StatusBadRequest, "unknown discovery type: "+src.Type)
 				return
 			}
-			merged, err := discovery.MergeConfig(config, req.Config, d.Info().SecretFields)
+			merged, err := discovery.MergeConfig(config, req.Config, d.Info())
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err.Error())
 				return

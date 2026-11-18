@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -68,25 +69,60 @@ func TestSuggestPrefersLANIPv4(t *testing.T) {
 	}
 }
 
-func TestMergeConfigKeepsSecret(t *testing.T) {
-	base := json.RawMessage(`{"url":"a","token_secret":"s3cret","verify_tls":true}`)
-	got, err := MergeConfig(base, json.RawMessage(`{"verify_tls":false,"token_secret":""}`), []string{"token_secret"})
-	if err != nil {
-		t.Fatal(err)
+func TestMergeConfig(t *testing.T) {
+	info := Info{
+		SecretFields:      []string{"token_secret"},
+		SecretBoundFields: []string{"url", "verify_tls", "fingerprint"},
 	}
-	var m map[string]any
-	if err := json.Unmarshal(got, &m); err != nil {
-		t.Fatal(err)
+	base := json.RawMessage(`{"url":"https://pve.lan:8006","token_secret":"s3cret","verify_tls":true,"name_hint":"x"}`)
+	tests := []struct {
+		name       string
+		update     string
+		wantSecret string // expected token_secret after the merge
+		wantErr    bool
+		secretErr  bool // error must be ErrSecretRequired
+	}{
+		{name: "unrelated field keeps secret", update: `{"name_hint":"y"}`, wantSecret: "s3cret"},
+		{name: "empty secret keeps secret", update: `{"name_hint":"y","token_secret":""}`, wantSecret: "s3cret"},
+		{name: "same bound values keep secret", update: `{"url":"https://pve.lan:8006","verify_tls":true}`, wantSecret: "s3cret"},
+		{name: "new secret replaces stored", update: `{"token_secret":"new"}`, wantSecret: "new"},
+		{name: "url change with new secret", update: `{"url":"https://other:8006","token_secret":"new"}`, wantSecret: "new"},
+		{name: "url change without secret", update: `{"url":"https://evil.example"}`, wantErr: true, secretErr: true},
+		{name: "url change with empty secret", update: `{"url":"https://evil.example","token_secret":""}`, wantErr: true, secretErr: true},
+		{name: "tls check turned off without secret", update: `{"verify_tls":false}`, wantErr: true, secretErr: true},
+		{name: "fingerprint added without secret", update: `{"fingerprint":"AA:BB"}`, wantErr: true, secretErr: true},
+		{name: "non-object update", update: `[]`, wantErr: true},
+		{name: "null update", update: `null`, wantErr: true},
 	}
-	if m["token_secret"] != "s3cret" || m["verify_tls"] != false || m["url"] != "a" {
-		t.Fatalf("merged = %s", got)
+	for _, tt := range tests {
+		got, err := MergeConfig(base, json.RawMessage(tt.update), info)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("%s: want error, got %s", tt.name, got)
+			} else if tt.secretErr && !errors.Is(err, ErrSecretRequired) {
+				t.Errorf("%s: want ErrSecretRequired, got %v", tt.name, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", tt.name, err)
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(got, &m); err != nil {
+			t.Fatalf("%s: %v", tt.name, err)
+		}
+		if m["token_secret"] != tt.wantSecret {
+			t.Errorf("%s: token_secret = %v, want %q", tt.name, m["token_secret"], tt.wantSecret)
+		}
 	}
-	got, _ = MergeConfig(base, json.RawMessage(`{"token_secret":"new"}`), []string{"token_secret"})
-	if err := json.Unmarshal(got, &m); err != nil || m["token_secret"] != "new" {
-		t.Fatalf("a new secret must replace the stored one: %s", got)
-	}
-	if _, err := MergeConfig(base, json.RawMessage(`[]`), nil); err == nil {
-		t.Fatal("a non-object update must be rejected")
+}
+
+func TestMergeConfigNoStoredSecret(t *testing.T) {
+	info := Info{SecretFields: []string{"token_secret"}, SecretBoundFields: []string{"url"}}
+	// Nothing stored to leak, so changing the endpoint is fine.
+	if _, err := MergeConfig(json.RawMessage(`{"url":"a"}`), json.RawMessage(`{"url":"b"}`), info); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

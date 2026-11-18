@@ -23,6 +23,9 @@ interface Form {
 
 const EMPTY: Form = { name: '', url: '', token_id: '', token_secret: '', verify_tls: true, fingerprint: '', ca_pem: '', sync_interval: 0 };
 
+// Matches the Proxmox discoverer's SecretBoundFields on the server.
+const SECRET_BOUND = ['url', 'token_id', 'verify_tls', 'fingerprint', 'ca_pem'] as const;
+
 function configOf(f: Form): Record<string, unknown> {
   return {
     url: f.url.trim(),
@@ -47,6 +50,8 @@ export default function DiscoverySources() {
   const [editing, setEditing] = useState<DiscoverySource | null>(null);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<Form>(EMPTY);
+  // The form as loaded for editing, to tell when the stored secret can't be kept.
+  const [initial, setInitial] = useState<Form>(EMPTY);
   const [error, setError] = useState('');
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [testing, setTesting] = useState(false);
@@ -68,12 +73,14 @@ export default function DiscoverySources() {
   function openEdit(s: DiscoverySource) {
     // settings is the stored config minus the secret, which is never sent back.
     const str = (k: string) => (typeof s.settings[k] === 'string' ? (s.settings[k] as string) : '');
-    setEditing(s);
-    setForm({
+    const loaded: Form = {
       name: s.name, url: str('url'), token_id: str('token_id'), token_secret: '',
       verify_tls: s.settings.verify_tls === true, fingerprint: str('fingerprint'), ca_pem: str('ca_pem'),
       sync_interval: s.sync_interval,
-    });
+    };
+    setEditing(s);
+    setForm(loaded);
+    setInitial(loaded);
     setError(''); setTestMsg(null); setSkipTest(false); setOpen(true);
   }
 
@@ -128,7 +135,12 @@ export default function DiscoverySources() {
     s === 0 ? t('discovery.syncManual')
       : s < 3600 ? t('discovery.syncEveryMinutes', { count: s / 60 })
         : t('discovery.syncEveryHours', { count: s / 3600 });
-  const canSave = form.name.trim() && form.url.trim() && form.token_id.trim() && (editing || form.token_secret.trim());
+  // The server keeps a stored secret only while the endpoint and TLS checks stay
+  // the same, so the secret is never sent somewhere it wasn't meant for.
+  const norm = (v: string | boolean) => (typeof v === 'string' ? v.trim() : v);
+  const secretBound = !!editing && SECRET_BOUND.some((k) => norm(form[k]) !== norm(initial[k]));
+  const needSecret = !editing || secretBound;
+  const canSave = form.name.trim() && form.url.trim() && form.token_id.trim() && (!needSecret || form.token_secret.trim());
 
   return (
     <section className="rounded-xl border border-border bg-surface p-6 shadow-card">
@@ -179,7 +191,7 @@ export default function DiscoverySources() {
             <Field label={t('discovery.tokenId')} hint={t('discovery.tokenIdHint')}>
               <Input value={form.token_id} onChange={(e) => set('token_id', e.target.value)} className="font-mono" placeholder="nurproxy@pve!discovery" />
             </Field>
-            <Field label={t('discovery.tokenSecret')} hint={editing ? t('discovery.tokenSecretKeep') : undefined}>
+            <Field label={t('discovery.tokenSecret')} hint={editing ? (secretBound ? t('discovery.tokenSecretRequired') : t('discovery.tokenSecretKeep')) : undefined}>
               <PasswordInput value={form.token_secret} onChange={(e) => set('token_secret', e.target.value)} className="font-mono" autoComplete="off" />
             </Field>
           </div>
@@ -202,7 +214,7 @@ export default function DiscoverySources() {
           <div className="flex flex-wrap justify-between gap-3 pt-1">
             <Button variant="secondary" onClick={() => setOpen(false)}>{t('common.cancel')}</Button>
             <div className="flex gap-3">
-              <Button variant="secondary" onClick={handleTest} loading={testing} disabled={!form.url.trim() || !form.token_id.trim() || (!editing && !form.token_secret.trim())}>{t('discovery.test')}</Button>
+              <Button variant="secondary" onClick={handleTest} loading={testing} disabled={!form.url.trim() || !form.token_id.trim() || (needSecret && !form.token_secret.trim())}>{t('discovery.test')}</Button>
               <Button onClick={handleSave} loading={saving} disabled={!canSave}>{t('common.save')}</Button>
             </div>
           </div>
