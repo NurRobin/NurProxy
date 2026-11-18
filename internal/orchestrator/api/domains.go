@@ -159,6 +159,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	s.triggerAgentPush(dom.ServerID)
 	s.triggerCertIssuance(dom)
+	if !dom.CertOnly {
+		s.triggerDNSReconcile(dom.ID)
+	}
 
 	writeJSON(w, http.StatusCreated, dom)
 }
@@ -197,10 +200,10 @@ type dnsReconciler interface {
 }
 
 // triggerDNSReconcile runs a DNS pass for the domain in the background after a
-// rename or zone move, so the new name gets its record (and the old one its
+// create, rename or zone move, so the name gets its record (and an old one its
 // cleanup) right away instead of up to a reconcile interval later, while the
-// agent has already dropped the old vhost. Best-effort: the pass is skipped
-// while a cycle runs, and the periodic cycle is the backstop.
+// agent already serves the vhost. Best-effort: the pass is skipped while a
+// cycle runs, and the periodic cycle is the backstop.
 func (s *Server) triggerDNSReconcile(domainID int64) {
 	rec, ok := s.takeover.(dnsReconciler)
 	if !ok {
@@ -870,6 +873,12 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 // not create; this is the explicit, audited escape hatch for migrating an existing
 // domain whose public DNS predates NurProxy. It also re-pushes the agent's routes so
 // the now-resolvable domain re-renders with its certificate.
+//
+// With ?dry_run=true nothing is changed: the response carries the plan, i.e. every
+// record at the name the takeover would delete (MX, TXT and the like included) and
+// the CNAME it would leave. The response of a real takeover carries the plan it
+// carried out. Takeover makes NurProxy the owner of the record (dns_managed=true):
+// deleting the domain later deletes the record.
 func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
 	if err != nil {
@@ -885,15 +894,71 @@ func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
 	}
-	if err := s.takeover.TakeoverDomainDNS(r.Context(), id); err != nil {
+	if dom.CertOnly {
+		writeError(w, http.StatusConflict, "domain is cert-only; NurProxy does not manage its public DNS")
+		return
+	}
+	if dom.Status == models.DomainStatusDeleting {
+		writeError(w, http.StatusConflict, "domain is being deleted")
+		return
+	}
+
+	if strings.EqualFold(r.URL.Query().Get("dry_run"), "true") {
+		plan, err := s.takeover.PreviewDomainDNSTakeover(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "DNS takeover preview failed: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"dry_run": true,
+			"message": takeoverPlanSummary(plan, true),
+			"plan":    plan,
+		})
+		return
+	}
+
+	plan, err := s.takeover.TakeoverDomainDNS(r.Context(), id)
+	if err != nil {
 		writeError(w, http.StatusBadGateway, "DNS takeover failed: "+err.Error())
 		return
 	}
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "dns_takeover", dom.Subdomain)
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"message": "DNS takeover applied — the record now points at the agent and routes were re-pushed",
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": takeoverPlanSummary(plan, false) + "; routes were re-pushed",
+		"plan":    plan,
 	})
+}
+
+// takeoverPlanSummary is a one-line description of a takeover plan, as it
+// would happen (preview) or as it happened.
+func takeoverPlanSummary(plan *models.DNSTakeoverPlan, preview bool) string {
+	var b strings.Builder
+	switch plan.Action {
+	case models.DNSTakeoverAdopt:
+		if preview {
+			fmt.Fprintf(&b, "would take ownership of the existing CNAME %s -> %s; nothing is deleted", plan.FQDN, plan.Target)
+		} else {
+			fmt.Fprintf(&b, "took ownership of the existing CNAME %s -> %s", plan.FQDN, plan.Target)
+		}
+	case models.DNSTakeoverCreate:
+		if preview {
+			fmt.Fprintf(&b, "%s is free; would create CNAME -> %s; nothing is deleted", plan.FQDN, plan.Target)
+		} else {
+			fmt.Fprintf(&b, "created CNAME %s -> %s", plan.FQDN, plan.Target)
+		}
+	default:
+		recs := make([]string, len(plan.Delete))
+		for i, rec := range plan.Delete {
+			recs[i] = rec.Type + " " + rec.Content
+		}
+		verb := "deleted"
+		if preview {
+			verb = "would delete"
+		}
+		fmt.Fprintf(&b, "%s %d record(s) at %s (%s) and create CNAME -> %s", verb, len(plan.Delete), plan.FQDN, strings.Join(recs, ", "), plan.Target)
+	}
+	return b.String()
 }
 
 // cascadeRequested reports whether the request opts into cascade deletion

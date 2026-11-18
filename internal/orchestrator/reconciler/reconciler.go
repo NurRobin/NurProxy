@@ -74,6 +74,8 @@ type Reconciler struct {
 	// API-triggered pass (ReconcileDNSNow) may otherwise run at the same time
 	// and both create a record for one name.
 	dnsMu sync.Mutex
+	// domainDNSLocks holds one *sync.Mutex per domain id (domainDNSLock).
+	domainDNSLocks sync.Map
 
 	applyAuthority interface {
 		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
@@ -983,13 +985,57 @@ func (r *Reconciler) reconcileDNS(ctx context.Context) error {
 	}
 
 	for i := range domains {
-		r.reconcileDomainDNS(ctx, &domains[i])
+		r.reconcileDomainDNSByID(ctx, domains[i].ID)
 	}
 	return nil
 }
 
+// reconcileDomainDNSByID converges one domain's record under its DNS lock,
+// from a fresh read of the domain: the list a cycle starts from can be stale
+// by the time a domain's turn comes (a takeover may have stored a record
+// meanwhile).
+func (r *Reconciler) reconcileDomainDNSByID(ctx context.Context, domainID int64) {
+	lk := r.domainDNSLock(domainID)
+	lk.Lock()
+	defer lk.Unlock()
+	dom, err := r.db.GetDomain(domainID)
+	if err != nil {
+		if !errors.Is(err, db.ErrDomainNotFound) {
+			log.Printf("reconciler: DNS pass for domain %d: %v", domainID, err)
+		}
+		return
+	}
+	r.reconcileDomainDNS(ctx, dom)
+}
+
+// failDomainDNS records why the domain's DNS record could not be converged:
+// on the domain (dns_error, shown as its error until a later pass succeeds),
+// in the log and, when audit is set, in the audit log.
+func (r *Reconciler) failDomainDNS(dom *models.Domain, msg, audit string) {
+	log.Printf("reconciler: domain %d: %s", dom.ID, msg)
+	if err := r.db.SetDomainDNSError(dom.ID, msg); err != nil {
+		log.Printf("reconciler: %v", err)
+	}
+	if audit != "" {
+		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), audit, msg)
+	}
+}
+
+// dnsConverged clears a DNS error recorded by an earlier pass.
+func (r *Reconciler) dnsConverged(dom *models.Domain) {
+	if dom.DNSError == "" {
+		return
+	}
+	if err := r.db.ClearDomainDNSError(dom.ID); err != nil {
+		log.Printf("reconciler: %v", err)
+	}
+}
+
 // reconcileDomainDNS converges one domain's CNAME: create or adopt it when the
-// domain has none, otherwise fix content and proxy drift.
+// domain has none, otherwise fix content and proxy drift. Every way it can
+// fail to put the record in place is recorded on the domain (failDomainDNS),
+// so a domain without its record always names the reason. Callers hold the
+// domain's DNS lock.
 func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain) {
 	// Skip domains not in an actionable state.
 	if dom.Status == models.DomainStatusDeleting {
@@ -1006,19 +1052,19 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 	// Resolve zone -> provider chain.
 	zone, zErr := r.db.GetZone(dom.ZoneID)
 	if zErr != nil {
-		log.Printf("reconciler: cannot get zone %s for domain %d: %v", dom.ZoneID, dom.ID, zErr)
+		r.failDomainDNS(dom, fmt.Sprintf("DNS not managed: cannot read zone %s: %v", dom.ZoneID, zErr), "")
 		return
 	}
 
 	prov, pErr := r.db.GetProvider(zone.ProviderID)
 	if pErr != nil {
-		log.Printf("reconciler: cannot get provider %s for zone %s: %v", zone.ProviderID, zone.ID, pErr)
+		r.failDomainDNS(dom, fmt.Sprintf("DNS not managed: cannot read DNS provider %s of zone %s: %v", zone.ProviderID, zone.Name, pErr), "")
 		return
 	}
 
 	dnsProvider, pErr := provider.Get(prov.Type)
 	if pErr != nil {
-		log.Printf("reconciler: DNS provider %s not registered: %v", prov.Type, pErr)
+		r.failDomainDNS(dom, fmt.Sprintf("DNS not managed: DNS provider type %s of zone %s is not available: %v", prov.Type, zone.Name, pErr), "")
 		return
 	}
 	dnsProvider = r.wrapDNS(dnsProvider)
@@ -1031,17 +1077,21 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 	// Resolve: domain -> server -> agent -> agent.FQDN for CNAME target.
 	srv, sErr := r.db.GetServer(dom.ServerID)
 	if sErr != nil {
-		log.Printf("reconciler: cannot get server %s for domain %d: %v", dom.ServerID, dom.ID, sErr)
+		r.failDomainDNS(dom, fmt.Sprintf("DNS record for %s not created: cannot read server %s: %v", fqdn, dom.ServerID, sErr), "")
 		return
 	}
 
 	agent, aErr := r.db.GetAgent(srv.AgentID)
 	if aErr != nil {
-		log.Printf("reconciler: cannot get agent %s for domain %d: %v", srv.AgentID, dom.ID, aErr)
+		r.failDomainDNS(dom, fmt.Sprintf("DNS record for %s not created: cannot read agent %s: %v", fqdn, srv.AgentID, aErr), "")
 		return
 	}
 
 	expectedTarget := agent.FQDN
+	if expectedTarget == "" {
+		r.failDomainDNS(dom, fmt.Sprintf("DNS record for %s not created: agent %s has no FQDN to point the CNAME at", fqdn, agent.ID), "")
+		return
+	}
 
 	if dom.DNSRecordID == "" {
 		// No record ID on file — resolve by name (adopt an identical existing
@@ -1061,7 +1111,7 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 		// defeating teardown cleanup (#66/§79). Preserve the stored dns_managed flag
 		// and the record id, and retry next cycle.
 		if !errors.Is(gErr, provider.ErrRecordNotFound) {
-			log.Printf("reconciler: transient read of DNS record %s for domain %d, preserving managed state and retrying next cycle: %v", dom.DNSRecordID, dom.ID, gErr)
+			r.failDomainDNS(dom, fmt.Sprintf("cannot read DNS record %s for %s, retrying next cycle: %v", dom.DNSRecordID, fqdn, gErr), "")
 			return
 		}
 		log.Printf("reconciler: DNS record %s for domain %d no longer exists, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
@@ -1093,11 +1143,7 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 			TTL:     0,
 			Proxied: wantProxied,
 		}); uErr != nil {
-			log.Printf("reconciler: failed to update DNS record for %s: %v", fqdn, uErr)
-			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", uErr)); dErr != nil {
-				log.Printf("reconciler: failed to update domain status: %v", dErr)
-			}
-			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_update_failed", uErr.Error())
+			r.failDomainDNS(dom, fmt.Sprintf("DNS update failed for %s: %v", fqdn, uErr), "dns_update_failed")
 			return
 		}
 		if contentDrift {
@@ -1107,6 +1153,7 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 			r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_proxied_updated", proxiedChangeDetail(fqdn, rec.Proxied, wantProxied))
 		}
 	}
+	r.dnsConverged(dom)
 }
 
 // ensureDomainCNAME makes the domain's CNAME exist and point at target WITHOUT
@@ -1121,10 +1168,7 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 	existing, lErr := lookupRecordsByName(ctx, dnsProvider, provConfig, fqdn)
 	if lErr != nil {
 		// Lookup failed (transient API/auth). Don't create blind — retry next cycle.
-		log.Printf("reconciler: DNS lookup for %s failed, retrying next cycle: %v", fqdn, lErr)
-		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS lookup failed: %v", lErr)); dErr != nil {
-			log.Printf("reconciler: failed to update domain status: %v", dErr)
-		}
+		r.failDomainDNS(dom, fmt.Sprintf("DNS lookup for %s failed, retrying next cycle: %v", fqdn, lErr), "")
 		return
 	}
 
@@ -1138,16 +1182,21 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		}
 		owned, queued, qErr := r.db.QueuedDomainDNSRecord(existing[i].ID, dom.ZoneID)
 		if qErr != nil {
-			log.Printf("reconciler: cannot check the DNS cleanup queue for %s, retrying next cycle: %v", fqdn, qErr)
+			r.failDomainDNS(dom, fmt.Sprintf("DNS record for %s not created: cannot check the DNS cleanup queue, retrying next cycle: %v", fqdn, qErr), "")
 			return
 		}
 		if !queued || !owned {
 			continue
 		}
 		if _, dErr := r.db.AdoptDomainDNSRecord(dom.ID, dom.Subdomain, existing[i].ID, dom.ZoneID); dErr != nil {
-			log.Printf("reconciler: did not take back DNS record %s for domain %d: %v", existing[i].ID, dom.ID, dErr)
+			if errors.Is(dErr, db.ErrDomainRenamed) {
+				log.Printf("reconciler: did not take back DNS record %s for domain %d: %v", existing[i].ID, dom.ID, dErr)
+			} else {
+				r.failDomainDNS(dom, fmt.Sprintf("could not take back DNS record %s for %s, retrying next cycle: %v", existing[i].ID, fqdn, dErr), "")
+			}
 			return
 		}
+		r.dnsConverged(dom)
 		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
 			log.Printf("reconciler: failed to clear domain status: %v", dErr)
 		}
@@ -1162,21 +1211,23 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		// create this record, so teardown must never delete it (§79). An adopted
 		// record still queued after a rename leaves the queue here.
 		if _, dErr := r.db.AdoptDomainDNSRecord(dom.ID, dom.Subdomain, adopt.ID, dom.ZoneID); dErr != nil {
-			// ErrDomainRenamed included: the record belongs to a name the
-			// domain left, and nothing was written.
-			log.Printf("reconciler: did not store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
+			// ErrDomainRenamed: the record belongs to a name the domain left,
+			// nothing was written, and the next pass resolves the new name.
+			if errors.Is(dErr, db.ErrDomainRenamed) {
+				log.Printf("reconciler: did not store adopted DNS record ID for domain %d: %v", dom.ID, dErr)
+			} else {
+				r.failDomainDNS(dom, fmt.Sprintf("could not store adopted DNS record %s for %s, retrying next cycle: %v", adopt.ID, fqdn, dErr), "")
+			}
 			return
 		}
 		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_adopted", fmt.Sprintf("adopted existing CNAME %s -> %s (%s)", fqdn, target, proxiedWord(adopt.Proxied)))
 		// The adopted record keeps its proxy state unless the operator set one.
 		if pErr := r.enforceProxied(ctx, dom, fqdn, adopt, dnsProvider, provConfig); pErr != nil {
-			log.Printf("reconciler: failed to set proxy state on adopted record for %s: %v", fqdn, pErr)
-			if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS update failed: %v", pErr)); dErr != nil {
-				log.Printf("reconciler: failed to update domain status: %v", dErr)
-			}
+			r.failDomainDNS(dom, fmt.Sprintf("DNS update failed: could not set the proxy state of %s: %v", fqdn, pErr), "")
 			return
 		}
 		// Clear any stale DNS error; the proxy apply sets the real status next.
+		r.dnsConverged(dom)
 		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
 			log.Printf("reconciler: failed to clear domain status: %v", dErr)
 		}
@@ -1187,11 +1238,7 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 		// A record with this name exists but is NOT the one we want. Never overwrite
 		// a record we didn't create — surface an explicit, actionable error.
 		msg := fmt.Sprintf("a DNS record for %s already exists that does not match the desired CNAME → %s. Current: %s. Resolve it at your DNS provider (delete it or point it at %s); NurProxy won't overwrite a record it didn't create.", fqdn, target, describeRecords(existing), target)
-		log.Printf("reconciler: DNS conflict for %s: %s", fqdn, msg)
-		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, msg); dErr != nil {
-			log.Printf("reconciler: failed to update domain status: %v", dErr)
-		}
-		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_conflict", msg)
+		r.failDomainDNS(dom, msg, "dns_conflict")
 		return
 	}
 
@@ -1200,18 +1247,16 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 	// rename or zone move: then it keeps that record's proxy state (#151).
 	proxied, wait := r.newRecordProxied(dom, dnsProvider)
 	if wait != "" {
-		// Not an error on the domain: the old record's state is read by the
-		// cleanup phase, whose failures show up in health and the log.
+		// Not an error on the domain: only a renamed or moved domain waits
+		// here, bounded by the cleanup wait, and the old record's state is
+		// read by the cleanup phase, whose failures show up in health and
+		// the log.
 		log.Printf("reconciler: not creating the DNS record for %s yet: %s", fqdn, wait)
 		return
 	}
 	recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: proxied})
 	if cErr != nil {
-		log.Printf("reconciler: failed to create DNS record for %s: %v", fqdn, cErr)
-		if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusError, fmt.Sprintf("DNS create failed: %v", cErr)); dErr != nil {
-			log.Printf("reconciler: failed to update domain status: %v", dErr)
-		}
-		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_create_failed", cErr.Error())
+		r.failDomainDNS(dom, fmt.Sprintf("DNS create failed for CNAME %s -> %s: %v", fqdn, target, cErr), "dns_create_failed")
 		return
 	}
 	r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_created", fmt.Sprintf("created CNAME %s -> %s (%s)", fqdn, target, proxiedWord(proxied)))
@@ -1223,7 +1268,9 @@ func (r *Reconciler) ensureDomainCNAME(ctx context.Context, dom *models.Domain, 
 	case errors.Is(sErr, db.ErrDomainRenamed):
 		r.queueStaleCreatedRecord(dom, fqdn, target, recordID, proxied)
 	case sErr != nil:
-		log.Printf("reconciler: failed to store DNS record ID for domain %d: %v", dom.ID, sErr)
+		r.failDomainDNS(dom, fmt.Sprintf("created CNAME %s (record %s) but could not store it on the domain: %v", fqdn, recordID, sErr), "")
+	default:
+		r.dnsConverged(dom)
 	}
 }
 
@@ -1284,101 +1331,6 @@ func proxiedWord(proxied bool) string {
 // proxiedChangeDetail is the audit text for a proxy-state change.
 func proxiedChangeDetail(fqdn string, from, to bool) string {
 	return fmt.Sprintf("set %s from %s to %s (operator setting)", fqdn, proxiedWord(from), proxiedWord(to))
-}
-
-// TakeoverDomainDNS forcibly aligns a domain's public DNS record with NurProxy's
-// desired CNAME → agent FQDN, using the zone provider's stored credentials. It is
-// the explicit, audited admin override of the default "never overwrite a record we
-// didn't create" stance (ensureDomainCNAME): on a conflict it DELETES the
-// pre-existing record(s) at the provider and creates the CNAME, marks it managed,
-// clears the conflict error, and re-pushes the agent's routes so the now-resolvable
-// domain re-renders WITH its (already issued) certificate. It is the supported path
-// to migrate an existing domain whose public DNS predates NurProxy (an A record, or
-// a CNAME pointing somewhere else).
-func (r *Reconciler) TakeoverDomainDNS(ctx context.Context, domID int64) error {
-	dom, err := r.db.GetDomain(domID)
-	if err != nil {
-		return fmt.Errorf("domain %d: %w", domID, err)
-	}
-	if dom.CertOnly {
-		return fmt.Errorf("domain %d is cert-only; NurProxy does not manage its public DNS", domID)
-	}
-
-	zone, err := r.db.GetZone(dom.ZoneID)
-	if err != nil {
-		return fmt.Errorf("resolving zone for domain %d: %w", domID, err)
-	}
-	prov, err := r.db.GetProvider(zone.ProviderID)
-	if err != nil {
-		return fmt.Errorf("resolving provider for zone %s: %w", zone.ID, err)
-	}
-	dnsProvider, err := provider.Get(prov.Type)
-	if err != nil {
-		return fmt.Errorf("DNS provider %s not registered: %w", prov.Type, err)
-	}
-	dnsProvider = r.wrapDNS(dnsProvider)
-	provConfig := mergeZoneIDIntoConfig(prov.Config, zone.ExternalID)
-
-	fqdn := dom.FQDN(zone.Name)
-	srv, err := r.db.GetServer(dom.ServerID)
-	if err != nil {
-		return fmt.Errorf("resolving server for domain %d: %w", domID, err)
-	}
-	agent, err := r.db.GetAgent(srv.AgentID)
-	if err != nil {
-		return fmt.Errorf("resolving agent for domain %d: %w", domID, err)
-	}
-	target := agent.FQDN
-
-	existing, err := lookupRecordsByName(ctx, dnsProvider, provConfig, fqdn)
-	if err != nil {
-		return fmt.Errorf("looking up existing DNS records for %s: %w", fqdn, err)
-	}
-
-	if adopt := matchingRecord(existing, "CNAME", target); adopt != nil {
-		// Already the record we want — just take ownership (managed=true) and fall
-		// through to the re-push so a stuck HTTP-only render heals.
-		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, adopt.ID, true); dErr != nil {
-			return fmt.Errorf("storing adopted record id: %w", dErr)
-		}
-		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took ownership of matching CNAME %s -> %s (%s)", fqdn, target, proxiedWord(adopt.Proxied)))
-		if pErr := r.enforceProxied(ctx, dom, fqdn, adopt, dnsProvider, provConfig); pErr != nil {
-			return fmt.Errorf("setting proxy state on %s: %w", fqdn, pErr)
-		}
-	} else {
-		// Delete every conflicting record at this name, then create the CNAME.
-		// The new CNAME inherits the proxy state of what it replaces (any proxied
-		// record at the name means the name was behind Cloudflare), unless the
-		// operator set one explicitly.
-		wasProxied := false
-		for i := range existing {
-			wasProxied = wasProxied || existing[i].Proxied
-			if dErr := dnsProvider.DeleteRecord(ctx, provConfig, existing[i].ID); dErr != nil {
-				return fmt.Errorf("deleting conflicting record %s (%s): %w", existing[i].ID, existing[i].Type, dErr)
-			}
-		}
-		proxied := desiredProxied(dom, wasProxied)
-		recordID, cErr := dnsProvider.CreateRecord(ctx, provConfig, provider.Record{Type: "CNAME", Name: fqdn, Content: target, TTL: 0, Proxied: proxied})
-		if cErr != nil {
-			return fmt.Errorf("creating CNAME for %s: %w", fqdn, cErr)
-		}
-		if dErr := r.db.UpdateDomainDNSRecord(dom.ID, recordID, true); dErr != nil {
-			return fmt.Errorf("storing created record id: %w", dErr)
-		}
-		r.auditDNS("domain", fmt.Sprintf("%d", dom.ID), "dns_takeover", fmt.Sprintf("took over DNS for %s: replaced %s with CNAME -> %s (%s)", fqdn, describeRecords(existing), target, proxiedWord(proxied)))
-	}
-
-	// Clear the conflict error; the proxy apply sets the real status next.
-	if dErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusPending, ""); dErr != nil {
-		return fmt.Errorf("clearing domain status: %w", dErr)
-	}
-	// Re-push so the now-resolvable domain re-renders WITH its certificate — the
-	// create-time push rendered HTTP-only before issuance completed. No-op if the
-	// agent isn't connected; the periodic reconcile is the backstop.
-	if pErr := r.PushAgentRoutes(srv.AgentID); pErr != nil {
-		log.Printf("reconciler: DNS takeover for %s done, but route re-push failed (next cycle retries): %v", fqdn, pErr)
-	}
-	return nil
 }
 
 // lookupRecordsByName returns the provider's records whose name equals fqdn

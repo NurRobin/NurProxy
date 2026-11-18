@@ -11,6 +11,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
 
 // The management CLI is a thin REST client over the orchestrator's /api/v1
@@ -224,6 +226,48 @@ func printTable(headers []string, rows [][]string) {
 func fatalf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// dnsCell names who owns a domain's DNS record: "managed" (NurProxy created
+// or took it over and deletes it with the domain), "adopted" (an existing
+// record NurProxy uses but leaves in place), "operator" for a cert-only domain,
+// or "none" while it has no record.
+func dnsCell(d models.Domain) string {
+	switch {
+	case d.CertOnly:
+		return "operator"
+	case d.DNSRecordID == "":
+		return "none"
+	case d.DNSManaged:
+		return "managed"
+	default:
+		return "adopted"
+	}
+}
+
+// takeoverText renders a DNS takeover response (or its dry run) for humans:
+// the summary and every record at the name that is (or would be) deleted.
+func takeoverText(raw []byte, dryRun bool) string {
+	var resp struct {
+		Message string                 `json:"message"`
+		Plan    models.DNSTakeoverPlan `json:"plan"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	var b strings.Builder
+	if dryRun {
+		b.WriteString("dry run, nothing changed: ")
+	}
+	b.WriteString(resp.Message)
+	for _, rec := range resp.Plan.Delete {
+		proxied := ""
+		if rec.Proxied {
+			proxied = " (proxied)"
+		}
+		fmt.Fprintf(&b, "\n  delete %s %s -> %s%s [%s]", rec.Type, rec.Name, rec.Content, proxied, rec.ID)
+	}
+	return b.String()
 }
 
 // dash renders empty strings as a placeholder for table cells.

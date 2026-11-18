@@ -431,6 +431,44 @@ func (pc ProxyConfig) CheckLoggingSupported(caps *ProxyCapabilities, backend str
 	return nil
 }
 
+// DNSTakeoverAction is what a DNS takeover does at the domain's name.
+type DNSTakeoverAction string
+
+const (
+	// DNSTakeoverAdopt: the desired CNAME already exists; it is taken over as
+	// managed and nothing is deleted.
+	DNSTakeoverAdopt DNSTakeoverAction = "adopt"
+	// DNSTakeoverReplace: every record at the name is deleted, then the CNAME
+	// is created.
+	DNSTakeoverReplace DNSTakeoverAction = "replace"
+	// DNSTakeoverCreate: the name is free; the CNAME is created.
+	DNSTakeoverCreate DNSTakeoverAction = "create"
+)
+
+// DNSRecordInfo is a provider record as shown to an operator.
+type DNSRecordInfo struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Content string `json:"content"`
+	Proxied bool   `json:"proxied"`
+}
+
+// DNSTakeoverPlan describes what a DNS takeover of one domain does: the
+// records it deletes and the CNAME it leaves in place. The preview returns it
+// without changing anything; the takeover returns what it carried out.
+type DNSTakeoverPlan struct {
+	DomainID int64             `json:"domain_id"`
+	FQDN     string            `json:"fqdn"`
+	Target   string            `json:"target"`
+	Action   DNSTakeoverAction `json:"action"`
+	// Delete lists every record at the name the takeover deletes, of any
+	// type (MX, TXT and so on included): a CNAME cannot share its name.
+	Delete []DNSRecordInfo `json:"delete"`
+	// Proxied is the Cloudflare proxy state the CNAME gets (or keeps).
+	Proxied bool `json:"proxied"`
+}
+
 // Domain represents a proxied subdomain.
 type Domain struct {
 	ID           int64       `json:"id"`
@@ -460,12 +498,16 @@ type Domain struct {
 	// proxy state the live record already has (a new record starts DNS-only).
 	// true / false are enforced by the reconciler as desired state. Only zones
 	// whose provider supports proxying accept true.
-	Proxied    *bool        `json:"proxied"`
-	Status     DomainStatus `json:"status"`
-	ErrorMsg   string       `json:"error_msg,omitempty"`
-	LastSynced *time.Time   `json:"last_synced,omitempty"`
-	CreatedAt  time.Time    `json:"created_at"`
-	UpdatedAt  time.Time    `json:"updated_at"`
+	Proxied  *bool        `json:"proxied"`
+	Status   DomainStatus `json:"status"`
+	ErrorMsg string       `json:"error_msg,omitempty"`
+	// DNSError is why the domain's public DNS record could not be created,
+	// adopted or corrected in the last DNS pass. While it is set the domain
+	// stays in error with this reason, whatever the route apply reports.
+	DNSError   string     `json:"dns_error,omitempty"`
+	LastSynced *time.Time `json:"last_synced,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 // OptionalBool is a PATCH-style JSON field for a tri-state bool: Set is false

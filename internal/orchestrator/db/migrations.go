@@ -843,6 +843,12 @@ var migrations = []string{
 	CREATE INDEX idx_domain_dns_cleanups_record
 		ON domain_dns_cleanups(zone_external_id, record_id);
 	`,
+	// dns_error holds the reason the domain's public DNS record could not be
+	// created, adopted or corrected, separately from error_msg. A route apply
+	// rewrites status and error_msg; while dns_error is set it keeps the
+	// domain in error with that reason instead of reporting it active or
+	// degraded for an unrelated cause. Empty means the last DNS pass worked.
+	`ALTER TABLE domains ADD COLUMN dns_error TEXT NOT NULL DEFAULT '';`,
 }
 
 // migrate applies any outstanding migrations. It uses a simple

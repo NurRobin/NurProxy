@@ -417,10 +417,35 @@ func cmdDomain(args []string) {
 		for i, d := range domains {
 			rows[i] = []string{
 				strconv.FormatInt(d.ID, 10), d.Subdomain, d.ServerID,
-				strconv.Itoa(d.Port), proxiedCell(d.Proxied), string(d.Status),
+				strconv.Itoa(d.Port), proxiedCell(d.Proxied), dnsCell(d), string(d.Status), dash(d.ErrorMsg),
 			}
 		}
-		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "PROXIED", "STATUS"}, rows)
+		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "PROXIED", "DNS", "STATUS", "REASON"}, rows)
+
+	case "get":
+		c, _, id := parseClient("domain get", rest, "domain id", nil)
+		var d models.Domain
+		if err := c.getInto("/api/v1/domains/"+id, &d); err != nil {
+			fatalf("%v", err)
+		}
+		if c.asJSON {
+			c.emit(mustJSON(d), "")
+			return
+		}
+		printTable([]string{"FIELD", "VALUE"}, [][]string{
+			{"id", strconv.FormatInt(d.ID, 10)},
+			{"subdomain", d.Subdomain},
+			{"zone", d.ZoneID},
+			{"server", d.ServerID},
+			{"port", strconv.Itoa(d.Port)},
+			{"cert_only", strconv.FormatBool(d.CertOnly)},
+			{"proxied", proxiedCell(d.Proxied)},
+			{"dns", dnsCell(d)},
+			{"dns_record_id", dash(d.DNSRecordID)},
+			{"status", string(d.Status)},
+			{"reason", dash(d.ErrorMsg)},
+			{"dns_error", dash(d.DNSError)},
+		})
 
 	case "add":
 		var subdomain, zone, server, sslMode, proxyFile, proxied, accessLog, errorLogLevel string
@@ -514,12 +539,19 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain marked for deletion: "+id)
 
 	case "dns-takeover":
-		c, _, id := parseClient("domain dns-takeover", rest, "domain id", nil)
-		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/dns/takeover", nil)
+		var dryRun bool
+		c, _, id := parseClient("domain dns-takeover", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.BoolVar(&dryRun, "dry-run", false, "Only list the records the takeover would delete; change nothing")
+		})
+		path := "/api/v1/domains/" + id + "/dns/takeover"
+		if dryRun {
+			path += "?dry_run=true"
+		}
+		raw, err := c.do(http.MethodPost, path, nil)
 		if err != nil {
 			fatalf("%v", err)
 		}
-		c.emit(raw, "DNS takeover applied for domain "+id)
+		c.emit(raw, takeoverText(raw, dryRun))
 
 	case "set-cert":
 		var certFile, keyFile string
@@ -544,7 +576,7 @@ func cmdDomain(args []string) {
 		c.emit(raw, msg)
 
 	default:
-		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE")
+		usage("domain", "list", "get <id>", "add", "update <id>", "delete <id>", "dns-takeover [--dry-run] <id>", "set-cert <id> --cert FILE --key FILE")
 	}
 }
 
