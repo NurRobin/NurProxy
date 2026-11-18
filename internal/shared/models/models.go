@@ -604,9 +604,16 @@ type Domain struct {
 	// proxy state the live record already has (a new record starts DNS-only).
 	// true / false are enforced by the reconciler as desired state. Only zones
 	// whose provider supports proxying accept true.
-	Proxied  *bool        `json:"proxied"`
-	Status   DomainStatus `json:"status"`
-	ErrorMsg string       `json:"error_msg,omitempty"`
+	Proxied *bool `json:"proxied"`
+	// BackupServerIDs are the domain's failover servers on other agents, most
+	// preferred first (#74). ActiveServerID is the server whose agent the
+	// domain's CNAME points at: the primary (ServerID) unless the reconciler
+	// failed over. Both live outside the domains row and are filled in by the
+	// API (db.FillDomainFailover); a bare row read leaves them empty.
+	BackupServerIDs []string     `json:"backup_server_ids,omitempty"`
+	ActiveServerID  string       `json:"active_server_id,omitempty"`
+	Status          DomainStatus `json:"status"`
+	ErrorMsg        string       `json:"error_msg,omitempty"`
 	// DNSError is why the domain's public DNS record could not be created,
 	// adopted or corrected in the last DNS pass. While it is set the domain
 	// stays in error with this reason, whatever the route apply reports.
@@ -614,6 +621,53 @@ type Domain struct {
 	LastSynced *time.Time `json:"last_synced,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// DomainFailoverState is the reconciler's stored failover decision for a domain
+// with backup servers (#74). ActiveServerID is where the CNAME points;
+// PendingServerID is a more preferred candidate that is healthy again and
+// waits out the failback delay since PendingSince. AllDown is set while no
+// candidate is healthy (the record then stays on the last active agent).
+// EvaluatedAt is the last pass that decided; SettleSince starts a settle
+// period in which a down target is held (after a late pass or all-down).
+type DomainFailoverState struct {
+	DomainID        int64      `json:"domain_id"`
+	ActiveServerID  string     `json:"active_server_id"`
+	PendingServerID string     `json:"pending_server_id,omitempty"`
+	PendingSince    *time.Time `json:"pending_since,omitempty"`
+	AllDown         bool       `json:"all_down"`
+	SwitchedAt      *time.Time `json:"switched_at,omitempty"`
+	Switches        int        `json:"switches"`
+	EvaluatedAt     *time.Time `json:"evaluated_at,omitempty"`
+	SettleSince     *time.Time `json:"settle_since,omitempty"`
+}
+
+// FailoverCandidate is one server that may serve a domain: the primary
+// (Priority 0) or a backup, with its agent's current health as the reconciler
+// judges it.
+type FailoverCandidate struct {
+	ServerID   string     `json:"server_id"`
+	ServerName string     `json:"server_name"`
+	AgentID    string     `json:"agent_id"`
+	AgentName  string     `json:"agent_name"`
+	AgentFQDN  string     `json:"agent_fqdn"`
+	Primary    bool       `json:"primary"`
+	Priority   int        `json:"priority"`
+	Eligible   bool       `json:"eligible"`
+	Healthy    bool       `json:"healthy"`
+	Active     bool       `json:"active"`
+	LastSeen   *time.Time `json:"last_seen,omitempty"`
+	Reason     string     `json:"reason,omitempty"`
+}
+
+// DomainFailoverStatus is the failover view of one domain for the API, CLI,
+// MCP and dashboard.
+type DomainFailoverStatus struct {
+	DomainFailoverState
+	Candidates []FailoverCandidate `json:"candidates"`
+	// Settling: a down target is held while agents report in (see
+	// failover.Policy.Settle).
+	Settling bool `json:"settling"`
 }
 
 // OptionalBool is a PATCH-style JSON field for a tri-state bool: Set is false

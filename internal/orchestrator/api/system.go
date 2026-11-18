@@ -218,6 +218,10 @@ func (s *Server) handleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "safe_auto_repair must be true or false")
 		return
 	}
+	if err := validFailoverSetting(key, req.Value); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if err := s.db.SetSetting(key, req.Value); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update setting")

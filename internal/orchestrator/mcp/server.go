@@ -10,6 +10,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -227,6 +228,18 @@ var tools = func() map[string]tool {
 			run:         toolUpdateDomain,
 		},
 		{
+			name:        "get_domain_failover",
+			description: "Show which servers may serve a domain (primary and failover backups on other agents), their agents' health, and which agent the domain's DNS record currently points at.",
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}`,
+			run:         toolGetDomainFailover,
+		},
+		{
+			name:        "set_domain_backups",
+			description: "Set a domain's failover backup servers, most preferred first; an empty list removes failover. Each backup must be a server on its own agent, other than the primary's, that serves the domain's zone. Backup agents get the route and certificate in advance; the DNS record moves to the first healthy agent when the active one goes offline. At most 3.",
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"server_ids":{"type":"array","items":{"type":"string"},"maxItems":3}},"required":["id","server_ids"],"additionalProperties":false}`,
+			run:         toolSetDomainBackups,
+		},
+		{
 			name:        "delete_domain",
 			description: "Delete a domain by id (marks it for teardown of its DNS record and route).",
 			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}`,
@@ -344,6 +357,9 @@ func toolListDomains(d *db.DB, args json.RawMessage) (any, error) {
 	}
 	if domains == nil {
 		domains = []models.Domain{}
+	}
+	if err := d.FillDomainFailover(domains); err != nil {
+		return nil, err
 	}
 	return domains, nil
 }
@@ -474,6 +490,9 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		if _, err := d.GetServer(*in.ServerID); err != nil {
 			return nil, fmt.Errorf("server not found")
 		}
+		if err := d.CheckPrimaryServer(dom.ID, *in.ServerID); err != nil {
+			return nil, err
+		}
 		dom.ServerID = *in.ServerID
 	}
 	if in.Port != nil {
@@ -598,10 +617,21 @@ func toolDeleteDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if in.ID == 0 {
 		return nil, fmt.Errorf("id is required")
 	}
+	dom, err := d.GetDomain(in.ID)
+	if err != nil {
+		return nil, fmt.Errorf("domain not found")
+	}
+	// Standby routes on failover backup agents (#74) get their tombstones
+	// before any push can stop retaining them; the reconciler teardown
+	// repeats this if it fails here.
+	_, standbyErr := d.TombstoneStandbyRoutes(dom, time.Now().UTC())
 	if err := d.UpdateDomainStatus(in.ID, models.DomainStatusDeleting, ""); err != nil {
 		return nil, fmt.Errorf("domain not found")
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", in.ID), "delete", "")
+	if standbyErr != nil {
+		return map[string]any{"id": in.ID, "status": "deleting", "warnings": []string{"standby route deletions could not be stored yet: " + standbyErr.Error()}}, nil
+	}
 	return map[string]any{"id": in.ID, "status": "deleting"}, nil
 }
 
@@ -625,4 +655,46 @@ func nonNilServers(s []models.Server, err error) (any, error) {
 		return []models.Server{}, nil
 	}
 	return s, nil
+}
+
+func toolGetDomainFailover(d *db.DB, args json.RawMessage) (any, error) {
+	var in struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	dom, err := d.GetDomain(in.ID)
+	if err != nil {
+		return nil, fmt.Errorf("domain not found")
+	}
+	return d.DomainFailoverStatus(dom, time.Now().UTC())
+}
+
+// toolSetDomainBackups stores the backup list like the REST API. The agents
+// that gain or lose a standby route, and the DNS target, follow on the next
+// reconcile cycle.
+func toolSetDomainBackups(d *db.DB, args json.RawMessage) (any, error) {
+	var in struct {
+		ID        int64    `json:"id"`
+		ServerIDs []string `json:"server_ids"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if in.ServerIDs == nil {
+		return nil, fmt.Errorf("server_ids is required (an empty list removes all backups)")
+	}
+	if _, err := d.SetDomainBackups(in.ID, in.ServerIDs, time.Now().UTC()); err != nil {
+		if errors.Is(err, db.ErrDomainNotFound) {
+			return nil, fmt.Errorf("domain not found")
+		}
+		return nil, err
+	}
+	auditMCP(d, "domain", fmt.Sprintf("%d", in.ID), "backups_set", "backup servers: ["+strings.Join(in.ServerIDs, ", ")+"]")
+	dom, err := d.GetDomain(in.ID)
+	if err != nil {
+		return nil, fmt.Errorf("domain not found")
+	}
+	return d.DomainFailoverStatus(dom, time.Now().UTC())
 }

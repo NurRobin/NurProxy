@@ -122,7 +122,7 @@ func TestTakeoverDomainDNS_lostNameDeletesForDeletedDomain(t *testing.T) {
 	d := testDB(t)
 	_, _, _, _, dom := setupScenario(t, d)
 	r := New(d, newMockAgentClient(), time.Minute)
-	tgt, err := r.resolveTakeover(context.Background(), dom.ID)
+	tgt, err := r.resolveTakeover(context.Background(), dom.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
