@@ -25,6 +25,7 @@ Listen 127.0.0.1:8081
 Listen 127.0.0.1:8082
 Listen 127.0.0.1:8083
 Listen 127.0.0.1:8084
+Listen 127.0.0.1:8085
 LoadModule mpm_event_module modules/mod_mpm_event.so
 LoadModule unixd_module modules/mod_unixd.so
 LoadModule authz_core_module modules/mod_authz_core.so
@@ -33,6 +34,8 @@ LoadModule rewrite_module modules/mod_rewrite.so
 LoadModule proxy_module modules/mod_proxy.so
 LoadModule proxy_http_module modules/mod_proxy_http.so
 LoadModule proxy_wstunnel_module modules/mod_proxy_wstunnel.so
+LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
+LoadModule ssl_module modules/mod_ssl.so
 User daemon
 Group daemon
 ServerName localhost
@@ -81,6 +84,8 @@ func TestIntegration_httpdServesPathRoutes(t *testing.T) {
 	}
 
 	routes := []proxymodel.PathRoute{
+		{Match: proxymodel.PathMatchPrefix, Path: "/live", WebSocket: true, Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8083}},
+		{Match: proxymodel.PathMatchExact, Path: "/secure", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8085, Scheme: proxymodel.SchemeHTTPS}},
 		{Match: proxymodel.PathMatchExact, Path: "/api/world", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8082}},
 		{Match: proxymodel.PathMatchPrefix, Path: "/media", Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8083}},
 		{Match: proxymodel.PathMatchPrefix, Path: "/ws.v1", StripPrefix: true, WebSocket: true, Upstream: proxymodel.Upstream{Addr: "127.0.0.1", Port: 8084}},
@@ -104,6 +109,9 @@ func TestIntegration_httpdServesPathRoutes(t *testing.T) {
 		route("ws.example.com", func(r *proxymodel.Route) { r.WebSocket = true }),
 		route("strip.example.com", func(r *proxymodel.Route) { r.Path.StripPrefix = "/app" }),
 		route("rewrite.example.com", func(r *proxymodel.Route) { r.Path.Rewrite = "/fixed" }),
+		route("tlsup.example.com", func(r *proxymodel.Route) {
+			r.Upstream = proxymodel.Upstream{Addr: "127.0.0.1", Port: 8085, Scheme: proxymodel.SchemeHTTPS}
+		}),
 	} {
 		res, err := Render(Input{Route: r})
 		if err != nil {
@@ -111,7 +119,11 @@ func TestIntegration_httpdServesPathRoutes(t *testing.T) {
 		}
 		vhosts.WriteString(res.VHost + "\n")
 	}
-	upstreams := pathRoutesUpstream(8081, "A") + pathRoutesUpstream(8082, "B") + pathRoutesUpstream(8083, "C") + pathRoutesUpstream(8084, "D")
+	// E speaks TLS, so reaching it needs SSLProxyEngine on in the proxy vhost.
+	certPath, keyPath := writeSelfSignedCert(t, dir)
+	tlsUpstream := strings.Replace(pathRoutesUpstream(8085, "E"), "</VirtualHost>",
+		"    SSLEngine on\n    SSLCertificateFile "+certPath+"\n    SSLCertificateKeyFile "+keyPath+"\n</VirtualHost>", 1)
+	upstreams := pathRoutesUpstream(8081, "A") + pathRoutesUpstream(8082, "B") + pathRoutesUpstream(8083, "C") + pathRoutesUpstream(8084, "D") + tlsUpstream
 	writeFile(t, filepath.Join(dir, "vhosts.conf"), vhosts.String())
 	writeFile(t, filepath.Join(dir, "httpd.conf"), fmt.Sprintf(pathRoutesMainConf, upstreams, filepath.Join(dir, "vhosts.conf")))
 
@@ -185,6 +197,11 @@ func TestIntegration_httpdServesPathRoutes(t *testing.T) {
 		{"strip.example.com", "/ws.v1/z", nil, "D", "/z", ""},
 		{"rewrite.example.com", "/anything", nil, "A", "/fixed", ""},
 		{"rewrite.example.com", "/media/z", nil, "C", "/media/z", ""},
+		{"paths.example.com", "/live/feed", upgrade, "C", "/live/feed", ""},
+		{"paths.example.com", "/live", upgrade, "C", "/live", ""},
+		{"paths.example.com", "/secure", nil, "E", "/secure", ""},
+		{"tlsup.example.com", "/x?y=1", nil, "E", "/x", "y=1"},
+		{"tlsup.example.com", "/api/world", nil, "B", "/api/world", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.host+tt.target, func(t *testing.T) {

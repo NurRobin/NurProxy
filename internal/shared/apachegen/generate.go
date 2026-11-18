@@ -227,6 +227,11 @@ func Render(in Input) (Result, error) {
 	// Preserve the original Host header to the upstream (mirrors nginx
 	// "proxy_set_header Host $host"). Off by default in Apache, so set it on.
 	b.WriteString("    ProxyPreserveHost On\n")
+	// mod_proxy refuses to talk TLS to a backend (500) unless SSLProxyEngine
+	// is on in the vhost.
+	if anyHTTPSUpstream(route) {
+		b.WriteString("    SSLProxyEngine on\n")
+	}
 
 	upstreamScheme := "http"
 	if route.EffectiveScheme() == proxymodel.SchemeHTTPS {
@@ -296,6 +301,20 @@ func timeoutParams(t proxymodel.Timeouts) string {
 	return s.String()
 }
 
+// anyHTTPSUpstream reports whether the default upstream or a path route is
+// reached over HTTPS.
+func anyHTTPSUpstream(route proxymodel.Route) bool {
+	if route.EffectiveScheme() == proxymodel.SchemeHTTPS {
+		return true
+	}
+	for _, p := range route.PathRoutes {
+		if p.EffectiveScheme() == proxymodel.SchemeHTTPS {
+			return true
+		}
+	}
+	return false
+}
+
 // wsScheme is the mod_proxy_wstunnel scheme for an upstream scheme.
 func wsScheme(s proxymodel.Scheme) string {
 	if s == proxymodel.SchemeHTTPS {
@@ -345,7 +364,9 @@ func writePathRoutes(b *strings.Builder, routes []proxymodel.PathRoute, timeouts
 		if p.StripPrefix {
 			fmt.Fprintf(b, "    RewriteRule %s %s://%s/$1 [P,L]\n", stripRouteRegex(p), wsScheme(p.EffectiveScheme()), hostPort)
 		} else {
-			fmt.Fprintf(b, "    RewriteRule ^(%s)$ %s://%s$1 [P,L]\n", pathRouteRegex(p), wsScheme(p.EffectiveScheme()), hostPort)
+			// The capture leaves out the leading slash, so the target keeps a
+			// path after host:port, the URL form the helper's policy admits.
+			fmt.Fprintf(b, "    RewriteRule ^/(%s)$ %s://%s/$1 [P,L]\n", pathRouteRegex(p)[1:], wsScheme(p.EffectiveScheme()), hostPort)
 		}
 	}
 	for _, p := range routes {
