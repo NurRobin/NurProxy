@@ -3,6 +3,8 @@ package caddy
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -187,6 +189,141 @@ func TestClientEnsureServer(t *testing.T) {
 	// Second call should succeed without creating again.
 	if err := c.EnsureServer(ctx); err != nil {
 		t.Fatalf("EnsureServer (second call) failed: %v", err)
+	}
+}
+
+func TestClientEnsureServer_listen(t *testing.T) {
+	tests := []struct {
+		name            string
+		host            string
+		httpPort        int
+		httpsPort       int
+		wantListen      []string
+		wantHTTPPort    any
+		wantHTTPSPortIn bool
+	}{
+		{name: "defaults", wantListen: []string{":443", ":80"}},
+		{name: "explicit defaults", httpPort: 80, httpsPort: 443, wantListen: []string{":443", ":80"}},
+		{name: "unprivileged loopback", host: "127.0.0.1", httpPort: 18080, httpsPort: 18443,
+			wantListen: []string{"127.0.0.1:18443", "127.0.0.1:18080"}, wantHTTPPort: float64(18080), wantHTTPSPortIn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var created map[string]any
+			mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && r.URL.Path == "/config/apps" {
+					var body struct {
+						HTTP map[string]any `json:"http"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					created = body.HTTP
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer mock.Close()
+
+			c := (&Client{baseURL: mock.URL, http: mock.Client()}).WithListen(tt.host, tt.httpPort, tt.httpsPort)
+			if err := c.EnsureServer(context.Background()); err != nil {
+				t.Fatalf("EnsureServer: %v", err)
+			}
+			srv0 := created["servers"].(map[string]any)["srv0"].(map[string]any)
+			got, _ := json.Marshal(srv0["listen"])
+			want, _ := json.Marshal(tt.wantListen)
+			if string(got) != string(want) {
+				t.Errorf("listen = %s, want %s", got, want)
+			}
+			if created["http_port"] != tt.wantHTTPPort {
+				t.Errorf("http_port = %v, want %v", created["http_port"], tt.wantHTTPPort)
+			}
+			if _, ok := created["https_port"]; ok != tt.wantHTTPSPortIn {
+				t.Errorf("https_port present = %v, want %v", ok, tt.wantHTTPSPortIn)
+			}
+		})
+	}
+}
+
+// The admin API's PUT answers 409 when a key already exists, so a second TLS
+// apply on a running Caddy must replace the values (PATCH) instead of failing.
+// Otherwise every push after the first fails and new hosts' certs never load.
+func TestClientApplyTLS_reapplyReplacesExistingKeys(t *testing.T) {
+	config := map[string]string{}
+	var tlsApp bool
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/tls":
+			if !tlsApp {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/tls":
+			tlsApp = true
+			config["/config/apps/tls/certificates"] = string(body)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut:
+			if _, ok := config[r.URL.Path]; ok {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":"key already exists"}`))
+				return
+			}
+			config[r.URL.Path] = string(body)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPatch:
+			if _, ok := config[r.URL.Path]; !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			config[r.URL.Path] = string(body)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mock.Close()
+
+	c := &Client{baseURL: mock.URL, http: mock.Client()}
+	ctx := context.Background()
+	first := json.RawMessage(`[{"certificate":"/a.crt","key":"/a.key"}]`)
+	second := json.RawMessage(`[{"certificate":"/a.crt","key":"/a.key"},{"certificate":"/b.crt","key":"/b.key"}]`)
+	auto := json.RawMessage(`{"disable":true}`)
+	policies := json.RawMessage(`[{}]`)
+	if err := c.ApplyTLS(ctx, first, auto, policies); err != nil {
+		t.Fatalf("first ApplyTLS: %v", err)
+	}
+	if err := c.ApplyTLS(ctx, second, auto, policies); err != nil {
+		t.Fatalf("second ApplyTLS: %v", err)
+	}
+	var certs struct {
+		LoadFiles []map[string]string `json:"load_files"`
+	}
+	if err := json.Unmarshal([]byte(config["/config/apps/tls/certificates"]), &certs); err != nil {
+		t.Fatalf("certificates: %v", err)
+	}
+	if len(certs.LoadFiles) != 2 {
+		t.Errorf("load_files after re-apply = %v, want both certs", certs.LoadFiles)
+	}
+}
+
+func TestClientSetKey_otherErrorsAreReturned(t *testing.T) {
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			t.Errorf("PATCH sent after a non-conflict error")
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer mock.Close()
+	c := &Client{baseURL: mock.URL, http: mock.Client()}
+	err := c.setKey(context.Background(), "/config/x", []byte(`{}`))
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("setKey error = %v, want the 400", err)
 	}
 }
 
