@@ -59,6 +59,14 @@ func TestValidateManagedAgreesWithRealNginx(t *testing.T) {
 	for name, generated := range policyTestGeneratedConfigs(t) {
 		cases = append(cases, nginxCase{name: "generated/" + name, content: offline.Replace(generated.full), admitted: true, validate: ValidateRendered})
 	}
+	for i, statement := range policyTestTuning {
+		cases = append(cases,
+			nginxCase{name: fmt.Sprintf("tuning server/%02d %s", i, statement), content: policyTestInServer(statement), admitted: true, validate: ValidateManaged},
+			nginxCase{name: fmt.Sprintf("tuning location/%02d %s", i, statement), content: policyTestInLocation(statement), admitted: true, validate: ValidateManaged})
+	}
+	for i, statement := range policyTestServerOnly {
+		cases = append(cases, nginxCase{name: fmt.Sprintf("tuning server only/%02d %s", i, statement), content: policyTestInServer(statement), admitted: true, validate: ValidateManaged})
+	}
 	for _, tt := range policyTestRefused {
 		cases = append(cases, nginxCase{name: "refused/" + tt.name, content: tt.content, validate: ValidateManaged})
 	}

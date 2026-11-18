@@ -3,6 +3,7 @@ package nginxparse
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
@@ -22,21 +23,18 @@ type ManagedPolicy struct {
 // ValidateManaged reports whether a raw nginx config is a bounded single-route
 // vhost the helper may write. The checks run on the statements as nginx's own
 // tokenizer reads them, and every directive name and argument must match an
-// explicit allowlist for its scope; anything else is refused. A raw config
-// must also be a clean single-route mask (Parse(content).OK).
+// explicit allowlist for its scope; anything else is refused. The error names
+// the offending directive and its line, and is safe to show to the operator:
+// it quotes directive names only, never argument values.
 func ValidateManaged(content string, policy ManagedPolicy) error {
 	blocks, directives, err := parsePolicyConfig(content, policy)
 	if err != nil {
 		return err
 	}
 	if len(directives) != 0 {
-		return fmt.Errorf("raw nginx configuration has unsupported top-level scope")
+		return fmt.Errorf("line %d: top-level directives are not allowed in a raw nginx config, only server blocks", lineAt(content, directives[0].offset))
 	}
-	parsed := Parse(content)
-	if !parsed.OK || parsed.Route.Host != policy.Host || parsed.Route.Upstream.Addr == "" || parsed.Route.Upstream.Port <= 0 || parsed.Route.Upstream.Port > 65535 {
-		return fmt.Errorf("raw nginx configuration is not a clean single-route mask")
-	}
-	return validateServers(blocks, policy, "")
+	return validateServers(blocks, policyScope{ManagedPolicy: policy, content: content, raw: true})
 }
 
 // ValidateRendered reports whether a vhost the helper rendered itself with
@@ -52,13 +50,13 @@ func ValidateRendered(content string, policy ManagedPolicy) error {
 	zone := ""
 	for _, d := range directives {
 		if d.comment || !plainName(d.tokens[0]) || d.tokens[0].value != "limit_req_zone" || zone != "" {
-			return fmt.Errorf("rendered nginx configuration has unsupported top-level scope")
+			return fmt.Errorf("line %d: rendered nginx configuration has unsupported top-level scope", lineAt(content, d.offset))
 		}
 		if zone = rateLimitZone(d.tokens[1:]); zone == "" {
-			return fmt.Errorf("rendered nginx limit_req_zone has unsupported arguments")
+			return fmt.Errorf("line %d: rendered nginx limit_req_zone has unsupported arguments", lineAt(content, d.offset))
 		}
 	}
-	return validateServers(blocks, policy, zone)
+	return validateServers(blocks, policyScope{ManagedPolicy: policy, content: content, zone: zone})
 }
 
 // parsePolicyConfig tokenizes content for a policy check and enforces the
@@ -79,20 +77,21 @@ func parsePolicyConfig(content string, policy ManagedPolicy) ([]block, []directi
 	if longestWordOrComment(content) > MaxWordBytes {
 		return nil, nil, fmt.Errorf("nginx configuration has a word or comment longer than %d bytes", MaxWordBytes)
 	}
-	if len(blocks) == 0 || len(blocks) > 2 {
-		return nil, nil, fmt.Errorf("nginx configuration has unsupported top-level scope")
+	if len(blocks) == 0 {
+		return nil, nil, fmt.Errorf("nginx configuration has no server block")
+	}
+	if len(blocks) > 2 {
+		return nil, nil, fmt.Errorf("line %d: nginx configuration may hold at most two server blocks (the proxied server and its port-80 redirect)", lineAt(content, blocks[2].offset))
 	}
 	return blocks, directives, nil
 }
 
-// validateServers checks every top-level server block. zone is the rate-limit
-// zone a rendered config declares, or "" when limit_req is not allowed.
-func validateServers(blocks []block, policy ManagedPolicy, zone string) error {
-	scope := policyScope{ManagedPolicy: policy, zone: zone}
+// validateServers checks every top-level server block.
+func validateServers(blocks []block, scope policyScope) error {
 	proxied := 0
 	for _, server := range blocks {
 		if !header(server, "server") {
-			return fmt.Errorf("nginx configuration has an unsupported block")
+			return fmt.Errorf("line %d: nginx block %s is not allowed at top level, only server", scope.line(server.offset), blockName(server))
 		}
 		if len(server.blocks) == 0 {
 			if err := validateRedirectServer(server, scope); err != nil {
@@ -106,7 +105,7 @@ func validateServers(blocks []block, policy ManagedPolicy, zone string) error {
 		}
 	}
 	if proxied != 1 {
-		return fmt.Errorf("nginx configuration must have exactly one proxied server")
+		return fmt.Errorf("nginx configuration must have exactly one proxied server (a server block with location /)")
 	}
 	return nil
 }
@@ -141,18 +140,74 @@ func longestWordOrComment(content string) int {
 // policyScope is what argument rules may compare against.
 type policyScope struct {
 	ManagedPolicy
+	// content is the checked config, for line numbers in errors.
+	content string
+	// raw is set for a hand-written config: the generator-only forms (basic
+	// auth, which needs the helper-written htpasswd file) are refused.
+	raw bool
 	// zone is the rate-limit zone declared by a rendered config, or "".
 	zone string
+}
+
+func (p policyScope) line(offset int) int { return lineAt(p.content, offset) }
+
+// lineAt returns the 1-based line of a source offset.
+func lineAt(content string, offset int) int {
+	return strings.Count(content[:min(max(offset, 0), len(content))], "\n") + 1
 }
 
 // argRule checks a directive's arguments (nginx values, name excluded).
 type argRule func(args []token, scope policyScope) bool
 
-// proxiedServerDirectives are the only directives allowed directly in the
-// proxied server block.
-var proxiedServerDirectives = map[string]argRule{
+// tuningDirectives are the per-request tuning directives allowed both in the
+// proxied server block and in its `location / {}`. None of them names a file,
+// loads code or takes a variable that could change where nginx reads or
+// writes; header values may reference variables, which only change the
+// header text.
+var tuningDirectives = map[string]argRule{
+	"client_max_body_size":    func(a []token, _ policyScope) bool { return plainMatch(a, bodySizeRe) },
+	"client_body_buffer_size": func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
+	"add_header": func(a []token, _ policyScope) bool {
+		if len(a) == 3 && !plainOneOf(a[2:], "always") {
+			return false
+		}
+		return (len(a) == 2 || len(a) == 3) && plainMatch(a[:1], headerNameRe) && headerValue(a[1])
+	},
+	"access_log": accessLogRule,
+	"proxy_set_header": func(a []token, _ policyScope) bool {
+		return len(a) == 2 && plainMatch(a[:1], headerNameRe) && headerValue(a[1])
+	},
+	"proxy_hide_header":       func(a []token, _ policyScope) bool { return plainMatch(a, headerNameRe) },
+	"proxy_http_version":      func(a []token, _ policyScope) bool { return plainOneOf(a, "1.0", "1.1") },
+	"proxy_connect_timeout":   func(a []token, _ policyScope) bool { return plainMatch(a, durationRe) },
+	"proxy_send_timeout":      func(a []token, _ policyScope) bool { return plainMatch(a, durationRe) },
+	"proxy_read_timeout":      func(a []token, _ policyScope) bool { return plainMatch(a, durationRe) },
+	"proxy_buffering":         onOff,
+	"proxy_request_buffering": onOff,
+	"proxy_buffer_size":       func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
+	"proxy_busy_buffers_size": func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
+	"proxy_buffers": func(a []token, _ policyScope) bool {
+		return len(a) == 2 && plainMatch(a[:1], countRe) && plainMatch(a[1:], bufferSizeRe)
+	},
+	"proxy_redirect":        func(a []token, _ policyScope) bool { return plainOneOf(a, "off") },
+	"proxy_ssl_server_name": onOff,
+	"gzip":                  onOff,
+	"gzip_vary":             onOff,
+	"gzip_comp_level":       func(a []token, _ policyScope) bool { return plainMatch(a, compLevelRe) },
+	"gzip_min_length":       func(a []token, _ policyScope) bool { return plainMatch(a, bufferSizeRe) },
+	"gzip_types": func(a []token, _ policyScope) bool {
+		return len(a) >= 1 && len(a) <= 32 && allPlain(a, func(v string) bool { return v == "*" || mimeTypeRe.MatchString(v) })
+	},
+	"gzip_proxied": func(a []token, _ policyScope) bool {
+		return len(a) >= 1 && len(a) <= 9 && allPlain(a, func(v string) bool { return gzipProxiedValues[v] })
+	},
+}
+
+// proxiedServerOnly are the directives allowed directly in the proxied server
+// block but not in its location.
+var proxiedServerOnly = map[string]argRule{
 	"listen":      func(a []token, _ policyScope) bool { return managedListen(a, false) },
-	"http2":       func(a []token, _ policyScope) bool { return plainOneOf(a, "on", "off") },
+	"http2":       onOff,
 	"server_name": func(a []token, p policyScope) bool { return plainExact(a, p.Host) },
 	"ssl_certificate": func(a []token, p policyScope) bool {
 		return p.CertPath != "" && plainExact(a, p.CertPath)
@@ -160,32 +215,52 @@ var proxiedServerDirectives = map[string]argRule{
 	"ssl_certificate_key": func(a []token, p policyScope) bool {
 		return p.KeyPath != "" && plainExact(a, p.KeyPath)
 	},
-	// auth_basic and limit_req only pass in rendered configs: for a raw
-	// config Parse() reports them as not clean, so ValidateManaged refuses
-	// them before these rules run, and limit_req also needs the zone that
-	// only ValidateRendered accepts.
-	"auth_basic": func(a []token, _ policyScope) bool { return len(a) == 1 && headerValue(a[0]) },
+	// Basic auth needs the htpasswd file the helper writes from the route's
+	// structured settings, so a raw config cannot carry it. limit_req needs
+	// the zone only a rendered config declares.
+	"auth_basic": func(a []token, p policyScope) bool { return !p.raw && len(a) == 1 && headerValue(a[0]) },
 	"auth_basic_user_file": func(a []token, p policyScope) bool {
-		return p.AuthPath != "" && plainExact(a, p.AuthPath)
+		return !p.raw && p.AuthPath != "" && plainExact(a, p.AuthPath)
 	},
-	"client_max_body_size": func(a []token, _ policyScope) bool { return plainMatch(a, bodySizeRe) },
-	"allow":                func(a []token, _ policyScope) bool { return plainMatch(a, addressRe) },
-	"deny":                 func(a []token, _ policyScope) bool { return plainMatch(a, addressRe) },
-	"add_header": func(a []token, _ policyScope) bool {
-		if len(a) == 3 && !plainOneOf(a[2:], "always") {
-			return false
-		}
-		return (len(a) == 2 || len(a) == 3) && plainMatch(a[:1], headerNameRe) && headerValue(a[1])
-	},
+	"allow": func(a []token, _ policyScope) bool { return plainMatch(a, addressRe) },
+	"deny":  func(a []token, _ policyScope) bool { return plainMatch(a, addressRe) },
 	"limit_req": func(a []token, p policyScope) bool {
 		return p.zone != "" && len(a) == 3 && plainOneOf(a[:1], "zone="+p.zone) && plainMatch(a[1:2], burstRe) && plainOneOf(a[2:], "nodelay")
 	},
-	"access_log": accessLogRule,
-	"error_log":  errorLogRule,
+	"error_log":     errorLogRule,
+	"server_tokens": onOff,
 }
 
+// locationOnly are the directives allowed in `location / {}` but not directly
+// in the server block.
+var locationOnly = map[string]argRule{
+	"proxy_pass": func(a []token, _ policyScope) bool { return managedProxyPass(a) },
+	"rewrite": func(a []token, _ policyScope) bool {
+		return len(a) == 3 && rewriteArgument(a[0]) && rewriteArgument(a[1]) && plainOneOf(a[2:], "break")
+	},
+}
+
+// proxiedServerDirectives are the only directives allowed directly in the
+// proxied server block; locationDirectives the only ones in `location / {}`.
+var (
+	proxiedServerDirectives = mergeRules(tuningDirectives, proxiedServerOnly)
+	locationDirectives      = mergeRules(tuningDirectives, locationOnly)
+)
+
+func mergeRules(sets ...map[string]argRule) map[string]argRule {
+	merged := map[string]argRule{}
+	for _, set := range sets {
+		for name, rule := range set {
+			merged[name] = rule
+		}
+	}
+	return merged
+}
+
+func onOff(a []token, _ policyScope) bool { return plainOneOf(a, "on", "off") }
+
 // accessLogRule accepts only `access_log off;`: any other form names a file
-// or syslog target nginx would open.
+// or syslog target nginx's root master process would open.
 func accessLogRule(a []token, _ policyScope) bool { return plainOneOf(a, "off") }
 
 // errorLogRule accepts only `error_log /var/log/nginx/error.log <level>;`,
@@ -193,21 +268,6 @@ func accessLogRule(a []token, _ policyScope) bool { return plainOneOf(a, "off") 
 // error log.
 func errorLogRule(a []token, _ policyScope) bool {
 	return len(a) == 2 && plainOneOf(a[:1], nginxgen.DefaultErrorLogPath) && plainOneOf(a[1:], proxymodel.ErrorLogLevels...)
-}
-
-// locationDirectives are the only directives allowed in `location / {}`.
-var locationDirectives = map[string]argRule{
-	"proxy_pass": func(a []token, _ policyScope) bool { return plainMatch(a, managedProxyPassRe) },
-	"proxy_set_header": func(a []token, _ policyScope) bool {
-		return len(a) == 2 && plainMatch(a[:1], headerNameRe) && headerValue(a[1])
-	},
-	"proxy_http_version": func(a []token, _ policyScope) bool { return plainOneOf(a, "1.0", "1.1") },
-	"rewrite": func(a []token, _ policyScope) bool {
-		return len(a) == 3 && rewriteArgument(a[0]) && rewriteArgument(a[1]) && plainOneOf(a[2:], "break")
-	},
-	"proxy_connect_timeout": func(a []token, _ policyScope) bool { return plainMatch(a, secondsRe) },
-	"proxy_send_timeout":    func(a []token, _ policyScope) bool { return plainMatch(a, secondsRe) },
-	"proxy_read_timeout":    func(a []token, _ policyScope) bool { return plainMatch(a, secondsRe) },
 }
 
 // redirectServerDirectives are the only directives allowed in the port-80
@@ -230,12 +290,43 @@ var (
 	headerNameRe       = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 	bodySizeRe         = regexp.MustCompile(`^[0-9]+[kKmMgG]?$`)
 	addressRe          = regexp.MustCompile(`^(all|[0-9A-Fa-f:.]+(/[0-9]{1,3})?)$`)
-	secondsRe          = regexp.MustCompile(`^[0-9]+s?$`)
+	bufferSizeRe       = regexp.MustCompile(`^[0-9]{1,9}[kKmM]?$`)
+	countRe            = regexp.MustCompile(`^[1-9][0-9]{0,3}$`)
+	durationRe         = regexp.MustCompile(`^[0-9]{1,9}(ms|s|m|h)?$`)
+	compLevelRe        = regexp.MustCompile(`^[1-9]$`)
+	mimeTypeRe         = regexp.MustCompile(`^[a-z0-9][a-z0-9.+-]*/[a-z0-9*][a-z0-9.+*-]*$`)
 	burstRe            = regexp.MustCompile(`^burst=[0-9]+$`)
 	zoneDeclRe         = regexp.MustCompile(`^zone=(nurproxy_[a-z0-9_]+):10m$`)
 	rateRe             = regexp.MustCompile(`^rate=[0-9]+r/[sm]$`)
-	managedProxyPassRe = regexp.MustCompile(`^https?://([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]):[0-9]+/?$`)
+	managedProxyPassRe = regexp.MustCompile(`^https?://([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]):([0-9]{1,5})/?$`)
 )
+
+// gzipProxiedValues are the gzip_proxied flags nginx knows.
+var gzipProxiedValues = map[string]bool{
+	"off": true, "expired": true, "no-cache": true, "no-store": true, "private": true,
+	"no_last_modified": true, "no_etag": true, "auth": true, "any": true,
+}
+
+// managedProxyPass accepts `proxy_pass scheme://host:port[/];` with a port in
+// 1..65535: no variables, upstream{} names or unix sockets.
+func managedProxyPass(a []token) bool {
+	if !plainMatch(a, managedProxyPassRe) {
+		return false
+	}
+	port, err := strconv.Atoi(managedProxyPassRe.FindStringSubmatch(a[0].value)[2])
+	return err == nil && port > 0 && port <= 65535
+}
+
+// allPlain reports whether every argument is a plain word whose value ok
+// accepts.
+func allPlain(args []token, ok func(string) bool) bool {
+	for _, a := range args {
+		if a.quote != 0 || !plainArgument(a.source) || !ok(a.value) {
+			return false
+		}
+	}
+	return true
+}
 
 // rateLimitZone returns the zone name of a `limit_req_zone` in the form
 // nginxgen renders, or "" when the arguments differ from that form.
@@ -247,48 +338,95 @@ func rateLimitZone(a []token) string {
 }
 
 func validateProxiedServer(server block, scope policyScope) error {
-	if err := validateDirectives(server.directives, proxiedServerDirectives, scope); err != nil {
+	if err := validateDirectives(server.directives, proxiedServerDirectives, scope, "the server block"); err != nil {
 		return err
+	}
+	if n := countDirectives(server.directives, "server_name"); n != 1 {
+		return fmt.Errorf("line %d: the proxied server block needs exactly one server_name %s, found %d", scope.line(server.offset), scope.Host, n)
+	}
+	for _, nested := range server.blocks {
+		if !header(nested, "location", "/") {
+			return fmt.Errorf("line %d: nginx block %s is not allowed in the server block, only one location /", scope.line(nested.offset), blockName(nested))
+		}
 	}
 	if len(server.blocks) != 1 {
-		return fmt.Errorf("nginx configuration has an unsupported nested scope")
+		return fmt.Errorf("line %d: the server block may hold only one location / block", scope.line(server.blocks[1].offset))
 	}
 	location := server.blocks[0]
-	if !header(location, "location", "/") || len(location.blocks) != 0 {
-		return fmt.Errorf("nginx configuration has an unsupported nested scope")
+	if len(location.blocks) != 0 {
+		return fmt.Errorf("line %d: nginx block %s is not allowed inside location /", scope.line(location.blocks[0].offset), blockName(location.blocks[0]))
 	}
-	return validateDirectives(location.directives, locationDirectives, scope)
-}
-
-func validateRedirectServer(server block, scope policyScope) error {
-	if err := validateDirectives(server.directives, redirectServerDirectives, scope); err != nil {
+	if err := validateDirectives(location.directives, locationDirectives, scope, "location /"); err != nil {
 		return err
 	}
-	count := map[string]int{}
-	for _, d := range server.directives {
-		count[d.tokens[0].value]++
-	}
-	if count["server_name"] != 1 || count["return"] != 1 {
-		return fmt.Errorf("nginx redirect server needs exactly one server_name and one return")
+	if n := countDirectives(location.directives, "proxy_pass"); n != 1 {
+		return fmt.Errorf("line %d: location / needs exactly one proxy_pass, found %d", scope.line(location.offset), n)
 	}
 	return nil
 }
 
-func validateDirectives(directives []directive, allowed map[string]argRule, scope policyScope) error {
+func validateRedirectServer(server block, scope policyScope) error {
+	if err := validateDirectives(server.directives, redirectServerDirectives, scope, "the redirect server block"); err != nil {
+		return err
+	}
+	if countDirectives(server.directives, "server_name") != 1 || countDirectives(server.directives, "return") != 1 {
+		return fmt.Errorf("line %d: nginx redirect server needs exactly one server_name and one return", scope.line(server.offset))
+	}
+	return nil
+}
+
+// countDirectives counts the directives with the given name. It runs after
+// validateDirectives, so every name is plain.
+func countDirectives(directives []directive, name string) int {
+	n := 0
+	for _, d := range directives {
+		if d.tokens[0].value == name {
+			n++
+		}
+	}
+	return n
+}
+
+func validateDirectives(directives []directive, allowed map[string]argRule, scope policyScope, where string) error {
 	for _, d := range directives {
 		if d.comment || !plainName(d.tokens[0]) {
-			return fmt.Errorf("nginx directive is not in plain form")
+			return fmt.Errorf("line %d: nginx directive is not in plain form (quoted or escaped name, or a comment inside the statement)", scope.line(d.offset))
 		}
 		name := d.tokens[0].value
 		rule, ok := allowed[name]
 		if !ok {
-			return fmt.Errorf("nginx directive %q is not allowed in this scope", name)
+			return fmt.Errorf("line %d: nginx directive %s is not allowed in %s", scope.line(d.offset), quoteName(name), where)
 		}
 		if !rule(d.tokens[1:], scope) {
-			return fmt.Errorf("nginx directive %q has unsupported arguments", name)
+			return fmt.Errorf("line %d: nginx directive %s has unsupported arguments in %s", scope.line(d.offset), quoteName(name), where)
 		}
 	}
 	return nil
+}
+
+// maxQuotedName bounds a directive or block name quoted in an error.
+const maxQuotedName = 64
+
+// quoteName quotes a plain directive name for an error, shortened to
+// maxQuotedName bytes.
+func quoteName(name string) string {
+	if len(name) > maxQuotedName {
+		name = name[:maxQuotedName] + "..."
+	}
+	return fmt.Sprintf("%q", name)
+}
+
+// blockName names a block's kind for an error, plus the path of a location,
+// or describes it when the kind is not a plain name.
+func blockName(b block) string {
+	if len(b.tokens) == 0 || b.comment || !plainName(b.tokens[0]) {
+		return "with a non-plain name"
+	}
+	name := quoteName(b.tokens[0].value)
+	if b.tokens[0].value == "location" && len(b.tokens) == 2 && plainArgument(b.tokens[1].source) && len(b.tokens[1].value) <= maxQuotedName {
+		name = fmt.Sprintf("%s %q", name, b.tokens[1].value)
+	}
+	return name
 }
 
 // header reports whether a block's header is exactly the given plain words.
