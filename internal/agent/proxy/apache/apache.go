@@ -177,6 +177,9 @@ func (b *Backend) Capabilities() proxy.Capabilities {
 		AccessLog:     true,
 		ErrorLogLevel: true,
 		PathRoutes:    true,
+		// httpd substitutes ${NAME} in every config line; apachegen refuses
+		// such header values and the orchestrator checks them on save.
+		HeaderConfigVars: true,
 	}
 }
 

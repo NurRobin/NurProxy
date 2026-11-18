@@ -39,8 +39,14 @@ type RoutePusher interface {
 // CNAME using the zone provider's stored credentials — the explicit admin override
 // of the default "never touch a record we didn't create" stance, used to migrate an
 // existing domain whose DNS predates NurProxy. The reconciler implements it.
+//
+// The takeover transfers ownership: the record is stored as managed, so a later
+// domain delete removes it at the provider, even when it was an operator-created
+// CNAME that already matched. PreviewDomainDNSTakeover returns the same plan
+// (the records that would be deleted) without changing anything.
 type DNSTakeover interface {
-	TakeoverDomainDNS(ctx context.Context, domID int64) error
+	TakeoverDomainDNS(ctx context.Context, domID int64, expectDelete []string) (*models.DNSTakeoverPlan, error)
+	PreviewDomainDNSTakeover(ctx context.Context, domID int64) (*models.DNSTakeoverPlan, error)
 }
 
 // CertIssuer obtains a central TLS certificate for a host on demand (the §7
