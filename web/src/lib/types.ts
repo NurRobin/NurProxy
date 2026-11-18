@@ -134,6 +134,8 @@ export interface ProxyCapabilities {
   /** Absent on agents that predate per-domain logging control. */
   access_log?: boolean;
   error_log_level?: boolean;
+  /** True when the backend replaces ${NAME} in header values at config load (Apache). */
+  header_config_vars?: boolean;
 }
 
 export interface Agent {
@@ -376,6 +378,8 @@ export interface ProxyConfig {
   // tls_policy selects how the public-listener cert is provisioned:
   // "central" (DNS-01 provided cert, the default), "self-acme", or "off".
   tls_policy?: string;
+  /** Serve the domain from its zone's shared *.<zone> certificate. */
+  tls_wildcard?: boolean;
   /** "off" writes no access log for the domain; unset keeps the host-wide log. */
   access_log?: string;
   /** Minimum error log level (e.g. "crit"); unset keeps the host default. */

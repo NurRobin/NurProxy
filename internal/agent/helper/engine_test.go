@@ -380,9 +380,9 @@ func TestEngineManagedApplyRequiresSignedIntentAndGrantAndExecutesOnce(t *testin
 
 // TestEngineManagedApplyPlanReturnsRefusalReason checks that a policy refusal
 // reaches the agent with its operator-facing reason, while any other planning
-// error, and the local cause behind a refusal, stay behind the fixed message.
+// error stays behind the fixed message.
 func TestEngineManagedApplyPlanReturnsRefusalReason(t *testing.T) {
-	const fixed = "local managed apply planning refused the desired state"
+	const fixed = helperprotocol.ManagedPlanRefusedMessage
 	tests := []struct {
 		name string
 		err  error
@@ -390,11 +390,8 @@ func TestEngineManagedApplyPlanReturnsRefusalReason(t *testing.T) {
 	}{
 		{
 			name: "policy refusal",
-			err: fmt.Errorf("compile: %w", &managedRefusal{
-				reason: "raw nginx config for app.example.com: line 5: nginx directive \"include\" is not allowed in the server block\n",
-				cause:  errors.New("lstat /etc/nginx/sites-available/secret: no such file"),
-			}),
-			want: fixed + `: raw nginx config for app.example.com: line 5: nginx directive "include" is not allowed in the server block`,
+			err:  fmt.Errorf("compile: %w", refuseLocally("raw nginx config for %s refused by the helper policy: %s\n", "app.example.com", `line 5: nginx directive "include" is not allowed in the server block`)),
+			want: fixed + `: raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "include" is not allowed in the server block`,
 		},
 		{name: "other error", err: errors.New("open /etc/nginx/private: permission denied"), want: fixed},
 	}

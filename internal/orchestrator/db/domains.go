@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -286,42 +287,54 @@ func (d *DB) DeleteDomain(id int64) error {
 	return nil
 }
 
-// UpdateDomainStatus sets the status and optional error message.
+// UpdateDomainStatus sets the status and optional error message. "deleting"
+// is final: any other status leaves a deleting domain unchanged, so a route ACK
+// or sync result read before the delete cannot pull the domain out of the
+// reconciler teardown.
 func (d *DB) UpdateDomainStatus(id int64, status models.DomainStatus, errMsg string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
-		UPDATE domains SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?`,
-		string(status), errMsg, now, id,
+		UPDATE domains SET status = ?, error_msg = ?, updated_at = ?
+		WHERE id = ? AND (? = 'deleting' OR status != 'deleting')`,
+		string(status), errMsg, now, id, string(status),
 	)
 	if err != nil {
 		return fmt.Errorf("updating domain status: %w", err)
 	}
+	return d.domainStatusWritten(res, id)
+}
 
-	n, _ := res.RowsAffected()
-	if n == 0 {
+// domainStatusWritten turns "no row updated" into a not-found error unless
+// the domain exists and was skipped because it is being deleted.
+func (d *DB) domainStatusWritten(res sql.Result, id int64) error {
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+	var exists int
+	err := d.sql.QueryRow(`SELECT 1 FROM domains WHERE id = ?`, id).Scan(&exists)
+	switch {
+	case err == sql.ErrNoRows:
 		return fmt.Errorf("domain not found: %d", id)
+	case err != nil:
+		return fmt.Errorf("checking domain %d: %w", id, err)
 	}
 	return nil
 }
 
 // MarkDomainSynced marks a domain as active, clears any error message, and
 // stamps last_synced with the current time. Used by the reconciler after a
-// successful sync cycle.
+// successful sync cycle. A deleting domain is left unchanged.
 func (d *DB) MarkDomainSynced(id int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
-		UPDATE domains SET status = ?, error_msg = '', last_synced = ?, updated_at = ? WHERE id = ?`,
+		UPDATE domains SET status = ?, error_msg = '', last_synced = ?, updated_at = ?
+		WHERE id = ? AND status != 'deleting'`,
 		string(models.DomainStatusActive), now, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("marking domain synced: %w", err)
 	}
-
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("domain not found: %d", id)
-	}
-	return nil
+	return d.domainStatusWritten(res, id)
 }
 
 // MarkDomainApplied records a successful route apply. For a domain that wants a
@@ -330,22 +343,27 @@ func (d *DB) MarkDomainSynced(id int64) error {
 // plaintext HTTP (TLS and any force_https redirect were dropped), so the domain
 // is marked "degraded" with an explanatory error rather than a bare "active"
 // that would hide the downgrade (§78). Otherwise the domain is marked active.
-func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) error {
+// fallbackHosts are further store keys that serve fqdn, such as the zone
+// wildcard cert "*.<zone>" of a domain opted into it.
+func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool, fallbackHosts ...string) error {
 	if wantsCentralTLS {
 		// Distinguish a genuinely absent certificate (degrade — the route is
 		// served plaintext) from a transient DB read error (propagate — do not
 		// mislabel a healthy domain as degraded). A bare existence probe avoids
 		// the key decryption that GetCertificate performs and lets sql.ErrNoRows
 		// cleanly signal not-found.
+		hosts := append([]any{fqdn}, toAnySlice(fallbackHosts)...)
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",")
 		var dummy int
 		err := d.read.QueryRow(
-			"SELECT 1 FROM certificates WHERE host = ?", fqdn,
+			"SELECT 1 FROM certificates WHERE host IN ("+placeholders+") LIMIT 1", hosts...,
 		).Scan(&dummy)
 		switch {
 		case err == sql.ErrNoRows:
 			now := time.Now().UTC().Format(time.RFC3339)
 			res, xErr := d.sql.Exec(`
-				UPDATE domains SET status = ?, error_msg = ?, last_synced = ?, updated_at = ? WHERE id = ?`,
+				UPDATE domains SET status = ?, error_msg = ?, last_synced = ?, updated_at = ?
+				WHERE id = ? AND status != 'deleting'`,
 				string(models.DomainStatusDegraded),
 				"served over plaintext HTTP — no TLS certificate issued yet; force_https not enforced",
 				now, now, id,
@@ -353,10 +371,7 @@ func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) erro
 			if xErr != nil {
 				return fmt.Errorf("marking domain degraded: %w", xErr)
 			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				return fmt.Errorf("domain not found: %d", id)
-			}
-			return nil
+			return d.domainStatusWritten(res, id)
 		case err != nil:
 			return fmt.Errorf("checking central-TLS certificate for %s: %w", fqdn, err)
 		}
@@ -415,4 +430,12 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 		domains = append(domains, *dom)
 	}
 	return domains, rows.Err()
+}
+
+func toAnySlice(values []string) []any {
+	out := make([]any, len(values))
+	for i, v := range values {
+		out[i] = v
+	}
+	return out
 }

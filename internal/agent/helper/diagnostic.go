@@ -71,34 +71,3 @@ func withNativeDiagnostic(message string, err error) string {
 	}
 	return message
 }
-
-// managedRefusal is a managed apply refusal written for the operator: it names
-// the route and the policy rule it broke and quotes no file contents, so the
-// helper returns its reason to the agent instead of a fixed message.
-type managedRefusal struct {
-	reason string
-	// cause is the local detail behind the refusal; it is logged, not
-	// returned to the agent.
-	cause error
-}
-
-func (e *managedRefusal) Error() string {
-	if e.cause == nil {
-		return e.reason
-	}
-	return e.reason + ": " + e.cause.Error()
-}
-
-func (e *managedRefusal) Unwrap() error { return e.cause }
-
-// withRefusalReason appends the operator-facing reason of a managedRefusal in
-// err's chain to a fixed message, folded onto one line and bounded.
-func withRefusalReason(message string, err error) string {
-	var refusal *managedRefusal
-	if errors.As(err, &refusal) {
-		if reason := sanitizeNativeDiagnostic(refusal.reason); reason != "" {
-			return message + ": " + reason
-		}
-	}
-	return message
-}

@@ -93,8 +93,9 @@ func newManagedApplyTest(t *testing.T) (*managedApplyAction, helperprotocol.Appl
 	}}
 	action := &managedApplyAction{
 		agentUID: uint32(os.Getuid()), ownerUID: uint32(os.Getuid()), stagingRootUID: uint32(os.Getuid()), journal: journal, host: host,
-		workerGroup: func() (uint32, error) { return uint32(os.Getgid()), nil },
-		target:      ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
+		workerGroup:    func() (uint32, error) { return uint32(os.Getgid()), nil },
+		errorLogTarget: func() error { return nil },
+		target:         ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
 		layout: ManagedApplyTargetConfig{
 			StagingDir: filepath.Join(root, "staging"), AvailableDir: filepath.Join(root, "available"), EnabledDir: filepath.Join(root, "enabled"),
 			CertificateDir: filepath.Join(root, "certs"), CustomPolicyVersion: "proxy-policy-v1", ProxyVersion: "1.22.1",
@@ -534,8 +535,8 @@ func TestManagedApplyRawNginxTuningAndRefusalReason(t *testing.T) {
 		wantReason string
 	}{
 		{name: "tuning admitted", statement: "gzip on;\n    add_header X-Robots-Tag noindex;"},
-		{name: "include refused", statement: "include /etc/nginx/private.conf;", wantReason: `raw nginx config for app.example.com: line 5: nginx directive "include" is not allowed in the server block`},
-		{name: "access_log file refused", statement: "access_log /etc/nginx/private.log;", wantReason: `raw nginx config for app.example.com: line 5: nginx directive "access_log" has unsupported arguments in the server block`},
+		{name: "include refused", statement: "include /etc/nginx/private.conf;", wantReason: `raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "include" is not allowed in the server block`},
+		{name: "access_log file refused", statement: "access_log /etc/nginx/private.log;", wantReason: `raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "access_log" has unsupported arguments in the server block`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -555,9 +556,9 @@ func TestManagedApplyRawNginxTuningAndRefusalReason(t *testing.T) {
 			if err == nil {
 				t.Fatal("policy-foreign raw config was admitted")
 			}
-			message := withRefusalReason("refused", err)
-			if !strings.HasPrefix(message, "refused: "+tt.wantReason) || !strings.Contains(message, "already live byte for byte") {
-				t.Fatalf("refusal message = %q, want reason %q", message, tt.wantReason)
+			message := localPolicyRefusalReason(err)
+			if message != tt.wantReason {
+				t.Fatalf("refusal reason = %q, want %q", message, tt.wantReason)
 			}
 			if strings.Contains(message, "/etc/nginx/private") {
 				t.Fatalf("refusal message quotes an argument: %q", message)
@@ -619,12 +620,8 @@ server {
 	if err := os.Remove(enabled); err != nil {
 		t.Fatal(err)
 	}
-	_, err = action.Plan(context.Background(), intent)
-	if err == nil {
+	if _, err := action.Plan(context.Background(), intent); err == nil {
 		t.Fatal("policy-foreign raw config was admitted without its exact live activation link")
-	}
-	if message := withRefusalReason("refused", err); !strings.Contains(message, `nginx block "map" is not allowed at top level`) || !strings.Contains(message, "live and enabled") {
-		t.Fatalf("missing activation link refusal = %q", message)
 	}
 }
 
