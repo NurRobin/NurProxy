@@ -461,6 +461,12 @@ func TestLoadCaddyListen(t *testing.T) {
 			wantHost: "127.0.0.2", wantHTTP: 38080, wantHTTPS: 38443},
 		{name: "out of range", flags: Flags{CaddyHTTPSPort: 70000}, wantErr: "invalid caddy_https_port"},
 		{name: "same port twice", flags: Flags{CaddyHTTPPort: 18080, CaddyHTTPSPort: 18080}, wantErr: "must differ"},
+		{name: "https on the default http port", flags: Flags{CaddyHTTPSPort: 80}, wantErr: "must differ"},
+		{name: "http on the default https port", flags: Flags{CaddyHTTPPort: 443}, wantErr: "must differ"},
+		{name: "hostname", flags: Flags{CaddyListenHost: "edge-1.example.com"}, wantHost: "edge-1.example.com"},
+		{name: "host with port", flags: Flags{CaddyListenHost: "127.0.0.1:80"}, wantErr: "invalid caddy_listen_host"},
+		{name: "bracketed IPv6", flags: Flags{CaddyListenHost: "[::1]"}, wantErr: "invalid caddy_listen_host"},
+		{name: "bad hostname", flags: Flags{CaddyListenHost: "-bad.example"}, wantErr: "invalid caddy_listen_host"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
