@@ -179,7 +179,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 }
 
 // collectFailover exports the failover series for every domain with backup
-// servers, labelled by the domain's FQDN.
+// servers, labeled by the domain's FQDN.
 func (c *collector) collectFailover(ch chan<- prometheus.Metric, domains []models.Domain) error {
 	states, err := c.db.ListDomainFailoverStates()
 	if err != nil {

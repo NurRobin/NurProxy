@@ -537,6 +537,14 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Standby routes on failover backup agents (#74) get their tombstones
+	// before any push leaves them out, like the primary's above. A failure is
+	// only logged: the reconciler teardown writes them again before it pushes.
+	standbyAgents, standbyErr := s.db.TombstoneStandbyRoutes(dom, time.Now().UTC())
+	if standbyErr != nil {
+		log.Printf("delete: standby route deletions for domain %d: %v", id, standbyErr)
+	}
+
 	// Set status to "deleting" — reconciler handles actual cleanup
 	if err := s.db.UpdateDomainStatus(id, models.DomainStatusDeleting, ""); err != nil {
 		if tombstone != nil {
@@ -550,12 +558,6 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	// A full-sync push now excludes the deleting domain, so a connected agent
 	// drops the route at once; DNS record + row cleanup follow in the reconciler.
 	s.triggerAgentPush(dom.ServerID)
-	// Failover backup agents drop their standby route the same way (#74); the
-	// reconciler teardown repeats the tombstones if this fails.
-	standbyAgents, err := s.db.TombstoneStandbyRoutes(dom, time.Now().UTC())
-	if err != nil {
-		log.Printf("delete: standby route deletions for domain %d: %v", id, err)
-	}
 	for _, agentID := range standbyAgents {
 		s.pushAgent(agentID)
 	}

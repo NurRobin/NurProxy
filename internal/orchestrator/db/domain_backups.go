@@ -91,12 +91,12 @@ func (d *DB) ListStandbyDomains(agentID string) ([]StandbyDomain, error) {
 	for rows.Next() {
 		var p pair
 		if err := rows.Scan(&p.domainID, &p.serverID); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf("scanning standby domain: %w", err)
 		}
 		pairs = append(pairs, p)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
@@ -181,16 +181,31 @@ func (d *DB) agentServesZone(agentID, zoneID string) (bool, error) {
 // SetDomainBackups replaces a domain's backup servers with serverIDs, most
 // preferred first, and returns the agents that lost their standby route (to
 // be pushed so they drop it). Each backup must sit on its own agent, other
-// than the primary's, that serves the domain's zone; cert-only and deleting
-// domains take none. A standby route an nginx/apache agent loses gets a
-// route tombstone, like a domain moved away (#148); an empty list also drops
-// the stored failover state, so the record returns to the primary.
+// than the primary's, and a newly added one on an agent that serves the
+// domain's zone; cert-only and deleting domains take no new backups. Keeping
+// or dropping existing backups is always allowed, so a backup whose agent
+// left the zone never blocks removing another one. A standby route an
+// nginx/apache agent loses gets a route tombstone, like a domain moved away
+// (#148); an empty list also drops the stored failover state, so the record
+// returns to the primary.
 func (d *DB) SetDomainBackups(domainID int64, serverIDs []string, at time.Time) ([]string, error) {
 	dom, err := d.GetDomain(domainID)
 	if err != nil {
 		return nil, err
 	}
-	if len(serverIDs) > 0 {
+	current, err := d.ListDomainBackups(domainID)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]bool, len(current))
+	for _, b := range current {
+		existing[b.ServerID] = true
+	}
+	adding := false
+	for _, id := range serverIDs {
+		adding = adding || !existing[id]
+	}
+	if adding {
 		if dom.CertOnly {
 			return nil, fmt.Errorf("%w: a cert-only domain has no DNS record to switch", ErrInvalidBackups)
 		}
@@ -220,20 +235,18 @@ func (d *DB) SetDomainBackups(domainID int64, serverIDs []string, at time.Time) 
 		if other, dup := newAgents[srv.AgentID]; dup {
 			return nil, fmt.Errorf("%w: servers %s and %s are on the same agent; use one backup per agent", ErrInvalidBackups, other, srv.ID)
 		}
-		serves, err := d.agentServesZone(srv.AgentID, dom.ZoneID)
-		if err != nil {
-			return nil, err
-		}
-		if !serves {
-			return nil, fmt.Errorf("%w: the agent of server %s does not serve this domain's zone", ErrInvalidBackups, srv.Name)
+		if !existing[srv.ID] {
+			serves, err := d.agentServesZone(srv.AgentID, dom.ZoneID)
+			if err != nil {
+				return nil, err
+			}
+			if !serves {
+				return nil, fmt.Errorf("%w: the agent of server %s does not serve this domain's zone", ErrInvalidBackups, srv.Name)
+			}
 		}
 		newAgents[srv.AgentID] = srv.ID
 	}
 
-	current, err := d.ListDomainBackups(domainID)
-	if err != nil {
-		return nil, err
-	}
 	var removed []string
 	for _, b := range current {
 		if _, kept := newAgents[b.AgentID]; !kept {
@@ -496,12 +509,12 @@ func (d *DB) FillDomainFailover(doms []models.Domain) error {
 		var id int64
 		var srv string
 		if err := rows.Scan(&id, &srv); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		backups[id] = append(backups[id], srv)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
