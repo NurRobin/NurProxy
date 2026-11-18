@@ -1992,6 +1992,9 @@ func (r *Reconciler) finalizePendingParentDeletions() {
 		case "zone":
 			delErr = r.db.DeleteZone(p.EntityID)
 		}
+		if errors.Is(delErr, db.ErrParentInUse) {
+			continue // a domain was added since the check; keep the intent
+		}
 		if delErr != nil {
 			// Most likely already gone (deleted manually in the meantime) — either
 			// way the intent is fulfilled or moot; clearing it stops the retry loop.
