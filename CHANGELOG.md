@@ -34,7 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its line (for example `line 12: nginx directive "include" is not allowed
   in the server block`) instead of only "privileged managed proxy
   reconciliation failed". File paths in logs stay limited to `access_log off`
-  and the stock error log.
+  and the stock error log. The policy also refuses what `nginx -t` would
+  reject: repeated single-value directives and proxy buffer settings that
+  break nginx's size rules (the three buffer directives go together). Raw
+  `rewrite` stays limited to the two forms the path settings render.
+- **A failed `nginx -t` names the domain that broke it.** The helper applies
+  all domains of an agent together, so one broken vhost fails all of them.
+  When the validator output names a managed vhost file, that domain's error
+  now shows the output, and the other domains say which domain blocked them.
 - **Renaming a domain or moving it to another zone cleans up the old name
   (#151).** The DNS record of the old name is queued and deleted through the
   provider and zone it was created in, once the record for the new name exists;
