@@ -176,16 +176,12 @@ func (c *Client) WithCertLoader(load CertLoader) *Client {
 // plane. The key material is never logged.
 func (c *Client) uploadCert(ctx context.Context, req proxymodel.CertUploadRequest) {
 	up := proxymodel.CertUpload{RequestID: req.RequestID, Fingerprint: req.Fingerprint}
-	switch {
-	case c.certLoader == nil:
+	if c.certLoader == nil {
 		up.Error = "certificate discovery is not enabled on this agent"
-	default:
-		b, err := c.certLoader(req.Fingerprint)
-		if err != nil {
-			up.Error = err.Error()
-		} else {
-			up.CertPEM, up.KeyPEM, up.SourcePath = string(b.CertPEM), string(b.KeyPEM), b.Pair.CertPath
-		}
+	} else if b, err := c.certLoader(req.Fingerprint); err != nil {
+		up.Error = err.Error()
+	} else {
+		up.CertPEM, up.KeyPEM, up.SourcePath = string(b.CertPEM), string(b.KeyPEM), b.Pair.CertPath
 	}
 	if up.Error != "" {
 		log.Printf("Stream: cannot upload certificate %s: %s", req.Fingerprint, up.Error)
