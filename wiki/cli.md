@@ -102,6 +102,25 @@ nurproxy server update <server-id> [--name n] [--address a] [--notes "..."]
 nurproxy server delete <server-id>
 ```
 
+### discovery
+
+Server discovery sources (Proxmox VE). Runs on the orchestrator; imported
+machines become ordinary servers under the agent you name. See
+[Server discovery](server-discovery) for the token setup.
+
+```bash
+nurproxy discovery types
+nurproxy discovery list
+nurproxy discovery add --name homelab --config '{"url":"https://pve1.lan:8006","token_id":"nurproxy@pve!discovery","token_secret":"...","fingerprint":"AB:CD:..."}' \
+                       [--sync-interval 3600] [--skip-test]
+nurproxy discovery update <source-id> [--name n] [--config '{"verify_tls":true}'] [--sync-interval s]
+nurproxy discovery run <source-id>          # query the cluster now and print the machines
+nurproxy discovery candidates <source-id>   # last stored result
+nurproxy discovery import <source-id> --agent <agent-id> (--id <external-id> ... | --all) \
+                       [--address <external-id>=<address> ...]
+nurproxy discovery delete <source-id>       # imported servers are kept
+```
+
 ### domain
 
 ```bash

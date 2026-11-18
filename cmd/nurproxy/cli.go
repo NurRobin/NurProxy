@@ -39,6 +39,8 @@ func runCLI(name string, args []string) bool {
 		cmdAgent(args)
 	case "server":
 		cmdServer(args)
+	case "discovery":
+		cmdDiscovery(args)
 	case "domain":
 		cmdDomain(args)
 	case "apikey":

@@ -237,9 +237,14 @@ func TestMigrationRestrictParentFKs(t *testing.T) {
 			t.Errorf("%s rows changed by the rebuild:\nbefore %v\nafter  %v", table, before[table], got)
 		}
 	}
+	// Every index and trigger from before must survive unchanged; later
+	// migrations may add their own (e.g. 38's discovery index on servers).
 	for table, want := range objectsBefore {
-		if got := schemaObjects(t, d.sql, table); !reflect.DeepEqual(got, want) {
-			t.Errorf("%s indexes/triggers changed:\nbefore %v\nafter  %v", table, want, got)
+		got := schemaObjects(t, d.sql, table)
+		for name, sqlText := range want {
+			if got[name] != sqlText {
+				t.Errorf("%s %s changed by the rebuild:\nbefore %q\nafter  %q (all after: %v)", table, name, sqlText, got[name], got)
+			}
 		}
 	}
 
