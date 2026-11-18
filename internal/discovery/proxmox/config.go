@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -41,10 +42,33 @@ func parseConfig(raw json.RawMessage) (*Config, error) {
 	if len(raw) == 0 {
 		return nil, errors.New("config is empty")
 	}
+	if err := checkKeys(raw); err != nil {
+		return nil, err
+	}
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	return &c, c.validate()
+}
+
+// configKeys are the exact JSON keys of Config.
+var configKeys = []string{"url", "token_id", "token_secret", "verify_tls", "ca_pem", "fingerprint"}
+
+// checkKeys refuses keys Config does not have. encoding/json matches keys
+// case-insensitively, so without this a key such as "Fingerprint" would set a
+// field while the secret-binding check in discovery.MergeConfig, which
+// compares exact keys, sees no change.
+func checkKeys(raw json.RawMessage) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	for k := range m {
+		if !slices.Contains(configKeys, k) {
+			return fmt.Errorf("invalid config: unknown key %q", k)
+		}
+	}
+	return nil
 }
 
 func (c *Config) validate() error {

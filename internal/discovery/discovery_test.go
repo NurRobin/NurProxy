@@ -91,6 +91,9 @@ func TestMergeConfig(t *testing.T) {
 		{name: "url change with empty secret", update: `{"url":"https://evil.example","token_secret":""}`, wantErr: true, secretErr: true},
 		{name: "tls check turned off without secret", update: `{"verify_tls":false}`, wantErr: true, secretErr: true},
 		{name: "fingerprint added without secret", update: `{"fingerprint":"AA:BB"}`, wantErr: true, secretErr: true},
+		{name: "bound key in other case", update: `{"Fingerprint":"AA:BB"}`, wantErr: true},
+		{name: "url key in other case", update: `{"URL":"https://evil.example"}`, wantErr: true},
+		{name: "secret key in other case", update: `{"Token_Secret":""}`, wantErr: true},
 		{name: "non-object update", update: `[]`, wantErr: true},
 		{name: "null update", update: `null`, wantErr: true},
 	}

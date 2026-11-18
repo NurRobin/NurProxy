@@ -167,6 +167,17 @@ func MergeConfig(base, update json.RawMessage, info Info) (json.RawMessage, erro
 	if err := json.Unmarshal(update, &patch); err != nil || patch == nil {
 		return nil, errors.New("config must be a JSON object")
 	}
+	// encoding/json matches keys case-insensitively, so a key that only differs
+	// in case from a protected one would reach the same field while the exact
+	// comparison below sees no change.
+	protected := append(slices.Clone(info.SecretFields), info.SecretBoundFields...)
+	for k := range patch {
+		for _, f := range protected {
+			if k != f && strings.EqualFold(k, f) {
+				return nil, fmt.Errorf("config key %q must be written %q", k, f)
+			}
+		}
+	}
 	merged := make(map[string]json.RawMessage, len(stored)+len(patch))
 	for k, v := range stored {
 		merged[k] = v
