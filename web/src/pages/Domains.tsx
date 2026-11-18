@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { api } from '../lib/api';
 import { proxyConfigChanges } from '../lib/proxy-config';
-import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities } from '../lib/types';
+import type { Domain, Agent, Server, Zone, Provider, ProxyCapabilities, DNSTakeoverPlan } from '../lib/types';
 import { formatRelativeTime, domainFqdn } from '../lib/utils';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
@@ -93,6 +93,9 @@ export default function Domains() {
   const [configManual, setConfigManual] = useState(false);
   const [advancedError, setAdvancedError] = useState('');
   const [editLoading, setEditLoading] = useState(false);
+  const [takeoverPlan, setTakeoverPlan] = useState<DNSTakeoverPlan | null>(null);
+  const [takeoverLoading, setTakeoverLoading] = useState(false);
+  const [takeoverError, setTakeoverError] = useState('');
 
   const undoableDelete = useUndoableDelete();
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -207,6 +210,47 @@ export default function Domains() {
     setEditConfigBackend('caddy');
     setConfigManual(false);
     setAdvancedError('');
+    setTakeoverPlan(null);
+    setTakeoverError('');
+  }
+
+  // The takeover deletes every record at the name, so the dashboard first
+  // fetches the dry run and shows those records; only the confirm button
+  // makes the destructive call.
+  async function previewTakeover() {
+    if (!detailDomain) return;
+    setTakeoverLoading(true);
+    setTakeoverError('');
+    try {
+      const res = await api.dnsTakeover(detailDomain.id, true);
+      setTakeoverPlan(res.plan);
+    } catch (err) {
+      setTakeoverError(errMessage(err, t('domains.takeoverFailed')));
+    } finally {
+      setTakeoverLoading(false);
+    }
+  }
+
+  async function confirmTakeover() {
+    if (!detailDomain) return;
+    setTakeoverLoading(true);
+    setTakeoverError('');
+    try {
+      const res = await api.dnsTakeover(detailDomain.id, false);
+      toast.success(res.message);
+      setTakeoverPlan(null);
+      fetchData();
+    } catch (err) {
+      setTakeoverError(errMessage(err, t('domains.takeoverFailed')));
+      fetchData();
+    } finally {
+      setTakeoverLoading(false);
+    }
+  }
+
+  function dnsOwner(d: Domain) {
+    if (!d.dns_record_id) return t('domains.dnsNone');
+    return d.dns_managed ? t('domains.dnsManaged') : t('domains.dnsAdopted');
   }
 
   async function handleSaveDetail() {
@@ -529,6 +573,40 @@ export default function Domains() {
             </div>
 
             {liveDomain.error_msg && <Callout tone="danger">{liveDomain.error_msg}</Callout>}
+
+            {!liveDomain.cert_only && (
+              <div className="space-y-3 rounded-lg border border-border p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm text-fg-muted">{dnsOwner(liveDomain)}</span>
+                  {!takeoverPlan && (
+                    <Button variant="secondary" size="sm" onClick={previewTakeover} loading={takeoverLoading}>{t('domains.takeoverPreview')}</Button>
+                  )}
+                </div>
+                {takeoverError && <Callout tone="danger">{takeoverError}</Callout>}
+                {takeoverPlan && (
+                  <div className="space-y-3">
+                    {takeoverPlan.delete.length > 0 ? (
+                      <Callout tone="warning" title={t('domains.takeoverDeletes', { count: takeoverPlan.delete.length, fqdn: takeoverPlan.fqdn })}>
+                        <ul className="mt-1 space-y-0.5 font-mono text-xs">
+                          {takeoverPlan.delete.map((rec) => (
+                            <li key={rec.id}>{rec.type} {rec.name} → {rec.content}{rec.proxied ? ` (${t('domains.takeoverProxied')})` : ''}</li>
+                          ))}
+                        </ul>
+                      </Callout>
+                    ) : (
+                      <Callout tone="info">{takeoverPlan.action === 'adopt' ? t('domains.takeoverAdopt', { fqdn: takeoverPlan.fqdn, target: takeoverPlan.target }) : t('domains.takeoverCreate', { fqdn: takeoverPlan.fqdn, target: takeoverPlan.target })}</Callout>
+                    )}
+                    <p className="text-xs text-fg-faint">{t('domains.takeoverOwnership', { target: takeoverPlan.target })}</p>
+                    <div className="flex justify-end gap-3">
+                      <Button variant="secondary" size="sm" onClick={() => setTakeoverPlan(null)}>{t('common.cancel')}</Button>
+                      <Button variant={takeoverPlan.delete.length > 0 ? 'danger' : 'primary'} size="sm" onClick={confirmTakeover} loading={takeoverLoading}>
+                        {takeoverPlan.delete.length > 0 ? t('domains.takeoverConfirmDelete', { count: takeoverPlan.delete.length }) : t('domains.takeoverConfirm')}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Tabs */}
             <div className="flex gap-1 border-b border-border">
