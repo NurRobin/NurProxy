@@ -118,9 +118,8 @@ func (s *Server) handleCreateZonesBatch(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleDeleteZone(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
 
-	// Refuse while domains still reference this zone: the ON DELETE CASCADE would
-	// orphan their DNS records/certs ahead of the reconciler teardown (see
-	// guardChildDomains).
+	// Refuse while domains still reference this zone; they must be torn down
+	// through the reconciler first (see guardChildDomains).
 	if cascadeRequested(r) {
 		s.cascadeDeleteParent(w, r, "zone", id, db.DomainFilter{ZoneID: id})
 		return
@@ -130,7 +129,7 @@ func (s *Server) handleDeleteZone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.DeleteZone(id); err != nil {
-		writeError(w, http.StatusNotFound, "zone not found")
+		writeParentDeleteError(w, "zone", err)
 		return
 	}
 

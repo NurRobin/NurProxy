@@ -120,11 +120,12 @@ func (d *DB) UpdateServer(s *models.Server) error {
 	return nil
 }
 
-// DeleteServer removes a server by ID.
+// DeleteServer removes a server by ID. It fails with ErrParentInUse while domains
+// still reference the server.
 func (d *DB) DeleteServer(id string) error {
 	res, err := d.sql.Exec("DELETE FROM servers WHERE id = ?", id)
 	if err != nil {
-		return fmt.Errorf("deleting server: %w", err)
+		return parentDeleteError("server", id, err)
 	}
 
 	n, _ := res.RowsAffected()
