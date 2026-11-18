@@ -24,6 +24,15 @@ func (e *RemoteError) Error() string {
 	return fmt.Sprintf("root helper request failed (%s): %s", e.Code, e.Message)
 }
 
+// RefusalReason returns the operator-facing reason of a managed apply plan
+// the helper's local policy refused, or "" when the error carries none.
+func (e *RemoteError) RefusalReason() string {
+	if e == nil {
+		return ""
+	}
+	return helperprotocol.ManagedPlanRefusalReason(e.Code, e.Message)
+}
+
 type Pin struct {
 	HelperInstanceID     string `json:"helper_instance_id"`
 	AttestationKeyID     string `json:"attestation_key_id"`

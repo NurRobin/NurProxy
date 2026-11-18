@@ -116,6 +116,11 @@ func Render(in Input) (Result, error) {
 	if err := route.Validate(); err != nil {
 		return Result{}, err
 	}
+	// Quoting does not stop httpd from replacing "${NAME}" in a header value
+	// with a process environment variable or Define value.
+	if err := proxymodel.CheckHeaderConfigVars(route.RequestHeaders, route.ResponseHeaders); err != nil {
+		return Result{}, err
+	}
 
 	var warnings []Warning
 	warn := func(option, reason string) {
