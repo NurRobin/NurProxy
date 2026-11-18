@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -203,8 +205,18 @@ func Load(f Flags) (*Config, error) {
 			return nil, fmt.Errorf("invalid %s %d (must be 1-65535, or 0 for the default)", p.name, p.port)
 		}
 	}
-	if cfg.CaddyHTTPPort != 0 && cfg.CaddyHTTPPort == cfg.CaddyHTTPSPort {
-		return nil, fmt.Errorf("caddy_http_port and caddy_https_port must differ (both %d)", cfg.CaddyHTTPPort)
+	httpPort, httpsPort := cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort
+	if httpPort == 0 {
+		httpPort = 80
+	}
+	if httpsPort == 0 {
+		httpsPort = 443
+	}
+	if httpPort == httpsPort {
+		return nil, fmt.Errorf("caddy_http_port and caddy_https_port must differ (both %d, 0 means 80/443)", httpPort)
+	}
+	if err := validateListenHost(cfg.CaddyListenHost); err != nil {
+		return nil, err
 	}
 	if cfg.ProxyMode != ProxyModeBuiltIn && cfg.ProxyMode != ProxyModeExisting {
 		return nil, fmt.Errorf("invalid proxy_mode %q (must be %q or %q)", cfg.ProxyMode, ProxyModeBuiltIn, ProxyModeExisting)
@@ -374,6 +386,32 @@ func mergeEnv(cfg *Config) {
 		cfg.DryRun = true
 	}
 }
+
+// validateListenHost accepts an empty value, an IP address (IPv6 without
+// brackets, since the port is joined later) or a DNS hostname; never a port.
+func validateListenHost(host string) error {
+	if host == "" {
+		return nil
+	}
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	if len(host) <= 253 {
+		ok := true
+		for _, label := range strings.Split(host, ".") {
+			if !hostnameLabel.MatchString(label) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid caddy_listen_host %q (want an IP address or hostname without port or brackets)", host)
+}
+
+var hostnameLabel = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 // dryRunDataDir returns a writable, per-agent temp data dir for sandbox mode.
 // Including the FQDN keeps multiple dry-run agents on one host isolated (separate
