@@ -102,31 +102,44 @@ func dumpTable(t *testing.T, q interface {
 	Query(string, ...any) (*sql.Rows, error)
 }, table string) [][]string {
 	t.Helper()
+	return dumpColumns(t, q, table, nil)
+}
+
+// dumpColumns is dumpTable limited to cols (all columns when nil), so a
+// comparison across an upgrade ignores columns later migrations add.
+func dumpColumns(t *testing.T, q interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, table string, cols []string) [][]string {
+	t.Helper()
+	sel := "*"
+	if len(cols) > 0 {
+		sel = `"` + strings.Join(cols, `", "`) + `"`
+	}
 	order := "rowid"
 	if table == "managed_route_tombstones" || table == "agent_zones" || table == "pending_parent_deletions" {
 		order = "1, 2"
 	}
-	rows, err := q.Query(fmt.Sprintf(`SELECT * FROM %s ORDER BY %s`, table, order))
+	rows, err := q.Query(fmt.Sprintf(`SELECT %s FROM %s ORDER BY %s`, sel, table, order))
 	if err != nil {
 		t.Fatalf("dump %s: %v", table, err)
 	}
 	defer rows.Close()
-	cols, err := rows.Columns()
+	names, err := rows.Columns()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out [][]string
 	for rows.Next() {
-		vals := make([]sql.NullString, len(cols))
-		ptrs := make([]any, len(cols))
+		vals := make([]sql.NullString, len(names))
+		ptrs := make([]any, len(names))
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
 			t.Fatal(err)
 		}
-		row := make([]string, 0, len(cols)+1)
-		row = append(row, strings.Join(cols, ","))
+		row := make([]string, 0, len(names)+1)
+		row = append(row, strings.Join(names, ","))
 		for _, v := range vals {
 			if v.Valid {
 				row = append(row, v.String)
@@ -192,8 +205,10 @@ func TestMigrationRestrictParentFKs(t *testing.T) {
 	raw := seedBeforeRestrict(t, dbPath, restrictSeed)
 
 	before := map[string][][]string{}
+	beforeCols := map[string][]string{}
 	for _, table := range restrictCheckedTables {
 		before[table] = dumpTable(t, raw, table)
+		beforeCols[table] = columnNames(t, raw, table)
 	}
 	objectsBefore := map[string]map[string]string{
 		"servers": schemaObjects(t, raw, "servers"),
@@ -218,7 +233,7 @@ func TestMigrationRestrictParentFKs(t *testing.T) {
 	}
 
 	for _, table := range restrictCheckedTables {
-		if got := dumpTable(t, d.sql, table); !reflect.DeepEqual(got, before[table]) {
+		if got := dumpColumns(t, d.sql, table, beforeCols[table]); !reflect.DeepEqual(got, before[table]) {
 			t.Errorf("%s rows changed by the rebuild:\nbefore %v\nafter  %v", table, before[table], got)
 		}
 	}
@@ -272,7 +287,7 @@ func TestMigrationRestrictParentFKs(t *testing.T) {
 		t.Error("raw DELETE of a server with a domain succeeded; RESTRICT not enforced")
 	}
 	for _, table := range []string{"agents", "servers", "domains", "config_artifacts"} {
-		if got := dumpTable(t, d.sql, table); !reflect.DeepEqual(got, before[table]) {
+		if got := dumpColumns(t, d.sql, table, beforeCols[table]); !reflect.DeepEqual(got, before[table]) {
 			t.Errorf("%s changed by refused deletes", table)
 		}
 	}
@@ -371,4 +386,27 @@ func TestRewriteCreateTableRejectsUnexpectedSchema(t *testing.T) {
 	if got != want {
 		t.Fatalf("rewrite = %s\nwant      %s", got, want)
 	}
+}
+
+// columnNames lists a table's columns in declaration order.
+func columnNames(t *testing.T, q interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, table string) []string {
+	t.Helper()
+	rows, err := q.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, name)
+	}
+	return out
 }

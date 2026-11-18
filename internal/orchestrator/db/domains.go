@@ -83,6 +83,7 @@ func scanDomain(sc interface {
 		&pcJSON, &manualConfig, &websocket, &forceHTTPS,
 		&dom.SSLMode, &dom.DNSRecordID, &dom.Status, &dom.ErrorMsg,
 		&lastSynced, &createdAt, &updatedAt, &dnsManaged, &certOnly, &proxied,
+		&dom.DNSError,
 	)
 	if err != nil {
 		return nil, err
@@ -113,7 +114,8 @@ func scanDomain(sc interface {
 
 const domainColumns = `id, subdomain, zone_id, server_id, port, proxy_config,
 	manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
-	error_msg, last_synced, created_at, updated_at, dns_managed, cert_only, proxied`
+	error_msg, last_synced, created_at, updated_at, dns_managed, cert_only, proxied,
+	dns_error`
 
 // GetDomain retrieves a domain by its auto-incremented ID.
 func (d *DB) GetDomain(id int64) (*models.Domain, error) {
@@ -323,13 +325,17 @@ func (d *DB) domainStatusWritten(res sql.Result, id int64) error {
 
 // MarkDomainSynced marks a domain as active, clears any error message, and
 // stamps last_synced with the current time. Used by the reconciler after a
-// successful sync cycle. A deleting domain is left unchanged.
+// successful sync cycle. A pending DNS error (dns_error) wins: the domain then
+// stays in error with that reason, since the route alone does not make it
+// reachable. A deleting domain is left unchanged.
 func (d *DB) MarkDomainSynced(id int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
-		UPDATE domains SET status = ?, error_msg = '', last_synced = ?, updated_at = ?
+		UPDATE domains SET
+			status = CASE WHEN dns_error != '' THEN ? ELSE ? END,
+			error_msg = dns_error, last_synced = ?, updated_at = ?
 		WHERE id = ? AND status != 'deleting'`,
-		string(models.DomainStatusActive), now, now, id,
+		string(models.DomainStatusError), string(models.DomainStatusActive), now, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("marking domain synced: %w", err)
@@ -362,9 +368,12 @@ func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool, fall
 		case err == sql.ErrNoRows:
 			now := time.Now().UTC().Format(time.RFC3339)
 			res, xErr := d.sql.Exec(`
-				UPDATE domains SET status = ?, error_msg = ?, last_synced = ?, updated_at = ?
+				UPDATE domains SET
+					status = CASE WHEN dns_error != '' THEN ? ELSE ? END,
+					error_msg = CASE WHEN dns_error != '' THEN dns_error ELSE ? END,
+					last_synced = ?, updated_at = ?
 				WHERE id = ? AND status != 'deleting'`,
-				string(models.DomainStatusDegraded),
+				string(models.DomainStatusError), string(models.DomainStatusDegraded),
 				"served over plaintext HTTP — no TLS certificate issued yet; force_https not enforced",
 				now, now, id,
 			)
@@ -377,6 +386,55 @@ func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool, fall
 		}
 	}
 	return d.MarkDomainSynced(id)
+}
+
+// ResetDomainPending sets the domain back to pending with no error, so the
+// next route apply reports its real state. A domain marked for deletion
+// meanwhile keeps that status.
+func (d *DB) ResetDomainPending(id int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := d.sql.Exec(`
+		UPDATE domains SET status = ?, error_msg = '', updated_at = ?
+		WHERE id = ? AND status != ?`,
+		string(models.DomainStatusPending), now, id, string(models.DomainStatusDeleting),
+	); err != nil {
+		return fmt.Errorf("resetting status of domain %d: %w", id, err)
+	}
+	return nil
+}
+
+// SetDomainDNSError records why the domain's DNS record could not be
+// converged and puts the domain in error with that reason. A domain being
+// deleted is left alone.
+func (d *DB) SetDomainDNSError(id int64, msg string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := d.sql.Exec(`
+		UPDATE domains SET dns_error = ?, status = ?, error_msg = ?, updated_at = ?
+		WHERE id = ? AND status != ?`,
+		msg, string(models.DomainStatusError), msg, now, id, string(models.DomainStatusDeleting),
+	); err != nil {
+		return fmt.Errorf("recording DNS error for domain %d: %w", id, err)
+	}
+	return nil
+}
+
+// ClearDomainDNSError forgets a recorded DNS error once the domain's record is
+// in place. When the domain still shows that error, it goes back to pending
+// so the next route apply reports its real state; any other status and
+// message (a route error, say) is kept.
+func (d *DB) ClearDomainDNSError(id int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := d.sql.Exec(`
+		UPDATE domains SET
+			status = CASE WHEN status = ? AND error_msg = dns_error THEN ? ELSE status END,
+			error_msg = CASE WHEN error_msg = dns_error THEN '' ELSE error_msg END,
+			dns_error = '', updated_at = ?
+		WHERE id = ? AND dns_error != ''`,
+		string(models.DomainStatusError), string(models.DomainStatusPending), now, id,
+	); err != nil {
+		return fmt.Errorf("clearing DNS error for domain %d: %w", id, err)
+	}
+	return nil
 }
 
 // UpdateDomainDNSRecord stores the provider record id for a domain and records
@@ -408,7 +466,8 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 	// Qualify all column references with d. to avoid ambiguity with the servers join.
 	qualifiedColumns := `d.id, d.subdomain, d.zone_id, d.server_id, d.port, d.proxy_config,
 		d.manual_config, d.websocket, d.force_https, d.ssl_mode, d.dns_record_id, d.status,
-		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed, d.cert_only, d.proxied`
+		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed, d.cert_only, d.proxied,
+		d.dns_error`
 
 	rows, err := d.read.Query(`
 		SELECT `+qualifiedColumns+`

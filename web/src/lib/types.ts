@@ -361,11 +361,34 @@ export interface Domain {
    *  live record has; true/false is enforced. Only Cloudflare zones accept true. */
   proxied?: boolean | null;
   dns_record_id?: string;
+  /** true: NurProxy created or took over the record and deletes it with the
+   *  domain; false with a record id: an existing record it uses but leaves. */
+  dns_managed?: boolean;
   status: 'pending' | 'active' | 'error' | 'deleting' | 'degraded';
   error_msg?: string;
+  /** Why the last DNS pass could not create, adopt or correct the record. */
+  dns_error?: string;
   last_synced?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface DNSRecordInfo {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+  proxied: boolean;
+}
+
+/** What a DNS takeover does at the domain's name (dry run or carried out). */
+export interface DNSTakeoverPlan {
+  domain_id: number;
+  fqdn: string;
+  target: string;
+  action: 'adopt' | 'replace' | 'create';
+  delete: DNSRecordInfo[];
+  proxied: boolean;
 }
 
 export interface ProxyConfig {
