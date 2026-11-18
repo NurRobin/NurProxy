@@ -388,6 +388,10 @@ func addLoggingFlags(fs *flag.FlagSet, accessLog, errorLogLevel *string) {
 	fs.StringVar(errorLogLevel, "error-log-level", "", `Minimum error log level for this domain (info, notice, warn, error, crit, alert, emerg) or "default"`)
 }
 
+// tlsWildcardFlagHelp documents --tls-wildcard on `domain add` / `domain update`.
+const tlsWildcardFlagHelp = "Serve this domain from its zone's shared *.<zone> certificate (central TLS, single label below the zone only). " +
+	"The same private key is then installed on every agent serving a wildcard domain of the zone"
+
 func cmdDomain(args []string) {
 	action, rest := shift(args)
 	switch action {
@@ -418,17 +422,43 @@ func cmdDomain(args []string) {
 		for i, d := range domains {
 			rows[i] = []string{
 				strconv.FormatInt(d.ID, 10), d.Subdomain, d.ServerID,
-				strconv.Itoa(d.Port), proxiedCell(d.Proxied), string(d.Status),
+				strconv.Itoa(d.Port), proxiedCell(d.Proxied), dnsCell(d), string(d.Status), dash(d.ErrorMsg),
 			}
 		}
-		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "PROXIED", "STATUS"}, rows)
+		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "PROXIED", "DNS", "STATUS", "REASON"}, rows)
+
+	case "get":
+		c, _, id := parseClient("domain get", rest, "domain id", nil)
+		var d models.Domain
+		if err := c.getInto("/api/v1/domains/"+id, &d); err != nil {
+			fatalf("%v", err)
+		}
+		if c.asJSON {
+			c.emit(mustJSON(d), "")
+			return
+		}
+		printTable([]string{"FIELD", "VALUE"}, [][]string{
+			{"id", strconv.FormatInt(d.ID, 10)},
+			{"subdomain", d.Subdomain},
+			{"zone", d.ZoneID},
+			{"server", d.ServerID},
+			{"port", strconv.Itoa(d.Port)},
+			{"cert_only", strconv.FormatBool(d.CertOnly)},
+			{"proxied", proxiedCell(d.Proxied)},
+			{"dns", dnsCell(d)},
+			{"dns_record_id", dash(d.DNSRecordID)},
+			{"status", string(d.Status)},
+			{"reason", dash(d.ErrorMsg)},
+			{"dns_error", dash(d.DNSError)},
+		})
 
 	case "add":
 		var subdomain, zone, server, sslMode, proxyFile, proxied, accessLog, errorLogLevel string
 		var port int
-		var ws, forceHTTPS bool
-		c, _, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
+		var ws, forceHTTPS, tlsWildcard bool
+		c, fs, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
 			addLoggingFlags(fs, &accessLog, &errorLogLevel)
+			fs.BoolVar(&tlsWildcard, "tls-wildcard", false, tlsWildcardFlagHelp)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -452,6 +482,11 @@ func cmdDomain(args []string) {
 		}
 		putStr(body, "access_log", accessLog)
 		putStr(body, "error_log_level", errorLogLevel)
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "tls-wildcard" {
+				body["tls_wildcard"] = tlsWildcard
+			}
+		})
 		if proxyFile != "" {
 			body["proxy_config"] = json.RawMessage(readFileArg(proxyFile))
 		}
@@ -464,9 +499,10 @@ func cmdDomain(args []string) {
 	case "update":
 		var subdomain, zone, server, sslMode, proxied, accessLog, errorLogLevel string
 		var port int
-		var ws, forceHTTPS bool
+		var ws, forceHTTPS, tlsWildcard bool
 		c, fs, id := parseClient("domain update", rest, "domain id", func(fs *flag.FlagSet) {
 			addLoggingFlags(fs, &accessLog, &errorLogLevel)
+			fs.BoolVar(&tlsWildcard, "tls-wildcard", false, tlsWildcardFlagHelp)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -498,6 +534,8 @@ func cmdDomain(args []string) {
 				body["access_log"] = accessLog
 			case "error-log-level":
 				body["error_log_level"] = errorLogLevel
+			case "tls-wildcard":
+				body["tls_wildcard"] = tlsWildcard
 			}
 		})
 		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id, body)
@@ -515,12 +553,24 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain marked for deletion: "+id)
 
 	case "dns-takeover":
-		c, _, id := parseClient("domain dns-takeover", rest, "domain id", nil)
-		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/dns/takeover", nil)
+		var dryRun bool
+		var expect string
+		c, fs, id := parseClient("domain dns-takeover", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.BoolVar(&dryRun, "dry-run", false, "Only list the records the takeover would delete; change nothing")
+			fs.StringVar(&expect, "expect-delete", "", "Comma-separated record ids from --dry-run; refuse if the records at the name changed (\"none\" when it listed none)")
+		})
+		path := "/api/v1/domains/" + id + "/dns/takeover"
+		var body any
+		if dryRun {
+			path += "?dry_run=true"
+		} else if ids, set := expectDeleteIDs(fs, expect); set {
+			body = map[string]any{"expect_delete": ids}
+		}
+		raw, err := c.do(http.MethodPost, path, body)
 		if err != nil {
 			fatalf("%v", err)
 		}
-		c.emit(raw, "DNS takeover applied for domain "+id)
+		c.emit(raw, takeoverText(raw, dryRun, id))
 
 	case "set-cert":
 		var certFile, keyFile string
@@ -581,7 +631,7 @@ func cmdDomain(args []string) {
 		printFailover(c, id)
 
 	default:
-		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>", "set-cert <id> --cert FILE --key FILE",
+		usage("domain", "list", "get <id>", "add", "update <id>", "delete <id>", "dns-takeover [--dry-run] <id>", "set-cert <id> --cert FILE --key FILE",
 			"backups <id> [--set srv-a,srv-b | --clear]", "failover <id>")
 	}
 }

@@ -114,12 +114,20 @@ func TestDomainFailoverStateRoundTrip(t *testing.T) {
 		t.Fatalf("FillDomainFailover = %+v, %v", doms[0], err)
 	}
 
-	// Clearing the backups drops the state: the domain is on its primary.
-	if _, err := d.SetDomainBackups(dom.ID, []string{}, time.Now()); err != nil {
+	// The record points at srv-a and the primary has no heartbeat: removing
+	// srv-a would leave nothing healthy to move to, so it is refused.
+	if _, err := d.SetDomainBackups(dom.ID, []string{}, time.Now()); !errors.Is(err, ErrActiveBackupInUse) {
+		t.Fatalf("removing the active backup with nothing healthy left = %v", err)
+	}
+	if _, err := d.RemoveServerFromBackups("srv-a", time.Now()); !errors.Is(err, ErrActiveBackupInUse) {
+		t.Fatalf("server cascade of the active backup = %v", err)
+	}
+	// With the primary back it may go; the reconciler moves the record.
+	if err := d.UpdateAgentHeartbeat("agent-p", ""); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := d.GetDomainFailover(dom.ID); got.ActiveServerID != "" {
-		t.Fatalf("state kept after clearing backups: %+v", got)
+	if _, err := d.SetDomainBackups(dom.ID, []string{}, time.Now()); err != nil {
+		t.Fatal(err)
 	}
 	doms = []models.Domain{*dom}
 	if err := d.FillDomainFailover(doms); err != nil || doms[0].ActiveServerID != "srv-p" || len(doms[0].BackupServerIDs) != 0 {

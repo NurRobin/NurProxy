@@ -21,7 +21,19 @@ func at(d time.Duration) *time.Time {
 	return &t
 }
 
-var policy = Policy{DownAfter: 120 * time.Second, Failback: true, FailbackAfter: 5 * time.Minute}
+var policy = Policy{DownAfter: 120 * time.Second, Failback: true, FailbackAfter: 5 * time.Minute, Settle: 90 * time.Second}
+
+func withStart(start time.Time) Policy {
+	p := policy
+	p.StartedAt = start
+	return p
+}
+
+func withStale(after time.Duration) Policy {
+	p := policy
+	p.StaleAfter = after
+	return p
+}
 
 func cands(primary, backup, second *time.Time) []Candidate {
 	out := []Candidate{
@@ -109,16 +121,69 @@ func TestDecide(t *testing.T) {
 			wantActive: "b",
 		},
 		{
-			name:       "all down, then the primary returns: failover to it at once",
+			name:       "all down, then the primary reports first: the down target is held to settle",
 			cands:      cands(seen(time.Second), seen(time.Hour), nil),
 			state:      models.DomainFailoverState{ActiveServerID: "b", AllDown: true},
-			wantActive: "p",
-			wantEvents: []Event{EventFailover},
+			wantActive: "b",
 			wantState: func(t *testing.T, st models.DomainFailoverState) {
-				if st.AllDown {
-					t.Fatal("all-down flag kept after a candidate came back")
+				if st.AllDown || st.SettleSince == nil || !st.SettleSince.Equal(t0) || st.Switches != 0 {
+					t.Fatalf("settle not started: %+v", st)
 				}
 			},
+		},
+		{
+			name:       "settle over and the target still down: failover",
+			cands:      cands(seen(time.Second), seen(time.Hour), nil),
+			state:      models.DomainFailoverState{ActiveServerID: "b", SettleSince: at(-91 * time.Second)},
+			wantActive: "p",
+			wantEvents: []Event{EventFailover},
+		},
+		{
+			name:       "inside the settle period a down target is held without events",
+			cands:      cands(seen(time.Hour), seen(time.Second), nil),
+			state:      models.DomainFailoverState{ActiveServerID: "p", SettleSince: at(-30 * time.Second)},
+			wantActive: "p",
+		},
+		{
+			name:       "right after start a down target is held",
+			cands:      cands(seen(time.Hour), seen(time.Second), nil),
+			state:      models.DomainFailoverState{ActiveServerID: "p"},
+			policy:     withStart(t0.Add(-10 * time.Second)),
+			wantActive: "p",
+		},
+		{
+			name:       "after the start settle the down target fails over",
+			cands:      cands(seen(time.Hour), seen(time.Second), nil),
+			state:      models.DomainFailoverState{ActiveServerID: "p"},
+			policy:     withStart(t0.Add(-2 * time.Minute)),
+			wantActive: "b",
+			wantEvents: []Event{EventFailover},
+		},
+		{
+			name:       "a stale pass (orchestrator away) starts a settle period",
+			cands:      cands(seen(time.Hour), seen(time.Second), nil),
+			state:      models.DomainFailoverState{ActiveServerID: "p", EvaluatedAt: at(-10 * time.Minute)},
+			policy:     withStale(3 * time.Minute),
+			wantActive: "p",
+			wantState: func(t *testing.T, st models.DomainFailoverState) {
+				if st.SettleSince == nil || !st.SettleSince.Equal(t0) || st.EvaluatedAt == nil || !st.EvaluatedAt.Equal(t0) {
+					t.Fatalf("stale pass not recorded: %+v", st)
+				}
+			},
+		},
+		{
+			name:       "removed target, nothing healthy: back to the primary, audited as removed",
+			cands:      cands(seen(time.Hour), seen(time.Hour), nil),
+			state:      models.DomainFailoverState{ActiveServerID: "gone"},
+			wantActive: "p",
+			wantEvents: []Event{EventTargetRemoved},
+		},
+		{
+			name:       "removed target: the first healthy candidate takes over",
+			cands:      cands(seen(time.Hour), seen(time.Second), nil),
+			state:      models.DomainFailoverState{ActiveServerID: "gone"},
+			wantActive: "b",
+			wantEvents: []Event{EventTargetRemoved},
 		},
 		{
 			name:       "all down, then the active backup returns: recovered",
@@ -165,23 +230,18 @@ func TestDecide(t *testing.T) {
 			name:       "failback off: stays on the backup",
 			cands:      cands(seen(time.Second), seen(time.Second), nil),
 			state:      models.DomainFailoverState{ActiveServerID: "b", PendingServerID: "p", PendingSince: at(-time.Hour)},
-			policy:     Policy{DownAfter: policy.DownAfter, Failback: false, FailbackAfter: policy.FailbackAfter},
+			policy:     Policy{DownAfter: policy.DownAfter, Failback: false, FailbackAfter: policy.FailbackAfter, Settle: policy.Settle},
 			wantActive: "b",
 		},
 		{
 			name:       "zero failback delay: fails back in the same pass",
 			cands:      cands(seen(time.Second), seen(time.Second), nil),
 			state:      models.DomainFailoverState{ActiveServerID: "b"},
-			policy:     Policy{DownAfter: policy.DownAfter, Failback: true},
+			policy:     Policy{DownAfter: policy.DownAfter, Failback: true, Settle: policy.Settle},
 			wantActive: "p",
 			wantEvents: []Event{EventFailback},
 		},
-		{
-			name:       "active server no longer a candidate: back to the primary",
-			cands:      cands(seen(time.Second), seen(time.Second), nil),
-			state:      models.DomainFailoverState{ActiveServerID: "gone"},
-			wantActive: "p",
-		},
+
 		{
 			name:       "on the second backup, the first comes back: fails back to the first",
 			cands:      cands(seen(time.Hour), seen(time.Second), seen(time.Second)),
@@ -193,7 +253,7 @@ func TestDecide(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := tt.policy
-			if p == (Policy{}) {
+			if p.DownAfter == 0 {
 				p = policy
 			}
 			dec := Decide(tt.cands, tt.state, p, t0)
@@ -213,17 +273,51 @@ func TestDecide(t *testing.T) {
 	}
 }
 
-func TestDecide_changedOnlyWhenStateMoves(t *testing.T) {
+func TestDecide_steadyState(t *testing.T) {
 	st := models.DomainFailoverState{DomainID: 7, ActiveServerID: "p"}
 	dec := Decide(cands(seen(time.Second), seen(time.Second), nil), st, policy, t0)
-	if dec.Changed {
-		t.Fatalf("steady state reported as changed: %+v", dec.State)
+	if len(dec.Events) != 0 || dec.State.ActiveServerID != "p" || dec.State.Switches != 0 {
+		t.Fatalf("steady state moved: %+v", dec)
 	}
-	if dec.State.DomainID != 7 {
-		t.Fatalf("domain id lost: %+v", dec.State)
+	if dec.State.DomainID != 7 || dec.State.EvaluatedAt == nil {
+		t.Fatalf("domain id or evaluation time lost: %+v", dec.State)
 	}
-	if dec := Decide(nil, st, policy, t0); dec.Active != -1 || dec.Changed {
+	if dec := Decide(nil, st, policy, t0); dec.Active != -1 {
 		t.Fatalf("no candidates: %+v", dec)
+	}
+}
+
+// Reconnect after all-down: agents report at different times. The record
+// stays put through the settle period and then goes to the most preferred
+// healthy agent, not to whoever reported first.
+func TestDecide_reconnectAfterAllDownPicksByPriority(t *testing.T) {
+	st := models.DomainFailoverState{ActiveServerID: "b", AllDown: true}
+	now := t0
+	primarySeen := (*time.Time)(nil)
+	backupSeen := (*time.Time)(nil)
+	second := now
+	step := func() Decision {
+		dec := Decide(cands(primarySeen, backupSeen, &second), st, policy, now)
+		st = dec.State
+		return dec
+	}
+	// The second backup reports first.
+	if dec := step(); dec.State.ActiveServerID != "b" || len(dec.Events) != 0 {
+		t.Fatalf("moved to the first reporter: %+v", dec)
+	}
+	// 40 s later the primary is back too.
+	now = t0.Add(40 * time.Second)
+	second, p := now, now
+	primarySeen = &p
+	if dec := step(); dec.State.ActiveServerID != "b" {
+		t.Fatalf("moved during settle: %+v", dec)
+	}
+	// After the settle period: the primary, by priority, with one failover.
+	now = t0.Add(95 * time.Second)
+	second, p = now, now
+	dec := step()
+	if dec.State.ActiveServerID != "p" || len(dec.Events) != 1 || dec.Events[0] != EventFailover || st.Switches != 1 {
+		t.Fatalf("after settle: %+v", dec)
 	}
 }
 
@@ -271,13 +365,13 @@ func TestLoadPolicy(t *testing.T) {
 		in   settings
 		want Policy
 	}{
-		{"defaults", settings{}, Policy{DownAfter: DefaultOfflineTimeout + DefaultGrace, Failback: true, FailbackAfter: DefaultFailbackDelay}},
-		{"configured", settings{"agent_offline_timeout": "60", "failover_grace": "0", "failover_failback": "false", "failover_failback_delay": "30"},
-			Policy{DownAfter: 60 * time.Second, Failback: false, FailbackAfter: 30 * time.Second}},
+		{"defaults", settings{}, Policy{DownAfter: DefaultOfflineTimeout + DefaultGrace, Failback: true, FailbackAfter: DefaultFailbackDelay, Settle: DefaultSettle}},
+		{"configured", settings{"agent_offline_timeout": "60", "failover_grace": "0", "failover_failback": "false", "failover_failback_delay": "30", "failover_settle": "10"},
+			Policy{DownAfter: 60 * time.Second, Failback: false, FailbackAfter: 30 * time.Second, Settle: 10 * time.Second}},
 		{"offline floor and negative grace", settings{"agent_offline_timeout": "1", "failover_grace": "-5"},
-			Policy{DownAfter: 15 * time.Second, Failback: true, FailbackAfter: DefaultFailbackDelay}},
+			Policy{DownAfter: 15 * time.Second, Failback: true, FailbackAfter: DefaultFailbackDelay, Settle: DefaultSettle}},
 		{"garbage falls back to defaults", settings{"failover_grace": "soon", "failover_failback": "maybe"},
-			Policy{DownAfter: DefaultOfflineTimeout + DefaultGrace, Failback: true, FailbackAfter: DefaultFailbackDelay}},
+			Policy{DownAfter: DefaultOfflineTimeout + DefaultGrace, Failback: true, FailbackAfter: DefaultFailbackDelay, Settle: DefaultSettle}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

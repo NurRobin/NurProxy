@@ -129,6 +129,10 @@ type DomainCandidate struct {
 	// primary always counts as serving it: it was bound before backups
 	// existed and nothing ever required it.
 	ServesZone bool
+	// Ready: the agent acknowledged the standby route with its certificate
+	// in place. Always true for the primary. NotReady says why not.
+	Ready    bool
+	NotReady string
 }
 
 // DomainCandidates returns the primary server of dom followed by its backups,
@@ -143,8 +147,12 @@ func (d *DB) DomainCandidates(dom *models.Domain) ([]DomainCandidate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving agent %s: %w", srv.AgentID, err)
 	}
-	out := []DomainCandidate{{Server: *srv, Agent: *agent, Primary: true, ServesZone: true}}
+	out := []DomainCandidate{{Server: *srv, Agent: *agent, Primary: true, ServesZone: true, Ready: true}}
 	backups, err := d.ListDomainBackups(dom.ID)
+	if err != nil {
+		return nil, err
+	}
+	standby, err := d.standbyStatus(dom.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +169,15 @@ func (d *DB) DomainCandidates(dom *models.Domain) ([]DomainCandidate, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, DomainCandidate{Server: *bs, Agent: *ba, Priority: b.Priority, ServesZone: serves})
+		c := DomainCandidate{Server: *bs, Agent: *ba, Priority: b.Priority, ServesZone: serves}
+		if s, ok := standby[ba.ID]; !ok {
+			c.NotReady = "standby route not applied yet"
+		} else if !s.ready {
+			c.NotReady = s.reason
+		} else {
+			c.Ready = true
+		}
+		out = append(out, c)
 	}
 	return out, nil
 }
@@ -253,6 +269,9 @@ func (d *DB) SetDomainBackups(domainID int64, serverIDs []string, at time.Time) 
 			removed = append(removed, b.AgentID)
 		}
 	}
+	if err := d.checkActiveBackupKept(dom, current, newAgents, at); err != nil {
+		return nil, err
+	}
 	zone, err := d.GetZone(dom.ZoneID)
 	if err != nil {
 		return nil, fmt.Errorf("resolving zone %s: %w", dom.ZoneID, err)
@@ -285,10 +304,12 @@ func (d *DB) SetDomainBackups(domainID int64, serverIDs []string, at time.Time) 
 			return nil, fmt.Errorf("storing backup %s of domain %d: %w", id, domainID, err)
 		}
 	}
-	if len(serverIDs) == 0 {
-		if _, err := tx.Exec(`DELETE FROM domain_failover WHERE domain_id = ?`, domainID); err != nil {
+	// The standby status of an agent that lost the route no longer says
+	// anything; a later re-add starts from "not applied yet".
+	for _, agentID := range removed {
+		if _, err := tx.Exec(`DELETE FROM domain_standby_status WHERE domain_id = ? AND agent_id = ?`, domainID, agentID); err != nil {
 			tx.Rollback()
-			return nil, fmt.Errorf("clearing failover state of domain %d: %w", domainID, err)
+			return nil, fmt.Errorf("clearing standby status of domain %d: %w", domainID, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -306,6 +327,47 @@ func (d *DB) SetDomainBackups(domainID int64, serverIDs []string, at time.Time) 
 		}
 	}
 	return removed, nil
+}
+
+// ErrActiveBackupInUse refuses removing the backup the domain's record points
+// at while no remaining candidate could take over; the API maps it to 409.
+var ErrActiveBackupInUse = errors.New("backup server is serving the domain")
+
+// checkActiveBackupKept refuses a backup list that drops the server the
+// record currently points at when no other candidate that stays (primary or
+// kept backup) is healthy and ready: the record would have to move to a down
+// agent. The record is never moved by a list edit itself; the next DNS pass
+// moves it to the first healthy candidate.
+func (d *DB) checkActiveBackupKept(dom *models.Domain, current []DomainBackup, kept map[string]string, now time.Time) error {
+	st, err := d.GetDomainFailover(dom.ID)
+	if err != nil || st.ActiveServerID == "" || st.ActiveServerID == dom.ServerID {
+		return err
+	}
+	var activeAgent string
+	for _, b := range current {
+		if b.ServerID == st.ActiveServerID {
+			activeAgent = b.AgentID
+		}
+	}
+	if activeAgent == "" {
+		return nil
+	}
+	if srv, ok := kept[activeAgent]; ok && srv == st.ActiveServerID {
+		return nil
+	}
+	status, err := d.DomainFailoverStatus(dom, now)
+	if err != nil {
+		return err
+	}
+	for _, c := range status.Candidates {
+		if c.ServerID == st.ActiveServerID || !c.Healthy {
+			continue
+		}
+		if c.Primary || kept[c.AgentID] == c.ServerID {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: the DNS record points at backup server %s and no other server that stays is healthy; keep it until the primary or another backup is back", ErrActiveBackupInUse, st.ActiveServerID)
 }
 
 // tombstoneStandby persists a route deletion on an nginx/apache agent; Caddy
@@ -429,12 +491,12 @@ func (d *DB) RemoveServerFromBackups(serverID string, at time.Time) ([]string, e
 // state (with DomainID set) when none is stored.
 func (d *DB) GetDomainFailover(domainID int64) (models.DomainFailoverState, error) {
 	st := models.DomainFailoverState{DomainID: domainID}
-	var pendingSince, switchedAt sql.NullString
+	var pendingSince, switchedAt, evaluatedAt, settleSince sql.NullString
 	var allDown int
 	err := d.read.QueryRow(`
-		SELECT active_server_id, pending_server_id, pending_since, all_down, switched_at, switches
+		SELECT active_server_id, pending_server_id, pending_since, all_down, switched_at, switches, evaluated_at, settle_since
 		FROM domain_failover WHERE domain_id = ?`, domainID).Scan(
-		&st.ActiveServerID, &st.PendingServerID, &pendingSince, &allDown, &switchedAt, &st.Switches)
+		&st.ActiveServerID, &st.PendingServerID, &pendingSince, &allDown, &switchedAt, &st.Switches, &evaluatedAt, &settleSince)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}
@@ -444,6 +506,8 @@ func (d *DB) GetDomainFailover(domainID int64) (models.DomainFailoverState, erro
 	st.AllDown = allDown != 0
 	st.PendingSince = parseNullTime(pendingSince)
 	st.SwitchedAt = parseNullTime(switchedAt)
+	st.EvaluatedAt = parseNullTime(evaluatedAt)
+	st.SettleSince = parseNullTime(settleSince)
 	return st, nil
 }
 
@@ -451,19 +515,74 @@ func (d *DB) GetDomainFailover(domainID int64) (models.DomainFailoverState, erro
 // deleted meanwhile is skipped.
 func (d *DB) SaveDomainFailover(st models.DomainFailoverState) error {
 	_, err := d.sql.Exec(`
-		INSERT INTO domain_failover (domain_id, active_server_id, pending_server_id, pending_since, all_down, switched_at, switches)
-		SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM domains WHERE id = ?)
+		INSERT INTO domain_failover (domain_id, active_server_id, pending_server_id, pending_since, all_down, switched_at, switches, evaluated_at, settle_since)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM domains WHERE id = ?)
 		ON CONFLICT(domain_id) DO UPDATE SET
 			active_server_id = excluded.active_server_id,
 			pending_server_id = excluded.pending_server_id,
 			pending_since = excluded.pending_since,
 			all_down = excluded.all_down,
 			switched_at = excluded.switched_at,
-			switches = excluded.switches`,
+			switches = excluded.switches,
+			evaluated_at = excluded.evaluated_at,
+			settle_since = excluded.settle_since`,
 		st.DomainID, st.ActiveServerID, st.PendingServerID, formatNullTime(st.PendingSince),
-		boolToInt(st.AllDown), formatNullTime(st.SwitchedAt), st.Switches, st.DomainID)
+		boolToInt(st.AllDown), formatNullTime(st.SwitchedAt), st.Switches,
+		formatNullTime(st.EvaluatedAt), formatNullTime(st.SettleSince), st.DomainID)
 	if err != nil {
 		return fmt.Errorf("storing failover state of domain %d: %w", st.DomainID, err)
+	}
+	return nil
+}
+
+// DeleteDomainFailover drops a domain's stored failover state, for a domain
+// that has no backups any more. Callers hold the domain's DNS lock.
+func (d *DB) DeleteDomainFailover(domainID int64) error {
+	if _, err := d.sql.Exec(`DELETE FROM domain_failover WHERE domain_id = ?`, domainID); err != nil {
+		return fmt.Errorf("clearing failover state of domain %d: %w", domainID, err)
+	}
+	return nil
+}
+
+type standbyState struct {
+	ready  bool
+	reason string
+}
+
+func (d *DB) standbyStatus(domainID int64) (map[string]standbyState, error) {
+	rows, err := d.read.Query(`SELECT agent_id, ready, reason FROM domain_standby_status WHERE domain_id = ?`, domainID)
+	if err != nil {
+		return nil, fmt.Errorf("reading standby status of domain %d: %w", domainID, err)
+	}
+	defer rows.Close()
+	out := make(map[string]standbyState)
+	for rows.Next() {
+		var agentID string
+		var ready int
+		var s standbyState
+		if err := rows.Scan(&agentID, &ready, &s.reason); err != nil {
+			return nil, err
+		}
+		s.ready = ready != 0
+		out[agentID] = s
+	}
+	return out, rows.Err()
+}
+
+// RecordStandbyApply stores the outcome of a backup agent's last standby
+// apply for a domain: ready, or the reason it is not (apply error, missing
+// certificate). Only a backup agent of the domain is recorded.
+func (d *DB) RecordStandbyApply(domainID int64, agentID string, ready bool, reason string) error {
+	_, err := d.sql.Exec(`
+		INSERT INTO domain_standby_status (domain_id, agent_id, ready, reason, updated_at)
+		SELECT ?, ?, ?, ?, ? WHERE EXISTS (
+			SELECT 1 FROM domain_backups b JOIN servers s ON s.id = b.server_id
+			WHERE b.domain_id = ? AND s.agent_id = ?)
+		ON CONFLICT(domain_id, agent_id) DO UPDATE SET
+			ready = excluded.ready, reason = excluded.reason, updated_at = excluded.updated_at`,
+		domainID, agentID, boolToInt(ready), reason, time.Now().UTC().Format(time.RFC3339Nano), domainID, agentID)
+	if err != nil {
+		return fmt.Errorf("storing standby status of domain %d on agent %s: %w", domainID, agentID, err)
 	}
 	return nil
 }
@@ -472,7 +591,7 @@ func (d *DB) SaveDomainFailover(st models.DomainFailoverState) error {
 // domain id.
 func (d *DB) ListDomainFailoverStates() (map[int64]models.DomainFailoverState, error) {
 	rows, err := d.read.Query(`
-		SELECT domain_id, active_server_id, pending_server_id, pending_since, all_down, switched_at, switches
+		SELECT domain_id, active_server_id, pending_server_id, pending_since, all_down, switched_at, switches, evaluated_at, settle_since
 		FROM domain_failover`)
 	if err != nil {
 		return nil, fmt.Errorf("listing failover states: %w", err)
@@ -481,11 +600,13 @@ func (d *DB) ListDomainFailoverStates() (map[int64]models.DomainFailoverState, e
 	out := make(map[int64]models.DomainFailoverState)
 	for rows.Next() {
 		var st models.DomainFailoverState
-		var pendingSince, switchedAt sql.NullString
+		var pendingSince, switchedAt, evaluatedAt, settleSince sql.NullString
 		var allDown int
-		if err := rows.Scan(&st.DomainID, &st.ActiveServerID, &st.PendingServerID, &pendingSince, &allDown, &switchedAt, &st.Switches); err != nil {
+		if err := rows.Scan(&st.DomainID, &st.ActiveServerID, &st.PendingServerID, &pendingSince, &allDown, &switchedAt, &st.Switches, &evaluatedAt, &settleSince); err != nil {
 			return nil, err
 		}
+		st.EvaluatedAt = parseNullTime(evaluatedAt)
+		st.SettleSince = parseNullTime(settleSince)
 		st.AllDown = allDown != 0
 		st.PendingSince = parseNullTime(pendingSince)
 		st.SwitchedAt = parseNullTime(switchedAt)
@@ -589,6 +710,8 @@ func (c *DomainCandidate) Eligible() (bool, string) {
 		return false, "agent has no FQDN"
 	case !c.ServesZone:
 		return false, "agent no longer serves the zone"
+	case !c.Ready:
+		return false, c.NotReady
 	}
 	return true, ""
 }
@@ -626,6 +749,9 @@ func (d *DB) DomainFailoverStatus(dom *models.Domain, now time.Time) (*models.Do
 	policy := failover.LoadPolicy(d)
 	fc := FailoverCandidates(cands)
 	out := &models.DomainFailoverStatus{DomainFailoverState: st, Candidates: make([]models.FailoverCandidate, 0, len(cands))}
+	if len(cands) > 1 {
+		out.Settling = failover.Decide(fc, st, policy, now).Settling
+	}
 	for i := range cands {
 		c := &cands[i]
 		_, reason := c.Eligible()

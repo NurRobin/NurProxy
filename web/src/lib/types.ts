@@ -134,6 +134,8 @@ export interface ProxyCapabilities {
   /** Absent on agents that predate per-domain logging control. */
   access_log?: boolean;
   error_log_level?: boolean;
+  /** True when the backend replaces ${NAME} in header values at config load (Apache). */
+  header_config_vars?: boolean;
 }
 
 export interface Agent {
@@ -364,8 +366,13 @@ export interface Domain {
   /** The server whose agent the domain's CNAME points at: the primary
    *  (server_id) unless the reconciler failed over to a backup. */
   active_server_id?: string;
+  /** true: NurProxy created or took over the record and deletes it with the
+   *  domain; false with a record id: an existing record it uses but leaves. */
+  dns_managed?: boolean;
   status: 'pending' | 'active' | 'error' | 'deleting' | 'degraded';
   error_msg?: string;
+  /** Why the last DNS pass could not create, adopt or correct the record. */
+  dns_error?: string;
   last_synced?: string;
   created_at: string;
   updated_at: string;
@@ -395,7 +402,29 @@ export interface DomainFailoverStatus {
   all_down: boolean;
   switched_at?: string;
   switches: number;
+  evaluated_at?: string;
+  settle_since?: string;
+  /** A down target is held while agents report in after a restart or outage. */
+  settling: boolean;
   candidates: FailoverCandidate[];
+}
+
+export interface DNSRecordInfo {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+  proxied: boolean;
+}
+
+/** What a DNS takeover does at the domain's name (dry run or carried out). */
+export interface DNSTakeoverPlan {
+  domain_id: number;
+  fqdn: string;
+  target: string;
+  action: 'adopt' | 'replace' | 'create';
+  delete: DNSRecordInfo[];
+  proxied: boolean;
 }
 
 export interface ProxyConfig {
@@ -408,6 +437,8 @@ export interface ProxyConfig {
   // tls_policy selects how the public-listener cert is provisioned:
   // "central" (DNS-01 provided cert, the default), "self-acme", or "off".
   tls_policy?: string;
+  /** Serve the domain from its zone's shared *.<zone> certificate. */
+  tls_wildcard?: boolean;
   /** "off" writes no access log for the domain; unset keeps the host-wide log. */
   access_log?: string;
   /** Minimum error log level (e.g. "crit"); unset keeps the host default. */

@@ -43,6 +43,7 @@ func TestSandboxFailover(t *testing.T) {
 		"agent_offline_timeout":   "30", // above the 20 s stream keepalive
 		"failover_grace":          "0",
 		"failover_failback_delay": "10",
+		"failover_settle":         "10",
 	} {
 		api.put("/api/v1/settings/"+key, map[string]string{"value": value}, nil)
 	}

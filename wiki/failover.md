@@ -19,6 +19,11 @@ servers** a domain can move to another agent on its own.
   pull the record back and forth.
 - If every agent is down, the record stays where it is. NurProxy never deletes
   the last record of a domain.
+- After the orchestrator starts, after it was away for a while, and after
+  every agent was down, the record is held for a settle period, so agents
+  that reconnect a little later are not passed over.
+- A backup only takes over once its agent has applied the route with the
+  certificate. A backup whose last apply failed is skipped.
 
 Each switch is in the activity log (`failover`, `failback`,
 `failover_all_down`, `failover_recovered`) and in Prometheus
@@ -65,6 +70,8 @@ Set these through the settings API (`PUT /api/v1/settings/<key>` with `{"value":
   once it is healthy again.
 - `failover_failback_delay` (default 300): seconds that agent must stay
   healthy before the record moves back.
+- `failover_settle` (default 90): seconds the record is held after a
+  restart, an orchestrator outage or all agents being down.
 
 With the defaults a failover happens about two minutes after the agent's last
 heartbeat.
@@ -80,5 +87,7 @@ heartbeat.
   the orchestrator is down, the record stays where it is.
 - A server that is a backup cannot be deleted until it is removed from the
   backup lists (or delete it with cascade, which does that for you).
+- The backup the record currently points at cannot be removed while no other
+  server of the domain is healthy (409).
 - A domain cannot be moved onto an agent that is one of its backups; remove
   that backup first.

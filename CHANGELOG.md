@@ -21,8 +21,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--access-log`, `--error-log-level`), MCP and the domain settings in the
   dashboard. Domains without the settings render exactly as before.
 
+### Security
+
+- **The root helper checks the error log itself before writing `error_log`
+  (#171).** It writes `error_log /var/log/nginx/error.log <level>;` only when
+  that file is a regular file (not a symlink) in a root-owned directory that
+  neither group nor others can write, or when `nginx -V` reports it as
+  `--error-log-path`. Otherwise the domain gets an error that says why.
+- **Apache header values with `${` are refused (#169).** httpd replaces
+  `${NAME}` in config lines with an environment variable or `Define` value,
+  quoted or not. apachegen refuses such header values, and the API refuses
+  them for domains served by an Apache agent (new `header_config_vars`
+  capability; agents that predate it are recognized by their proxy kind).
+  nginx keeps accepting `${var}`, which it reads as a request variable.
+- **Raw Apache configs pass a policy check in the root helper.** Like raw
+  nginx configs since 0.5.1, a raw Apache config is written only when every
+  directive is on an allowlist of the forms apachegen renders: two
+  `<VirtualHost *:80|*:443>` sections at most, the domain's own `ServerName`,
+  the helper's certificate and htpasswd paths, `ProxyPass` and `RewriteRule
+  [P]` to http(s)/ws(s) upstreams, literal `Header`/`RequestHeader` values,
+  `<Location />` with `Require` and the generated `AuthName "Restricted: <host>"`
+  (httpd evaluates AuthName as an expression), `CustomLog /dev/null` and
+  `LogLevel`. Line continuations are refused, also at the end of comments.
+  `LoadModule`, `Include`, piped or file logs, `Define`/`SetEnv`,
+  `<Directory>`, `RewriteMap`, `ScriptAlias`, handler flags and everything
+  else are refused. A config outside the policy is still kept when exactly
+  these bytes are already the live file. Every vhost the helper renders for
+  Apache now passes the same check.
+- Helper policy refusals (raw config directives, the error log check, render
+  errors) now reach the domain's error message with the reason, the domain
+  and the offending directive and line, instead of a generic "privileged
+  managed proxy reconciliation failed".
+
 ### Fixed
 
+- **Raw nginx configs may carry common tuning directives, and a refusal says
+  why (#149).** The root helper's raw-config policy now admits `gzip*`,
+  `proxy_buffering`, `proxy_request_buffering`, proxy buffer sizes and
+  timeouts, `proxy_hide_header`, `proxy_redirect off`, `proxy_ssl_server_name`,
+  `client_body_buffer_size` and `server_tokens`, and allows the existing header,
+  body-size and `access_log off` directives inside `location /` too. A raw
+  config no longer has to match the dashboard's structured form exactly. When
+  the helper refuses a raw config, the domain's error now names the directive
+  and its line (for example `line 12: nginx directive "include" is not allowed
+  in the server block`) instead of only "privileged managed proxy
+  reconciliation failed". File paths in logs stay limited to `access_log off`
+  and the stock error log. The policy also refuses what `nginx -t` would
+  reject: repeated single-value directives and proxy buffer settings that
+  break nginx's size rules (the three buffer directives go together). Raw
+  `rewrite` stays limited to the two forms the path settings render.
+- **A failed `nginx -t` names the domain that broke it.** The helper applies
+  all domains of an agent together, so one broken vhost fails all of them.
+  When the validator output names a managed vhost file, that domain's error
+  now shows the output, and the other domains say which domain blocked them.
 - **Renaming a domain or moving it to another zone cleans up the old name
   (#151).** The DNS record of the old name is queued and deleted through the
   provider and zone it was created in, once the record for the new name exists;
