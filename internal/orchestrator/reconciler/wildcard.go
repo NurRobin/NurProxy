@@ -69,12 +69,13 @@ func isZoneWildcardCert(c *models.Certificate) bool {
 	return c.IsWildcard && strings.HasPrefix(c.Host, "*.")
 }
 
-// pruneUnusedWildcardCerts deletes zone wildcard certs no domain opts into any
-// more: the last wildcard domain of the zone was deleted, opted out, or moved to
-// another zone. The check runs inside the delete statement
-// (DeleteWildcardCertIfUnused), so a cert with a live consumer is never removed.
-// A wildcard cert whose zone no longer resolves is kept and logged rather than
-// guessed at.
+// pruneUnusedWildcardCerts deletes "*.<zone>" certs no domain uses any more:
+// the last opted-in domain of the zone was deleted, opted out, or moved to
+// another zone, and the zone has no catch-all "*" domain, which is served from
+// the same cert. The check runs inside the delete statement
+// (DeleteWildcardCertIfUnused), so a cert with a live user is never removed.
+// Imported certs are the operator's and are left alone. A cert whose zone no
+// longer resolves is kept and logged rather than guessed at.
 func (r *Reconciler) pruneUnusedWildcardCerts() {
 	certs, err := r.db.ListCertificates()
 	if err != nil {
@@ -84,7 +85,7 @@ func (r *Reconciler) pruneUnusedWildcardCerts() {
 	var zones []models.Zone
 	for i := range certs {
 		c := &certs[i]
-		if !isZoneWildcardCert(c) || c.Source != models.CertSourceACME {
+		if !strings.HasPrefix(c.Host, "*.") || c.Source != models.CertSourceACME {
 			continue
 		}
 		if zones == nil {
@@ -116,9 +117,16 @@ func (r *Reconciler) pruneUnusedWildcardCerts() {
 	}
 }
 
+// usesZoneCert reports whether dom is served from the cert stored under host
+// ("*.<zone>"): it opted into the zone wildcard cert, or it is the zone's
+// catch-all "*" domain whose own FQDN is that host.
+func usesZoneCert(dom *models.Domain, zoneName, host string) bool {
+	return caddygen.WildcardCertHost(*dom, zoneName) == host || dom.FQDN(zoneName) == host
+}
+
 // agentsUsingWildcard returns the ids of the agents serving a domain that uses
-// the zone wildcard cert stored under host, so a renewed wildcard reaches every
-// agent that installed a copy of it.
+// the cert stored under host ("*.<zone>"), opted-in or catch-all, so a renewed
+// cert reaches every agent that installed a copy of it.
 func (r *Reconciler) agentsUsingWildcard(host string) ([]string, error) {
 	domains, err := r.db.ListDomains(db.DomainFilter{})
 	if err != nil {
@@ -129,7 +137,7 @@ func (r *Reconciler) agentsUsingWildcard(host string) ([]string, error) {
 	zoneNames := make(map[string]string)
 	for i := range domains {
 		dom := &domains[i]
-		if dom.Status == models.DomainStatusDeleting || !dom.ProxyConfig.TLSWildcard {
+		if dom.Status == models.DomainStatusDeleting {
 			continue
 		}
 		zoneName, ok := zoneNames[dom.ZoneID]
@@ -141,7 +149,7 @@ func (r *Reconciler) agentsUsingWildcard(host string) ([]string, error) {
 			zoneName = zone.Name
 			zoneNames[dom.ZoneID] = zoneName
 		}
-		if caddygen.WildcardCertHost(*dom, zoneName) != host {
+		if !usesZoneCert(dom, zoneName, host) {
 			continue
 		}
 		srv, sErr := r.db.GetServer(dom.ServerID)

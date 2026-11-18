@@ -47,6 +47,9 @@ the same as with a per-host certificate.
 - When the last wildcard domain of a zone is deleted, moves to another zone, or
   turns the setting off, the shared certificate is deleted on the next
   reconcile cycle. A domain that turns it off gets its own certificate issued.
+- A catch-all domain (subdomain `*`) has the name `*.<zone>` itself, so it uses
+  the same certificate. The certificate stays as long as either the catch-all
+  or a wildcard domain of the zone exists.
 
 API: the field is `proxy_config.tls_wildcard` (boolean). `POST /api/v1/domains`
 and `PUT /api/v1/domains/{id}` also accept a top-level `tls_wildcard` as a

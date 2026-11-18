@@ -1842,6 +1842,21 @@ func (r *Reconciler) cleanupCertForDomain(dom *models.Domain) {
 		log.Printf("reconciler: keeping certificate for %s (another domain still serves this host)", host)
 		return
 	}
+	if strings.HasPrefix(host, "*.") {
+		// A catch-all "*" domain shares its cert with the zone's wildcard
+		// opt-in domains; delete it only when none of them is left.
+		deleted, dErr := r.db.DeleteWildcardCertIfUnused(host, dom.ZoneID)
+		if dErr != nil {
+			log.Printf("reconciler: failed to delete certificate for %s: %v", host, dErr)
+			return
+		}
+		if deleted {
+			r.audit("certificate", host, "deleted", "removed with domain teardown; no remaining domain uses this certificate")
+		} else {
+			log.Printf("reconciler: keeping certificate for %s (wildcard domains of the zone still use it)", host)
+		}
+		return
+	}
 	if dErr := r.db.DeleteCertificate(host); dErr != nil {
 		log.Printf("reconciler: failed to delete certificate for %s: %v", host, dErr)
 		return

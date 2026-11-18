@@ -128,9 +128,10 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		}
 		consumed := certHasCentralConsumer(c, centralHosts)
 		if isZoneWildcardCert(c) {
-			// A zone wildcard cert serves only the domains that opted into it,
-			// not every central host that happens to sit below the zone.
-			consumed = wildcardHosts[c.Host]
+			// A "*.<zone>" cert serves the domains that opted into it and the
+			// zone's catch-all "*" domain, not every central host that happens
+			// to sit below the zone.
+			consumed = wildcardHosts[c.Host] || centralHosts[c.Host]
 		}
 		if !consumed {
 			log.Printf("reconciler: renewal: no central-TLS domain consumes cert host %q, skipping renewal", c.Host)
@@ -167,10 +168,11 @@ func (s *CertRenewalStore) DueForRenewal(_ context.Context, window time.Duration
 		if caddygen.TLSPolicyForDomain(*dom) != proxymodel.TLSPolicyCentral {
 			continue // self-acme / off domains need no provided cert
 		}
-		isWildcard := false
 		if wildHost := caddygen.WildcardCertHost(*dom, zoneName); wildHost != "" {
-			fqdn, isWildcard = wildHost, true
+			fqdn = wildHost
 		}
+		// A catch-all "*" domain's own FQDN is the same "*.<zone>" name.
+		isWildcard := strings.HasPrefix(fqdn, "*.")
 		if seen[fqdn] {
 			continue
 		}
