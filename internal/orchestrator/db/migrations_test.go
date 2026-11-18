@@ -181,8 +181,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 36 {
-		t.Fatalf("this test pins the schema target at 36 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 39 {
+		t.Fatalf("this test pins the schema target at 39 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -241,6 +241,17 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if proxied.Valid {
 			t.Errorf("domains.proxied = %d, want NULL (default on pre-existing row)", proxied.Int64)
+		}
+	})
+
+	// migration 37: domains.dns_error is empty on pre-existing rows.
+	t.Run("domain_dns_error_default", func(t *testing.T) {
+		var dnsErr string
+		if err := d.sql.QueryRow("SELECT dns_error FROM domains WHERE id=1").Scan(&dnsErr); err != nil {
+			t.Fatalf("select dns_error: %v", err)
+		}
+		if dnsErr != "" {
+			t.Errorf("domains.dns_error = %q, want empty (default on pre-existing row)", dnsErr)
 		}
 	})
 
@@ -307,6 +318,22 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if _, err := d.sql.Exec("UPDATE certificates SET source='manual' WHERE host='app.example.com'"); err == nil {
 			t.Error("certificates.source accepted a value outside acme|imported")
+		}
+	})
+
+	// migration 38: a server that existed before discovery is a plain,
+	// unlinked server, and the discovery sources table starts empty.
+	t.Run("server_discovery_defaults", func(t *testing.T) {
+		srv, err := d.GetServer("srv1")
+		if err != nil {
+			t.Fatalf("GetServer: %v", err)
+		}
+		if srv.DiscoverySourceID != "" || srv.ExternalID != "" || srv.DiscoveryMissingSince != nil {
+			t.Errorf("pre-existing server = %+v, want no discovery link", srv)
+		}
+		sources, err := d.ListDiscoverySources()
+		if err != nil || len(sources) != 0 {
+			t.Errorf("discovery sources = %v, %v; want empty", sources, err)
 		}
 	})
 

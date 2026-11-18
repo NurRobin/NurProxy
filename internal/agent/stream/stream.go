@@ -435,25 +435,58 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 			c.syncRecoveryHealth()
 		}
 		log.Printf("Stream: privileged managed apply failed: %v", err)
+		message := managedApplyFailureMessage(err)
 		if c.health != nil {
-			c.health.SetError("privileged managed proxy reconciliation failed")
+			c.health.SetError(message)
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed", nil)
+		c.sendManagedAck(ctx, envelope.IntentSet, message, nil)
 		return
 	}
 	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
 		log.Printf("Stream: privileged managed apply %s ended as %s: %s", receipt.Envelope.Payload.OperationID,
 			receipt.Envelope.Payload.State, receipt.Envelope.Payload.SanitizedResult)
+		const message = "privileged managed proxy reconciliation did not succeed"
 		if c.health != nil {
-			c.health.SetError("privileged managed proxy reconciliation did not succeed")
+			c.health.SetError(message)
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation did not succeed", nil)
+		reports, _ := c.managedAckReports(ctx, envelope.IntentSet, message)
+		attributeManagedFailure(reports, envelope.IntentSet, c.caddy.Info().Kind, message, receipt.Envelope.Payload.SanitizedResult)
+		c.sendAck(ctx, reports)
 		return
 	}
 	if c.health != nil {
 		c.health.SetError("")
 	}
 	c.sendManagedAck(ctx, envelope.IntentSet, "", receipt.Envelope.Payload.ManagedArtifacts)
+}
+
+// maxManagedRefusalBytes bounds the helper's refusal reason in an artifact
+// report.
+const maxManagedRefusalBytes = 400
+
+// managedApplyFailureMessage is the artifact error for a failed privileged
+// apply. When the root helper's local policy refused the desired state with
+// a reason (a refused raw config directive, an unsafe error log target), the
+// reason is appended so it reaches the domain's error message.
+func managedApplyFailureMessage(err error) string {
+	const message = "privileged managed proxy reconciliation failed"
+	var refusal interface{ RefusalReason() string }
+	if !errors.As(err, &refusal) {
+		return message
+	}
+	reason := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(refusal.RefusalReason(), ""))
+	if len(reason) > maxManagedRefusalBytes {
+		reason = strings.ToValidUTF8(reason[:maxManagedRefusalBytes], "")
+	}
+	if reason = strings.TrimSpace(reason); reason == "" {
+		return message
+	}
+	return message + ": " + reason
 }
 
 func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string, attested []helperprotocol.ManagedArtifactReceipt) {
@@ -573,6 +606,46 @@ func (c *Client) managedAckReports(ctx context.Context, set proxymodel.IntentSet
 		reports = append(reports, report)
 	}
 	return reports, managed
+}
+
+// attributeManagedFailure points a failed batch apply at the routes whose
+// managed vhost the helper's validator output names. The helper applies all
+// routes of the agent as one unit, so one broken vhost fails every route;
+// nginx and apachectl name the file (".../nurproxy-<host>.conf:<line>"), which
+// identifies the route. That route's report gets the validator output, the
+// others say which route blocked them. When no managed file is named, the
+// reports keep the base message.
+func attributeManagedFailure(reports []proxymodel.ArtifactReport, set proxymodel.IntentSet, kind proxy.Kind, base, result string) {
+	if result == "" || len(reports) != len(set.Intents) {
+		return
+	}
+	var culprits []string
+	blamed := make([]bool, len(set.Intents))
+	for i, intent := range set.Intents {
+		var name string
+		switch kind {
+		case proxy.KindNginx:
+			name = nginxproxy.ManagedFileName(intent.Route.Host)
+		case proxy.KindApache:
+			name = apacheproxy.ManagedFileName(intent.Route.Host)
+		default:
+			return
+		}
+		if strings.Contains(result, "/"+name+":") {
+			blamed[i] = true
+			culprits = append(culprits, intent.Route.Host)
+		}
+	}
+	if len(culprits) == 0 {
+		return
+	}
+	for i := range reports {
+		if blamed[i] {
+			reports[i].Error = base + ": the proxy rejected this domain's config: " + result
+		} else {
+			reports[i].Error = base + ": the proxy rejected the config of " + strings.Join(culprits, ", ") + ", so no domain on this agent was applied"
+		}
+	}
 }
 
 func managedFileTarget(info proxy.Info, intent proxymodel.RouteIntent) (proxy.Target, error) {

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/NurRobin/NurProxy/internal/discovery/proxmox"
 	"github.com/NurRobin/NurProxy/internal/notifier"
 	"github.com/NurRobin/NurProxy/internal/notifier/webhook"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agentclient"
@@ -22,6 +23,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/orchestrator/api"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/dataperms"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/discoverysvc"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/mcp"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/metrics"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/reconciler"
@@ -102,8 +104,11 @@ func main() {
 	dnsDryRun := envBoolDefault("NP_DNS_DRY_RUN", dryRunAll)
 	acmeDryRun := envBoolDefault("NP_ACME_DRY_RUN", dryRunAll)
 	acmeFailMode := os.Getenv("NP_DRY_RUN_FAIL")
-	if dnsDryRun || acmeDryRun {
-		log.Printf("DRY-RUN MODE: dns=%v acme=%v fail=%q — no external DNS/ACME calls will be made", dnsDryRun, acmeDryRun, acmeFailMode)
+	// Server discovery sources (#25) return a fixed sandbox set instead of
+	// contacting Proxmox.
+	discoveryDryRun := envBoolDefault("NP_DISCOVERY_DRY_RUN", dryRunAll)
+	if dnsDryRun || acmeDryRun || discoveryDryRun {
+		log.Printf("DRY-RUN MODE: dns=%v acme=%v discovery=%v fail=%q — no external DNS/ACME/discovery calls will be made", dnsDryRun, acmeDryRun, discoveryDryRun, acmeFailMode)
 	}
 
 	// Ensure data dir exists
@@ -253,6 +258,11 @@ func main() {
 	srv.SetDNSTakeover(rec)
 	// Surface sandbox state so the dashboard can show a "dry-run" banner (#93).
 	srv.SetDryRun(dnsDryRun, acmeDryRun)
+	// Server discovery (#25): on-demand runs through the API plus a periodic
+	// re-sync for sources with a sync interval.
+	discoverySvc := discoverysvc.New(database, discoveryDryRun)
+	discoverySvc.Start(rootCtx, time.Minute)
+	srv.SetDiscovery(discoverySvc)
 	// ACME-CA reachability probe (#91): a periodic GET of the ACME directory so
 	// an orchestrator-egress problem shows up in /health and as a dashboard
 	// banner instead of masquerading as per-domain issuance flakiness. The

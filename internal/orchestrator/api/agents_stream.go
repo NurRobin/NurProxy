@@ -207,7 +207,11 @@ func (s *Server) handleAgentRoutesAck(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if applied[fqdn] {
-			if err := s.db.MarkDomainApplied(dom.ID, fqdn, caddygen.TLSPolicyForDomain(*dom) == proxymodel.TLSPolicyCentral); err != nil {
+			var fallback []string
+			if wildHost := caddygen.WildcardCertHost(*dom, zone.Name); wildHost != "" {
+				fallback = append(fallback, wildHost)
+			}
+			if err := s.db.MarkDomainApplied(dom.ID, fqdn, caddygen.TLSPolicyForDomain(*dom) == proxymodel.TLSPolicyCentral, fallback...); err != nil {
 				log.Printf("ack: failed to mark domain %d applied: %v", dom.ID, err)
 			}
 		}

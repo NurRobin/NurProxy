@@ -63,6 +63,13 @@ func errorLogTargetIsDefault(versionOutput string, readFile func(string) ([]byte
 	return err == nil && info.Mode().IsRegular()
 }
 
+// CompiledErrorLogPath returns the --error-log-path that `nginx -V` output
+// reports, or "" when it names none.
+func CompiledErrorLogPath(versionOutput string) string {
+	path, _ := configureArgs(versionOutput)
+	return path
+}
+
 // configureArgs extracts --error-log-path and --conf-path from `nginx -V`.
 func configureArgs(versionOutput string) (errorLogPath, confPath string) {
 	for _, field := range strings.Fields(versionOutput) {

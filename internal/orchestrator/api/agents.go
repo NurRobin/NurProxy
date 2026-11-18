@@ -330,9 +330,8 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
 
-	// Refuse while domains still reference this agent's servers: the ON DELETE
-	// CASCADE (agent -> servers -> domains) would orphan their DNS records/certs
-	// ahead of the reconciler teardown (see guardChildDomains).
+	// Refuse while domains still reference this agent's servers; they must be
+	// torn down through the reconciler first (see guardChildDomains).
 	if cascadeRequested(r) {
 		s.cascadeDeleteParent(w, r, "agent", id, db.DomainFilter{AgentID: id})
 		return
@@ -342,7 +341,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.DeleteAgent(id); err != nil {
-		writeError(w, http.StatusNotFound, "agent not found")
+		writeParentDeleteError(w, "agent", err)
 		return
 	}
 
