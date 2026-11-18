@@ -90,11 +90,12 @@ func (d *DB) ListZonesByProvider(providerID string) ([]models.Zone, error) {
 	return zones, rows.Err()
 }
 
-// DeleteZone removes a zone by ID.
+// DeleteZone removes a zone by ID. It fails with ErrParentInUse while domains
+// still reference the zone.
 func (d *DB) DeleteZone(id string) error {
 	res, err := d.sql.Exec("DELETE FROM zones WHERE id = ?", id)
 	if err != nil {
-		return fmt.Errorf("deleting zone: %w", err)
+		return parentDeleteError("zone", id, err)
 	}
 
 	n, _ := res.RowsAffected()

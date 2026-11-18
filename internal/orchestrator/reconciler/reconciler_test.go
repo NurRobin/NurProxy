@@ -1780,7 +1780,7 @@ func TestTakeoverDomainDNS(t *testing.T) {
 	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99", Proxied: true})
 
 	r := New(d, newMockAgentClient(), time.Minute)
-	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 		t.Fatalf("TakeoverDomainDNS: %v", err)
 	}
 
@@ -1822,7 +1822,7 @@ func TestTakeoverDomainDNS_adoptsMatchingRecord(t *testing.T) {
 	seedID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN})
 
 	r := New(d, newMockAgentClient(), time.Minute)
-	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 		t.Fatalf("TakeoverDomainDNS: %v", err)
 	}
 
@@ -2467,4 +2467,45 @@ func TestFinalizePendingParentDeletions(t *testing.T) {
 		t.Errorf("pending intent should be cleared, got %+v", pending)
 	}
 	_ = agent
+}
+
+// An agent cascade with RESTRICT foreign keys: the domains are torn down by
+// reconcileDeletions, then finalizing removes the agent together with all of
+// its servers, including one that never had a domain.
+func TestFinalizePendingAgentDeletionRemovesServers(t *testing.T) {
+	ctx := context.Background()
+	d := testDB(t)
+	registerMockProvider(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+	if err := d.CreateServer(&models.Server{ID: "srv-empty", AgentID: agent.ID, Name: "empty", Address: "10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	if err := d.DeleteAgent(agent.ID); !errors.Is(err, db.ErrParentInUse) {
+		t.Fatalf("DeleteAgent with a live domain = %v, want ErrParentInUse", err)
+	}
+
+	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AddPendingParentDeletion(db.PendingParentDeletion{EntityType: "agent", EntityID: agent.ID, Actor: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileDeletions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.finalizePendingParentDeletions()
+
+	if _, err := d.GetAgent(agent.ID); err == nil {
+		t.Fatal("agent should be removed once its domains are gone")
+	}
+	for _, id := range []string{"srv-1", "srv-empty"} {
+		if _, err := d.GetServer(id); err == nil {
+			t.Fatalf("server %s should be removed with its agent", id)
+		}
+	}
+	if pending, _ := d.ListPendingParentDeletions(); len(pending) != 0 {
+		t.Errorf("pending intent should be cleared, got %+v", pending)
+	}
 }

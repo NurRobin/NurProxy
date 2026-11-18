@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/apachegen"
 	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
@@ -70,6 +71,9 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		// Proxied is the Cloudflare orange-cloud setting (#126): omitted/null
 		// keeps whatever the live record has, true/false is enforced.
 		Proxied *bool `json:"proxied"`
+		// TLSWildcard sets proxy_config.tls_wildcard without sending the
+		// whole proxy_config.
+		TLSWildcard *bool `json:"tls_wildcard"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -143,7 +147,14 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
-	if err := s.db.CheckDomainLogging(dom); err != nil {
+	if err := s.db.CheckDomainBackendOptions(dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.TLSWildcard != nil {
+		dom.ProxyConfig.TLSWildcard = *req.TLSWildcard
+	}
+	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -154,11 +165,17 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "create", dom.Subdomain)
+	if dom.ProxyConfig.TLSWildcard {
+		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "tls_wildcard_set", dom.Subdomain+": on; "+tls.WildcardSharedKeyWarning)
+	}
 	if err := s.db.ClaimDomainRoute(dom); err != nil {
 		log.Printf("create: cannot drop colliding route tombstones for domain %d: %v", dom.ID, err)
 	}
 	s.triggerAgentPush(dom.ServerID)
 	s.triggerCertIssuance(dom)
+	if !dom.CertOnly {
+		s.triggerDNSReconcile(dom.ID)
+	}
 
 	writeJSON(w, http.StatusCreated, dom)
 }
@@ -169,6 +186,8 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 // that wants no central cert (self-acme / off) is skipped here, and the periodic
 // scan is the backstop if the async attempt fails. A no-op when no issuer is
 // wired (tests / headless without ACME) or the domain's zone can't be resolved.
+// A wildcard domain asks for its zone's shared "*.<zone>" cert, which the
+// issuer's per-host lock and on-file check issue only once per zone.
 func (s *Server) triggerCertIssuance(dom *models.Domain) {
 	if s.issuer == nil || dom == nil {
 		return
@@ -181,6 +200,9 @@ func (s *Server) triggerCertIssuance(dom *models.Domain) {
 		return
 	}
 	host := dom.FQDN(zone.Name)
+	if wildHost := caddygen.WildcardCertHost(*dom, zone.Name); wildHost != "" {
+		host = wildHost
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
@@ -197,10 +219,10 @@ type dnsReconciler interface {
 }
 
 // triggerDNSReconcile runs a DNS pass for the domain in the background after a
-// rename or zone move, so the new name gets its record (and the old one its
+// create, rename or zone move, so the name gets its record (and an old one its
 // cleanup) right away instead of up to a reconcile interval later, while the
-// agent has already dropped the old vhost. Best-effort: the pass is skipped
-// while a cycle runs, and the periodic cycle is the backstop.
+// agent already serves the vhost. Best-effort: the pass is skipped while a
+// cycle runs, and the periodic cycle is the backstop.
 func (s *Server) triggerDNSReconcile(domainID int64) {
 	rec, ok := s.takeover.(dnsReconciler)
 	if !ok {
@@ -260,6 +282,8 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		// proxy_config keys, applied after proxy_config.
 		AccessLog     *string `json:"access_log"`
 		ErrorLogLevel *string `json:"error_log_level"`
+		// TLSWildcard is the shortcut for proxy_config.tls_wildcard.
+		TLSWildcard *bool `json:"tls_wildcard"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -323,7 +347,16 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applyLoggingPatch(&dom.ProxyConfig, req.AccessLog, req.ErrorLogLevel)
-	if err := s.db.CheckDomainLogging(dom); err != nil {
+	if err := s.db.CheckDomainBackendOptions(dom); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.TLSWildcard != nil {
+		dom.ProxyConfig.TLSWildcard = *req.TLSWildcard
+	}
+	// Checked against the final subdomain, zone and TLS policy, so a rename to a
+	// deeper name or a switch away from central TLS cannot leave a stale opt-in.
+	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -361,6 +394,13 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "update", dom.Subdomain)
+	if before.ProxyConfig.TLSWildcard != dom.ProxyConfig.TLSWildcard {
+		detail := dom.Subdomain + ": off"
+		if dom.ProxyConfig.TLSWildcard {
+			detail = dom.Subdomain + ": on; " + tls.WildcardSharedKeyWarning
+		}
+		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "tls_wildcard_set", detail)
+	}
 	if models.ProxiedLabel(before.Proxied) != models.ProxiedLabel(dom.Proxied) {
 		s.audit(r, "domain", strconv.FormatInt(dom.ID, 10), "proxied_set",
 			fmt.Sprintf("%s: %s -> %s", dom.Subdomain, models.ProxiedLabel(before.Proxied), models.ProxiedLabel(dom.Proxied)))
@@ -387,8 +427,12 @@ func (s *Server) handleUpdateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.triggerAgentPush(dom.ServerID)
-	if rename != nil {
+	// Switching between the zone wildcard and a per-host cert changes which
+	// cert the host needs; issue it now rather than at the next scan.
+	if rename != nil || before.ProxyConfig.TLSWildcard != dom.ProxyConfig.TLSWildcard {
 		s.triggerCertIssuance(dom)
+	}
+	if rename != nil {
 		s.triggerDNSReconcile(dom.ID)
 	}
 
@@ -462,16 +506,14 @@ func artifactIDForDomainID(domainID int64) string {
 	return "dom-" + strconv.FormatInt(domainID, 10)
 }
 
-// DELETE /api/v1/domains/{id}
 // guardChildDomains refuses to delete a parent (server, agent, or zone) while
 // domains still reference it. It writes a 409 listing the blocking subdomains and
-// returns true when deletion must abort. Without this guard the DB's ON DELETE
-// CASCADE hard-removes those domain rows the instant the parent is deleted, which
-// runs BEFORE the reconciler's teardown (reconcileDeletions) and so never deletes
-// their managed DNS records or certificates — they leak at the provider with no
-// audit. Domains must be deleted first, individually, so each routes through the
-// reconciler teardown. The 409 body carries the domain list so a UI/CLI can offer
-// an explicit cascade (delete the domains first, then retry) rather than guessing.
+// returns true when deletion must abort. The foreign keys are ON DELETE RESTRICT,
+// so the delete would fail anyway; the guard turns that into a useful answer.
+// Domains must go through the reconciler teardown (reconcileDeletions) so their
+// managed DNS records and certificates are removed and audited. The 409 body
+// carries the domain list so a UI/CLI can offer an explicit cascade
+// (?cascade=true) rather than guessing.
 func (s *Server) guardChildDomains(w http.ResponseWriter, parent string, filter db.DomainFilter) bool {
 	doms, err := s.db.ListDomains(filter)
 	if err != nil {
@@ -492,6 +534,18 @@ func (s *Server) guardChildDomains(w http.ResponseWriter, parent string, filter 
 	return true
 }
 
+// writeParentDeleteError answers a failed parent delete: 409 when a domain was
+// added after the guard ran and the RESTRICT foreign key refused the delete,
+// otherwise 404.
+func writeParentDeleteError(w http.ResponseWriter, parent string, err error) {
+	if errors.Is(err, db.ErrParentInUse) {
+		writeError(w, http.StatusConflict, parent+" still has domains; delete them first")
+		return
+	}
+	writeError(w, http.StatusNotFound, parent+" not found")
+}
+
+// DELETE /api/v1/domains/{id}
 func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
 	if err != nil {
@@ -870,6 +924,13 @@ func (s *Server) handleResetDomainConfig(w http.ResponseWriter, r *http.Request)
 // not create; this is the explicit, audited escape hatch for migrating an existing
 // domain whose public DNS predates NurProxy. It also re-pushes the agent's routes so
 // the now-resolvable domain re-renders with its certificate.
+//
+// With ?dry_run=true nothing is changed: the response carries the plan, i.e. every
+// record at the name the takeover would delete (MX, TXT and the like included) and
+// the CNAME it would leave. The response of a real takeover carries the plan it
+// carried out. A body {"expect_delete": [ids]} (the ids from the preview) makes
+// the takeover refuse with 409 when the records at the name changed since. Takeover makes NurProxy the owner of the record (dns_managed=true):
+// deleting the domain later deletes the record.
 func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(pathParam(r, "id"), 10, 64)
 	if err != nil {
@@ -885,15 +946,95 @@ func (s *Server) handleDomainDNSTakeover(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "domain not found")
 		return
 	}
-	if err := s.takeover.TakeoverDomainDNS(r.Context(), id); err != nil {
-		writeError(w, http.StatusBadGateway, "DNS takeover failed: "+err.Error())
+	if dom.CertOnly {
+		writeError(w, http.StatusConflict, "domain is cert-only; NurProxy does not manage its public DNS")
+		return
+	}
+	if dom.Status == models.DomainStatusDeleting {
+		writeError(w, http.StatusConflict, "domain is being deleted")
+		return
+	}
+
+	dryRun := false
+	if v := r.URL.Query().Get("dry_run"); v != "" {
+		b, pErr := strconv.ParseBool(v)
+		if pErr != nil {
+			writeError(w, http.StatusBadRequest, "dry_run must be true or false")
+			return
+		}
+		dryRun = b
+	}
+	if dryRun {
+		plan, err := s.takeover.PreviewDomainDNSTakeover(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "DNS takeover preview failed: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"dry_run": true,
+			"message": takeoverPlanSummary(plan, true),
+			"plan":    plan,
+		})
+		return
+	}
+
+	var req struct {
+		// ExpectDelete: the record ids the caller saw in the preview. Absent
+		// (null) skips the check; [] expects no record to be deleted.
+		ExpectDelete []string `json:"expect_delete"`
+	}
+	if r.ContentLength != 0 {
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	plan, err := s.takeover.TakeoverDomainDNS(r.Context(), id, req.ExpectDelete)
+	if err != nil {
+		code := http.StatusBadGateway
+		if errors.Is(err, models.ErrDNSTakeoverPlanChanged) || errors.Is(err, models.ErrDNSTakeoverRefused) {
+			code = http.StatusConflict
+		}
+		writeError(w, code, "DNS takeover failed: "+err.Error())
 		return
 	}
 	s.audit(r, "domain", strconv.FormatInt(id, 10), "dns_takeover", dom.Subdomain)
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"message": "DNS takeover applied — the record now points at the agent and routes were re-pushed",
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": takeoverPlanSummary(plan, false) + "; routes were re-pushed",
+		"plan":    plan,
 	})
+}
+
+// takeoverPlanSummary is a one-line description of a takeover plan, as it
+// would happen (preview) or as it happened.
+func takeoverPlanSummary(plan *models.DNSTakeoverPlan, preview bool) string {
+	var b strings.Builder
+	switch plan.Action {
+	case models.DNSTakeoverAdopt:
+		if preview {
+			fmt.Fprintf(&b, "would take ownership of the existing CNAME %s -> %s; nothing is deleted", plan.FQDN, plan.Target)
+		} else {
+			fmt.Fprintf(&b, "took ownership of the existing CNAME %s -> %s", plan.FQDN, plan.Target)
+		}
+	case models.DNSTakeoverCreate:
+		if preview {
+			fmt.Fprintf(&b, "%s is free; would create CNAME -> %s; nothing is deleted", plan.FQDN, plan.Target)
+		} else {
+			fmt.Fprintf(&b, "created CNAME %s -> %s", plan.FQDN, plan.Target)
+		}
+	default:
+		recs := make([]string, len(plan.Delete))
+		for i, rec := range plan.Delete {
+			recs[i] = rec.Type + " " + rec.Content
+		}
+		verb := "deleted"
+		if preview {
+			verb = "would delete"
+		}
+		fmt.Fprintf(&b, "%s %d record(s) at %s (%s) and create CNAME -> %s", verb, len(plan.Delete), plan.FQDN, strings.Join(recs, ", "), plan.Target)
+	}
+	return b.String()
 }
 
 // cascadeRequested reports whether the request opts into cascade deletion

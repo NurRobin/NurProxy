@@ -14,8 +14,12 @@ This is read-only. Nothing is created automatically — you click **Add** on a s
 
 The scan resolves both direct `proxy_pass http://host:port` targets and named `upstream { ... }` blocks. Targets that use variables (`proxy_pass $backend`) are skipped, because there is no fixed address to suggest.
 
+## Importing from Proxmox VE
+
+If your backends run as Proxmox VMs or containers, add the cluster under **Settings → Server discovery** and use **Discover from Proxmox VE** on an agent to import them in bulk, with their detected LAN addresses. See [Server discovery](server-discovery).
+
 ## Servers and domains
 
 A domain is the public side (the subdomain and its DNS record); a server is the private side (where the traffic goes). One server can back many domains. Deleting an agent removes its servers; a server in use by a domain is shown with its usage count so you do not pull it out from under a live route by accident.
 
-See also: [Domains](domains), [Managing existing proxies](existing-proxies).
+See also: [Domains](domains), [Server discovery](server-discovery), [Managing existing proxies](existing-proxies).

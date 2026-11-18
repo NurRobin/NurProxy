@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,9 +33,13 @@ type fakeManagedApplyHandler struct {
 	rollbackCount int
 	revalidate    string
 	executeErr    error
+	planErr       error
 }
 
 func (h *fakeManagedApplyHandler) Plan(context.Context, helperprotocol.ApplyIntent) (ManagedApplyMaterial, error) {
+	if h.planErr != nil {
+		return ManagedApplyMaterial{}, h.planErr
+	}
 	return h.material, nil
 }
 
@@ -370,6 +375,39 @@ func TestEngineManagedApplyRequiresSignedIntentAndGrantAndExecutesOnce(t *testin
 	retry, err := fixture.engine.ExecuteManagedApply(context.Background(), request)
 	if err != nil || retry.Signature != receipt.Signature || fixture.managed.executeCount != 1 || fixture.managed.prepareCount != 1 {
 		t.Fatalf("managed retry repeated mutation: receipt=%+v err=%v execute=%d prepare=%d", retry, err, fixture.managed.executeCount, fixture.managed.prepareCount)
+	}
+}
+
+// TestEngineManagedApplyPlanReturnsRefusalReason checks that a policy refusal
+// reaches the agent with its operator-facing reason, while any other planning
+// error stays behind the fixed message.
+func TestEngineManagedApplyPlanReturnsRefusalReason(t *testing.T) {
+	const fixed = helperprotocol.ManagedPlanRefusedMessage
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "policy refusal",
+			err:  fmt.Errorf("compile: %w", refuseLocally("raw nginx config for %s refused by the helper policy: %s\n", "app.example.com", `line 5: nginx directive "include" is not allowed in the server block`)),
+			want: fixed + `: raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "include" is not allowed in the server block`,
+		},
+		{name: "other error", err: errors.New("open /etc/nginx/private: permission denied"), want: fixed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newEngineFixture(t)
+			fixture.managed.planErr = tt.err
+			_, err := fixture.engine.PlanManagedApply(context.Background(), helperprotocol.PlanManagedApplyRequest{RequestID: "managed-plan-1", Intent: fixture.managedIntent(t)})
+			var protocolErr *ProtocolError
+			if !errors.As(err, &protocolErr) || protocolErr.Code != helperprotocol.ErrorAmbiguousLocalTarget {
+				t.Fatalf("plan error = %v, want an AMBIGUOUS_LOCAL_TARGET protocol error", err)
+			}
+			if protocolErr.Message != tt.want {
+				t.Fatalf("message = %q, want %q", protocolErr.Message, tt.want)
+			}
+		})
 	}
 }
 
