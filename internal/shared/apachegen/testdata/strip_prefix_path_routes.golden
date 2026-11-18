@@ -4,6 +4,7 @@
 
     RequestHeader set X-Forwarded-Proto http
     ProxyPreserveHost On
+    SSLProxyEngine on
 
     RewriteEngine On
     RewriteCond %{HTTP:Upgrade} =websocket [NC]
