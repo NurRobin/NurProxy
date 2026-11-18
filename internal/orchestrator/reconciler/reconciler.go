@@ -386,11 +386,11 @@ func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertB
 			continue
 		}
 		fqdn := dom.FQDN(zone.Name)
-		cert, cErr := r.db.GetCertificate(fqdn)
-		if cErr != nil {
+		cert := r.certForDomain(dom, fqdn, zone.Name)
+		if cert == nil {
 			continue // not issued yet; installs on a later push
 		}
-		bundles = append(bundles, proxymodel.CertBundle{Host: cert.Host, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM, MaterializeKey: true})
+		bundles = append(bundles, proxymodel.CertBundle{Host: fqdn, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM, MaterializeKey: true})
 		if dom.Status != models.DomainStatusActive {
 			if uErr := r.db.UpdateDomainStatus(dom.ID, models.DomainStatusActive, ""); uErr != nil {
 				log.Printf("reconciler: failed to mark cert-only domain %d active: %v", dom.ID, uErr)
@@ -409,6 +409,21 @@ func (r *Reconciler) gatherCertOnlyCerts(agent *models.Agent) []proxymodel.CertB
 // tls.Reloader. Best-effort by contract: if the agent is offline PushAgentRoutes
 // is a no-op and the agent re-syncs (with the fresh cert) on reconnect.
 func (r *Reconciler) RepushCertForHost(_ context.Context, host string) error {
+	if strings.HasPrefix(host, "*.") {
+		// A zone wildcard cert is installed on every agent serving one of its
+		// domains, each copy keyed by that domain's FQDN.
+		agentIDs, err := r.agentsUsingWildcard(host)
+		if err != nil {
+			return fmt.Errorf("resolving agents for wildcard %q: %w", host, err)
+		}
+		var firstErr error
+		for _, id := range agentIDs {
+			if pErr := r.PushAgentRoutes(id); pErr != nil && firstErr == nil {
+				firstErr = pErr
+			}
+		}
+		return firstErr
+	}
 	agentID, err := r.agentServingHost(host)
 	if err != nil {
 		return err
@@ -460,14 +475,17 @@ func (r *Reconciler) gatherCerts(desired map[string]desiredRoute) []proxymodel.C
 	}
 	bundles := make([]proxymodel.CertBundle, 0, len(desired))
 	for fqdn, d := range desired {
-		cert, err := r.db.GetCertificate(fqdn)
-		if err != nil {
+		cert := r.certForDomain(d.domain, fqdn, d.zoneName)
+		if cert == nil {
 			// No cert for this host yet (or lookup failed): skip — the host either
 			// has no central cert or falls back to self-ACME. Never fail the push.
 			continue
 		}
 		bundles = append(bundles, proxymodel.CertBundle{
-			Host:    cert.Host,
+			// Keyed by the route's FQDN, not cert.Host: a shared zone wildcard
+			// cert is installed once per domain under that domain's name, so the
+			// agent's per-host install and prune paths see an ordinary host cert.
+			Host:    fqdn,
 			CertPEM: cert.CertPEM,
 			KeyPEM:  cert.KeyPEM,
 			// A raw vhost is rendered centrally and references the conventional
@@ -606,6 +624,10 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 	// finished the reconciler teardown above — never before, so DNS records and
 	// certs are always cleaned up through the audited path.
 	r.finalizePendingParentDeletions()
+
+	// Drop zone wildcard certs whose last consumer just went away (deleted,
+	// opted out, or moved zones) before the pushes below gather certs.
+	r.pruneUnusedWildcardCerts()
 
 	// Reconcile routes for each adopted agent.
 	agents, err := r.db.ListAgents()
@@ -840,6 +862,7 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 		desiredByFQDN[fqdn] = desiredRoute{
 			domain:     dom,
 			fqdn:       fqdn,
+			zoneName:   zoneName,
 			route:      route,
 			intent:     intent,
 			artifactID: artifactID,
@@ -918,7 +941,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 				continue
 			}
 			r.audit("domain", fmt.Sprintf("%d", desired.domain.ID), "route_pushed", "pushed missing route to agent")
-			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+			if dErr := r.markDomainApplied(desired, fqdn); dErr != nil {
 				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
@@ -928,7 +951,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		if routesMatch(desired.route, actual) {
 			// All good — keep last_synced fresh so the dashboard reflects the
 			// most recent successful reconciliation.
-			if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+			if dErr := r.markDomainApplied(desired, fqdn); dErr != nil {
 				log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 			}
 			continue
@@ -956,7 +979,7 @@ func (r *Reconciler) reconcileRoutes(ctx context.Context, agent *models.Agent) e
 		// Route the drift-fix through the same applied path as the push/match cases so
 		// it honors the §78 degraded check (a central-TLS domain with no issued cert
 		// is marked "degraded", not a bare "active" that hides the plaintext downgrade).
-		if dErr := r.db.MarkDomainApplied(desired.domain.ID, fqdn, caddygen.TLSPolicyForDomain(*desired.domain) == proxymodel.TLSPolicyCentral); dErr != nil {
+		if dErr := r.markDomainApplied(desired, fqdn); dErr != nil {
 			log.Printf("reconciler: failed to mark domain applied: %v", dErr)
 		}
 	}
@@ -1852,8 +1875,9 @@ func (r *Reconciler) resolveDNS(zoneID string) (*models.Zone, *models.Provider, 
 // ---------------------------------------------------------------------------
 
 type desiredRoute struct {
-	domain *models.Domain
-	fqdn   string
+	domain   *models.Domain
+	fqdn     string
+	zoneName string
 	// route is the rendered Caddy route JSON, kept for the inbound-HTTP fallback
 	// path (the agent's local REST API still speaks Caddy JSON for same-host /
 	// port-forwarded setups).

@@ -19,6 +19,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
@@ -488,6 +489,11 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	}
 	applyLoggingArgs(&dom.ProxyConfig, in.AccessLog, in.ErrorLogLevel)
 	if err := d.CheckDomainLogging(dom); err != nil {
+		return nil, err
+	}
+	// A rename or ssl_mode change must not leave a zone wildcard opt-in the
+	// shared cert can no longer cover.
+	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
 		return nil, err
 	}
 	dom.Status = models.DomainStatusPending // re-queue for reconciliation

@@ -384,6 +384,11 @@ type ProxyConfig struct {
 	// or for orchestrator-down resilience; "off" disables TLS. Empty is treated as
 	// "central" by the renderer.
 	TLSPolicy string `json:"tls_policy,omitempty"`
+	// TLSWildcard serves the domain from the one "*.<zone>" certificate shared
+	// by every opted-in domain of its zone instead of a per-host certificate.
+	// Only valid with central TLS and for a single label directly below the
+	// zone apex; an imported certificate for the host still takes precedence.
+	TLSWildcard bool `json:"tls_wildcard,omitempty"`
 	// AccessLog is "off" to write no access log for this domain. Empty (or
 	// "default", normalized to empty on save) keeps the proxy's host-wide log.
 	AccessLog string `json:"access_log,omitempty"`

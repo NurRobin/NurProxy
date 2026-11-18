@@ -387,6 +387,10 @@ func addLoggingFlags(fs *flag.FlagSet, accessLog, errorLogLevel *string) {
 	fs.StringVar(errorLogLevel, "error-log-level", "", `Minimum error log level for this domain (info, notice, warn, error, crit, alert, emerg) or "default"`)
 }
 
+// tlsWildcardFlagHelp documents --tls-wildcard on `domain add` / `domain update`.
+const tlsWildcardFlagHelp = "Serve this domain from its zone's shared *.<zone> certificate (central TLS, single label below the zone only). " +
+	"The same private key is then installed on every agent serving a wildcard domain of the zone"
+
 func cmdDomain(args []string) {
 	action, rest := shift(args)
 	switch action {
@@ -425,9 +429,10 @@ func cmdDomain(args []string) {
 	case "add":
 		var subdomain, zone, server, sslMode, proxyFile, proxied, accessLog, errorLogLevel string
 		var port int
-		var ws, forceHTTPS bool
-		c, _, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
+		var ws, forceHTTPS, tlsWildcard bool
+		c, fs, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
 			addLoggingFlags(fs, &accessLog, &errorLogLevel)
+			fs.BoolVar(&tlsWildcard, "tls-wildcard", false, tlsWildcardFlagHelp)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -451,6 +456,11 @@ func cmdDomain(args []string) {
 		}
 		putStr(body, "access_log", accessLog)
 		putStr(body, "error_log_level", errorLogLevel)
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "tls-wildcard" {
+				body["tls_wildcard"] = tlsWildcard
+			}
+		})
 		if proxyFile != "" {
 			body["proxy_config"] = json.RawMessage(readFileArg(proxyFile))
 		}
@@ -463,9 +473,10 @@ func cmdDomain(args []string) {
 	case "update":
 		var subdomain, zone, server, sslMode, proxied, accessLog, errorLogLevel string
 		var port int
-		var ws, forceHTTPS bool
+		var ws, forceHTTPS, tlsWildcard bool
 		c, fs, id := parseClient("domain update", rest, "domain id", func(fs *flag.FlagSet) {
 			addLoggingFlags(fs, &accessLog, &errorLogLevel)
+			fs.BoolVar(&tlsWildcard, "tls-wildcard", false, tlsWildcardFlagHelp)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -497,6 +508,8 @@ func cmdDomain(args []string) {
 				body["access_log"] = accessLog
 			case "error-log-level":
 				body["error_log_level"] = errorLogLevel
+			case "tls-wildcard":
+				body["tls_wildcard"] = tlsWildcard
 			}
 		})
 		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id, body)

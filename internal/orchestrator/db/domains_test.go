@@ -53,6 +53,27 @@ func TestMarkDomainApplied(t *testing.T) {
 		}
 	})
 
+	t.Run("zone wildcard cert as fallback => active", func(t *testing.T) {
+		d, id := markDomainAppliedFixture(t)
+		if err := d.UpsertCertificate(&models.Certificate{
+			ID: "*.example.com", Host: "*.example.com", IsWildcard: true, CertPEM: "CERT", KeyPEM: "KEY",
+		}); err != nil {
+			t.Fatalf("UpsertCertificate: %v", err)
+		}
+		if err := d.MarkDomainApplied(id, fqdn, true); err != nil {
+			t.Fatalf("MarkDomainApplied: %v", err)
+		}
+		if got := domainStatus(t, d, id); got != models.DomainStatusDegraded {
+			t.Fatalf("without fallback: status %q, want degraded", got)
+		}
+		if err := d.MarkDomainApplied(id, fqdn, true, "*.example.com"); err != nil {
+			t.Fatalf("MarkDomainApplied: %v", err)
+		}
+		if got := domainStatus(t, d, id); got != models.DomainStatusActive {
+			t.Errorf("with fallback: status %q, want active", got)
+		}
+	})
+
 	t.Run("missing cert => degraded plaintext", func(t *testing.T) {
 		d, id := markDomainAppliedFixture(t)
 
