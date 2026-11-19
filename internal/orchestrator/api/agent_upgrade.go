@@ -133,7 +133,10 @@ func (c *upgradeCoordinator) eligibility(agent *models.Agent, target string, su 
 	if c.s.hub == nil || !c.s.hub.Connected(agent.ID) {
 		return refuse(http.StatusConflict, "agent is not connected")
 	}
-	if su.Capability != nil && !su.Capability.Supported {
+	if su.Capability == nil {
+		return refuse(http.StatusConflict, "agent has not reported self-update support; agents older than 0.6.0 cannot self-update, so install the new version on this host by hand once")
+	}
+	if !su.Capability.Supported {
 		return refuse(http.StatusConflict, "agent cannot self-update: %s", su.Capability.Reason)
 	}
 	if cmp, ok := models.CompareReleaseVersions(agent.Version, target); ok && cmp >= 0 {

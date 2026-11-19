@@ -305,14 +305,14 @@ func TestDiscoverySourceProxmoxValidationAndMasking(t *testing.T) {
 	// skip_test stores without contacting the cluster (no network in tests).
 	w = doRequest(t, handler, "POST", "/api/v1/discovery/sources", map[string]any{
 		"type": "proxmox", "name": "PVE", "skip_test": true, "sync_interval": 3600,
-		"config": map[string]any{"url": "pve.lan", "token_id": "nurproxy@pve!disc", "token_secret": "very-secret-uuid"},
+		"config": map[string]any{"url": "pve.lan", "token_id": "nurproxy@pve!disc", "token_secret": "very-secret-uuid", "verify_tls": false},
 	}, cookie)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
 	if strings.Contains(body, "very-secret-uuid") || !strings.Contains(body, "https://pve.lan:8006 as nurproxy@pve!disc") ||
-		!strings.Contains(body, `"settings":{"token_id":"nurproxy@pve!disc","url":"pve.lan"}`) {
+		!strings.Contains(body, `"settings":{"token_id":"nurproxy@pve!disc","url":"pve.lan","verify_tls":false}`) {
 		t.Fatalf("create response = %s", body)
 	}
 	var created struct {
@@ -383,7 +383,7 @@ func TestDiscoveryDryRunFixture(t *testing.T) {
 
 	w := doRequest(t, handler, "POST", "/api/v1/discovery/sources", map[string]any{
 		"type": "proxmox", "name": "PVE dry",
-		"config": map[string]any{"url": "pve.sandbox.test", "token_id": "root@pam!dry", "token_secret": "dummy"},
+		"config": map[string]any{"url": "pve.sandbox.test", "token_id": "root@pam!dry", "token_secret": "dummy", "verify_tls": true},
 	}, cookie)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("create in dry-run (connection test simulated): %d %s", w.Code, w.Body.String())

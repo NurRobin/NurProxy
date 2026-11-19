@@ -145,6 +145,11 @@ func (d *DB) PathRouteAddrs(dom models.Domain) (map[string]string, error) {
 	return addrs, nil
 }
 
+// ErrRoutesWithBackups refuses path routes and failover backup servers on
+// one domain. Route servers must sit on the agent that serves the domain, so
+// a standby copy on a backup agent would dial the primary site's addresses.
+var ErrRoutesWithBackups = errors.New("path routes cannot be combined with failover backup servers: route servers belong to the primary agent, which a backup agent cannot reach. Remove the backup servers or the path routes")
+
 // CheckDomainRoutes validates a domain's path routes as the REST API and the
 // MCP tools accept them: shape, route servers on the domain's agent, and a
 // backend on that agent that can render them.
@@ -154,6 +159,15 @@ func (d *DB) CheckDomainRoutes(dom *models.Domain) error {
 	}
 	if dom.CertOnly {
 		return fmt.Errorf("a cert-only domain serves no vhost and cannot have path routes")
+	}
+	if dom.ID != 0 {
+		backups, err := d.ListDomainBackups(dom.ID)
+		if err != nil {
+			return err
+		}
+		if len(backups) > 0 {
+			return ErrRoutesWithBackups
+		}
 	}
 	intents := make([]proxymodel.PathRoute, 0, len(dom.ProxyConfig.Routes))
 	for _, p := range dom.ProxyConfig.Routes {
