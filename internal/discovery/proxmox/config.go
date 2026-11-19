@@ -42,13 +42,22 @@ func parseConfig(raw json.RawMessage) (*Config, error) {
 	if len(raw) == 0 {
 		return nil, errors.New("config is empty")
 	}
-	if err := checkKeys(raw); err != nil {
+	keys, err := checkKeys(raw)
+	if err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
-	return &c, c.validate()
+	// An omitted verify_tls would mean "skip certificate checks" and send the
+	// token to whoever answers. Turning verification off must be explicit.
+	if err := c.validate(); err != nil {
+		return &c, err
+	}
+	if _, ok := keys["verify_tls"]; !ok && c.Fingerprint == "" {
+		return &c, errors.New("verify_tls is required unless a fingerprint is pinned (true, or false to skip certificate checks)")
+	}
+	return &c, nil
 }
 
 // configKeys are the exact JSON keys of Config.
@@ -58,17 +67,17 @@ var configKeys = []string{"url", "token_id", "token_secret", "verify_tls", "ca_p
 // case-insensitively, so without this a key such as "Fingerprint" would set a
 // field while the secret-binding check in discovery.MergeConfig, which
 // compares exact keys, sees no change.
-func checkKeys(raw json.RawMessage) error {
+func checkKeys(raw json.RawMessage) (map[string]json.RawMessage, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return fmt.Errorf("invalid config: %w", err)
+		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	for k := range m {
 		if !slices.Contains(configKeys, k) {
-			return fmt.Errorf("invalid config: unknown key %q", k)
+			return nil, fmt.Errorf("invalid config: unknown key %q", k)
 		}
 	}
-	return nil
+	return m, nil
 }
 
 func (c *Config) validate() error {
