@@ -3,6 +3,7 @@ package dryrun
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/NurRobin/NurProxy/internal/provider"
@@ -227,8 +228,14 @@ func TestPatchRecordKeepsOtherFields(t *testing.T) {
 func TestUpdateUnknownFails(t *testing.T) {
 	d := newWrapped()
 	err := d.UpdateRecord(context.Background(), json.RawMessage(`{}`), "missing", provider.Record{Type: "A", Name: "x", Content: "1.2.3.4"})
-	if err == nil {
-		t.Fatal("UpdateRecord on unknown ID should fail")
+	if !errors.Is(err, provider.ErrRecordNotFound) {
+		t.Fatalf("UpdateRecord on unknown ID: err = %v, want provider.ErrRecordNotFound", err)
+	}
+	// The reconciler re-resolves a record by name only on ErrRecordNotFound;
+	// any other error counts as transient. A restarted dry orchestrator has an
+	// empty store, so this is what lets its domains converge again.
+	if _, err := d.GetRecord(context.Background(), json.RawMessage(`{}`), "missing"); !errors.Is(err, provider.ErrRecordNotFound) {
+		t.Fatalf("GetRecord on unknown ID: err = %v, want provider.ErrRecordNotFound", err)
 	}
 }
 
