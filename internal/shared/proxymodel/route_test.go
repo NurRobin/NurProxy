@@ -1,6 +1,10 @@
 package proxymodel
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func validStructured() Route {
 	return Route{
@@ -130,6 +134,31 @@ func TestRoute_Validate(t *testing.T) {
 			mutate:  func(r *Route) { r.BasicAuth = &BasicAuth{Username: "u"} },
 			wantErr: true,
 		},
+		{
+			name:    "access log off",
+			mutate:  func(r *Route) { r.AccessLog = AccessLogOff },
+			wantErr: false,
+		},
+		{
+			name:    "unknown access log mode",
+			mutate:  func(r *Route) { r.AccessLog = "syslog" },
+			wantErr: true,
+		},
+		{
+			name:    "error log level crit",
+			mutate:  func(r *Route) { r.ErrorLogLevel = "crit" },
+			wantErr: false,
+		},
+		{
+			name:    "error log level debug refused",
+			mutate:  func(r *Route) { r.ErrorLogLevel = "debug" },
+			wantErr: true,
+		},
+		{
+			name:    "error log level with injected directive",
+			mutate:  func(r *Route) { r.ErrorLogLevel = "crit; include /etc/passwd" },
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -164,5 +193,49 @@ func TestRoute_Validate_raw(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestRoute_JSONOmitsDefaultLogging pins that a route without logging settings
+// serializes exactly as before the fields existed, so the helper's intent
+// digest of existing routes does not change.
+func TestRoute_JSONOmitsDefaultLogging(t *testing.T) {
+	data, err := json.Marshal(validStructured())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "AccessLog") || strings.Contains(string(data), "ErrorLogLevel") {
+		t.Fatalf("default logging leaked into route JSON: %s", data)
+	}
+	r := validStructured()
+	r.AccessLog = AccessLogOff
+	r.ErrorLogLevel = "crit"
+	data, err = json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Route
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.AccessLog != AccessLogOff || back.ErrorLogLevel != "crit" {
+		t.Fatalf("logging did not round-trip: %+v", back)
+	}
+}
+
+// The API validates stored settings through ValidateOptions, so the logging
+// values must be checked there and not only in Validate.
+func TestRoute_ValidateOptions_logging(t *testing.T) {
+	for _, tt := range []struct {
+		access  AccessLogMode
+		level   string
+		wantErr bool
+	}{
+		{"", "", false}, {AccessLogOff, "crit", false}, {"on", "", true}, {"", "debug", true}, {"", "crit;", true},
+	} {
+		r := Route{AccessLog: tt.access, ErrorLogLevel: tt.level}
+		if err := r.ValidateOptions(); (err != nil) != tt.wantErr {
+			t.Errorf("ValidateOptions(access=%q, level=%q) error = %v, wantErr %v", tt.access, tt.level, err, tt.wantErr)
+		}
 	}
 }

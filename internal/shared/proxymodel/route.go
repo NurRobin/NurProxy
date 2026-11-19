@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -127,6 +128,35 @@ func (r RawConfig) IsZero() bool {
 	return r.Backend == "" && r.Content == ""
 }
 
+// AccessLogMode selects how a route's access log is written.
+type AccessLogMode string
+
+const (
+	// AccessLogDefault inherits the proxy's host-wide access log.
+	AccessLogDefault AccessLogMode = ""
+	// AccessLogOff writes no access log for the route.
+	AccessLogOff AccessLogMode = "off"
+)
+
+// ErrorLogLevels are the accepted per-route error log levels, from most to
+// least verbose. nginx and Apache both understand every one of them; "debug" is
+// left out because nginx only honors it in debug builds.
+var ErrorLogLevels = []string{"info", "notice", "warn", "error", "crit", "alert", "emerg"}
+
+// ValidErrorLogLevel reports whether level is empty (host default) or one of
+// ErrorLogLevels.
+func ValidErrorLogLevel(level string) bool {
+	if level == "" {
+		return true
+	}
+	for _, l := range ErrorLogLevels {
+		if l == level {
+			return true
+		}
+	}
+	return false
+}
+
 // Route is the backend-neutral intent for proxying one host to one upstream.
 //
 // It is consumed by every backend renderer and is deliberately free of any
@@ -175,6 +205,23 @@ type Route struct {
 
 	// TLS selects the public-listener TLS policy for the route.
 	TLS TLSConfig
+
+	// AccessLog controls the per-host access log. The zero value keeps the
+	// proxy's host-wide default, so routes without the setting render exactly as
+	// before. The JSON tag drops the zero value, keeping the helper intent digest
+	// of existing routes unchanged.
+	AccessLog AccessLogMode `json:",omitempty"`
+	// ErrorLogLevel sets the minimum severity of the per-host error log (one of
+	// ErrorLogLevels). Empty keeps the proxy's host-wide default.
+	ErrorLogLevel string `json:",omitempty"`
+
+	// PathRoutes send requests whose path matches to other upstreams; every
+	// other request goes to Upstream. Server-wide options (TLS, force-https,
+	// IP lists, basic auth, rate limit, body size, response headers, logging)
+	// apply to them as well, and so do RequestHeaders and Timeouts. Path rules
+	// only apply to the default upstream. Empty keeps the single-upstream
+	// render and the helper intent digest of existing routes unchanged.
+	PathRoutes []PathRoute `json:",omitempty"`
 
 	// Raw is the per-backend escape hatch. When non-zero, renderers for the
 	// matching backend use Raw.Content verbatim and ignore the structured
@@ -245,6 +292,9 @@ func (r Route) Validate() error {
 	if !validUpstreamAddr(r.Upstream.Addr) {
 		return fmt.Errorf("upstream address %q is not a host name or IP address", r.Upstream.Addr)
 	}
+	if err := ValidatePathRoutes(r.PathRoutes, true); err != nil {
+		return err
+	}
 	return r.ValidateOptions()
 }
 
@@ -265,10 +315,14 @@ const MaxHeaderValueBytes = 3900
 const maxPathBytes = 1024
 
 // ValidateOptions checks the option values that renderers interpolate into
-// native proxy configs: header names and values, body size, path rules, IP
-// lists and basic-auth credentials. It does not require a host or upstream,
-// so the orchestrator can check a domain's proxy settings on their own.
+// native proxy configs: header names and values, body size, path rules, path
+// routes (without their upstream addresses), IP lists and basic-auth
+// credentials. It does not require a host or upstream, so the orchestrator
+// can check a domain's proxy settings on their own.
 func (r Route) ValidateOptions() error {
+	if err := ValidatePathRoutes(r.PathRoutes, false); err != nil {
+		return err
+	}
 	for kind, headers := range map[string]map[string]string{"request": r.RequestHeaders, "response": r.ResponseHeaders} {
 		for name, value := range headers {
 			if !headerNameRe.MatchString(name) {
@@ -287,6 +341,14 @@ func (r Route) ValidateOptions() error {
 				return fmt.Errorf("%s header %s %w", kind, name, err)
 			}
 		}
+	}
+	switch r.AccessLog {
+	case AccessLogDefault, AccessLogOff:
+	default:
+		return fmt.Errorf("access log mode %q must be empty (host default) or %q", r.AccessLog, AccessLogOff)
+	}
+	if !ValidErrorLogLevel(r.ErrorLogLevel) {
+		return fmt.Errorf("error log level %q must be empty (host default) or one of %s", r.ErrorLogLevel, strings.Join(ErrorLogLevels, ", "))
 	}
 	if r.MaxBodySize != "" && !bodySizeRe.MatchString(r.MaxBodySize) {
 		return fmt.Errorf("max body size %q is not a whole size like 10m, 1GB, 0 or unlimited", r.MaxBodySize)
@@ -315,6 +377,38 @@ func (r Route) ValidateOptions() error {
 		}
 	}
 	return nil
+}
+
+// ConfigVarRef starts a config-time variable in Apache: httpd replaces
+// "${NAME}" in every config line, quoted or not, with an environment variable
+// or Define value before mod_headers sees a header value.
+const ConfigVarRef = "${"
+
+// CheckHeaderConfigVars refuses request and response header values that
+// contain ConfigVarRef. Renderers for backends that substitute such
+// references at config load (Apache) call it; nginx reads "${var}" as a
+// request variable and keeps accepting it.
+func CheckHeaderConfigVars(requestHeaders, responseHeaders map[string]string) error {
+	for _, h := range []struct {
+		kind    string
+		headers map[string]string
+	}{{"request", requestHeaders}, {"response", responseHeaders}} {
+		for _, name := range sortedHeaderNames(h.headers) {
+			if strings.Contains(h.headers[name], ConfigVarRef) {
+				return fmt.Errorf("%s header %s contains %q, which Apache replaces with an environment variable or Define value when it loads the config", h.kind, name, ConfigVarRef)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedHeaderNames(headers map[string]string) []string {
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // validHost accepts a DNS name with an optional leading "*." wildcard label.

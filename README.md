@@ -106,6 +106,8 @@ There is no extra proxy layer, no port conflict, and no TLS delegation chain. Th
 
 - **Central TLS issuance**: The orchestrator issues Let's Encrypt certificates via DNS-01, using the DNS provider credentials it already has. Certificates are stored encrypted at rest and pushed to agents, so you don't need port-80 challenge traffic.
 - **Automatic renewal**: A background loop renews certificates before expiry and re-pushes them to the serving agent.
+- **Certificate import**: Moving a host that already has a valid certificate? Upload it with `nurproxy domain set-cert <id> --cert fullchain.pem --key privkey.pem` (or `PUT /api/v1/domains/{id}/certificate`) instead of ordering a new one. NurProxy checks that the key matches, the certificate covers the host (wildcards included), the chain is in order and the certificate is currently valid, then stores it encrypted and pushes it to the agent. It is not renewed until it is 30 days from expiry; from then on central ACME renewal issues a regular certificate for that host and replaces it. Only domains on central TLS accept an import.
+- **Adopting certificates already on the host**: The agent also looks for certificates it can reuse: certbot's `/etc/letsencrypt/live`, acme.sh homes, and the files the host's nginx or Apache vhosts point at. It reports only metadata (names, expiry, issuer, fingerprint, path). `nurproxy domain cert-candidates <id>` lists the ones that cover a domain, and `nurproxy domain adopt-cert <id>` (or the Adopt button in the domain's settings) has the agent upload that bundle, which is then checked and stored like an import. While a new domain's agent reports a usable certificate, NurProxy waits up to an hour before ordering one from the CA, so there is time to adopt it; `nurproxy domain issue-cert <id>` (or "Issue a new certificate instead") skips the wait. Certificates from another agent, such as the host you are moving away from, are only taken when you name that agent with `--from-agent` and `--fingerprint`. An agent that runs without root usually cannot read certbot's directories; it says so, and you can grant read access or fall back to `set-cert`.
 - **Backend-aware**: Built-in Caddy agents can also use self-managed ACME as fallback. Existing nginx/Apache agents receive centrally issued certificates with paths that match their config conventions.
 - **ACME email setup**: Configurable in the setup wizard or settings. Issuance stays inactive until an email is set, and the dashboard warns when central-TLS domains exist without one.
 
@@ -305,7 +307,18 @@ nurproxy-agent -dry-run -orchestrator http://localhost:8080 -fqdn edge1.example.
 
 `make dev-sandbox` builds and launches a dry-run orchestrator plus one or more dry-run agents and seeds a working topology (provider with a dummy token, zone, adopted agents, servers, and central-TLS domains) — a fully populated, "live"-looking environment with zero external calls and zero privileges. Knobs: `AGENTS=3`, `PORT=9000`, `KEEP=0` (tear down after seeding). The launcher lives at [`scripts/dev-sandbox.sh`](scripts/dev-sandbox.sh).
 
-`make test-sandbox` runs the same flow as a self-contained end-to-end test (`test/sandbox`, behind the `sandbox` build tag): it boots both binaries in dry-run, drives the REST API to stand up a central-TLS domain, and asserts the control plane converges (domain active, certificate issued, DNS records simulated, audit tagged `dryrun`) — no secrets, no external dependencies. It also runs in CI.
+`make test-sandbox` runs the same flow as a self-contained end-to-end test (`test/sandbox`, behind the `sandbox` build tag): it boots both binaries in dry-run, drives the REST API to stand up a central-TLS domain, and asserts the control plane converges (domain active, certificate issued, DNS records simulated, audit tagged `dryrun`) — no secrets, no external dependencies. It also runs in CI. When a real `caddy` is on PATH (or `NP_SANDBOX_CADDY` points to one), the test also runs the rendered Caddy config through `caddy validate`; with `nginx` on PATH (or `NP_SANDBOX_DOCKER=1`) the rendered nginx vhosts get a real `nginx -t`.
+
+### Live profile: real traffic
+
+`PROFILE=live make dev-sandbox` keeps DNS and ACME simulated but lets the agents run a real Caddy on unprivileged loopback ports (`127.0.0.1:18080` / `:18443` by default) in front of a small fake upstream, so you can watch a real request and a real TLS handshake go through the config NurProxy rendered. It needs a `caddy` binary (PATH or `CADDY_BIN`) and no root:
+
+```bash
+PROFILE=live make dev-sandbox
+curl -k --resolve app1.sandbox.test:18443:127.0.0.1 https://app1.sandbox.test:18443/
+```
+
+`make test-sandbox-live` is the scripted version (it skips when caddy is missing). The ports come from three agent options that default to the usual 80/443 on all interfaces: `-caddy-http-port`, `-caddy-https-port`, `-caddy-listen-host`.
 
 ## Tech stack
 

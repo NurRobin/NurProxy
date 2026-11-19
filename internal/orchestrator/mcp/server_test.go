@@ -141,7 +141,7 @@ func TestToolsList(t *testing.T) {
 	want := map[string]bool{
 		"create_domain": true, "delete_domain": true, "update_domain": true,
 		"list_domains": true, "list_agents": true, "list_servers": true,
-		"get_agent_status": true,
+		"get_agent_status": true, "get_domain_failover": true, "set_domain_backups": true,
 	}
 	if len(list) != len(want) {
 		t.Errorf("expected %d tools, got %d", len(want), len(list))
@@ -242,6 +242,50 @@ func TestCreateListUpdateDeleteDomain(t *testing.T) {
 	callTool(t, h, "update_domain", map[string]any{"id": created.ID, "port": 9090}, &updated)
 	if updated.Port != 9090 {
 		t.Errorf("update_domain port = %d, want 9090", updated.Port)
+	}
+
+	// update_domain: per-domain logging, checked against the agent's reported
+	// capability matrix.
+	callTool(t, h, "update_domain", map[string]any{"id": created.ID, "access_log": "off", "error_log_level": "crit"}, &updated)
+	if updated.ProxyConfig.AccessLog != "off" || updated.ProxyConfig.ErrorLogLevel != "crit" {
+		t.Errorf("update_domain logging = %+v, want off/crit", updated.ProxyConfig)
+	}
+	if isErr := callTool(t, h, "update_domain", map[string]any{"id": created.ID, "error_log_level": "verbose"}, nil); !isErr {
+		t.Error("unknown error_log_level should report isError")
+	}
+	// update_domain: path routes replace the stored list; a server on another
+	// agent is refused.
+	if err := d.CreateServer(&models.Server{ID: "srv-api", AgentID: agentID, Name: "API", Address: "10.0.0.2"}); err != nil {
+		t.Fatal(err)
+	}
+	route := map[string]any{"match": "exact", "path": "/api/world", "server_id": "srv-api", "port": 80}
+	callTool(t, h, "update_domain", map[string]any{"id": created.ID, "routes": []any{route}}, &updated)
+	if len(updated.ProxyConfig.Routes) != 1 || updated.ProxyConfig.Routes[0].Path != "/api/world" {
+		t.Errorf("update_domain routes = %+v", updated.ProxyConfig.Routes)
+	}
+	if err := d.CreateAgent(&models.Agent{ID: "agent-2", Name: "A2", FQDN: "edge2.example.com", Status: models.AgentStatusAdopted}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CreateServer(&models.Server{ID: "srv-far", AgentID: "agent-2", Name: "Far", Address: "10.0.0.3"}); err != nil {
+		t.Fatal(err)
+	}
+	route["server_id"] = "srv-far"
+	if isErr := callTool(t, h, "update_domain", map[string]any{"id": created.ID, "routes": []any{route}}, nil); !isErr {
+		t.Error("a path route to another agent's server should report isError")
+	}
+	var cleared models.Domain
+	callTool(t, h, "update_domain", map[string]any{"id": created.ID, "routes": []any{}}, &cleared)
+	if len(cleared.ProxyConfig.Routes) != 0 {
+		t.Errorf("update_domain with routes [] kept %+v", cleared.ProxyConfig.Routes)
+	}
+
+	if err := d.UpdateAgentCapabilities(agentID, &models.ProxyCapabilities{ReverseProxy: true, AccessLog: true}); err != nil {
+		t.Fatal(err)
+	}
+	if isErr := callTool(t, h, "create_domain", map[string]any{
+		"subdomain": "quiet", "zone_id": zoneID, "server_id": serverID, "port": 8080, "error_log_level": "crit",
+	}, nil); !isErr {
+		t.Error("error_log_level on a backend without the capability should report isError")
 	}
 
 	// delete_domain

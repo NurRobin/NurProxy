@@ -1,0 +1,12 @@
+----
+<VirtualHost *:80>
+    ServerName app.example.com
+
+    CustomLog /dev/null common
+
+    RequestHeader set X-Forwarded-Proto http
+    ProxyPreserveHost On
+
+    ProxyPass / http://10.0.0.4:8080/
+    ProxyPassReverse / http://10.0.0.4:8080/
+</VirtualHost>

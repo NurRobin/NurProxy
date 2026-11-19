@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
@@ -15,6 +16,9 @@ type DomainFilter struct {
 	ServerID string
 	ZoneID   string
 	Status   string
+	// RouteServerID matches domains with a path route to this server
+	// (proxy_config.routes[].server_id).
+	RouteServerID string
 }
 
 // CreateDomain inserts a new domain record. ProxyConfig is marshaled to JSON.
@@ -45,14 +49,14 @@ func (d *DB) CreateDomain(dom *models.Domain) error {
 		INSERT INTO domains (subdomain, zone_id, server_id, port, proxy_config,
 			manual_config, websocket, force_https, ssl_mode, dns_record_id,
 			status, error_msg, last_synced, created_at, updated_at, dns_managed,
-			cert_only)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			cert_only, proxied)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
 		string(dom.SSLMode), dom.DNSRecordID,
 		string(dom.Status), dom.ErrorMsg, lastSynced,
 		now.Format(time.RFC3339), now.Format(time.RFC3339), boolToInt(dom.DNSManaged),
-		boolToInt(dom.CertOnly),
+		boolToInt(dom.CertOnly), nullableBool(dom.Proxied),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting domain: %w", err)
@@ -73,6 +77,7 @@ func scanDomain(sc interface {
 	var dom models.Domain
 	var pcJSON string
 	var manualConfig, websocket, forceHTTPS, dnsManaged, certOnly int
+	var proxied sql.NullInt64
 	var lastSynced sql.NullString
 	var createdAt, updatedAt string
 
@@ -80,7 +85,8 @@ func scanDomain(sc interface {
 		&dom.ID, &dom.Subdomain, &dom.ZoneID, &dom.ServerID, &dom.Port,
 		&pcJSON, &manualConfig, &websocket, &forceHTTPS,
 		&dom.SSLMode, &dom.DNSRecordID, &dom.Status, &dom.ErrorMsg,
-		&lastSynced, &createdAt, &updatedAt, &dnsManaged, &certOnly,
+		&lastSynced, &createdAt, &updatedAt, &dnsManaged, &certOnly, &proxied,
+		&dom.DNSError,
 	)
 	if err != nil {
 		return nil, err
@@ -91,6 +97,10 @@ func scanDomain(sc interface {
 	dom.ForceHTTPS = forceHTTPS != 0
 	dom.DNSManaged = dnsManaged != 0
 	dom.CertOnly = certOnly != 0
+	if proxied.Valid {
+		p := proxied.Int64 != 0
+		dom.Proxied = &p
+	}
 	dom.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	dom.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	if lastSynced.Valid {
@@ -107,7 +117,8 @@ func scanDomain(sc interface {
 
 const domainColumns = `id, subdomain, zone_id, server_id, port, proxy_config,
 	manual_config, websocket, force_https, ssl_mode, dns_record_id, status,
-	error_msg, last_synced, created_at, updated_at, dns_managed, cert_only`
+	error_msg, last_synced, created_at, updated_at, dns_managed, cert_only, proxied,
+	dns_error`
 
 // GetDomain retrieves a domain by its auto-incremented ID.
 func (d *DB) GetDomain(id int64) (*models.Domain, error) {
@@ -117,7 +128,7 @@ func (d *DB) GetDomain(id int64) (*models.Domain, error) {
 
 	dom, err := scanDomain(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("domain not found: %d", id)
+		return nil, fmt.Errorf("%w: %d", ErrDomainNotFound, id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("querying domain: %w", err)
@@ -147,6 +158,10 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 	if filter.AgentID != "" {
 		conditions = append(conditions, "server_id IN (SELECT id FROM servers WHERE agent_id = ?)")
 		args = append(args, filter.AgentID)
+	}
+	if filter.RouteServerID != "" {
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(proxy_config) THEN proxy_config ELSE '{}' END, '$.routes') WHERE json_extract(value, '$.server_id') = ?)`)
+		args = append(args, filter.RouteServerID)
 	}
 
 	if len(conditions) > 0 {
@@ -178,6 +193,14 @@ func (d *DB) ListDomains(filter DomainFilter) ([]models.Domain, error) {
 }
 
 // UpdateDomain updates all mutable fields of a domain.
+//
+// When the update changes the domain's name (subdomain or zone), the DNS record
+// stored for the old name is released in the same transaction: it is queued in
+// domain_dns_cleanups (snapshotting the old zone's provider) and the domain's
+// dns_record_id / dns_managed are cleared, so the reconciler resolves the new
+// name from scratch and deletes the old record only if NurProxy created it
+// (#151). Otherwise dns_record_id / dns_managed are never written here; dom's
+// copies are refreshed from the row.
 func (d *DB) UpdateDomain(dom *models.Domain) error {
 	dom.UpdatedAt = time.Now().UTC()
 
@@ -199,17 +222,34 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 		return 0
 	}
 
-	res, err := d.sql.Exec(`
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning domain update: %w", err)
+	}
+	defer tx.Rollback()
+	released, err := releaseRenamedDomainRecordTx(tx, dom)
+	if err != nil {
+		return err
+	}
+
+	// dns_record_id / dns_managed belong to the reconciler (UpdateDomainDNSRecord,
+	// SetDomainDNSRecordIfNamed, AdoptDomainDNSRecord). An update only clears
+	// them when it releases the record on a rename; otherwise it keeps what is
+	// stored, so an update built from a row loaded before the reconciler stored
+	// a fresh record cannot erase that record (or its ownership).
+	res, err := tx.Exec(`
 		UPDATE domains
 		SET subdomain = ?, zone_id = ?, server_id = ?, port = ?, proxy_config = ?,
 			manual_config = ?, websocket = ?, force_https = ?, ssl_mode = ?,
-			dns_record_id = ?, status = ?, error_msg = ?, last_synced = ?, updated_at = ?,
-			dns_managed = ?
+			dns_record_id = CASE WHEN ? THEN '' ELSE dns_record_id END,
+			status = ?, error_msg = ?, last_synced = ?, updated_at = ?,
+			dns_managed = CASE WHEN ? THEN 0 ELSE dns_managed END, proxied = ?
 		WHERE id = ?`,
 		dom.Subdomain, dom.ZoneID, dom.ServerID, dom.Port, string(pcJSON),
 		boolToInt(dom.ManualConfig), boolToInt(dom.WebSocket), boolToInt(dom.ForceHTTPS),
-		string(dom.SSLMode), dom.DNSRecordID, string(dom.Status), dom.ErrorMsg,
-		lastSynced, dom.UpdatedAt.Format(time.RFC3339), boolToInt(dom.DNSManaged), dom.ID,
+		string(dom.SSLMode), boolToInt(released), string(dom.Status), dom.ErrorMsg,
+		lastSynced, dom.UpdatedAt.Format(time.RFC3339), boolToInt(released),
+		nullableBool(dom.Proxied), dom.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("updating domain: %w", err)
@@ -219,7 +259,27 @@ func (d *DB) UpdateDomain(dom *models.Domain) error {
 	if n == 0 {
 		return fmt.Errorf("domain not found: %d", dom.ID)
 	}
+	var managed int
+	if err := tx.QueryRow(`SELECT dns_record_id, dns_managed FROM domains WHERE id = ?`, dom.ID).
+		Scan(&dom.DNSRecordID, &managed); err != nil {
+		return fmt.Errorf("reading stored DNS record of domain %d: %w", dom.ID, err)
+	}
+	dom.DNSManaged = managed != 0
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing domain update: %w", err)
+	}
 	return nil
+}
+
+// nullableBool maps a tri-state bool to SQL: nil -> NULL, else 0/1.
+func nullableBool(b *bool) any {
+	if b == nil {
+		return nil
+	}
+	if *b {
+		return 1
+	}
+	return 0
 }
 
 // DeleteDomain removes a domain by ID.
@@ -236,42 +296,58 @@ func (d *DB) DeleteDomain(id int64) error {
 	return nil
 }
 
-// UpdateDomainStatus sets the status and optional error message.
+// UpdateDomainStatus sets the status and optional error message. "deleting"
+// is final: any other status leaves a deleting domain unchanged, so a route ACK
+// or sync result read before the delete cannot pull the domain out of the
+// reconciler teardown.
 func (d *DB) UpdateDomainStatus(id int64, status models.DomainStatus, errMsg string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
-		UPDATE domains SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?`,
-		string(status), errMsg, now, id,
+		UPDATE domains SET status = ?, error_msg = ?, updated_at = ?
+		WHERE id = ? AND (? = 'deleting' OR status != 'deleting')`,
+		string(status), errMsg, now, id, string(status),
 	)
 	if err != nil {
 		return fmt.Errorf("updating domain status: %w", err)
 	}
+	return d.domainStatusWritten(res, id)
+}
 
-	n, _ := res.RowsAffected()
-	if n == 0 {
+// domainStatusWritten turns "no row updated" into a not-found error unless
+// the domain exists and was skipped because it is being deleted.
+func (d *DB) domainStatusWritten(res sql.Result, id int64) error {
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+	var exists int
+	err := d.sql.QueryRow(`SELECT 1 FROM domains WHERE id = ?`, id).Scan(&exists)
+	switch {
+	case err == sql.ErrNoRows:
 		return fmt.Errorf("domain not found: %d", id)
+	case err != nil:
+		return fmt.Errorf("checking domain %d: %w", id, err)
 	}
 	return nil
 }
 
 // MarkDomainSynced marks a domain as active, clears any error message, and
 // stamps last_synced with the current time. Used by the reconciler after a
-// successful sync cycle.
+// successful sync cycle. A pending DNS error (dns_error) wins: the domain then
+// stays in error with that reason, since the route alone does not make it
+// reachable. A deleting domain is left unchanged.
 func (d *DB) MarkDomainSynced(id int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := d.sql.Exec(`
-		UPDATE domains SET status = ?, error_msg = '', last_synced = ?, updated_at = ? WHERE id = ?`,
-		string(models.DomainStatusActive), now, now, id,
+		UPDATE domains SET
+			status = CASE WHEN dns_error != '' THEN ? ELSE ? END,
+			error_msg = dns_error, last_synced = ?, updated_at = ?
+		WHERE id = ? AND status != 'deleting'`,
+		string(models.DomainStatusError), string(models.DomainStatusActive), now, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("marking domain synced: %w", err)
 	}
-
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("domain not found: %d", id)
-	}
-	return nil
+	return d.domainStatusWritten(res, id)
 }
 
 // MarkDomainApplied records a successful route apply. For a domain that wants a
@@ -280,38 +356,92 @@ func (d *DB) MarkDomainSynced(id int64) error {
 // plaintext HTTP (TLS and any force_https redirect were dropped), so the domain
 // is marked "degraded" with an explanatory error rather than a bare "active"
 // that would hide the downgrade (§78). Otherwise the domain is marked active.
-func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool) error {
+// fallbackHosts are further store keys that serve fqdn, such as the zone
+// wildcard cert "*.<zone>" of a domain opted into it.
+func (d *DB) MarkDomainApplied(id int64, fqdn string, wantsCentralTLS bool, fallbackHosts ...string) error {
 	if wantsCentralTLS {
 		// Distinguish a genuinely absent certificate (degrade — the route is
 		// served plaintext) from a transient DB read error (propagate — do not
 		// mislabel a healthy domain as degraded). A bare existence probe avoids
 		// the key decryption that GetCertificate performs and lets sql.ErrNoRows
 		// cleanly signal not-found.
+		hosts := append([]any{fqdn}, toAnySlice(fallbackHosts)...)
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",")
 		var dummy int
 		err := d.read.QueryRow(
-			"SELECT 1 FROM certificates WHERE host = ?", fqdn,
+			"SELECT 1 FROM certificates WHERE host IN ("+placeholders+") LIMIT 1", hosts...,
 		).Scan(&dummy)
 		switch {
 		case err == sql.ErrNoRows:
 			now := time.Now().UTC().Format(time.RFC3339)
 			res, xErr := d.sql.Exec(`
-				UPDATE domains SET status = ?, error_msg = ?, last_synced = ?, updated_at = ? WHERE id = ?`,
-				string(models.DomainStatusDegraded),
+				UPDATE domains SET
+					status = CASE WHEN dns_error != '' THEN ? ELSE ? END,
+					error_msg = CASE WHEN dns_error != '' THEN dns_error ELSE ? END,
+					last_synced = ?, updated_at = ?
+				WHERE id = ? AND status != 'deleting'`,
+				string(models.DomainStatusError), string(models.DomainStatusDegraded),
 				"served over plaintext HTTP — no TLS certificate issued yet; force_https not enforced",
 				now, now, id,
 			)
 			if xErr != nil {
 				return fmt.Errorf("marking domain degraded: %w", xErr)
 			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				return fmt.Errorf("domain not found: %d", id)
-			}
-			return nil
+			return d.domainStatusWritten(res, id)
 		case err != nil:
 			return fmt.Errorf("checking central-TLS certificate for %s: %w", fqdn, err)
 		}
 	}
 	return d.MarkDomainSynced(id)
+}
+
+// ResetDomainPending sets the domain back to pending with no error, so the
+// next route apply reports its real state. A domain marked for deletion
+// meanwhile keeps that status.
+func (d *DB) ResetDomainPending(id int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := d.sql.Exec(`
+		UPDATE domains SET status = ?, error_msg = '', updated_at = ?
+		WHERE id = ? AND status != ?`,
+		string(models.DomainStatusPending), now, id, string(models.DomainStatusDeleting),
+	); err != nil {
+		return fmt.Errorf("resetting status of domain %d: %w", id, err)
+	}
+	return nil
+}
+
+// SetDomainDNSError records why the domain's DNS record could not be
+// converged and puts the domain in error with that reason. A domain being
+// deleted is left alone.
+func (d *DB) SetDomainDNSError(id int64, msg string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := d.sql.Exec(`
+		UPDATE domains SET dns_error = ?, status = ?, error_msg = ?, updated_at = ?
+		WHERE id = ? AND status != ?`,
+		msg, string(models.DomainStatusError), msg, now, id, string(models.DomainStatusDeleting),
+	); err != nil {
+		return fmt.Errorf("recording DNS error for domain %d: %w", id, err)
+	}
+	return nil
+}
+
+// ClearDomainDNSError forgets a recorded DNS error once the domain's record is
+// in place. When the domain still shows that error, it goes back to pending
+// so the next route apply reports its real state; any other status and
+// message (a route error, say) is kept.
+func (d *DB) ClearDomainDNSError(id int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := d.sql.Exec(`
+		UPDATE domains SET
+			status = CASE WHEN status = ? AND error_msg = dns_error THEN ? ELSE status END,
+			error_msg = CASE WHEN error_msg = dns_error THEN '' ELSE error_msg END,
+			dns_error = '', updated_at = ?
+		WHERE id = ? AND dns_error != ''`,
+		string(models.DomainStatusError), string(models.DomainStatusPending), now, id,
+	); err != nil {
+		return fmt.Errorf("clearing DNS error for domain %d: %w", id, err)
+	}
+	return nil
 }
 
 // UpdateDomainDNSRecord stores the provider record id for a domain and records
@@ -343,7 +473,8 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 	// Qualify all column references with d. to avoid ambiguity with the servers join.
 	qualifiedColumns := `d.id, d.subdomain, d.zone_id, d.server_id, d.port, d.proxy_config,
 		d.manual_config, d.websocket, d.force_https, d.ssl_mode, d.dns_record_id, d.status,
-		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed, d.cert_only`
+		d.error_msg, d.last_synced, d.created_at, d.updated_at, d.dns_managed, d.cert_only, d.proxied,
+		d.dns_error`
 
 	rows, err := d.read.Query(`
 		SELECT `+qualifiedColumns+`
@@ -365,4 +496,12 @@ func (d *DB) ListDomainsByAgent(agentID string) ([]models.Domain, error) {
 		domains = append(domains, *dom)
 	}
 	return domains, rows.Err()
+}
+
+func toAnySlice(values []string) []any {
+	out := make([]any, len(values))
+	for i, v := range values {
+		out[i] = v
+	}
+	return out
 }

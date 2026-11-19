@@ -1,8 +1,10 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -792,6 +794,199 @@ var migrations = []string{
 		UNIQUE (zone_id, record_id)
 	);
 	`,
+
+	// Migration 33: per-domain Cloudflare proxy (orange cloud) setting (#126).
+	// NULL means "not set": the reconciler keeps whatever proxy state the live
+	// record has, so existing domains keep today's behavior. 0 / 1 are an
+	// explicit operator choice that the reconciler enforces.
+	`
+	ALTER TABLE domains ADD COLUMN proxied INTEGER CHECK (proxied IS NULL OR proxied IN (0, 1));
+	`,
+
+	// Migration 34: where a stored certificate came from (#80). 'acme' is a
+	// centrally issued cert; 'imported' is an operator-uploaded bundle. Renewal
+	// re-issues an imported cert for its host only, not for the SAN list the
+	// operator's CA chose. Existing rows were all issued by NurProxy.
+	`
+	ALTER TABLE certificates ADD COLUMN source TEXT NOT NULL DEFAULT 'acme'
+		CHECK (source IN ('acme', 'imported'));
+	`,
+
+	// Migration 35: domain CNAME records released by a rename or zone move
+	// (#151). Same contract as agent_anchor_cleanups: a row stays until the
+	// provider delete succeeds or the record is already gone, and provider_id /
+	// zone_external_id snapshot the ORIGINAL provider and zone so a
+	// cross-provider move still deletes through the old one. Adopted rows
+	// (owned=0) are never deleted; they stay until the new record exists so
+	// their proxied snapshot can still be inherited. content is the target the
+	// record had when it was released, proxied the record's Cloudflare proxy
+	// state read once from the provider (NULL until read). deleted=1 marks an
+	// owned record already deleted by the wait bound while the domain still has
+	// no new record; the row then only keeps the proxied snapshot. No FK to
+	// domains: the domain may be deleted before the cleanup runs.
+	`
+	CREATE TABLE domain_dns_cleanups (
+		id               INTEGER PRIMARY KEY AUTOINCREMENT,
+		domain_id        INTEGER NOT NULL,
+		fqdn             TEXT NOT NULL,
+		record_id        TEXT NOT NULL,
+		owned            INTEGER NOT NULL DEFAULT 0 CHECK (owned IN (0, 1)),
+		content          TEXT NOT NULL DEFAULT '',
+		proxied          INTEGER CHECK (proxied IS NULL OR proxied IN (0, 1)),
+		deleted          INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+		zone_id          TEXT NOT NULL DEFAULT '',
+		provider_id      TEXT NOT NULL DEFAULT '',
+		zone_external_id TEXT NOT NULL DEFAULT '',
+		attempts         INTEGER NOT NULL DEFAULT 0,
+		last_error       TEXT NOT NULL DEFAULT '',
+		created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE (zone_id, record_id)
+	);
+	CREATE INDEX idx_domain_dns_cleanups_record
+		ON domain_dns_cleanups(zone_external_id, record_id);
+	`,
+
+	// Migration 36: domains.server_id, domains.zone_id and servers.agent_id
+	// become ON DELETE RESTRICT (#104). A parent with children can then only
+	// be removed after its domains went through the reconciler teardown; no
+	// raw DB cascade can skip the DNS/cert/artifact cleanup. SQLite cannot
+	// alter a constraint, so the tables are rebuilt in Go (see
+	// rebuildParentFKsRestrict) from their live schema, which keeps every
+	// column, CHECK, index and trigger later migrations added.
+	migrationRestrictParentFKs,
+
+	// Migration 37: dns_error holds the reason the domain's public DNS record
+	// could not be created, adopted or corrected, separately from error_msg.
+	// A route apply rewrites status and error_msg; while dns_error is set it
+	// keeps the domain in error with that reason instead of reporting it
+	// active or degraded for an unrelated cause. Empty means the last DNS pass
+	// worked.
+	`ALTER TABLE domains ADD COLUMN dns_error TEXT NOT NULL DEFAULT '';`,
+
+	// Migration 38: server discovery sources (#25). config is the source's
+	// credentials, AES-256-GCM encrypted like providers.config. last_result is
+	// the JSON result of the last successful run (machines and addresses, no
+	// secrets); sync_interval is in seconds, 0 = run only on demand. An
+	// imported server remembers its source and the machine's external_id; the
+	// partial unique index keeps one server per machine.
+	// discovery_missing_since is set while a re-sync no longer finds the
+	// machine ('' = present).
+	`
+	CREATE TABLE discovery_sources (
+		id            TEXT PRIMARY KEY,
+		type          TEXT NOT NULL,
+		name          TEXT NOT NULL,
+		config        TEXT NOT NULL,
+		sync_interval INTEGER NOT NULL DEFAULT 0,
+		last_run_at   TEXT NOT NULL DEFAULT '',
+		last_error    TEXT NOT NULL DEFAULT '',
+		last_result   TEXT NOT NULL DEFAULT '',
+		created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+	ALTER TABLE servers ADD COLUMN discovery_source_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE servers ADD COLUMN external_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE servers ADD COLUMN discovery_missing_since TEXT NOT NULL DEFAULT '';
+	CREATE UNIQUE INDEX idx_servers_discovery_external
+		ON servers(discovery_source_id, external_id) WHERE external_id <> '';
+	`,
+
+	// Migration 39: per-domain failover to backup servers on other agents
+	// (#74). domain_backups lists the backups in priority order (lower first;
+	// the primary is domains.server_id and not stored here). domain_failover
+	// is the reconciler's decision state for a domain with backups: the server
+	// whose agent the CNAME points at, the more preferred candidate waiting out
+	// the failback delay and since when, whether every candidate was down at
+	// the last pass, how often the target switched, when the last pass ran
+	// and since when a settle period holds the target. domain_standby_status
+	// is the last standby apply a backup agent acknowledged: ready when the
+	// route applied and the certificate it needs was in the store.
+	`
+	CREATE TABLE domain_backups (
+		domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+		server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+		priority  INTEGER NOT NULL,
+		PRIMARY KEY (domain_id, server_id)
+	);
+	CREATE INDEX idx_domain_backups_server ON domain_backups(server_id);
+	CREATE TABLE domain_failover (
+		domain_id         INTEGER PRIMARY KEY REFERENCES domains(id) ON DELETE CASCADE,
+		active_server_id  TEXT NOT NULL DEFAULT '',
+		pending_server_id TEXT NOT NULL DEFAULT '',
+		pending_since     TEXT,
+		all_down          INTEGER NOT NULL DEFAULT 0 CHECK (all_down IN (0, 1)),
+		switched_at       TEXT,
+		switches          INTEGER NOT NULL DEFAULT 0,
+		evaluated_at      TEXT,
+		settle_since      TEXT
+	);
+	CREATE TABLE domain_standby_status (
+		domain_id  INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+		agent_id   TEXT NOT NULL,
+		ready      INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0, 1)),
+		reason     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (domain_id, agent_id)
+	);
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_grace', '30');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_failback', 'true');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_failback_delay', '300');
+	INSERT OR IGNORE INTO settings (key, value) VALUES ('failover_settle', '90');
+	`,
+
+	// Migration 40: agent self-update (#73). agent_upgrades records every
+	// operator-requested upgrade and its progress; the partial unique index
+	// keeps at most one unfinished upgrade per agent. agent_self_update holds
+	// the per-agent auto-upgrade opt-in (off by default) and the agent's last
+	// self-update capability report. Both live beside the agents table so the
+	// hot agent row and its scanner stay unchanged; rows go with the agent.
+	`
+	CREATE TABLE agent_upgrades (
+		id             TEXT PRIMARY KEY,
+		agent_id       TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+		from_version   TEXT NOT NULL DEFAULT '',
+		target_version TEXT NOT NULL,
+		state          TEXT NOT NULL CHECK (state IN ('requested', 'downloading', 'installed', 'restarting', 'done', 'failed', 'rolled_back')),
+		error          TEXT NOT NULL DEFAULT '',
+		triggered_by   TEXT NOT NULL DEFAULT 'manual' CHECK (triggered_by IN ('manual', 'rollout', 'auto')),
+		rollout_id     TEXT NOT NULL DEFAULT '',
+		requested_by   TEXT NOT NULL DEFAULT '',
+		created_at     TEXT NOT NULL,
+		updated_at     TEXT NOT NULL
+	);
+	CREATE INDEX idx_agent_upgrades_agent ON agent_upgrades(agent_id, created_at);
+	CREATE UNIQUE INDEX idx_agent_upgrades_active ON agent_upgrades(agent_id)
+		WHERE state IN ('requested', 'downloading', 'installed', 'restarting');
+	CREATE TABLE agent_self_update (
+		agent_id     TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+		auto_upgrade INTEGER NOT NULL DEFAULT 0 CHECK (auto_upgrade IN (0, 1)),
+		capability   TEXT,
+		updated_at   TEXT NOT NULL
+	);
+	`,
+
+	// Migration 41: certificate bundles the agent found on its host (#80), as
+	// a JSON array of models.DiscoveredCert. Metadata only, never key material;
+	// the operator adopts one explicitly and only then the agent uploads it.
+	// domains.cert_adoption_skipped records that the operator chose to issue a
+	// new certificate instead of adopting one, which ends the issuance hold.
+	`
+	ALTER TABLE agents ADD COLUMN detected_certs TEXT NOT NULL DEFAULT '';
+	ALTER TABLE domains ADD COLUMN cert_adoption_skipped INTEGER NOT NULL DEFAULT 0
+		CHECK (cert_adoption_skipped IN (0, 1));
+	`,
+}
+
+// migrationRestrictParentFKs is the placeholder text of the migration that
+// rebuilds servers and domains with RESTRICT foreign keys. It is a plain SQL
+// comment, so executing it as text is a no-op; migrate runs the Go step from
+// goMigrations instead.
+const migrationRestrictParentFKs = "-- migration 36: rebuildParentFKsRestrict (Go)"
+
+// goMigrations maps a migration's placeholder text to the Go step that
+// performs it. Keyed by text, not by version, so renumbering on a rebase
+// cannot attach a step to the wrong migration.
+var goMigrations = map[string]func(ctx context.Context, tx *sql.Tx) error{
+	migrationRestrictParentFKs: rebuildParentFKsRestrict,
 }
 
 // migrate applies any outstanding migrations. It uses a simple
@@ -806,9 +1001,20 @@ var migrations = []string{
 // schema is never left at a partially-migrated version. Idempotency is
 // preserved — only versions strictly greater than the recorded maximum are
 // applied, so a second call with nothing pending opens no transaction at all.
+//
+// The batch runs with foreign key enforcement OFF on a pinned connection, the
+// procedure SQLite prescribes for table rebuilds: with enforcement on, DROP
+// TABLE runs an implicit DELETE that fires ON DELETE actions in other tables
+// (CASCADE, SET NULL) and would wipe or detach rows the rebuild is about to
+// copy back. PRAGMA foreign_keys is a no-op inside a transaction, so it is
+// switched before BEGIN and restored after COMMIT. Before committing,
+// PRAGMA foreign_key_check must not report any violation that was not already
+// there before the batch.
 func (d *DB) migrate() error {
+	ctx := context.Background()
+
 	// Ensure the version tracking table exists.
-	if _, err := d.sql.Exec(`
+	if _, err := d.sql.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_version (
 			version INTEGER NOT NULL
 		)
@@ -817,7 +1023,7 @@ func (d *DB) migrate() error {
 	}
 
 	var current int
-	row := d.sql.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+	row := d.sql.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_version")
 	if err := row.Scan(&current); err != nil {
 		return fmt.Errorf("reading schema version: %w", err)
 	}
@@ -827,28 +1033,122 @@ func (d *DB) migrate() error {
 		return nil
 	}
 
-	tx, err := d.sql.Begin()
+	conn, err := d.sql.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("pinning migration connection: %w", err)
+	}
+	defer conn.Close()
+
+	if err := setForeignKeys(ctx, conn, false); err != nil {
+		return err
+	}
+	migErr := applyMigrations(ctx, conn, current)
+	// Restore enforcement even when the batch failed: the connection goes back
+	// to the pool. If restoring fails, Open fails and closes the pool anyway.
+	if err := setForeignKeys(ctx, conn, true); err != nil && migErr == nil {
+		migErr = err
+	}
+	return migErr
+}
+
+// applyMigrations runs every migration after version current in one
+// transaction on conn and commits only if no new foreign key violation
+// appeared.
+func applyMigrations(ctx context.Context, conn *sql.Conn, current int) error {
+	before, err := foreignKeyViolations(ctx, conn)
+	if err != nil {
+		return err
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("beginning migrations: %w", err)
 	}
+	defer tx.Rollback()
 
 	for i := current; i < len(migrations); i++ {
-		if _, err := tx.Exec(migrations[i]); err != nil {
-			tx.Rollback()
+		if step, ok := goMigrations[migrations[i]]; ok {
+			err = step(ctx, tx)
+		} else {
+			_, err = tx.ExecContext(ctx, migrations[i])
+		}
+		if err != nil {
 			return fmt.Errorf("executing migration %d: %w", i+1, err)
 		}
 
-		if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", i+1); err != nil {
-			tx.Rollback()
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_version (version) VALUES (?)", i+1); err != nil {
 			return fmt.Errorf("recording migration %d: %w", i+1, err)
 		}
+	}
+
+	after, err := foreignKeyViolations(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var added []string
+	for edge, n := range after {
+		if n > before[edge] {
+			added = append(added, fmt.Sprintf("%s (%d new)", edge, n-before[edge]))
+		}
+	}
+	if len(added) > 0 {
+		sort.Strings(added)
+		return fmt.Errorf("migrations would introduce foreign key violations: %s", strings.Join(added, ", "))
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing migrations: %w", err)
 	}
-
 	return nil
+}
+
+// setForeignKeys switches foreign key enforcement on conn and reads it back,
+// because SQLite silently ignores the pragma inside an open transaction.
+func setForeignKeys(ctx context.Context, conn *sql.Conn, on bool) error {
+	want := 0
+	if on {
+		want = 1
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA foreign_keys = %d", want)); err != nil {
+		return fmt.Errorf("setting foreign_keys=%d: %w", want, err)
+	}
+	var got int
+	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&got); err != nil {
+		return fmt.Errorf("reading foreign_keys: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("foreign_keys is %d after setting it to %d", got, want)
+	}
+	return nil
+}
+
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// foreignKeyViolations counts PRAGMA foreign_key_check rows per
+// "child -> parent" edge. Counting per edge rather than per rowid keeps the
+// comparison stable across a table rebuild.
+func foreignKeyViolations(ctx context.Context, q queryer) (map[string]int, error) {
+	rows, err := q.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return nil, fmt.Errorf("checking foreign keys: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var table, parent string
+		var rowid sql.NullInt64
+		var fkid int
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			return nil, fmt.Errorf("scanning foreign key check: %w", err)
+		}
+		out[table+" -> "+parent]++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("checking foreign keys: %w", err)
+	}
+	return out, nil
 }
 
 // SchemaVersion reports the applied schema version of the database at dbPath

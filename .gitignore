@@ -2,6 +2,7 @@
 /nurproxy
 /nurproxy-agent
 /nurproxy-headless
+/nurproxy-sandbox-upstream
 *.exe
 *.dll
 *.so
@@ -57,3 +58,6 @@ coverage.html
 # Build artifacts + local dev sandbox state
 /nurproxy-agent-*
 /.dev-sandbox/
+
+# Local ghosttree projection (generated per machine, never committed)
+.ghosttree/

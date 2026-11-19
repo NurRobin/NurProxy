@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -87,6 +88,40 @@ func TestUpsertCertificate_reissueOverwrites(t *testing.T) {
 	}
 }
 
+// TestUpsertCertificate_source covers the import provenance (#80): an imported
+// bundle keeps its source until a later upsert (an ACME renewal) replaces it,
+// and an unset source is stored as acme.
+func TestUpsertCertificate_source(t *testing.T) {
+	tests := []struct {
+		name   string
+		writes []string
+		want   string
+	}{
+		{name: "unset defaults to acme", writes: []string{""}, want: models.CertSourceACME},
+		{name: "imported", writes: []string{models.CertSourceImported}, want: models.CertSourceImported},
+		{name: "renewal replaces import", writes: []string{models.CertSourceImported, models.CertSourceACME}, want: models.CertSourceACME},
+		{name: "re-import over acme", writes: []string{models.CertSourceACME, models.CertSourceImported}, want: models.CertSourceImported},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			for _, source := range tc.writes {
+				c := &models.Certificate{ID: "h.example.com", Host: "h.example.com", CertPEM: "C", KeyPEM: "K", Source: source}
+				if err := d.UpsertCertificate(c); err != nil {
+					t.Fatalf("UpsertCertificate(%q): %v", source, err)
+				}
+			}
+			got, err := d.GetCertificate("h.example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Source != tc.want {
+				t.Errorf("source = %q, want %q", got.Source, tc.want)
+			}
+		})
+	}
+}
+
 func TestCertificatesDueForRenewal_window(t *testing.T) {
 	d := testDB(t)
 
@@ -120,6 +155,102 @@ func TestDeleteCertificate(t *testing.T) {
 	}
 	if err := d.DeleteCertificate("h.example.com"); err == nil {
 		t.Error("expected error deleting non-existent certificate")
+	}
+}
+
+// TestReplaceCertificateIfUnchanged is the store half of the import race
+// (#80): an ACME result is only written while the row still holds the cert the
+// order started from.
+func TestReplaceCertificateIfUnchanged(t *testing.T) {
+	tests := []struct {
+		name     string
+		stored   string // "" = no row
+		prior    string
+		wantSave bool
+	}{
+		{name: "first issuance, still no row", prior: "", wantSave: true},
+		{name: "first issuance, import landed", stored: "IMPORTED", prior: "", wantSave: false},
+		{name: "renewal, row unchanged", stored: "OLD", prior: "OLD", wantSave: true},
+		{name: "renewal, import replaced the row", stored: "IMPORTED", prior: "OLD", wantSave: false},
+		{name: "renewal, row deleted meanwhile", prior: "OLD", wantSave: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			if tc.stored != "" {
+				if err := d.UpsertCertificate(&models.Certificate{ID: "h.example.com", Host: "h.example.com", CertPEM: tc.stored, KeyPEM: "K", Source: models.CertSourceImported}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			saved, err := d.ReplaceCertificateIfUnchanged(&models.Certificate{ID: "h.example.com", Host: "h.example.com", CertPEM: "ACME", KeyPEM: "K2"}, tc.prior)
+			if err != nil {
+				t.Fatalf("ReplaceCertificateIfUnchanged: %v", err)
+			}
+			if saved != tc.wantSave {
+				t.Fatalf("saved = %v, want %v", saved, tc.wantSave)
+			}
+			got, err := d.GetCertificate("h.example.com")
+			switch {
+			case tc.wantSave:
+				if err != nil || got.CertPEM != "ACME" {
+					t.Errorf("after save: cert=%v err=%v, want ACME", got, err)
+				}
+			case tc.stored != "":
+				if err != nil || got.CertPEM != tc.stored || got.Source != models.CertSourceImported {
+					t.Errorf("refused save changed the stored cert: %+v err=%v", got, err)
+				}
+			default:
+				if err == nil {
+					t.Errorf("refused save created a row: %+v", got)
+				}
+			}
+		})
+	}
+}
+
+// TestImportCertificateForDomain checks that the import write is refused for a
+// domain that is gone or being deleted, so teardown cannot miss the new row.
+func TestImportCertificateForDomain(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  models.DomainStatus
+		missing bool
+		wantErr error
+	}{
+		{name: "active domain", status: models.DomainStatusActive},
+		{name: "deleting domain", status: models.DomainStatusDeleting, wantErr: ErrDomainDeleting},
+		{name: "domain row gone", status: models.DomainStatusActive, missing: true, wantErr: ErrDomainDeleting},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			mustNoErr(t, d.CreateProvider(&models.Provider{ID: "p", Type: "cloudflare", Name: "CF", Config: `{}`}))
+			mustNoErr(t, d.CreateZone(&models.Zone{ID: "z", ProviderID: "p", ExternalID: "e", Name: "example.com"}))
+			mustNoErr(t, d.CreateAgent(&models.Agent{ID: "a", Name: "A", FQDN: "a.example.com"}))
+			mustNoErr(t, d.CreateServer(&models.Server{ID: "s", AgentID: "a", Name: "S", Address: "10.0.0.1"}))
+			dom := &models.Domain{Subdomain: "app", ZoneID: "z", ServerID: "s", Port: 80, Status: tc.status}
+			mustNoErr(t, d.CreateDomain(dom))
+			id := dom.ID
+			if tc.missing {
+				id += 100
+			}
+
+			err := d.ImportCertificateForDomain(id, &models.Certificate{ID: "app.example.com", Host: "app.example.com", CertPEM: "C", KeyPEM: "K", Source: models.CertSourceImported})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+			_, gErr := d.GetCertificate("app.example.com")
+			if stored := gErr == nil; stored != (tc.wantErr == nil) {
+				t.Errorf("certificate stored = %v, want %v", stored, tc.wantErr == nil)
+			}
+		})
+	}
+}
+
+func mustNoErr(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

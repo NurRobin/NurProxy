@@ -148,10 +148,10 @@ grep -n "foreign_keys(1)" internal/orchestrator/db/db.go
 
 | Child table.column | References | ON DELETE | Source |
 |---|---|---|---|
-| `servers.agent_id` | `agents(id)` | **CASCADE** | mig 1, `migrations.go:42` |
-| `domains.server_id` | `servers(id)` | **CASCADE** | mig 1 + 3, `migrations.go:53,162` |
+| `servers.agent_id` | `agents(id)` | **RESTRICT** | mig 1, rebuilt by mig 36 (`migration_rebuild.go`) |
+| `domains.server_id` | `servers(id)` | **RESTRICT** | mig 1 + 3, rebuilt by mig 36 |
 | `domains.provider_id` (v1) / `domains.zone_id` (v3+) | `providers(id)` / `zones(id)` | *(none → implicit RESTRICT/NO ACTION)* | `migrations.go:52,161` |
-| `domains.zone_id` | `zones(id)` | *(none → implicit RESTRICT)* | `migrations.go:161` |
+| `domains.zone_id` | `zones(id)` | **RESTRICT** | mig 3, rebuilt by mig 36 |
 | `zones.provider_id` | `providers(id)` | *(none → implicit RESTRICT)* | `migrations.go:131` |
 | `agent_zones.agent_id` | `agents(id)` | **CASCADE** | mig 3, `migrations.go:139` |
 | `agent_zones.zone_id` | `zones(id)` | **CASCADE** | mig 3, `migrations.go:140` |
@@ -162,9 +162,9 @@ grep -n "foreign_keys(1)" internal/orchestrator/db/db.go
 
 `certificates` and `agent_admin_ops` declare **no** FK constraints (`agent_admin_ops.agent_id` is a plain `TEXT NOT NULL`, no `REFERENCES` — `migrations.go:374`); they are not cascade-cleaned by the DB.
 
-**KNOWN ISSUE (regression-guard, cross-link to teardown spec / RELEASE-QA §2.4):** deleting a **server / agent / zone** that still has domains is refused **only by an application-layer 409 guard**, not by the FK. The chain `agents → servers → domains` is `ON DELETE CASCADE`, so a **direct DB delete** (`DELETE FROM agents …` via `sqlite3`) cascades through servers into domains and **orphans those domains' managed DNS records and certs** — they were never torn down via the reconciler, so the records/certs leak. The certs live in `certificates` (no FK) and the managed-DNS-record IDs live on the now-deleted `domains` rows. The `RESTRICT` follow-up (make the FK itself block the delete) is still open.
+**Parent deletes (#104):** a **server / agent / zone** that still has domains cannot be deleted, neither through the API nor by a raw `DELETE`. The API answers **409** listing the blocking domains (or, with `?cascade=true`, marks them `deleting` and lets the reconciler remove the parent once their DNS records and certs are torn down). Below the API, `servers.agent_id`, `domains.server_id` and `domains.zone_id` are `ON DELETE RESTRICT`, so a direct `DELETE FROM agents …` fails with `FOREIGN KEY constraint failed` instead of cascading into domains and leaking their DNS records and certs. `DeleteAgent` removes the agent's servers itself, children before the parent.
 
-**Access:** `sqlite3` to demonstrate the raw cascade; the REST API (`DELETE /api/v1/servers/{id}` etc.) for the 409 guard.
+**Access:** `sqlite3` to show the raw delete is refused; the REST API (`DELETE /api/v1/servers/{id}` etc.) for the 409 guard.
 **Prerequisites:** a DB with an agent → server → domain chain (use the sandbox seed, or create via API).
 **Steps:**
 ```bash
@@ -172,13 +172,12 @@ grep -n "foreign_keys(1)" internal/orchestrator/db/db.go
 curl -s -X DELETE localhost:18081/api/v1/servers/<server-id> -H "X-API-Key: $KEY" -w " http=%{http_code}\n"
 #    -> 409 with body listing the blocking domains.
 
-# 2. The raw-cascade leak (DO NOT do this on prod). On a throwaway dry DB:
-sqlite3 "$DB" "PRAGMA foreign_keys=ON; SELECT COUNT(*) FROM domains;"   # before
+# 2. The raw delete is refused (only on a throwaway dry DB, never on prod):
 sqlite3 "$DB" "PRAGMA foreign_keys=ON; DELETE FROM agents WHERE id='<agent-id>';"
-sqlite3 "$DB" "SELECT COUNT(*) FROM domains;"                          # after: dropped via CASCADE
-sqlite3 "$DB" "SELECT COUNT(*) FROM certificates;"                     # cert rows: NOT removed (orphaned/leak)
+#    -> Error: FOREIGN KEY constraint failed
+sqlite3 "$DB" "SELECT COUNT(*) FROM domains;"                          # unchanged
 ```
-**Pass:** API path returns **409** and the domain/server/agent/zone is **not** deleted while children exist. The raw-`sqlite3` path demonstrates the cascade and the orphaned `certificates` rows — confirming the leak is FK-level, the guard is app-level.
+**Pass:** API path returns **409** and the domain/server/agent/zone is **not** deleted while children exist. The raw `sqlite3` delete fails with a foreign key error and leaves every row in place.
 **Coverage:** D.
 **Pitfalls:**
 - Domain delete is **soft** (`status=deleting`); the 409 guard counts `deleting` rows too, so a parent delete right after a domain delete correctly 409s until the reconciler finishes (RELEASE-QA §2.4).

@@ -1,0 +1,158 @@
+{
+  "@id": "domain-app-example-com",
+  "match": [
+    {
+      "host": [
+        "app.example.com"
+      ]
+    }
+  ],
+  "handle": [
+    {
+      "handler": "subroute",
+      "routes": [
+        {
+          "match": [
+            {
+              "protocol": "http"
+            }
+          ],
+          "handle": [
+            {
+              "handler": "static_response",
+              "status_code": "302",
+              "headers": {
+                "Location": [
+                  "https://{http.request.host}{http.request.uri}"
+                ]
+              }
+            }
+          ],
+          "terminal": true
+        }
+      ]
+    },
+    {
+      "handler": "subroute",
+      "routes": [
+        {
+          "match": [
+            {
+              "remote_ip": {
+                "ranges": [
+                  "10.6.6.6/32"
+                ]
+              }
+            }
+          ],
+          "handle": [
+            {
+              "handler": "static_response",
+              "status_code": "403",
+              "body": "Forbidden"
+            }
+          ],
+          "terminal": true
+        },
+        {
+          "match": [
+            {
+              "not": [
+                {
+                  "remote_ip": {
+                    "ranges": [
+                      "10.0.0.0/8"
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "handle": [
+            {
+              "handler": "static_response",
+              "status_code": "403",
+              "body": "Forbidden"
+            }
+          ],
+          "terminal": true
+        },
+        {
+          "handle": [
+            {
+              "handler": "rewrite",
+              "strip_path_prefix": "/app"
+            },
+            {
+              "handler": "authentication",
+              "providers": {
+                "http_basic": {
+                  "accounts": [
+                    {
+                      "password": "JDJhJDEwJHg=",
+                      "username": "u"
+                    }
+                  ],
+                  "hash": {
+                    "algorithm": "bcrypt"
+                  }
+                }
+              }
+            },
+            {
+              "handler": "rate_limit",
+              "rate_limits": {
+                "default": {
+                  "key": "{http.request.remote.host}",
+                  "max_events": 5,
+                  "window": "1s"
+                }
+              }
+            },
+            {
+              "handler": "request_body",
+              "max_size": "50MB"
+            },
+            {
+              "handler": "reverse_proxy",
+              "upstreams": [
+                {
+                  "dial": "10.0.0.4:8080"
+                }
+              ],
+              "flush_interval": -1,
+              "headers": {
+                "request": {
+                  "set": {
+                    "X-Forwarded-Proto": [
+                      "{http.request.scheme}"
+                    ],
+                    "X-Real-IP": [
+                      "{http.request.remote.host}"
+                    ],
+                    "X-Team": [
+                      "edge"
+                    ]
+                  }
+                },
+                "response": {
+                  "set": {
+                    "X-Frame-Options": [
+                      "DENY"
+                    ]
+                  }
+                }
+              },
+              "transport": {
+                "protocol": "http",
+                "dial_timeout": "30s",
+                "response_header_timeout": "60s"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "terminal": true
+}

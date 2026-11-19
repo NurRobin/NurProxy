@@ -327,6 +327,40 @@ func TestGenerateRoute_ManualOverride_WrongBackend(t *testing.T) {
 	}
 }
 
+func TestGenerateRouteWith_ForceHTTPSPort(t *testing.T) {
+	cfg := proxymodel.Route{
+		Host:       "redirect.example.com",
+		Upstream:   proxymodel.Upstream{Addr: "10.0.0.6", Port: 5000},
+		ForceHTTPS: true,
+	}
+	plain, err := GenerateRoute(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		port         int
+		wantLocation string
+	}{
+		{0, "https://{http.request.host}{http.request.uri}"},
+		{443, "https://{http.request.host}{http.request.uri}"},
+		{18443, "https://{http.request.host}:18443{http.request.uri}"},
+	}
+	for _, tt := range tests {
+		raw, err := GenerateRouteWith(cfg, RouteOptions{HTTPSPort: tt.port})
+		if err != nil {
+			t.Fatalf("port %d: %v", tt.port, err)
+		}
+		want, _ := json.Marshal(tt.wantLocation)
+		if !strings.Contains(string(raw), `"Location":[`+string(want)+`]`) {
+			t.Errorf("port %d: route lacks Location %s:\n%s", tt.port, want, raw)
+		}
+		// The standard port must render byte-identical to GenerateRoute.
+		if (tt.port == 0 || tt.port == 443) && string(raw) != string(plain) {
+			t.Errorf("port %d: output differs from GenerateRoute", tt.port)
+		}
+	}
+}
+
 func TestGenerateRoute_ForceHTTPS(t *testing.T) {
 	cfg := proxymodel.Route{
 		Host:       "redirect.example.com",
@@ -566,7 +600,7 @@ func TestConfigFromDomain(t *testing.T) {
 			BasicAuth:   &models.BasicAuthConfig{Username: "u", Password: "h"},
 		},
 	}
-	route := ConfigFromDomain(d, "x.example.com", "10.0.0.9")
+	route := ConfigFromDomain(d, "x.example.com", "10.0.0.9", nil)
 	if route.Upstream.Addr != "10.0.0.9" || route.Upstream.Port != 3000 {
 		t.Errorf("upstream wrong: %+v", route)
 	}
@@ -589,6 +623,30 @@ func TestConfigFromDomain(t *testing.T) {
 	}
 }
 
+func TestConfigFromDomain_Logging(t *testing.T) {
+	tests := []struct {
+		name       string
+		pc         models.ProxyConfig
+		wantAccess proxymodel.AccessLogMode
+		wantLevel  string
+	}{
+		{"unset", models.ProxyConfig{}, proxymodel.AccessLogDefault, ""},
+		{"explicit default", models.ProxyConfig{AccessLog: "default", ErrorLogLevel: "default"}, proxymodel.AccessLogDefault, ""},
+		{"off and crit", models.ProxyConfig{AccessLog: "off", ErrorLogLevel: "crit"}, proxymodel.AccessLogOff, "crit"},
+		// Invalid stored values pass through, so Route validation refuses them
+		// and the reconciler holds the domain back instead of rendering a default.
+		{"invalid passes through", models.ProxyConfig{AccessLog: "on", ErrorLogLevel: "debug"}, "on", "debug"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			route := ConfigFromDomain(models.Domain{Port: 80, ProxyConfig: tt.pc}, "x.example.com", "10.0.0.9", nil)
+			if route.AccessLog != tt.wantAccess || route.ErrorLogLevel != tt.wantLevel {
+				t.Fatalf("got access=%q level=%q, want %q %q", route.AccessLog, route.ErrorLogLevel, tt.wantAccess, tt.wantLevel)
+			}
+		})
+	}
+}
+
 func TestConfigFromDomain_RawConfig(t *testing.T) {
 	d := models.Domain{
 		Port: 80,
@@ -596,7 +654,7 @@ func TestConfigFromDomain_RawConfig(t *testing.T) {
 			RawConfig: models.RawConfig{Backend: "caddy", Content: `{"@id":"r"}`},
 		},
 	}
-	route := ConfigFromDomain(d, "raw.example.com", "10.0.0.1")
+	route := ConfigFromDomain(d, "raw.example.com", "10.0.0.1", nil)
 	if !route.IsRaw() {
 		t.Fatalf("expected raw route, got %+v", route.Raw)
 	}
@@ -629,7 +687,7 @@ func TestConfigFromDomain_TLSPolicy(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := models.Domain{Port: 80, ProxyConfig: tt.cfg, SSLMode: tt.sslMode}
-			route := ConfigFromDomain(d, "h.example.com", "10.0.0.1")
+			route := ConfigFromDomain(d, "h.example.com", "10.0.0.1", nil)
 			if route.TLS.Policy != tt.want {
 				t.Errorf("TLS.Policy = %q, want %q", route.TLS.Policy, tt.want)
 			}
@@ -688,7 +746,7 @@ func TestConfigFromDomain_addressWithPort(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := ConfigFromDomain(models.Domain{Subdomain: "x", Port: tt.domPort}, "x.example.com", tt.addr)
+			r := ConfigFromDomain(models.Domain{Subdomain: "x", Port: tt.domPort}, "x.example.com", tt.addr, nil)
 			if r.Upstream.Addr != tt.wantAddr || r.Upstream.Port != tt.wantPort {
 				t.Errorf("upstream = %q:%d, want %q:%d", r.Upstream.Addr, r.Upstream.Port, tt.wantAddr, tt.wantPort)
 			}

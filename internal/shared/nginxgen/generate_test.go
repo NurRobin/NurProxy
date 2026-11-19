@@ -399,6 +399,8 @@ func TestRender_invalidStructured_errors(t *testing.T) {
 		{"missing_upstream_addr", proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Port: 80}}},
 		{"bad_port", proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 0}}},
 		{"port_too_high", proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 70000}}},
+		{"unknown_access_log_mode", proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 80}, AccessLog: "syslog:server=evil"}},
+		{"error_log_level_injection", proxymodel.Route{Host: "h", Upstream: proxymodel.Upstream{Addr: "x", Port: 80}, ErrorLogLevel: "crit;\n    include /etc/shadow"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

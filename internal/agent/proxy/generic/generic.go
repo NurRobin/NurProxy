@@ -79,9 +79,40 @@ type RouteContext struct {
 	// ForceHTTPS / WebSocket mirror the route options for convenience.
 	ForceHTTPS bool
 	WebSocket  bool
+	// AccessLogOff is true when the route asks for no access log.
+	// ErrorLogLevel is the requested error log level, empty for the host
+	// default. A template honors them only if the operator declared the
+	// access_log / error_log_level capabilities.
+	AccessLogOff  bool
+	ErrorLogLevel string
+	// PathRoutes are the route's extra path-routed upstreams, most specific
+	// first (exact before prefix, longer before shorter). A template that
+	// renders them in this order with first-match semantics, or as nginx-style
+	// locations, gets the same precedence as the native backends. Routes with
+	// path routes only reach a template that declared path_routes.
+	PathRoutes []PathRouteContext
 	// Route is the complete backend-neutral intent, for anything the flat fields
 	// above don't cover (headers, path rules, timeouts, IP rules, rate limit).
 	Route proxymodel.Route
+}
+
+// PathRouteContext is one path route as a template receives it.
+type PathRouteContext struct {
+	// Exact is true for an exact match, false for a prefix match. A prefix
+	// Path matches itself and everything below it on a segment boundary.
+	Exact bool
+	// Path is the request path, starting with "/" (no trailing slash on a
+	// prefix).
+	Path string
+	// Scheme, UpstreamHost, UpstreamPort and UpstreamAddr describe the
+	// route's backend like the top-level fields.
+	Scheme       string
+	UpstreamHost string
+	UpstreamPort int
+	UpstreamAddr string
+	WebSocket    bool
+	// StripPrefix asks for Path to be removed before forwarding.
+	StripPrefix bool
 }
 
 // Runner runs the custom engine's validate (optional) and reload commands.
@@ -213,21 +244,40 @@ func (b *Backend) Render(_ context.Context, route proxymodel.Route) (proxy.Artif
 		}, nil
 	}
 
+	// A template that never declared path routes would render only the
+	// default upstream and lose the other paths unnoticed.
+	if len(route.PathRoutes) > 0 && !b.caps.PathRoutes {
+		return proxy.Artifact{}, fmt.Errorf("custom proxy: %q has path routes, but the template does not declare the path_routes capability", route.Host)
+	}
 	policy := route.TLS.Policy
 	if policy == "" {
 		policy = proxymodel.TLSPolicyCentral
 	}
 	ctx := RouteContext{
-		Host:         route.Host,
-		TLS:          policy != proxymodel.TLSPolicyOff,
-		Policy:       string(policy),
-		Scheme:       string(route.EffectiveScheme()),
-		UpstreamHost: route.Upstream.Addr,
-		UpstreamPort: route.Upstream.Port,
-		UpstreamAddr: upstreamAddr(route.Upstream),
-		ForceHTTPS:   route.ForceHTTPS,
-		WebSocket:    route.WebSocket,
-		Route:        route,
+		Host:          route.Host,
+		TLS:           policy != proxymodel.TLSPolicyOff,
+		Policy:        string(policy),
+		Scheme:        string(route.EffectiveScheme()),
+		UpstreamHost:  route.Upstream.Addr,
+		UpstreamPort:  route.Upstream.Port,
+		UpstreamAddr:  upstreamAddr(route.Upstream),
+		ForceHTTPS:    route.ForceHTTPS,
+		WebSocket:     route.WebSocket,
+		AccessLogOff:  route.AccessLog == proxymodel.AccessLogOff,
+		ErrorLogLevel: route.ErrorLogLevel,
+		Route:         route,
+	}
+	for _, p := range proxymodel.SortedPathRoutes(route.PathRoutes) {
+		ctx.PathRoutes = append(ctx.PathRoutes, PathRouteContext{
+			Exact:        p.Match == proxymodel.PathMatchExact,
+			Path:         p.Path,
+			Scheme:       string(p.EffectiveScheme()),
+			UpstreamHost: p.Upstream.Addr,
+			UpstreamPort: p.Upstream.Port,
+			UpstreamAddr: upstreamAddr(p.Upstream),
+			WebSocket:    p.WebSocket,
+			StripPrefix:  p.StripPrefix,
+		})
 	}
 	// Resolve provided-cert paths for a central-TLS route; a missing store or
 	// cert leaves them empty and the template guards with {{ if .CertPath }}.

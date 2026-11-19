@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/agent/certdiscover"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
 	"github.com/NurRobin/NurProxy/internal/agent/logtail"
 	"github.com/NurRobin/NurProxy/internal/agent/proxy"
@@ -156,6 +157,71 @@ type Client struct {
 	recovery       *recovery.Coordinator
 	managedApplyMu sync.RWMutex
 	managedApply   ManagedApplier
+	certLoader     CertLoader
+	upgrades       UpgradeHandler
+}
+
+// UpgradeHandler acts on an operator-requested self-update pushed down the
+// stream. Handle must not block the stream.
+type UpgradeHandler interface {
+	Handle(ctx context.Context, cmd models.UpgradeCommand)
+}
+
+// WithUpgrades wires the self-update handler. Without one, upgrade events are
+// ignored and the orchestrator times the request out.
+func (c *Client) WithUpgrades(h UpgradeHandler) *Client {
+	c.upgrades = h
+	return c
+}
+
+// CertLoader returns the on-disk certificate bundle with the given leaf
+// fingerprint, chosen only among bundles the agent discovered itself.
+type CertLoader func(fingerprint string) (*certdiscover.Bundle, error)
+
+// WithCertLoader enables uploads of discovered certificates the operator
+// adopts (#80). Without it every upload request is answered with an error.
+func (c *Client) WithCertLoader(load CertLoader) *Client {
+	c.certLoader = load
+	return c
+}
+
+// uploadCert answers a cert_upload_request: it loads the requested bundle and
+// POSTs it, or the reason it cannot, over the agent-authenticated control
+// plane. The key material is never logged.
+func (c *Client) uploadCert(ctx context.Context, req proxymodel.CertUploadRequest) {
+	up := proxymodel.CertUpload{RequestID: req.RequestID, Fingerprint: req.Fingerprint}
+	if c.certLoader == nil {
+		up.Error = "certificate discovery is not enabled on this agent"
+	} else if b, err := c.certLoader(req.Fingerprint); err != nil {
+		up.Error = err.Error()
+	} else {
+		up.CertPEM, up.KeyPEM, up.SourcePath = string(b.CertPEM), string(b.KeyPEM), b.Pair.CertPath
+	}
+	if up.Error != "" {
+		log.Printf("Stream: cannot upload certificate %s: %s", req.Fingerprint, up.Error)
+	} else {
+		log.Printf("Stream: uploading certificate %s from %s for adoption", req.Fingerprint, up.SourcePath)
+	}
+	body, err := json.Marshal(up)
+	if err != nil {
+		return
+	}
+	url := fmt.Sprintf("%s/api/v1/agents/%s/certificates/upload", c.orchestratorURL, c.agentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(httpReq)
+	if err != nil {
+		log.Printf("Stream: certificate upload failed: %v", err)
+		return
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Stream: certificate upload rejected with status %d", resp.StatusCode)
+	}
 }
 
 func (c *Client) WithRecovery(coordinator *recovery.Coordinator) *Client {
@@ -340,6 +406,13 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			return
 		}
 		c.applyManagedIntents(ctx, envelope)
+	case "cert_upload_request":
+		var req proxymodel.CertUploadRequest
+		if err := json.Unmarshal([]byte(data), &req); err != nil || req.RequestID == "" {
+			log.Printf("Stream: bad cert_upload_request payload")
+			return
+		}
+		go c.uploadCert(ctx, req)
 	case "ping":
 		// Liveness only — nothing to do.
 	case "log_tail":
@@ -383,6 +456,17 @@ func (c *Client) handleEvent(ctx context.Context, eventType, data string) {
 			log.Printf("Stream: rejected repair request %q: %v", envelope.Request.OperationID, err)
 		}
 		c.syncRecoveryHealth()
+	case "upgrade":
+		if c.upgrades == nil {
+			log.Printf("Stream: ignoring upgrade request (self-update not wired)")
+			return
+		}
+		var cmd models.UpgradeCommand
+		if err := json.Unmarshal([]byte(data), &cmd); err != nil || cmd.Validate() != nil {
+			log.Printf("Stream: bad upgrade payload")
+			return
+		}
+		c.upgrades.Handle(ctx, cmd)
 	default:
 		log.Printf("Stream: ignoring unknown event %q", eventType)
 	}
@@ -410,25 +494,58 @@ func (c *Client) applyManagedIntents(ctx context.Context, envelope helperprotoco
 			c.syncRecoveryHealth()
 		}
 		log.Printf("Stream: privileged managed apply failed: %v", err)
+		message := managedApplyFailureMessage(err)
 		if c.health != nil {
-			c.health.SetError("privileged managed proxy reconciliation failed")
+			c.health.SetError(message)
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation failed", nil)
+		c.sendManagedAck(ctx, envelope.IntentSet, message, nil)
 		return
 	}
 	if receipt.Envelope.Payload.State != helperprotocol.JournalSucceeded {
 		log.Printf("Stream: privileged managed apply %s ended as %s: %s", receipt.Envelope.Payload.OperationID,
 			receipt.Envelope.Payload.State, receipt.Envelope.Payload.SanitizedResult)
+		const message = "privileged managed proxy reconciliation did not succeed"
 		if c.health != nil {
-			c.health.SetError("privileged managed proxy reconciliation did not succeed")
+			c.health.SetError(message)
 		}
-		c.sendManagedAck(ctx, envelope.IntentSet, "privileged managed proxy reconciliation did not succeed", nil)
+		reports, _ := c.managedAckReports(ctx, envelope.IntentSet, message)
+		attributeManagedFailure(reports, envelope.IntentSet, c.caddy.Info().Kind, message, receipt.Envelope.Payload.SanitizedResult)
+		c.sendAck(ctx, reports)
 		return
 	}
 	if c.health != nil {
 		c.health.SetError("")
 	}
 	c.sendManagedAck(ctx, envelope.IntentSet, "", receipt.Envelope.Payload.ManagedArtifacts)
+}
+
+// maxManagedRefusalBytes bounds the helper's refusal reason in an artifact
+// report.
+const maxManagedRefusalBytes = 400
+
+// managedApplyFailureMessage is the artifact error for a failed privileged
+// apply. When the root helper's local policy refused the desired state with
+// a reason (a refused raw config directive, an unsafe error log target), the
+// reason is appended so it reaches the domain's error message.
+func managedApplyFailureMessage(err error) string {
+	const message = "privileged managed proxy reconciliation failed"
+	var refusal interface{ RefusalReason() string }
+	if !errors.As(err, &refusal) {
+		return message
+	}
+	reason := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(refusal.RefusalReason(), ""))
+	if len(reason) > maxManagedRefusalBytes {
+		reason = strings.ToValidUTF8(reason[:maxManagedRefusalBytes], "")
+	}
+	if reason = strings.TrimSpace(reason); reason == "" {
+		return message
+	}
+	return message + ": " + reason
 }
 
 func (c *Client) sendManagedAck(ctx context.Context, set proxymodel.IntentSet, applyError string, attested []helperprotocol.ManagedArtifactReceipt) {
@@ -548,6 +665,46 @@ func (c *Client) managedAckReports(ctx context.Context, set proxymodel.IntentSet
 		reports = append(reports, report)
 	}
 	return reports, managed
+}
+
+// attributeManagedFailure points a failed batch apply at the routes whose
+// managed vhost the helper's validator output names. The helper applies all
+// routes of the agent as one unit, so one broken vhost fails every route;
+// nginx and apachectl name the file (".../nurproxy-<host>.conf:<line>"), which
+// identifies the route. That route's report gets the validator output, the
+// others say which route blocked them. When no managed file is named, the
+// reports keep the base message.
+func attributeManagedFailure(reports []proxymodel.ArtifactReport, set proxymodel.IntentSet, kind proxy.Kind, base, result string) {
+	if result == "" || len(reports) != len(set.Intents) {
+		return
+	}
+	var culprits []string
+	blamed := make([]bool, len(set.Intents))
+	for i, intent := range set.Intents {
+		var name string
+		switch kind {
+		case proxy.KindNginx:
+			name = nginxproxy.ManagedFileName(intent.Route.Host)
+		case proxy.KindApache:
+			name = apacheproxy.ManagedFileName(intent.Route.Host)
+		default:
+			return
+		}
+		if strings.Contains(result, "/"+name+":") {
+			blamed[i] = true
+			culprits = append(culprits, intent.Route.Host)
+		}
+	}
+	if len(culprits) == 0 {
+		return
+	}
+	for i := range reports {
+		if blamed[i] {
+			reports[i].Error = base + ": the proxy rejected this domain's config: " + result
+		} else {
+			reports[i].Error = base + ": the proxy rejected the config of " + strings.Join(culprits, ", ") + ", so no domain on this agent was applied"
+		}
+	}
 }
 
 func managedFileTarget(info proxy.Info, intent proxymodel.RouteIntent) (proxy.Target, error) {

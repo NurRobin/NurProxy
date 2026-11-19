@@ -34,7 +34,7 @@ func (d *DB) GetZone(id string) (*models.Zone, error) {
 		FROM zones WHERE id = ?`, id,
 	).Scan(&z.ID, &z.ProviderID, &z.ExternalID, &z.Name, &createdAt)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("zone not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrZoneNotFound, id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("querying zone: %w", err)
@@ -90,11 +90,12 @@ func (d *DB) ListZonesByProvider(providerID string) ([]models.Zone, error) {
 	return zones, rows.Err()
 }
 
-// DeleteZone removes a zone by ID.
+// DeleteZone removes a zone by ID. It fails with ErrParentInUse while domains
+// still reference the zone.
 func (d *DB) DeleteZone(id string) error {
 	res, err := d.sql.Exec("DELETE FROM zones WHERE id = ?", id)
 	if err != nil {
-		return fmt.Errorf("deleting zone: %w", err)
+		return parentDeleteError("zone", id, err)
 	}
 
 	n, _ := res.RowsAffected()

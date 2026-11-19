@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -92,8 +93,9 @@ func newManagedApplyTest(t *testing.T) (*managedApplyAction, helperprotocol.Appl
 	}}
 	action := &managedApplyAction{
 		agentUID: uint32(os.Getuid()), ownerUID: uint32(os.Getuid()), stagingRootUID: uint32(os.Getuid()), journal: journal, host: host,
-		workerGroup: func() (uint32, error) { return uint32(os.Getgid()), nil },
-		target:      ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
+		workerGroup:    func() (uint32, error) { return uint32(os.Getgid()), nil },
+		errorLogTarget: func() error { return nil },
+		target:         ProxyTargetConfig{Kind: "nginx", Binary: "/usr/sbin/nginx", Unit: "nginx.service", SystemctlBinary: "/usr/bin/systemctl", ConfigRoots: []string{filepath.Join(root, "available")}},
 		layout: ManagedApplyTargetConfig{
 			StagingDir: filepath.Join(root, "staging"), AvailableDir: filepath.Join(root, "available"), EnabledDir: filepath.Join(root, "enabled"),
 			CertificateDir: filepath.Join(root, "certs"), CustomPolicyVersion: "proxy-policy-v1", ProxyVersion: "1.22.1",
@@ -415,6 +417,153 @@ func TestManagedApplyAdmitsParserBoundedNginxCustomConfiguration(t *testing.T) {
 	if len(compilation.Files) != 1 || !strings.Contains(string(compilation.Files[0].Content), "proxy_pass http://10.0.0.2:8080") ||
 		!proxy.HasManagedArtifactMarker(string(compilation.Files[0].Content)) {
 		t.Fatalf("bounded raw config was not compiled: %+v", compilation)
+	}
+}
+
+func TestManagedApplyRendersPerDomainLogging(t *testing.T) {
+	tests := []struct {
+		name      string
+		kind      string
+		access    proxymodel.AccessLogMode
+		level     string
+		want      []string
+		wantNoLog bool
+	}{
+		{name: "nginx_default", kind: "nginx", wantNoLog: true},
+		{name: "nginx_off_crit", kind: "nginx", access: proxymodel.AccessLogOff, level: "crit", want: []string{"    access_log off;\n", "    error_log /var/log/nginx/error.log crit;\n"}},
+		{name: "apache_off_crit", kind: "apache", access: proxymodel.AccessLogOff, level: "crit", want: []string{"    CustomLog /dev/null common\n", "    LogLevel crit\n"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, intent, _ := newManagedApplyTest(t)
+			action.target.Kind = tt.kind
+			intent.Routes[0].Backend = tt.kind
+			intent.Routes[0].Route.AccessLog = tt.access
+			intent.Routes[0].Route.ErrorLogLevel = tt.level
+			compilation, err := action.compile(intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(compilation.Files) != 1 {
+				t.Fatalf("unexpected compilation: %+v", compilation)
+			}
+			content := string(compilation.Files[0].Content)
+			for _, want := range tt.want {
+				if !strings.Contains(content, want) {
+					t.Errorf("compiled config lacks %q:\n%s", want, content)
+				}
+			}
+			if tt.wantNoLog && (strings.Contains(content, "access_log") || strings.Contains(content, "error_log")) {
+				t.Errorf("default route gained a log directive:\n%s", content)
+			}
+		})
+	}
+}
+
+func TestManagedApplyRefusesInvalidLogLevelInIntent(t *testing.T) {
+	action, intent, _ := newManagedApplyTest(t)
+	intent.Routes[0].Route.ErrorLogLevel = "crit;\n    include /etc/shadow"
+	if _, err := action.Plan(context.Background(), intent); err == nil {
+		t.Fatal("helper accepted an error log level that smuggles a directive")
+	}
+}
+
+func TestManagedApplyRawNginxLogDirectivesPolicy(t *testing.T) {
+	const base = `server {
+    listen 80;
+    listen [::]:80;
+    server_name app.example.com;
+    %s
+    location / {
+        proxy_pass http://10.0.0.2:8080;
+        proxy_set_header Host $host;
+    }
+}`
+	tests := []struct {
+		name    string
+		logs    string
+		wantErr bool
+	}{
+		{"access_off_and_default_error_log", "access_log off;\n    error_log /var/log/nginx/error.log crit;", false},
+		{"error_log_to_foreign_path", "error_log /etc/cron.d/nurproxy crit;", true},
+		{"access_log_to_file", "access_log /var/log/nginx/app.log;", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, intent, _ := newManagedApplyTest(t)
+			intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: fmt.Sprintf(base, tt.logs)}
+			if tt.wantErr {
+				// Policy-foreign raw config is only ever kept if exactly these
+				// bytes already exist on disk; with nothing there, Plan refuses.
+				if _, err := action.Plan(context.Background(), intent); err == nil {
+					t.Fatal("policy-foreign log directive was admitted")
+				}
+				return
+			}
+			if _, err := action.Plan(context.Background(), intent); err != nil {
+				t.Fatalf("bounded raw config with log directives was refused: %v", err)
+			}
+			compilation, err := action.compile(intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(compilation.Files) != 1 || compilation.Files[0].Preserve || !strings.Contains(string(compilation.Files[0].Content), "access_log off;") {
+				t.Fatalf("raw config with log directives was not compiled: %+v", compilation)
+			}
+		})
+	}
+}
+
+// TestManagedApplyRawNginxTuningAndRefusalReason checks that a raw config with
+// common tuning directives is written, and that a refused one fails planning
+// with a reason that names the route, directive and line but no argument.
+func TestManagedApplyRawNginxTuningAndRefusalReason(t *testing.T) {
+	const base = `server {
+    listen 80;
+    server_name app.example.com;
+    client_max_body_size 50m;
+    %s
+    location / {
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_pass http://10.0.0.2:8080;
+    }
+}`
+	tests := []struct {
+		name       string
+		statement  string
+		wantReason string
+	}{
+		{name: "tuning admitted", statement: "gzip on;\n    add_header X-Robots-Tag noindex;"},
+		{name: "include refused", statement: "include /etc/nginx/private.conf;", wantReason: `raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "include" is not allowed in the server block`},
+		{name: "access_log file refused", statement: "access_log /etc/nginx/private.log;", wantReason: `raw nginx config for app.example.com refused by the helper policy: line 5: nginx directive "access_log" has unsupported arguments in the server block`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, intent, _ := newManagedApplyTest(t)
+			intent.Routes[0].Route.Raw = proxymodel.RawConfig{Backend: "nginx", Content: fmt.Sprintf(base, tt.statement)}
+			_, err := action.Plan(context.Background(), intent)
+			if tt.wantReason == "" {
+				if err != nil {
+					t.Fatalf("raw config with tuning directives was refused: %v", err)
+				}
+				compilation, err := action.compile(intent)
+				if err != nil || len(compilation.Files) != 1 || compilation.Files[0].Preserve || !strings.Contains(string(compilation.Files[0].Content), "gzip on;") {
+					t.Fatalf("raw config with tuning directives was not compiled for writing: %+v, %v", compilation, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("policy-foreign raw config was admitted")
+			}
+			message := localPolicyRefusalReason(err)
+			if message != tt.wantReason {
+				t.Fatalf("refusal reason = %q, want %q", message, tt.wantReason)
+			}
+			if strings.Contains(message, "/etc/nginx/private") {
+				t.Fatalf("refusal message quotes an argument: %q", message)
+			}
+		})
 	}
 }
 

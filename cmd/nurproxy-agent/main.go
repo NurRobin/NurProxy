@@ -15,6 +15,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/adoption"
 	"github.com/NurRobin/NurProxy/internal/agent/api"
 	"github.com/NurRobin/NurProxy/internal/agent/caddy"
+	"github.com/NurRobin/NurProxy/internal/agent/certdiscover"
 	agentconfig "github.com/NurRobin/NurProxy/internal/agent/config"
 	"github.com/NurRobin/NurProxy/internal/agent/ddns"
 	"github.com/NurRobin/NurProxy/internal/agent/health"
@@ -29,6 +30,7 @@ import (
 	"github.com/NurRobin/NurProxy/internal/agent/recovery"
 	"github.com/NurRobin/NurProxy/internal/agent/recoverycontrol"
 	"github.com/NurRobin/NurProxy/internal/agent/runtimeenv"
+	"github.com/NurRobin/NurProxy/internal/agent/selfupdate"
 
 	"github.com/NurRobin/NurProxy/internal/agent/stream"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
@@ -46,6 +48,10 @@ var version = "dev"
 // missed beat never flaps the agent offline.
 const heartbeatInterval = 30 * time.Second
 
+// helperCertificateDir is where the root helper materializes certificates for
+// managed vhosts.
+const helperCertificateDir = "/var/lib/nurproxy-agent/certs"
+
 var (
 	orchestratorURL = flag.String("orchestrator", "", "Orchestrator URL (required)")
 	fqdn            = flag.String("fqdn", "", "Agent FQDN (required)")
@@ -53,6 +59,9 @@ var (
 	apiPort         = flag.Int("api-port", 8780, "Agent API port")
 	apiBind         = flag.String("api-bind", "", "Agent API bind address (default 127.0.0.1; widen only if the orchestrator must reach this agent inbound)")
 	caddyAdminPort  = flag.Int("caddy-admin-port", 2019, "Caddy admin API port (localhost)")
+	caddyHTTPPort   = flag.Int("caddy-http-port", 0, "Port the bundled Caddy serves plain HTTP on (default 80)")
+	caddyHTTPSPort  = flag.Int("caddy-https-port", 0, "Port the bundled Caddy serves HTTPS on (default 443)")
+	caddyListenHost = flag.String("caddy-listen-host", "", "Address the bundled Caddy's HTTP/HTTPS listeners bind (default all interfaces)")
 	showVersion     = flag.Bool("version", false, "Print version and exit")
 	dryRun          = flag.Bool("dry-run", false, "Sandbox mode: simulate the proxy in-memory (no Caddy process, no :80/:443, unprivileged)")
 
@@ -99,6 +108,15 @@ func main() {
 		case "helper-bootstrap":
 			cmdHelperBootstrap(os.Args[2:])
 			return
+		case "self-update-apply":
+			cmdSelfUpdateApply(os.Args[2:])
+			return
+		case "self-update-enable":
+			cmdSelfUpdateEnable(os.Args[2:])
+			return
+		case "self-update-disable":
+			cmdSelfUpdateDisable(os.Args[2:])
+			return
 		}
 	}
 
@@ -111,21 +129,24 @@ func main() {
 
 	// Load config with priority: flags > env > config file > defaults.
 	cfg, err := agentconfig.Load(agentconfig.Flags{
-		Orchestrator:   *orchestratorURL,
-		FQDN:           *fqdn,
-		DataDir:        *dataDir,
-		APIPort:        *apiPort,
-		APIBind:        *apiBind,
-		CaddyPort:      *caddyAdminPort,
-		ProxyMode:      *proxyMode,
-		ProxyType:      *proxyType,
-		ProxyBinary:    *proxyBinary,
-		ProxyConfigDir: *proxyConfigDir,
-		ProxyReloadCmd: *proxyReloadCmd,
-		ProxyTestCmd:   *proxyTestCmd,
-		ProxyLogPaths:  *proxyLogPaths,
-		ProxyService:   *proxyService,
-		DryRun:         *dryRun,
+		Orchestrator:    *orchestratorURL,
+		FQDN:            *fqdn,
+		DataDir:         *dataDir,
+		APIPort:         *apiPort,
+		APIBind:         *apiBind,
+		CaddyPort:       *caddyAdminPort,
+		CaddyHTTPPort:   *caddyHTTPPort,
+		CaddyHTTPSPort:  *caddyHTTPSPort,
+		CaddyListenHost: *caddyListenHost,
+		ProxyMode:       *proxyMode,
+		ProxyType:       *proxyType,
+		ProxyBinary:     *proxyBinary,
+		ProxyConfigDir:  *proxyConfigDir,
+		ProxyReloadCmd:  *proxyReloadCmd,
+		ProxyTestCmd:    *proxyTestCmd,
+		ProxyLogPaths:   *proxyLogPaths,
+		ProxyService:    *proxyService,
+		DryRun:          *dryRun,
 	})
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
@@ -137,6 +158,9 @@ func main() {
 	log.Printf("  Data dir:     %s", cfg.DataDir)
 	log.Printf("  API port:     %d", cfg.APIPort)
 	log.Printf("  Caddy admin:  %d", cfg.CaddyAdminPort)
+	if cfg.CaddyHTTPPort != 0 || cfg.CaddyHTTPSPort != 0 || cfg.CaddyListenHost != "" {
+		log.Printf("  Caddy listen: host=%q http=%d https=%d (0 = default)", cfg.CaddyListenHost, cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort)
+	}
 	log.Printf("  Proxy mode:   %s", cfg.ProxyMode)
 	if cfg.DryRun {
 		log.Printf("  DRY-RUN:      proxy simulated in-memory — no Caddy process, no :80/:443, no privileged file ops")
@@ -172,7 +196,13 @@ func main() {
 	// which proxy is installed (+ version/paths) and which process holds :80/:443.
 	// The result rides the agent-initiated adoption + heartbeat payloads (the
 	// agent always dials out; the orchestrator never probes it inbound).
-	rawDetection, detection := detectProxy(ctx, cfg.ProxyConfigDir)
+	// newDetector applies the operator's proxy-config-dir override (empty = §9
+	// OS default) and the certificate scan (#80) to every detection run.
+	certScanner, certConfigRefs := diskCertScanner(cfg)
+	newDetector := func() *proxy.Detector {
+		return proxy.NewDetector().WithConfigDir(cfg.ProxyConfigDir).WithCertScanner(certScanner, certConfigRefs)
+	}
+	rawDetection, detection := detectProxy(ctx, newDetector())
 	if detection != nil {
 		log.Printf("Proxy detection: installed=%t kind=%q version=%q config_dir=%q",
 			detection.Installed, detection.Kind, detection.Version, detection.ConfigDir)
@@ -266,6 +296,7 @@ func main() {
 	} else {
 		caddyClient = caddy.NewClient(cfg.CaddyAdminPort)
 	}
+	caddyClient.WithListen(cfg.CaddyListenHost, cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort)
 
 	// Drive the bundled Caddy through the proxy.Proxy interface: the agent
 	// reconciles routes via the admin-API caddy backend (§5) instead of the raw
@@ -379,7 +410,8 @@ func main() {
 		CertKey:            certKey,
 		Detection:          rawDetection,
 		CaddyFactory: func() proxy.Proxy {
-			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort))
+			b := caddybackend.New(caddy.NewClient(cfg.CaddyAdminPort).
+				WithListen(cfg.CaddyListenHost, cfg.CaddyHTTPPort, cfg.CaddyHTTPSPort))
 			if certStore != nil {
 				b.WithCertStore(certStore)
 			}
@@ -438,7 +470,29 @@ func main() {
 	// drift detection (§11).
 	streamClient := stream.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), holder, hs).
 		WithLogPaths(cfg.ProxyLogPaths).
-		WithCertStore(certStore)
+		WithCertStore(certStore).
+		WithCertLoader(func(fingerprint string) (*certdiscover.Bundle, error) {
+			s, _ := newDetector().CertScanner()
+			return s.Load(fingerprint)
+		})
+
+	// Self-update (#73): operator-requested upgrades arrive on the stream. The
+	// agent downloads and verifies the release and hands it to the privileged
+	// applier; Watch relays the applier's verdict, HeartbeatOK writes the health
+	// proof after a restart into a new binary.
+	updater, updaterErr := selfupdate.NewAgent(version, cfg.DataDir, env, cfg.DryRun, selfupdate.HTTPReporter{
+		OrchestratorURL: cfg.OrchestratorURL, AgentID: mgr.AgentID(), Token: mgr.Token(),
+	})
+	if updaterErr != nil {
+		log.Printf("WARNING: self-update unavailable: %v", updaterErr)
+	} else {
+		updater.Fetcher = selfupdate.Fetcher{BaseURL: cfg.UpdateMirror}
+		if cfg.DryRun {
+			updater.DryRunFail = os.Getenv("NP_DRY_RUN_UPDATE_FAIL")
+		}
+		streamClient.WithUpgrades(updater)
+		go updater.Watch(ctx)
+	}
 
 	// Recovery is optional at startup and fail-closed: if durable storage or path
 	// guards cannot be established, the agent keeps reconciling normally but does
@@ -515,7 +569,7 @@ func main() {
 	hb := ddns.New(cfg.OrchestratorURL, mgr.AgentID(), mgr.Token(), version, heartbeatInterval, hs.Snapshot)
 	// Re-report detection on every beat so the orchestrator's stored copy tracks
 	// host changes (e.g. a previously-conflicting proxy releasing :443).
-	hb.SetDetectionFn(func() *models.ProxyDetection { _, m := detectProxy(ctx, cfg.ProxyConfigDir); return m })
+	hb.SetDetectionFn(func() *models.ProxyDetection { _, m := detectProxy(ctx, newDetector()); return m })
 	// Re-report the capability matrix on each beat so module changes (e.g.
 	// caddy-ratelimit installed later) propagate. The probe reuses the same caddy
 	// backend the agent reconciles through, so the report matches what Render emits.
@@ -546,6 +600,12 @@ func main() {
 	// Report each managed artifact's checksum so the orchestrator detects drift
 	// (on-disk/live != accepted state, §11) without ever probing the agent inbound.
 	hb.SetArtifactChecksumsFn(streamClient.ManagedChecksums)
+	if updater != nil {
+		hb.SetVersionFn(updater.CurrentVersion)
+		hb.SetSelfUpdateFn(func() *models.SelfUpdateStatus { status := updater.Status(); return &status })
+		hb.SetOnSuccess(updater.HeartbeatOK)
+		updater.AfterSimulatedRestart = hb.Kick
+	}
 	if recoveryCoordinator != nil {
 		hb.SetRecoveryCapabilityFn(func() *recoverymodel.Capability { capability := recoveryCoordinator.Capability(); return &capability })
 		hb.SetRecoveryPolicyFn(recoveryCoordinator.SetPolicy)
@@ -625,13 +685,40 @@ func watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 	}
 }
 
+// diskCertScanner picks where the agent looks for adoptable certificates
+// (#80) and whether the host proxy's vhosts are followed. A real agent scans
+// certbot, acme.sh and the proxy config. A dry-run agent never reads the
+// host's certificates: it scans only a simulated certbot directory in its data
+// dir, populated for the names in NP_DRY_RUN_DISK_CERTS (comma-separated).
+func diskCertScanner(cfg *agentconfig.Config) (certdiscover.Scanner, bool) {
+	if !cfg.DryRun {
+		s := certdiscover.Default()
+		// Vhosts NurProxy rendered reference the certificates it installed, per
+		// FQDN and including copies of zone wildcard certs: under the data dir,
+		// or the root helper's fixed certificate dir. Those are not candidates.
+		s.Exclude = []string{helperCertificateDir}
+		if dataDir, err := filepath.Abs(cfg.DataDir); err == nil && cfg.DataDir != "" {
+			s.Exclude = append(s.Exclude, dataDir)
+		}
+		return s, true
+	}
+	names := strings.Split(os.Getenv("NP_DRY_RUN_DISK_CERTS"), ",")
+	live, err := certdiscover.WriteSimulated(filepath.Join(cfg.DataDir, "dryrun-disk-certs"), names, time.Now())
+	if err != nil {
+		if strings.TrimSpace(os.Getenv("NP_DRY_RUN_DISK_CERTS")) != "" {
+			log.Printf("WARNING: dry-run: cannot simulate on-disk certificates: %v", err)
+		}
+		return certdiscover.Scanner{}, false
+	}
+	log.Printf("Dry-run: simulating on-disk certificates for %s", os.Getenv("NP_DRY_RUN_DISK_CERTS"))
+	return certdiscover.Scanner{CertbotLive: []string{live}, LiveSource: certdiscover.SourceDryRun}, false
+}
+
 // detectProxy runs read-only proxy detection and converts it to the shared wire
 // model. It never mutates host state; a detection error is logged and reported
-// as nil (the orchestrator keeps any prior value), never fatal. configDir is the
-// operator's optional proxy-config-dir override (empty = §9 OS default), applied
-// to both the reported config dir and upstream discovery.
-func detectProxy(ctx context.Context, configDir string) (*proxy.Detection, *models.ProxyDetection) {
-	det, err := proxy.NewDetector().WithConfigDir(configDir).Detect(ctx)
+// as nil (the orchestrator keeps any prior value), never fatal.
+func detectProxy(ctx context.Context, d *proxy.Detector) (*proxy.Detection, *models.ProxyDetection) {
+	det, err := d.Detect(ctx)
 	if err != nil {
 		log.Printf("Proxy detection failed: %v", err)
 		return nil, nil
@@ -802,6 +889,12 @@ func declaredCapsFromNames(names []string) *proxy.Capabilities {
 			c.RateLimit = true
 		case "central_tls", "centraltls":
 			c.CentralTLS = true
+		case "access_log", "accesslog":
+			c.AccessLog = true
+		case "error_log_level", "errorloglevel":
+			c.ErrorLogLevel = true
+		case "path_routes", "pathroutes":
+			c.PathRoutes = true
 		}
 	}
 	return &c

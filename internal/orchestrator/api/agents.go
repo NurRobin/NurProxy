@@ -37,6 +37,16 @@ var registerLimiter = ratelimit.New(10, 15*time.Minute, 15*time.Minute)
 // real host's interface/log/upstream/conflict count.
 const maxProxyDetectionEntries = 256
 
+// detectionTooLarge reports whether any list in a reported detection exceeds
+// maxProxyDetectionEntries.
+func detectionTooLarge(d *models.ProxyDetection) bool {
+	return len(d.LogPaths) > maxProxyDetectionEntries ||
+		len(d.PortConflicts) > maxProxyDetectionEntries ||
+		len(d.DiscoveredUpstreams) > maxProxyDetectionEntries ||
+		len(d.Networks) > maxProxyDetectionEntries ||
+		len(d.DiscoveredCerts) > maxProxyDetectionEntries
+}
+
 // GET /api/v1/agents
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents, err := s.db.ListAgents()
@@ -47,6 +57,7 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	if agents == nil {
 		agents = []models.Agent{}
 	}
+	s.attachUpgradeInfo(agents)
 
 	// Build response with zones included
 	type agentResponse struct {
@@ -118,10 +129,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	// Bound the variable-length detection slices a single registration can
 	// persist (the body cap still permits many tiny entries).
 	if d := req.ProxyDetection; d != nil {
-		if len(d.LogPaths) > maxProxyDetectionEntries ||
-			len(d.PortConflicts) > maxProxyDetectionEntries ||
-			len(d.DiscoveredUpstreams) > maxProxyDetectionEntries ||
-			len(d.Networks) > maxProxyDetectionEntries {
+		if detectionTooLarge(d) {
 			writeError(w, http.StatusBadRequest, "proxy_detection has too many entries")
 			return
 		}
@@ -329,9 +337,8 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r, "id")
 
-	// Refuse while domains still reference this agent's servers: the ON DELETE
-	// CASCADE (agent -> servers -> domains) would orphan their DNS records/certs
-	// ahead of the reconciler teardown (see guardChildDomains).
+	// Refuse while domains still reference this agent's servers; they must be
+	// torn down through the reconciler first (see guardChildDomains).
 	if cascadeRequested(r) {
 		s.cascadeDeleteParent(w, r, "agent", id, db.DomainFilter{AgentID: id})
 		return
@@ -341,7 +348,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.DeleteAgent(id); err != nil {
-		writeError(w, http.StatusNotFound, "agent not found")
+		writeParentDeleteError(w, "agent", err)
 		return
 	}
 
@@ -482,6 +489,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// overwriting while unresolved. Empty/omitted leaves drift state untouched.
 		ArtifactChecksums  []proxymodel.ArtifactChecksum `json:"artifact_checksums"`
 		RecoveryCapability *recoverymodel.Capability     `json:"recovery_capability"`
+		// SelfUpdate is the agent's verdict on whether it can self-update (#73).
+		// Nil (older agent) leaves the stored report as it is.
+		SelfUpdate *models.SelfUpdateStatus `json:"self_update"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -508,7 +518,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Persist the agent's read-only proxy detection (§13.0). It's a narrow update
 	// so it doesn't clobber operator-owned fields or the health self-report just
 	// written above. Only update when the agent actually reported detection.
-	if req.ProxyDetection != nil {
+	if req.ProxyDetection != nil && detectionTooLarge(req.ProxyDetection) {
+		log.Printf("agent %s reported a detection with too many entries; ignoring it", id)
+	} else if req.ProxyDetection != nil {
 		if uerr := s.db.UpdateAgentDetection(id, req.ProxyDetection); uerr != nil {
 			log.Printf("failed to update agent %s detection: %v", id, uerr)
 		}
@@ -582,6 +594,16 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("failed to update agent version: %v", uerr)
 		}
 	}
+
+	if req.SelfUpdate != nil {
+		if uerr := s.db.SetAgentSelfUpdateCapability(id, req.SelfUpdate); uerr != nil {
+			log.Printf("failed to store agent %s self-update capability: %v", id, uerr)
+		}
+	}
+	// An unfinished upgrade is complete once the agent runs the target version.
+	s.upgrades.observeVersion(id, req.Version, func(action, details string) {
+		s.audit(r, "agent", id, action, details)
+	})
 
 	// Drift detection (§11): compare each reported on-disk checksum against the
 	// accepted state. A divergence flags the artifact for review (never

@@ -12,6 +12,7 @@ import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
 import { Checkbox, Field, Input, PasswordInput, Select } from '../components/Field';
 import MultiSelect from '../components/MultiSelect';
+import DiscoverySources from '../components/DiscoverySources';
 import { useToast, errMessage } from '../components/toast-context';
 import { useUIVariant, UI_VARIANTS } from '../lib/ui-variant-context';
 
@@ -311,6 +312,8 @@ export default function Settings() {
           </div>
         )}
       </Section>
+
+      <DiscoverySources />
 
       <Section title={t('settings.reconciler')} help="reconciler">
         <p className="-mt-1 text-sm text-fg-muted">{t('settings.reconcilerSub')}</p>

@@ -220,6 +220,13 @@ type mockDNSProvider struct {
 	// getErr, when set, is returned by GetRecord instead of the stored record —
 	// used to simulate a transient read failure vs. a genuine ErrRecordNotFound.
 	getErr error
+	// createErr, when set, is returned by CreateRecord instead of creating.
+	createErr error
+	// deleteConfigs records the provider config of every DeleteRecord call, so
+	// a test can tell which provider/zone a delete went through.
+	deleteConfigs []string
+	// id overrides the registry id ("mock"), e.g. to stand in for cloudflare.
+	id string
 }
 
 func newMockDNSProvider() *mockDNSProvider {
@@ -229,11 +236,17 @@ func newMockDNSProvider() *mockDNSProvider {
 }
 
 func (p *mockDNSProvider) Info() provider.ProviderInfo {
+	id := "mock"
+	if p.id != "" {
+		id = p.id
+	}
 	return provider.ProviderInfo{
-		ID:          "mock",
+		ID:          id,
 		Name:        "Mock Provider",
 		Description: "In-memory mock for testing",
 		RecordTypes: []string{"A", "AAAA", "CNAME"},
+		// Standing in for cloudflare, the mock can proxy records too.
+		SupportsProxied: id == "cloudflare",
 	}
 }
 
@@ -252,6 +265,9 @@ func (p *mockDNSProvider) ListZones(_ context.Context, _ json.RawMessage) ([]pro
 func (p *mockDNSProvider) CreateRecord(_ context.Context, _ json.RawMessage, rec provider.Record) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.createErr != nil {
+		return "", p.createErr
+	}
 	p.nextID++
 	id := fmt.Sprintf("rec-%d", p.nextID)
 	p.records[id] = rec
@@ -268,9 +284,10 @@ func (p *mockDNSProvider) UpdateRecord(_ context.Context, _ json.RawMessage, rec
 	return nil
 }
 
-func (p *mockDNSProvider) DeleteRecord(_ context.Context, _ json.RawMessage, recordID string) error {
+func (p *mockDNSProvider) DeleteRecord(_ context.Context, config json.RawMessage, recordID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.deleteConfigs = append(p.deleteConfigs, string(config))
 	if p.deleteErr != nil {
 		return p.deleteErr
 	}
@@ -1013,6 +1030,50 @@ func TestReconcileDNS_TransientGetRecordPreservesManaged(t *testing.T) {
 				t.Errorf("dns_record_id = %q, want preserved %q", got.DNSRecordID, recordID)
 			}
 		})
+	}
+}
+
+// A transient read failure is only reported on the domain after
+// dnsReadFailureLimit passes in a row, so a single provider blip does not put
+// every domain in error; a successful read resets the count.
+func TestReconcileDNS_TransientGetRecordReportedAfterLimit(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, _, _, _, dom := setupScenario(t, d)
+	recordID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: "agent1.example.com"})
+	if err := d.UpdateDomainDNSRecord(dom.ID, recordID, true); err != nil {
+		t.Fatal(err)
+	}
+	r := New(d, newMockAgentClient(), time.Minute)
+	pass := func() *models.Domain {
+		t.Helper()
+		if err := r.reconcileDNS(context.Background()); err != nil {
+			t.Fatalf("reconcileDNS: %v", err)
+		}
+		got, err := d.GetDomain(dom.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	mp.getErr = errors.New("cloudflare API error: 429 rate limited")
+	for i := 1; i < dnsReadFailureLimit; i++ {
+		if got := pass(); got.DNSError != "" || got.Status == models.DomainStatusError {
+			t.Fatalf("pass %d: domain reported a transient read error too early: status=%s dns_error=%q", i, got.Status, got.DNSError)
+		}
+	}
+	// A good read in between starts the count again.
+	mp.getErr = nil
+	pass()
+	mp.getErr = errors.New("cloudflare API error: 429 rate limited")
+	for i := 1; i < dnsReadFailureLimit; i++ {
+		if got := pass(); got.DNSError != "" {
+			t.Fatalf("count was not reset by a good read: dns_error=%q after %d failures", got.DNSError, i)
+		}
+	}
+	if got := pass(); got.DNSError == "" || got.Status != models.DomainStatusError {
+		t.Fatalf("lasting read failure not reported: status=%s dns_error=%q", got.Status, got.DNSError)
 	}
 }
 
@@ -1763,7 +1824,7 @@ func TestTakeoverDomainDNS(t *testing.T) {
 	conflictID := mp.seedRecord(provider.Record{Type: "A", Name: "app.example.com", Content: "203.0.113.99", Proxied: true})
 
 	r := New(d, newMockAgentClient(), time.Minute)
-	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 		t.Fatalf("TakeoverDomainDNS: %v", err)
 	}
 
@@ -1805,7 +1866,7 @@ func TestTakeoverDomainDNS_adoptsMatchingRecord(t *testing.T) {
 	seedID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: agent.FQDN})
 
 	r := New(d, newMockAgentClient(), time.Minute)
-	if err := r.TakeoverDomainDNS(context.Background(), dom.ID); err != nil {
+	if _, err := r.TakeoverDomainDNS(context.Background(), dom.ID, nil); err != nil {
 		t.Fatalf("TakeoverDomainDNS: %v", err)
 	}
 
@@ -2111,6 +2172,75 @@ func TestDueForRenewal_skipsCertsWithoutCentralConsumer(t *testing.T) {
 	}
 }
 
+// TestDueForRenewal_importedCertRenewsForItsHostOnly covers the #80 hand-over:
+// an imported cert in the renew window is re-issued by ACME for the host it is
+// stored under, never for the SAN set the operator's CA put on it, and only a
+// domain on that exact host counts as its consumer.
+func TestDueForRenewal_importedCertRenewsForItsHostOnly(t *testing.T) {
+	registerMockProvider(t)
+
+	soon := time.Now().UTC().Add(24 * time.Hour)
+	later := time.Now().UTC().Add(90 * 24 * time.Hour)
+	imported := func(host string, names []string, expires time.Time) models.Certificate {
+		return models.Certificate{ID: host, Host: host, Names: names, CertPEM: "C", KeyPEM: "K", ExpiresAt: expires, Source: models.CertSourceImported}
+	}
+
+	tests := []struct {
+		name      string
+		certs     []models.Certificate
+		wantHost  string // "" means no renewal target
+		wantNames []string
+	}{
+		{
+			name:      "imported wildcard with foreign SANs renews the host alone",
+			certs:     []models.Certificate{imported("app.example.com", []string{"*.example.com", "shop.other.net"}, soon)},
+			wantHost:  "app.example.com",
+			wantNames: []string{"app.example.com"},
+		},
+		{
+			name:  "imported cert outside the window is left alone",
+			certs: []models.Certificate{imported("app.example.com", []string{"app.example.com"}, later)},
+		},
+		{
+			// The wildcard SAN covers the live app.example.com, but the import was
+			// made for gone.example.com, which nothing serves any more.
+			name: "wildcard SAN does not make another domain its consumer",
+			certs: []models.Certificate{
+				{ID: "app.example.com", Host: "app.example.com", Names: []string{"app.example.com"}, CertPEM: "C", KeyPEM: "K", ExpiresAt: later},
+				imported("gone.example.com", []string{"*.example.com"}, soon),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			setupScenario(t, d)
+			for i := range tt.certs {
+				if err := d.UpsertCertificate(&tt.certs[i]); err != nil {
+					t.Fatalf("UpsertCertificate: %v", err)
+				}
+			}
+
+			targets, err := NewCertRenewalStore(d).DueForRenewal(context.Background(), tls.DefaultRenewWindow)
+			if err != nil {
+				t.Fatalf("DueForRenewal: %v", err)
+			}
+			if tt.wantHost == "" {
+				if len(targets) != 0 {
+					t.Fatalf("renewal targets = %+v, want none", targets)
+				}
+				return
+			}
+			if len(targets) != 1 || targets[0].Host != tt.wantHost {
+				t.Fatalf("renewal targets = %+v, want exactly %q", targets, tt.wantHost)
+			}
+			if strings.Join(targets[0].Names, ",") != strings.Join(tt.wantNames, ",") || targets[0].IsWildcard {
+				t.Errorf("target names = %v wildcard=%v, want %v and no wildcard", targets[0].Names, targets[0].IsWildcard, tt.wantNames)
+			}
+		})
+	}
+}
+
 // TestCertOnly_excludedFromRoutesAndCertGathered asserts a cert-only domain (§7)
 // gets its certificate gathered for the agent push and flips active, but is never
 // rendered as a route (no vhost — the operator hand-writes the config).
@@ -2381,4 +2511,45 @@ func TestFinalizePendingParentDeletions(t *testing.T) {
 		t.Errorf("pending intent should be cleared, got %+v", pending)
 	}
 	_ = agent
+}
+
+// An agent cascade with RESTRICT foreign keys: the domains are torn down by
+// reconcileDeletions, then finalizing removes the agent together with all of
+// its servers, including one that never had a domain.
+func TestFinalizePendingAgentDeletionRemovesServers(t *testing.T) {
+	ctx := context.Background()
+	d := testDB(t)
+	registerMockProvider(t)
+	_, _, agent, _, dom := setupScenario(t, d)
+	if err := d.CreateServer(&models.Server{ID: "srv-empty", AgentID: agent.ID, Name: "empty", Address: "10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
+	r := New(d, newMockAgentClient(), time.Minute)
+
+	if err := d.DeleteAgent(agent.ID); !errors.Is(err, db.ErrParentInUse) {
+		t.Fatalf("DeleteAgent with a live domain = %v, want ErrParentInUse", err)
+	}
+
+	if err := d.UpdateDomainStatus(dom.ID, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AddPendingParentDeletion(db.PendingParentDeletion{EntityType: "agent", EntityID: agent.ID, Actor: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileDeletions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.finalizePendingParentDeletions()
+
+	if _, err := d.GetAgent(agent.ID); err == nil {
+		t.Fatal("agent should be removed once its domains are gone")
+	}
+	for _, id := range []string{"srv-1", "srv-empty"} {
+		if _, err := d.GetServer(id); err == nil {
+			t.Fatalf("server %s should be removed with its agent", id)
+		}
+	}
+	if pending, _ := d.ListPendingParentDeletions(); len(pending) != 0 {
+		t.Errorf("pending intent should be cleared, got %+v", pending)
+	}
 }

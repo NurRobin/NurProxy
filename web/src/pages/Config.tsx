@@ -784,6 +784,16 @@ function MaskForm({ mask, loading }: { mask: ArtifactMask | null; loading: boole
     [t('config.form.websocket'), r.WebSocket ? t('config.form.enabled') : t('config.form.none')],
     [t('config.form.forceHttps'), r.ForceHTTPS ? t('config.form.enabled') : t('config.form.none')],
     [t('config.form.maxBodySize'), r.MaxBodySize || t('config.form.none')],
+    [t('config.form.accessLog'), r.AccessLog === 'off' ? t('config.form.off') : t('config.form.none')],
+    [t('config.form.errorLogLevel'), r.ErrorLogLevel || t('config.form.none')],
+    [
+      t('config.form.pathRoutes'),
+      r.PathRoutes?.length
+        ? r.PathRoutes.map((p) =>
+            `${p.Match === 'exact' ? '= ' : ''}${p.Path} → ${p.Upstream?.Scheme || 'http'}://${p.Upstream?.Addr ?? ''}:${p.Upstream?.Port ?? ''}${p.StripPrefix ? ' (strip)' : ''}${p.WebSocket ? ' (ws)' : ''}`,
+          ).join('\n')
+        : t('config.form.none'),
+    ],
     [t('config.form.stripPrefix'), r.Path?.StripPrefix || t('config.form.none')],
     [t('config.form.rewrite'), r.Path?.Rewrite || t('config.form.none')],
     [t('config.form.requestHeaders'), headerList(r.RequestHeaders)],
@@ -806,11 +816,20 @@ function MaskForm({ mask, loading }: { mask: ArtifactMask | null; loading: boole
   return (
     <div className="space-y-3">
       {!mask.ok && <Callout tone="warning">{t('config.maskAdvisory')}</Callout>}
+      {/* Notes name what the form could not carry over, e.g. a location that
+          did not become a path route; they must stay visible. */}
+      {mask.notes && mask.notes.length > 0 && (
+        <Callout tone="warning" title={t('config.maskNotes')}>
+          <ul className="list-disc space-y-1 pl-4">
+            {mask.notes.map((n, i) => <li key={i}>{n}</li>)}
+          </ul>
+        </Callout>
+      )}
       <dl className="divide-y divide-border rounded-lg border border-border">
         {rows.map(([label, value]) => (
           <div key={String(label)} className="flex justify-between gap-4 px-3 py-2 text-sm">
             <dt className="text-fg-faint">{label}</dt>
-            <dd className="min-w-0 break-words text-right font-mono text-xs text-fg">{value}</dd>
+            <dd className="min-w-0 whitespace-pre-line break-words text-right font-mono text-xs text-fg">{value}</dd>
           </div>
         ))}
       </dl>

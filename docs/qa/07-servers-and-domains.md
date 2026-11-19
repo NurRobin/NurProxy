@@ -223,7 +223,7 @@
 - **Access:**
   - REST: `GET /api/v1/domains?agent_id=&server_id=&status=`.
   - CLI: `nurproxy domain list [--agent] [--server] [--status]`
-    (`cli_commands.go:334-364`; table `ID SUBDOMAIN SERVER PORT STATUS`).
+    (`cli_commands.go:334-364`; table `ID SUBDOMAIN SERVER PORT PROXIED STATUS`).
   - MCP: `list_domains` `{"agent_id","status"}` (no `server_id` in the MCP schema —
     `server.go:206-209`).
   - Dashboard: **Domains** page (status + agent filters in the toolbar).

@@ -2,8 +2,12 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 	"github.com/NurRobin/NurProxy/internal/shared/recoverymodel"
 )
 
@@ -96,6 +100,18 @@ type ProxyCapabilities struct {
 	IPFilter      bool `json:"ip_filter"`
 	RateLimit     bool `json:"rate_limit"`
 	CentralTLS    bool `json:"central_tls"`
+	// AccessLog reports that the backend can turn a domain's access log off.
+	AccessLog bool `json:"access_log"`
+	// ErrorLogLevel reports that the backend can set a per-domain error log
+	// level.
+	ErrorLogLevel bool `json:"error_log_level"`
+	// PathRoutes reports that the backend can route request paths of one
+	// domain to different upstreams.
+	PathRoutes bool `json:"path_routes"`
+	// HeaderConfigVars reports that the backend replaces "${NAME}" in header
+	// values with an environment variable or Define value when it loads the
+	// config (Apache), so such values are refused.
+	HeaderConfigVars bool `json:"header_config_vars"`
 }
 
 // ProxyDetection is the agent's read-only Phase-0 detection result (§13.0, §2.1,
@@ -126,6 +142,32 @@ type ProxyDetection struct {
 	// Networks are the IP subnets attached to the agent host's interfaces (§38), so
 	// the dashboard can suggest a CIDR when adding a Server.
 	Networks []DiscoveredNetwork `json:"networks,omitempty"`
+	// DiscoveredCerts are certificate bundles already on the agent host (certbot,
+	// acme.sh, files referenced by the host proxy's vhosts) that an operator can
+	// adopt instead of having NurProxy order a new certificate (#80). Metadata
+	// only: private keys never leave the host until the operator adopts one.
+	DiscoveredCerts []DiscoveredCert `json:"discovered_certs,omitempty"`
+}
+
+// DiscoveredCert describes one certificate bundle found on an agent host. The
+// agent reports it so the operator can adopt it for a domain; the bundle itself
+// is uploaded only when the operator asks for that specific fingerprint.
+type DiscoveredCert struct {
+	// Fingerprint is the lowercase hex SHA-256 of the leaf certificate's DER.
+	// Empty when the certificate file could not be read or parsed.
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	Names       []string  `json:"names,omitempty"`
+	Issuer      string    `json:"issuer,omitempty"`
+	NotBefore   time.Time `json:"not_before"`
+	NotAfter    time.Time `json:"not_after"`
+	// Source names where the bundle was found: certbot, acme.sh, nginx, apache
+	// or dryrun.
+	Source   string `json:"source"`
+	CertPath string `json:"cert_path"`
+	KeyPath  string `json:"key_path,omitempty"`
+	// Error says why the bundle cannot be adopted as found, for example a key
+	// the agent may not read or a key that does not match the certificate.
+	Error string `json:"error,omitempty"`
 }
 
 // DiscoveredNetwork is one IP subnet attached to the agent host (§38): the host's
@@ -311,8 +353,16 @@ type Agent struct {
 	SafeAutoRepairOverride  *bool                     `json:"safe_auto_repair_override"`
 	SafeAutoRepairEffective bool                      `json:"safe_auto_repair_effective"`
 	RecoveryCapability      *recoverymodel.Capability `json:"recovery_capability,omitempty"`
-	CreatedAt               time.Time                 `json:"created_at"`
-	UpdatedAt               time.Time                 `json:"updated_at"`
+	// AutoUpgrade is the per-agent opt-in to be upgraded to the orchestrator's
+	// version without an operator click. Off by default. Like SelfUpdate and
+	// Upgrade it lives outside the agents table and is attached by the API.
+	AutoUpgrade bool `json:"auto_upgrade"`
+	// SelfUpdate is the agent's last report on whether it can self-update.
+	SelfUpdate *SelfUpdateStatus `json:"self_update,omitempty"`
+	// Upgrade is the latest upgrade attempt for this agent.
+	Upgrade   *AgentUpgrade `json:"upgrade,omitempty"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
 }
 
 // Server represents a backend server managed by an agent.
@@ -323,6 +373,28 @@ type Server struct {
 	Address   string    `json:"address"`
 	Notes     string    `json:"notes,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	// DiscoverySourceID and ExternalID link a server imported from a
+	// discovery source to the machine it came from (#25).
+	DiscoverySourceID string `json:"discovery_source_id,omitempty"`
+	ExternalID        string `json:"external_id,omitempty"`
+	// DiscoveryMissingSince is set while the source no longer reports the
+	// machine.
+	DiscoveryMissingSince *time.Time `json:"discovery_missing_since,omitempty"`
+}
+
+// DiscoverySource is a configured server discovery source (#25), e.g. a
+// Proxmox VE cluster.
+type DiscoverySource struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Name   string `json:"name"`
+	Config string `json:"-"` // encrypted at rest, never in API responses
+	// SyncInterval is the periodic re-sync interval in seconds; 0 = only on
+	// demand.
+	SyncInterval int        `json:"sync_interval"`
+	LastRunAt    *time.Time `json:"last_run_at,omitempty"`
+	LastError    string     `json:"last_error,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
 }
 
 // BasicAuthConfig holds credentials for HTTP basic authentication.
@@ -376,6 +448,165 @@ type ProxyConfig struct {
 	// or for orchestrator-down resilience; "off" disables TLS. Empty is treated as
 	// "central" by the renderer.
 	TLSPolicy string `json:"tls_policy,omitempty"`
+	// TLSWildcard serves the domain from the one "*.<zone>" certificate shared
+	// by every opted-in domain of its zone instead of a per-host certificate.
+	// Only valid with central TLS and for a single label directly below the
+	// zone apex; an imported certificate for the host still takes precedence.
+	TLSWildcard bool `json:"tls_wildcard,omitempty"`
+	// AccessLog is "off" to write no access log for this domain. Empty (or
+	// "default", normalized to empty on save) keeps the proxy's host-wide log.
+	AccessLog string `json:"access_log,omitempty"`
+	// ErrorLogLevel raises the domain's error log threshold to one of
+	// proxymodel.ErrorLogLevels (e.g. "crit"). Empty keeps the host default.
+	ErrorLogLevel string `json:"error_log_level,omitempty"`
+	// Routes send matching request paths to other upstreams; everything else
+	// goes to the domain's server and port. See proxymodel.PathRoute for the
+	// matching rules.
+	Routes []PathRoute `json:"routes,omitempty"`
+}
+
+// PathRoute is one extra path-routed upstream of a domain. ServerID must
+// belong to the same agent as the domain's server, since that agent proxies
+// the request.
+type PathRoute struct {
+	// Match is "prefix" or "exact".
+	Match string `json:"match"`
+	// Path is the request path, starting with "/".
+	Path     string `json:"path"`
+	ServerID string `json:"server_id"`
+	Port     int    `json:"port"`
+	// UpstreamScheme is "http" (default) or "https".
+	UpstreamScheme string `json:"upstream_scheme,omitempty"`
+	WebSocket      bool   `json:"websocket,omitempty"`
+	// StripPrefix removes Path from the forwarded request path (prefix
+	// routes only).
+	StripPrefix bool `json:"strip_prefix,omitempty"`
+}
+
+// Intent converts the stored route into the backend-neutral form with the
+// given upstream address.
+func (p PathRoute) Intent(addr string) proxymodel.PathRoute {
+	return proxymodel.PathRoute{
+		Match:       proxymodel.PathMatch(p.Match),
+		Path:        p.Path,
+		Upstream:    proxymodel.Upstream{Addr: addr, Port: p.Port, Scheme: proxymodel.Scheme(p.UpstreamScheme)},
+		WebSocket:   p.WebSocket,
+		StripPrefix: p.StripPrefix,
+	}
+}
+
+// CheckRoutesSupported refuses path routes when the serving agent reported a
+// backend that cannot render them. A nil matrix is not checked.
+func (pc ProxyConfig) CheckRoutesSupported(caps *ProxyCapabilities, backend string) error {
+	if caps == nil || len(pc.Routes) == 0 || caps.PathRoutes {
+		return nil
+	}
+	if backend == "" {
+		backend = "the agent's proxy"
+	}
+	return fmt.Errorf("%s cannot render path routes", backend)
+}
+
+// NormalizeLogging canonicalizes the logging settings ("default" becomes
+// empty) and rejects unknown values.
+func (pc *ProxyConfig) NormalizeLogging() error {
+	switch pc.AccessLog {
+	case "", "default":
+		pc.AccessLog = ""
+	case string(proxymodel.AccessLogOff):
+	default:
+		return fmt.Errorf("access_log must be \"default\" or \"off\", got %q", pc.AccessLog)
+	}
+	if pc.ErrorLogLevel == "default" {
+		pc.ErrorLogLevel = ""
+	}
+	if !proxymodel.ValidErrorLogLevel(pc.ErrorLogLevel) {
+		return fmt.Errorf("error_log_level must be empty or one of %s, got %q", strings.Join(proxymodel.ErrorLogLevels, ", "), pc.ErrorLogLevel)
+	}
+	return nil
+}
+
+// CheckHeadersSupported refuses custom header values the serving agent's
+// backend would not send literally: values with "${" on a backend that
+// replaces config-time variables (HeaderConfigVars). backendKind is the
+// detected proxy kind; an Apache agent from before the capability existed
+// reports it as false, so "apache" is refused by kind as well.
+func (pc ProxyConfig) CheckHeadersSupported(caps *ProxyCapabilities, backendKind string) error {
+	if (caps == nil || !caps.HeaderConfigVars) && backendKind != "apache" {
+		return nil
+	}
+	if err := proxymodel.CheckHeaderConfigVars(pc.CustomRequestHeaders, pc.CustomResponseHeaders); err != nil {
+		return fmt.Errorf("the agent's Apache cannot send this header literally: %w", err)
+	}
+	return nil
+}
+
+// CheckLoggingSupported refuses logging settings the serving agent's backend
+// cannot render. A nil matrix (agent never reported one) is not checked.
+// Agents from before these capabilities existed report them as false, which
+// is correct: their renderers would silently ignore the settings.
+func (pc ProxyConfig) CheckLoggingSupported(caps *ProxyCapabilities, backend string) error {
+	if caps == nil {
+		return nil
+	}
+	if backend == "" {
+		backend = "the agent's proxy"
+	}
+	if pc.AccessLog != "" && !caps.AccessLog {
+		return fmt.Errorf("%s cannot turn off the access log for a domain", backend)
+	}
+	if pc.ErrorLogLevel != "" && !caps.ErrorLogLevel {
+		return fmt.Errorf("%s cannot set a per-domain error log level", backend)
+	}
+	return nil
+}
+
+// ErrDNSTakeoverRefused is wrapped by a takeover or preview that is refused
+// because of the domain itself (cert-only, being deleted), not because a
+// provider call failed.
+var ErrDNSTakeoverRefused = errors.New("DNS takeover refused")
+
+// ErrDNSTakeoverPlanChanged is wrapped by a takeover whose caller named the
+// records it expects to delete (from a preview) when the records at the name
+// are no longer exactly those. Nothing was changed.
+var ErrDNSTakeoverPlanChanged = errors.New("DNS records changed since the preview")
+
+// DNSTakeoverAction is what a DNS takeover does at the domain's name.
+type DNSTakeoverAction string
+
+const (
+	// DNSTakeoverAdopt: the desired CNAME already exists; it is taken over as
+	// managed and nothing is deleted.
+	DNSTakeoverAdopt DNSTakeoverAction = "adopt"
+	// DNSTakeoverReplace: every record at the name is deleted, then the CNAME
+	// is created.
+	DNSTakeoverReplace DNSTakeoverAction = "replace"
+	// DNSTakeoverCreate: the name is free; the CNAME is created.
+	DNSTakeoverCreate DNSTakeoverAction = "create"
+)
+
+// DNSRecordInfo is a provider record as shown to an operator.
+type DNSRecordInfo struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Content string `json:"content"`
+	Proxied bool   `json:"proxied"`
+}
+
+// DNSTakeoverPlan describes what a DNS takeover of one domain does: the
+// records it deletes and the CNAME it leaves in place. The preview returns it
+// without changing anything; the takeover returns what it carried out.
+type DNSTakeoverPlan struct {
+	DomainID int64             `json:"domain_id"`
+	FQDN     string            `json:"fqdn"`
+	Target   string            `json:"target"`
+	Action   DNSTakeoverAction `json:"action"`
+	// Delete lists every record at the name the takeover deletes, of any
+	// type (MX, TXT and so on included): a CNAME cannot share its name.
+	Delete []DNSRecordInfo `json:"delete"`
+	// Proxied is the Cloudflare proxy state the CNAME gets (or keeps).
+	Proxied bool `json:"proxied"`
 }
 
 // Domain represents a proxied subdomain.
@@ -401,12 +632,111 @@ type Domain struct {
 	// (§7). The operator hand-writes the engine config and points it at the stable
 	// cert path; NurProxy keeps the cert fresh. No public DNS record is managed —
 	// the operator owns DNS for their own hand-written vhost.
-	CertOnly   bool         `json:"cert_only"`
-	Status     DomainStatus `json:"status"`
-	ErrorMsg   string       `json:"error_msg,omitempty"`
-	LastSynced *time.Time   `json:"last_synced,omitempty"`
-	CreatedAt  time.Time    `json:"created_at"`
-	UpdatedAt  time.Time    `json:"updated_at"`
+	CertOnly bool `json:"cert_only"`
+	// Proxied is the operator's Cloudflare proxy (orange cloud) setting for the
+	// domain's DNS record (#126). nil means "not set": NurProxy keeps whatever
+	// proxy state the live record already has (a new record starts DNS-only).
+	// true / false are enforced by the reconciler as desired state. Only zones
+	// whose provider supports proxying accept true.
+	Proxied *bool `json:"proxied"`
+	// BackupServerIDs are the domain's failover servers on other agents, most
+	// preferred first (#74). ActiveServerID is the server whose agent the
+	// domain's CNAME points at: the primary (ServerID) unless the reconciler
+	// failed over. Both live outside the domains row and are filled in by the
+	// API (db.FillDomainFailover); a bare row read leaves them empty.
+	BackupServerIDs []string     `json:"backup_server_ids,omitempty"`
+	ActiveServerID  string       `json:"active_server_id,omitempty"`
+	Status          DomainStatus `json:"status"`
+	ErrorMsg        string       `json:"error_msg,omitempty"`
+	// DNSError is why the domain's public DNS record could not be created,
+	// adopted or corrected in the last DNS pass. While it is set the domain
+	// stays in error with this reason, whatever the route apply reports.
+	DNSError   string     `json:"dns_error,omitempty"`
+	LastSynced *time.Time `json:"last_synced,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// DomainFailoverState is the reconciler's stored failover decision for a domain
+// with backup servers (#74). ActiveServerID is where the CNAME points;
+// PendingServerID is a more preferred candidate that is healthy again and
+// waits out the failback delay since PendingSince. AllDown is set while no
+// candidate is healthy (the record then stays on the last active agent).
+// EvaluatedAt is the last pass that decided; SettleSince starts a settle
+// period in which a down target is held (after a late pass or all-down).
+type DomainFailoverState struct {
+	DomainID        int64      `json:"domain_id"`
+	ActiveServerID  string     `json:"active_server_id"`
+	PendingServerID string     `json:"pending_server_id,omitempty"`
+	PendingSince    *time.Time `json:"pending_since,omitempty"`
+	AllDown         bool       `json:"all_down"`
+	SwitchedAt      *time.Time `json:"switched_at,omitempty"`
+	Switches        int        `json:"switches"`
+	EvaluatedAt     *time.Time `json:"evaluated_at,omitempty"`
+	SettleSince     *time.Time `json:"settle_since,omitempty"`
+}
+
+// FailoverCandidate is one server that may serve a domain: the primary
+// (Priority 0) or a backup, with its agent's current health as the reconciler
+// judges it.
+type FailoverCandidate struct {
+	ServerID   string     `json:"server_id"`
+	ServerName string     `json:"server_name"`
+	AgentID    string     `json:"agent_id"`
+	AgentName  string     `json:"agent_name"`
+	AgentFQDN  string     `json:"agent_fqdn"`
+	Primary    bool       `json:"primary"`
+	Priority   int        `json:"priority"`
+	Eligible   bool       `json:"eligible"`
+	Healthy    bool       `json:"healthy"`
+	Active     bool       `json:"active"`
+	LastSeen   *time.Time `json:"last_seen,omitempty"`
+	Reason     string     `json:"reason,omitempty"`
+}
+
+// DomainFailoverStatus is the failover view of one domain for the API, CLI,
+// MCP and dashboard.
+type DomainFailoverStatus struct {
+	DomainFailoverState
+	Candidates []FailoverCandidate `json:"candidates"`
+	// Settling: a down target is held while agents report in (see
+	// failover.Policy.Settle).
+	Settling bool `json:"settling"`
+}
+
+// OptionalBool is a PATCH-style JSON field for a tri-state bool: Set is false
+// when the key is absent, and Value is nil for an explicit null (clear the
+// setting) or points at true / false.
+type OptionalBool struct {
+	Set   bool
+	Value *bool
+}
+
+// UnmarshalJSON records that the key was present and decodes null/true/false.
+func (o *OptionalBool) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var v bool
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// ProxiedLabel renders a tri-state proxied setting for audit text.
+func ProxiedLabel(p *bool) string {
+	switch {
+	case p == nil:
+		return "keep existing"
+	case *p:
+		return "proxied"
+	default:
+		return "DNS only"
+	}
 }
 
 // IsApex reports whether the domain targets the zone apex (root), represented by
@@ -596,7 +926,16 @@ type Certificate struct {
 	IssuedAt  time.Time `json:"issued_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Source says where the stored bundle came from: CertSourceACME (central
+	// issuance) or CertSourceImported (operator upload, #80). Empty is treated
+	// as ACME.
+	Source string `json:"source"`
 }
+
+const (
+	CertSourceACME     = "acme"
+	CertSourceImported = "imported"
+)
 
 // AdminOpType names a kind of pending agent admin op (§19). It drives the
 // payload schema and the agent-side handler.

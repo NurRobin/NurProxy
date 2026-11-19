@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"reflect"
 	"testing"
+
+	"github.com/NurRobin/NurProxy/internal/agent/certdiscover"
 )
 
 func TestDetect_nginxPopulatesDiscoveredUpstreams(t *testing.T) {
@@ -40,6 +42,48 @@ func TestDetect_nginxPopulatesDiscoveredUpstreams(t *testing.T) {
 	u := got.DiscoveredUpstreams[0]
 	if u.Host != "10.0.0.4" || u.Port != 8080 {
 		t.Errorf("bad discovered upstream: %+v", u)
+	}
+}
+
+func TestDetect_certScanFollowsProxyConfig(t *testing.T) {
+	restore := stubFS(map[string]bool{"/etc/nginx": true}, map[string]bool{})
+	defer restore()
+	gatherNginxConfig = func(string) string {
+		return `server { server_name app.example.com; ssl_certificate /nonexistent/app.pem; ssl_certificate_key /nonexistent/app.key; }`
+	}
+	nginx := func(name string) (string, error) {
+		if name == "nginx" {
+			return "/usr/sbin/nginx", nil
+		}
+		return "", exec.ErrNotFound
+	}
+	newDetector := func() *Detector {
+		return &Detector{
+			lookPath:      nginx,
+			run:           func(context.Context, string, ...string) (string, error) { return "nginx version: nginx/1.24.0\n", nil },
+			listListeners: func(context.Context) ([]listener, error) { return nil, nil },
+		}
+	}
+
+	// Without a scanner nothing is scanned.
+	if got, _ := newDetector().Detect(context.Background()); got.DiscoveredCerts != nil {
+		t.Errorf("certs scanned without a scanner: %+v", got.DiscoveredCerts)
+	}
+	// With config refs the vhost's files are reported (here unreadable).
+	got, err := newDetector().WithCertScanner(certdiscover.Scanner{}, true).Detect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DiscoveredCerts) != 1 || got.DiscoveredCerts[0].CertPath != "/nonexistent/app.pem" ||
+		got.DiscoveredCerts[0].Source != certdiscover.SourceNginx || got.DiscoveredCerts[0].Error == "" {
+		t.Errorf("DiscoveredCerts = %+v", got.DiscoveredCerts)
+	}
+	if m := got.ToModel(); len(m.DiscoveredCerts) != 1 {
+		t.Errorf("ToModel dropped discovered certs")
+	}
+	// Without config refs (the dry-run agent) the vhost is not followed.
+	if got, _ := newDetector().WithCertScanner(certdiscover.Scanner{}, false).Detect(context.Background()); len(got.DiscoveredCerts) != 0 {
+		t.Errorf("config followed with configRefs=false: %+v", got.DiscoveredCerts)
 	}
 }
 

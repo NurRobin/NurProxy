@@ -237,6 +237,49 @@ func TestBackend_Render_matchesCaddygen(t *testing.T) {
 	}
 }
 
+// TestBackend_Render_logging pins the built-in Caddy's logging behavior: the
+// route JSON never changes (Caddy logs no access lines without a logs block,
+// which NurProxy never configures), and a per-domain error level is dropped
+// with a warning because Caddy's error log is process-wide.
+func TestBackend_Render_logging(t *testing.T) {
+	b := New(agentcaddy.NewMockClient())
+	plain, err := b.Render(context.Background(), sampleRoute())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		mode     proxymodel.AccessLogMode
+		level    string
+		wantWarn bool
+	}{
+		{"default", proxymodel.AccessLogDefault, "", false},
+		{"access off", proxymodel.AccessLogOff, "", false},
+		{"error level", proxymodel.AccessLogDefault, "crit", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := sampleRoute()
+			r.AccessLog = tt.mode
+			r.ErrorLogLevel = tt.level
+			art, err := b.Render(context.Background(), r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if art.Content != plain.Content {
+				t.Fatalf("logging changed the caddy route:\n got: %s\nwant: %s", art.Content, plain.Content)
+			}
+			if got := len(art.Warnings) > 0; got != tt.wantWarn {
+				t.Fatalf("warnings = %v, want warning %v", art.Warnings, tt.wantWarn)
+			}
+		})
+	}
+	caps := b.Capabilities()
+	if !caps.AccessLog || caps.ErrorLogLevel {
+		t.Fatalf("caddy logging capabilities = access %v, level %v; want true, false", caps.AccessLog, caps.ErrorLogLevel)
+	}
+}
+
 func TestBackend_Render_targetCarriesRouteID(t *testing.T) {
 	b := New(agentcaddy.NewMockClient())
 	art, err := b.Render(context.Background(), sampleRoute())
@@ -463,6 +506,66 @@ func readTLSMock(t *testing.T, b *Backend) (loadFiles []caddygen.LoadFile, auto 
 		}
 	}
 	return loadFiles, auto
+}
+
+// With no provided cert left (last central domain removed, or its cert not
+// installed yet) the backend must send an empty load_files list: Caddy refuses
+// null, and the empty list unloads earlier certs.
+func TestBackend_EnsureServerTLS_noCertsSendsEmptyList(t *testing.T) {
+	for name, intents := range map[string][]proxy.TLSIntent{
+		"no hosts":           nil,
+		"cert not installed": {{Host: "app.example.com", Policy: proxymodel.TLSPolicyCentral}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			key, err := crypto.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := New(agentcaddy.NewMockClient()).WithCertStore(certstore.New(dir, key))
+			if err := b.EnsureServerTLS(context.Background(), intents); err != nil {
+				t.Fatalf("EnsureServerTLS: %v", err)
+			}
+			cfg, err := b.GetConfig(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed struct {
+				LoadFiles json.RawMessage `json:"tls_load_files"`
+			}
+			if err := json.Unmarshal(cfg, &parsed); err != nil {
+				t.Fatal(err)
+			}
+			if string(parsed.LoadFiles) != "[]" {
+				t.Errorf("load_files = %s, want []", parsed.LoadFiles)
+			}
+		})
+	}
+}
+
+// Render puts a non-standard HTTPS port into the force-HTTPS redirect.
+func TestBackend_Render_forceHTTPSUsesHTTPSPort(t *testing.T) {
+	route := proxymodel.Route{
+		Host:       "app.example.com",
+		Upstream:   proxymodel.Upstream{Addr: "10.0.0.5", Port: 8080},
+		ForceHTTPS: true,
+	}
+	for _, tt := range []struct {
+		port int
+		want string
+	}{
+		{0, `"https://{http.request.host}{http.request.uri}"`},
+		{18443, `"https://{http.request.host}:18443{http.request.uri}"`},
+	} {
+		b := New(agentcaddy.NewMockClient().WithListen("", 0, tt.port))
+		art, err := b.Render(context.Background(), route)
+		if err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		if !bytes.Contains([]byte(art.Content), []byte(tt.want)) {
+			t.Errorf("https port %d: content lacks %s:\n%s", tt.port, tt.want, art.Content)
+		}
+	}
 }
 
 // TestBackend_EnsureServerTLS_providedCert verifies the central path: an

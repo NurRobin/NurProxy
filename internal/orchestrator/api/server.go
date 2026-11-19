@@ -10,6 +10,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/agenthub"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
+	"github.com/NurRobin/NurProxy/internal/orchestrator/discoverysvc"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/logbroker"
 	"github.com/NurRobin/NurProxy/internal/orchestrator/tls"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
@@ -39,8 +40,14 @@ type RoutePusher interface {
 // CNAME using the zone provider's stored credentials — the explicit admin override
 // of the default "never touch a record we didn't create" stance, used to migrate an
 // existing domain whose DNS predates NurProxy. The reconciler implements it.
+//
+// The takeover transfers ownership: the record is stored as managed, so a later
+// domain delete removes it at the provider, even when it was an operator-created
+// CNAME that already matched. PreviewDomainDNSTakeover returns the same plan
+// (the records that would be deleted) without changing anything.
 type DNSTakeover interface {
-	TakeoverDomainDNS(ctx context.Context, domID int64) error
+	TakeoverDomainDNS(ctx context.Context, domID int64, expectDelete []string) (*models.DNSTakeoverPlan, error)
+	PreviewDomainDNSTakeover(ctx context.Context, domID int64) (*models.DNSTakeoverPlan, error)
 }
 
 // CertIssuer obtains a central TLS certificate for a host on demand (the §7
@@ -63,6 +70,9 @@ type Server struct {
 	takeover DNSTakeover
 	issuer   CertIssuer
 	logs     *logbroker.Broker
+	// certUploads pairs operator adoption requests with the bundle the agent
+	// uploads in answer (#80).
+	certUploads *certUploadBroker
 	// loginLimiter blunts online password guessing: too many failed logins from
 	// one IP trip a temporary lockout.
 	loginLimiter *ratelimit.Limiter
@@ -84,6 +94,22 @@ type Server struct {
 	// caStatus reports the latest ACME-CA reachability observation (#91), wired
 	// from the tls.CAProber. Nil (never wired, or ACME dry-run) omits the check.
 	caStatus func() tls.CAStatus
+
+	// upgrades coordinates agent self-updates (#73); lifetime outlives single
+	// requests so a rollout started by one keeps running.
+	upgrades *upgradeCoordinator
+	lifetime context.Context
+
+	// discovery runs server discovery sources (#25).
+	discovery *discoverysvc.Service
+}
+
+// lifetimeContext is the server's lifetime context (set by StartUpgradeLoop).
+func (s *Server) lifetimeContext() context.Context {
+	if s.lifetime != nil {
+		return s.lifetime
+	}
+	return context.Background()
 }
 
 // SetDryRun records whether the orchestrator is running in DNS/ACME sandbox mode
@@ -127,13 +153,15 @@ func (s *Server) SetCertIssuer(issuer CertIssuer) {
 // NewServer creates a new API server and registers all routes.
 func NewServer(database *db.DB, version string) *Server {
 	s := &Server{
-		db:       database,
-		version:  version,
-		mux:      http.NewServeMux(),
-		sessions: auth.NewSessionManager(loadOrCreateSessionKey(database)),
-		logs:     logbroker.New(),
+		db:          database,
+		version:     version,
+		mux:         http.NewServeMux(),
+		sessions:    auth.NewSessionManager(loadOrCreateSessionKey(database)),
+		logs:        logbroker.New(),
+		certUploads: newCertUploadBroker(),
 		// 5 failed logins per IP within 15 min → locked out for 15 min.
 		loginLimiter: ratelimit.New(5, 15*time.Minute, 15*time.Minute),
+		discovery:    discoverysvc.New(database, false),
 	}
 
 	// Wire the session TTL and the server-side revocation-version provider ONCE,
@@ -146,6 +174,7 @@ func NewServer(database *db.DB, version string) *Server {
 	// that window. Doing it once (rather than on every auth call) also removes the
 	// concurrent unsynchronized writes to sm.ttl/sm.version that raced with the
 	// requireAuth Verify reads.
+	s.upgrades = newUpgradeCoordinator(s)
 	s.sessions.WithTTLFunc(s.sessionDuration)
 	s.sessions.WithVersion(func() int { return s.currentSessionVersion() })
 
@@ -243,6 +272,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/v1/providers/{id}", s.requireAuth(s.handleDeleteProvider))
 	s.mux.HandleFunc("GET /api/v1/providers/{id}/zones", s.requireAuth(s.handleListProviderZones))
 
+	// Server discovery sources (#25)
+	s.mux.HandleFunc("GET /api/v1/discovery/types", s.requireAuth(s.handleListDiscoveryTypes))
+	s.mux.HandleFunc("GET /api/v1/discovery/sources", s.requireAuth(s.handleListDiscoverySources))
+	s.mux.HandleFunc("POST /api/v1/discovery/sources", s.requireAuth(s.handleCreateDiscoverySource))
+	s.mux.HandleFunc("POST /api/v1/discovery/test", s.requireAuth(s.handleTestDiscoverySource))
+	s.mux.HandleFunc("GET /api/v1/discovery/sources/{id}", s.requireAuth(s.handleGetDiscoverySource))
+	s.mux.HandleFunc("PUT /api/v1/discovery/sources/{id}", s.requireAuth(s.handleUpdateDiscoverySource))
+	s.mux.HandleFunc("DELETE /api/v1/discovery/sources/{id}", s.requireAuth(s.handleDeleteDiscoverySource))
+	s.mux.HandleFunc("POST /api/v1/discovery/sources/{id}/run", s.requireAuth(s.handleRunDiscovery))
+	s.mux.HandleFunc("GET /api/v1/discovery/sources/{id}/candidates", s.requireAuth(s.handleDiscoveryCandidates))
+
 	// Zones (auth required)
 	s.mux.HandleFunc("GET /api/v1/zones", s.requireAuth(s.handleListAllZones))
 	s.mux.HandleFunc("POST /api/v1/zones", s.requireAuth(s.handleCreateZone))
@@ -282,6 +322,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/recovery/applies/{operationId}/receipt", s.requireAgentAuth(s.handleSubmitManagedApplyReceipt))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/repairs/{opId}/ack", s.requireAgentAuth(s.handleRepairAck))
 	s.mux.HandleFunc("PUT /api/v1/agents/{id}/safe-auto-repair", s.requireAuth(s.handleSetSafeAutoRepair))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/upgrade", s.requireAuth(s.handleUpgradeAgent))
+	s.mux.HandleFunc("GET /api/v1/agents/{id}/upgrades", s.requireAuth(s.handleListAgentUpgrades))
+	s.mux.HandleFunc("PUT /api/v1/agents/{id}/auto-upgrade", s.requireAuth(s.handleSetAutoUpgrade))
+	s.mux.HandleFunc("POST /api/v1/agents/upgrade-outdated", s.requireAuth(s.handleUpgradeOutdated))
+	s.mux.HandleFunc("GET /api/v1/agents/upgrade-rollout", s.requireAuth(s.handleGetUpgradeRollout))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/upgrade/report", s.requireAgentAuth(s.handleAgentUpgradeReport))
 	// Live push channel: the agent dials out and holds this open; the
 	// orchestrator pushes config down it (works behind NAT). Agent auth.
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/stream", s.requireAgentAuth(s.handleAgentStream))
@@ -293,6 +339,7 @@ func (s *Server) registerRoutes() {
 	// (agent auth); the dashboard starts/polls/stops a tail (user auth). The tail
 	// request rides the agent's existing stream — never an inbound probe.
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/chunk", s.requireAgentAuth(s.handleAgentLogChunk))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/certificates/upload", s.requireAgentAuth(s.handleAgentCertUpload))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/logs/tail", s.requireAuth(s.handleStartLogTail))
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handlePollLogTail))
 	s.mux.HandleFunc("DELETE /api/v1/agents/{id}/logs/tail/{session}", s.requireAuth(s.handleStopLogTail))
@@ -308,6 +355,7 @@ func (s *Server) registerRoutes() {
 	// Servers (auth required)
 	s.mux.HandleFunc("GET /api/v1/agents/{id}/servers", s.requireAuth(s.handleListServers))
 	s.mux.HandleFunc("POST /api/v1/agents/{id}/servers", s.requireAuth(s.handleCreateServer))
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/servers/import", s.requireAuth(s.handleImportServers))
 	s.mux.HandleFunc("PUT /api/v1/servers/{id}", s.requireAuth(s.handleUpdateServer))
 	s.mux.HandleFunc("DELETE /api/v1/servers/{id}", s.requireAuth(s.handleDeleteServer))
 
@@ -321,6 +369,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/domains/{id}/config", s.requireAuth(s.handleUpdateDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/config/reset", s.requireAuth(s.handleResetDomainConfig))
 	s.mux.HandleFunc("POST /api/v1/domains/{id}/dns/takeover", s.requireAuth(s.handleDomainDNSTakeover))
+	s.mux.HandleFunc("GET /api/v1/domains/{id}/failover", s.requireAuth(s.handleGetDomainFailover))
+	s.mux.HandleFunc("PUT /api/v1/domains/{id}/backups", s.requireAuth(s.handleSetDomainBackups))
+	s.mux.HandleFunc("PUT /api/v1/domains/{id}/certificate", s.requireAuth(s.handleImportDomainCertificate))
+	s.mux.HandleFunc("GET /api/v1/domains/{id}/certificate/candidates", s.requireAuth(s.handleDomainCertificateCandidates))
+	s.mux.HandleFunc("POST /api/v1/domains/{id}/certificate/adopt", s.requireAuth(s.handleAdoptDomainCertificate))
+	s.mux.HandleFunc("POST /api/v1/domains/{id}/certificate/issue-now", s.requireAuth(s.handleIssueDomainCertificateNow))
 
 	// Config artifacts + drift review (auth required, §11 Phase 3)
 	s.mux.HandleFunc("GET /api/v1/artifacts", s.requireAuth(s.handleListArtifacts))

@@ -25,9 +25,13 @@
 // (nginxgen's force-https pair). Inside the primary server it maps listen/ssl
 // (TLS policy), server_name (Host), client_max_body_size (MaxBodySize),
 // allow/deny (IP allow/block), auth_basic* (BasicAuth presence), limit_req
-// (RateLimit), add_header (ResponseHeaders), and the location / block's
+// (RateLimit), add_header (ResponseHeaders), access_log off / error_log at the
+// default path (AccessLog, ErrorLogLevel), and the location / block's
 // proxy_pass (Upstream), proxy_set_header (RequestHeaders + websocket + the
 // standard forwarded headers), rewrite (Path), and proxy_*_timeout (Timeouts).
+// Exact (`location = P`) and prefix (`location P/`, `location P`) locations
+// become PathRoutes; any other location or nested block is kept in Unparsed
+// with a note that it was not carried over.
 package nginxparse
 
 import (
@@ -36,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NurRobin/NurProxy/internal/shared/nginxgen"
 	"github.com/NurRobin/NurProxy/internal/shared/proxymodel"
 )
 
@@ -200,6 +205,14 @@ func parseProxiedServer(s block, res *Result) bool {
 			// server). We can detect its presence but not the exact rate from here.
 			res.Notes = append(res.Notes, "rate limit detected (rate is defined by the limit_req_zone in http context)")
 			clean = false
+		case "access_log", "error_log":
+			// Only the exact forms nginxgen emits map onto the Route; any other
+			// path or format stays raw and marks the mask unclean.
+			if !parseLogDirective(d.name, d.args, r) {
+				res.Unparsed = append(res.Unparsed, d.raw)
+				res.Notes = append(res.Notes, fmt.Sprintf("unrecognized %s form", d.name))
+				clean = false
+			}
 		case "add_header":
 			k, v, ok := parseAddHeader(d.args)
 			if !ok {
@@ -234,7 +247,183 @@ func parseProxiedServer(s block, res *Result) bool {
 	if !parseLocation(loc, res) {
 		clean = false
 	}
+	if !parsePathLocations(s, res) {
+		clean = false
+	}
 	return clean
+}
+
+// pathLocation is one non-root location block read as a path route.
+type pathLocation struct {
+	route proxymodel.PathRoute
+	// companion marks a `location = P` that may be the exact half of a prefix
+	// route rendered for P.
+	companion bool
+}
+
+// parsePathLocations maps the location blocks besides `location /` onto
+// res.Route.PathRoutes and returns whether every one was recognized in the
+// shape nginxgen renders. A location that cannot become a path route (regex,
+// `^~`, nested blocks, its own headers or timeouts) is kept in Unparsed with
+// a note naming it, so an import never drops a route without saying so.
+func parsePathLocations(s block, res *Result) bool {
+	clean := true
+	var exacts []pathLocation
+	var prefixes []pathLocation
+	skip := func(b block, why string) {
+		res.Unparsed = append(res.Unparsed, b.raw)
+		res.Notes = append(res.Notes, fmt.Sprintf("%s %s not carried over: %s", b.kind, b.args, why))
+		clean = false
+	}
+	for _, b := range s.blocks {
+		if b.kind == "location" && b.args == "/" {
+			continue
+		}
+		if b.kind != "location" {
+			skip(b, "only location blocks are modeled")
+			continue
+		}
+		if len(b.blocks) != 0 {
+			skip(b, "nested blocks are not modeled")
+			continue
+		}
+		match, path, slash, ok := locationMatch(b)
+		if !ok {
+			skip(b, "only exact (=) and plain prefix locations become path routes; regex and ^~ locations are not supported")
+			continue
+		}
+		sub := Result{}
+		subClean := parseLocation(b, &sub)
+		pr := proxymodel.PathRoute{Match: match, Path: path, Upstream: sub.Route.Upstream, WebSocket: sub.Route.WebSocket}
+		if sub.Route.Upstream.Scheme == proxymodel.SchemeHTTP {
+			pr.Upstream.Scheme = ""
+		}
+		switch {
+		case sub.Route.Path.Rewrite != "":
+			subClean = false
+			sub.Notes = append(sub.Notes, "a whole-URI rewrite is not modeled on a path route")
+		case sub.Route.Path.StripPrefix != "":
+			// An exact location carries the strip rewrite only as the `=`
+			// half of a stripping prefix route; pairing below checks that.
+			if sub.Route.Path.StripPrefix != path {
+				subClean = false
+				sub.Notes = append(sub.Notes, "the rewrite does not strip the location's own path")
+			}
+			pr.StripPrefix = true
+		}
+		if !equalHeaders(sub.Route.RequestHeaders, res.Route.RequestHeaders) || sub.Route.Timeouts != res.Route.Timeouts {
+			subClean = false
+			sub.Notes = append(sub.Notes, "path routes use the domain's request headers and timeouts; this location sets its own")
+		}
+		if !subClean || sub.Route.Upstream.Addr == "" {
+			res.Unparsed = append(res.Unparsed, b.raw)
+			res.Notes = append(res.Notes, fmt.Sprintf("location %s not carried over cleanly: %s", b.args, strings.Join(sub.Notes, "; ")))
+			clean = false
+			if sub.Route.Upstream.Addr == "" {
+				continue
+			}
+		}
+		if match == proxymodel.PathMatchExact {
+			exacts = append(exacts, pathLocation{route: pr, companion: true})
+			continue
+		}
+		if !slash {
+			// `location /api` also matches "/apix"; the path route matches on
+			// a segment boundary only.
+			res.Notes = append(res.Notes, fmt.Sprintf("location %s imported as prefix route %s, which matches only on a path segment boundary (nginx's form also matched %sx)", b.args, path, path))
+			clean = false
+		}
+		prefixes = append(prefixes, pathLocation{route: pr})
+	}
+
+	// A prefix route renders as `location = P` plus `location P/`. Fold an
+	// exact location into the prefix route for the same path when it proxies
+	// the same way; otherwise it is an exact route of its own.
+	for _, p := range prefixes {
+		found := false
+		for i := range exacts {
+			e := &exacts[i]
+			if e.companion && e.route.Path == p.route.Path && samePathTarget(e.route, p.route) {
+				e.companion = false
+				e.route = proxymodel.PathRoute{}
+				found = true
+				break
+			}
+		}
+		if !found && !exactFor(exacts, p.route.Path) {
+			res.Notes = append(res.Notes, fmt.Sprintf("prefix route %s has no `location = %s`; nginx answered %s with a redirect to %s/, the path route proxies it", p.route.Path, p.route.Path, p.route.Path, p.route.Path))
+			clean = false
+		}
+	}
+	for _, e := range exacts {
+		if e.route.Path != "" {
+			res.Route.PathRoutes = append(res.Route.PathRoutes, e.route)
+		}
+	}
+	for _, p := range prefixes {
+		res.Route.PathRoutes = append(res.Route.PathRoutes, p.route)
+	}
+	if err := proxymodel.ValidatePathRoutes(res.Route.PathRoutes, true); err != nil {
+		res.Notes = append(res.Notes, err.Error())
+		clean = false
+	}
+	return clean
+}
+
+// locationMatch reads a location header as a path route match: `= P` is an
+// exact route, `P/` and `P` are prefix routes for P (slash reports the
+// trailing slash form nginxgen renders). ok is false for regex, `^~` and
+// paths a path route cannot carry.
+func locationMatch(b block) (match proxymodel.PathMatch, path string, slash, ok bool) {
+	words := wordsOf(b)
+	if b.comment || !header(b, words...) {
+		return "", "", false, false
+	}
+	switch len(words) {
+	case 3:
+		if words[1] != "=" || proxymodel.ValidateRoutePath(proxymodel.PathMatchExact, words[2]) != nil {
+			return "", "", false, false
+		}
+		return proxymodel.PathMatchExact, words[2], false, true
+	case 2:
+		path = words[1]
+		slash = strings.HasSuffix(path, "/")
+		path = strings.TrimSuffix(path, "/")
+		if proxymodel.ValidateRoutePath(proxymodel.PathMatchPrefix, path) != nil {
+			return "", "", false, false
+		}
+		return proxymodel.PathMatchPrefix, path, slash, true
+	}
+	return "", "", false, false
+}
+
+// exactFor reports whether an exact route (not a folded companion) exists
+// for path.
+func exactFor(exacts []pathLocation, path string) bool {
+	for _, e := range exacts {
+		if e.route.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// samePathTarget reports whether an exact and a prefix location proxy the
+// same way, so the exact one is the prefix route's `=` companion.
+func samePathTarget(a, b proxymodel.PathRoute) bool {
+	return a.Upstream == b.Upstream && a.WebSocket == b.WebSocket && a.StripPrefix == b.StripPrefix
+}
+
+func equalHeaders(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if w, ok := b[k]; !ok || w != v {
+			return false
+		}
+	}
+	return true
 }
 
 // parseLocation maps the `location / {}` block onto the Route and returns
@@ -381,6 +570,27 @@ func parseSeconds(args string) (int, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// parseLogDirective maps the logging directives nginxgen emits back onto the
+// Route: `access_log off;` and `error_log <nginxgen.DefaultErrorLogPath>
+// <level>;` with a level from proxymodel.ErrorLogLevels. Anything else returns
+// false.
+func parseLogDirective(name, args string, r *proxymodel.Route) bool {
+	fields := strings.Fields(args)
+	switch name {
+	case "access_log":
+		if len(fields) == 1 && fields[0] == "off" {
+			r.AccessLog = proxymodel.AccessLogOff
+			return true
+		}
+	case "error_log":
+		if len(fields) == 2 && fields[0] == nginxgen.DefaultErrorLogPath && fields[1] != "" && proxymodel.ValidErrorLogLevel(fields[1]) {
+			r.ErrorLogLevel = fields[1]
+			return true
+		}
+	}
+	return false
 }
 
 // parseAddHeader splits `add_header Name Value [always];` into name + value,

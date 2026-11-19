@@ -154,7 +154,7 @@ func (d *dryProvider) UpdateRecord(ctx context.Context, config json.RawMessage, 
 	}
 	shared.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("dryrun: record %q not found", recordID)
+		return fmt.Errorf("%w: dryrun: record %q not found", provider.ErrRecordNotFound, recordID)
 	}
 
 	d.logger.InfoContext(ctx, "dryrun DNS: would update record",
@@ -166,6 +166,44 @@ func (d *dryProvider) UpdateRecord(ctx context.Context, config json.RawMessage, 
 		slog.String("content", record.Content),
 		slog.Int("ttl", record.TTL),
 		slog.Bool("proxied", record.Proxied),
+	)
+	return nil
+}
+
+// PatchRecord mirrors Cloudflare's PATCH: only the given fields change, the
+// rest of the stored record is kept.
+func (d *dryProvider) PatchRecord(ctx context.Context, config json.RawMessage, recordID string, patch provider.RecordPatch) error {
+	if recordID == "" {
+		return fmt.Errorf("dryrun: PatchRecord requires a record ID")
+	}
+	shared.mu.Lock()
+	existing, ok := shared.records[recordID]
+	if !ok {
+		shared.mu.Unlock()
+		return fmt.Errorf("%w: dryrun: record %q not found", provider.ErrRecordNotFound, recordID)
+	}
+	rec := existing.rec
+	if patch.Content != nil {
+		rec.Content = *patch.Content
+	}
+	if patch.Proxied != nil {
+		rec.Proxied = *patch.Proxied
+	}
+	if err := validateRecord(rec); err != nil {
+		shared.mu.Unlock()
+		return err
+	}
+	shared.records[recordID] = entry{rec: rec, zone: existing.zone}
+	shared.mu.Unlock()
+
+	d.logger.InfoContext(ctx, "dryrun DNS: would patch record",
+		slog.String("op", "PatchRecord"),
+		slog.String("id", recordID),
+		slog.String("zone", zoneKey(config)),
+		slog.String("type", rec.Type),
+		slog.String("name", rec.Name),
+		slog.String("content", rec.Content),
+		slog.Bool("proxied", rec.Proxied),
 	)
 	return nil
 }
@@ -195,7 +233,7 @@ func (d *dryProvider) GetRecord(ctx context.Context, _ json.RawMessage, recordID
 	e, ok := shared.records[recordID]
 	shared.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("dryrun: record %q not found", recordID)
+		return nil, fmt.Errorf("%w: dryrun: record %q not found", provider.ErrRecordNotFound, recordID)
 	}
 	d.logger.DebugContext(ctx, "dryrun DNS: get record", slog.String("id", recordID))
 	out := e.rec
@@ -242,6 +280,11 @@ func validateRecord(r provider.Record) error {
 	}
 	if r.TTL < 0 {
 		return fmt.Errorf("dryrun: record TTL must be >= 0")
+	}
+	// Mirror Cloudflare, which rejects the proxy flag on record types it cannot
+	// proxy (TXT, MX, ...). Catches a proxied ACME challenge record in dry-run.
+	if r.Proxied && !provider.ProxiableType(r.Type) {
+		return fmt.Errorf("dryrun: %s records cannot be proxied", r.Type)
 	}
 	return nil
 }

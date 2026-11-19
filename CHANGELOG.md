@@ -5,6 +5,204 @@ All notable changes to NurProxy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.6.0] - 2026-11-19
+
+### Upgrade notes
+
+- The orchestrator runs migrations 33–41 on its first start (from 0.5.1).
+  Among them, servers and domains are rebuilt with `ON DELETE RESTRICT`
+  foreign keys. Take a backup first (`nurproxy backup`).
+- Agents before 0.6.0 cannot update themselves. Install 0.6.0 on each agent
+  host by hand once; remote upgrades work from then on. The orchestrator
+  refuses a remote upgrade for agents that never reported self-update support.
+- 0.5.1 agents keep working with a 0.6.0 orchestrator, including as failover
+  standby. Path routes and per-domain log settings are held back for them
+  until they run 0.6.0.
+- Deleting an agent, server or zone that is still in use now answers 409
+  instead of 404.
+- Proxmox discovery sources created through the API or CLI need an explicit
+  `verify_tls` unless a `fingerprint` is pinned.
+
+### Added
+
+- **Failover across agents (#74).** A domain can have up to three backup
+  servers on other agents that serve its zone. Each backup agent keeps the
+  route and certificate warm, and the domain's CNAME points at the first
+  healthy agent, so a failover is only a DNS change. Health is the agent
+  heartbeat (down after `agent_offline_timeout + failover_grace`, 90 + 30 s by
+  default); failback waits `failover_failback_delay` (300 s) and can be turned
+  off. If every agent is down the record stays where it is. Audit entries
+  `failover`/`failback`, metrics `nurproxy_domain_on_backup` and
+  `nurproxy_domain_failover_switches_total`. A domain has either backup
+  servers or path routes, not both, for now. See `wiki/failover.md`.
+- **Agent self-update (#73).** Agents can be upgraded from the dashboard, the
+  CLI (`nurproxy agent upgrade`), in a sequential "all outdated" rollout that
+  stops at the first failure, or automatically for agents that opt in (off by
+  default). The agent verifies the release's cosign keyless signature against
+  the release workflow identity and the archive checksum. A root applier,
+  installed once with `sudo nurproxy-agent self-update-enable`, swaps the
+  binary and restarts the agent; if the new agent does not report healthy
+  within 3 minutes it goes back to the old one. Package-managed (deb, rpm,
+  AUR, Homebrew) and container installs refuse with a reason. See
+  `wiki/agent-upgrades.md`.
+- **Adopt certificates already on an agent's disk (#80).** Agents report
+  certificates they find in certbot's and acme.sh's directories and in the
+  host proxy's `ssl_certificate` / `SSLCertificateFile` directives
+  (metadata only). The operator can adopt one for a domain
+  (`nurproxy domain adopt-cert`, or the Adopt button), and only then the agent
+  uploads it. A new central-TLS domain waits up to an hour before its first
+  ACME order while its agent reports an adoptable certificate, so moving a host
+  to NurProxy does not force a new Let's Encrypt order.
+- **Shared zone wildcard certificates (#69).** A domain can opt into one
+  `*.<zone>` certificate (`tls_wildcard`), issued once per zone and pushed to
+  every agent that serves an opted-in domain. It is removed when no domain of
+  the zone uses it any more.
+- **Proxmox VE server discovery (#25).** A Proxmox source (read-only API
+  token, stored encrypted) lists the cluster's VMs and containers with their
+  addresses (guest agent, cloud-init, LXC interfaces). Selected machines can
+  be imported as normal servers. A re-sync shows new machines and flags
+  imported ones that are gone, but never deletes or overwrites them.
+  Dashboard: Settings → Server discovery, and "Discover from Proxmox VE" per
+  agent. CLI: `nurproxy discovery`. See `wiki/server-discovery.md`.
+- **Cloudflare proxied state is kept (#126).** Record updates no longer flip
+  an orange-cloud record to grey. A domain can also set `proxied` explicitly.
+- **DNS takeover preview (#128).** `?dry_run=true`, `--dry-run` and a
+  dashboard preview show which records a takeover would delete and create. A
+  takeover that stops halfway says which records were already deleted.
+
+- **Path routes: several upstreams per domain (#89).** A domain can send exact
+  paths (`= /api/world`) and path prefixes (`/media`, matching `/media` and
+  `/media/...` but not `/mediax`) to other servers on the same agent, with
+  their own port, scheme, WebSocket switch and optional prefix strip. An exact
+  route wins over any prefix and the longest prefix wins, on nginx, Apache and
+  the built-in Caddy alike; regex is not supported. Managed in the API
+  (`proxy_config.routes`), CLI (`nurproxy domain route list|add|remove`), MCP
+  (`routes` on create_domain/update_domain) and the new Paths tab of the
+  domain settings. A custom engine template opts in with `path_routes`. The
+  nginx config view imports existing `location = /p` and `location /p/` blocks
+  as path routes and lists every location it cannot carry over. A server used
+  by a path route cannot be deleted. Domains without path routes render
+  exactly as before.
+- **Live sandbox profile (#96).** `PROFILE=live make dev-sandbox` and
+  `make test-sandbox-live` run the agents with a real Caddy on unprivileged
+  loopback ports in front of a fake upstream, while DNS and ACME stay
+  simulated, so real HTTP and TLS go through the rendered config. The sandbox
+  tests also run the rendered config through `caddy validate` and `nginx -t`
+  when those binaries (or docker) are available; CI does both. New agent
+  options `-caddy-http-port`, `-caddy-https-port` and `-caddy-listen-host`
+  (default: 80/443 on all interfaces, as before).
+
+- **Per-domain access log and error log level (#150).** A domain can turn its
+  access log off (`access_log: off`) and set a minimum error log level
+  (`error_log_level`: info … emerg), so visitor IPs of that domain stay out of
+  the host-wide logs. nginx renders `access_log off;` and
+  `error_log /var/log/nginx/error.log <level>;`, Apache `CustomLog /dev/null`
+  and `LogLevel`. The built-in Caddy writes no access log anyway and has no
+  per-domain error level. nginx only offers the error level when the host's
+  error log is `/var/log/nginx/error.log`. The orchestrator refuses a setting
+  the domain's agent doesn't offer. Available in the API, CLI
+  (`--access-log`, `--error-log-level`), MCP and the domain settings in the
+  dashboard. Domains without the settings render exactly as before.
+
+### Security
+
+- **The root helper checks the error log itself before writing `error_log`
+  (#171).** It writes `error_log /var/log/nginx/error.log <level>;` only when
+  that file is a regular file (not a symlink) in a root-owned directory that
+  neither group nor others can write, or when `nginx -V` reports it as
+  `--error-log-path`. Otherwise the domain gets an error that says why.
+- **Apache header values with `${` are refused (#169).** httpd replaces
+  `${NAME}` in config lines with an environment variable or `Define` value,
+  quoted or not. apachegen refuses such header values, and the API refuses
+  them for domains served by an Apache agent (new `header_config_vars`
+  capability; agents that predate it are recognized by their proxy kind).
+  nginx keeps accepting `${var}`, which it reads as a request variable.
+- **Raw Apache configs pass a policy check in the root helper.** Like raw
+  nginx configs since 0.5.1, a raw Apache config is written only when every
+  directive is on an allowlist of the forms apachegen renders: two
+  `<VirtualHost *:80|*:443>` sections at most, the domain's own `ServerName`,
+  the helper's certificate and htpasswd paths, `ProxyPass` and `RewriteRule
+  [P]` to http(s)/ws(s) upstreams, literal `Header`/`RequestHeader` values,
+  `<Location />` with `Require` and the generated `AuthName "Restricted: <host>"`
+  (httpd evaluates AuthName as an expression), `CustomLog /dev/null` and
+  `LogLevel`. Line continuations are refused, also at the end of comments.
+  `LoadModule`, `Include`, piped or file logs, `Define`/`SetEnv`,
+  `<Directory>`, `RewriteMap`, `ScriptAlias`, handler flags and everything
+  else are refused. A config outside the policy is still kept when exactly
+  these bytes are already the live file. Every vhost the helper renders for
+  Apache now passes the same check.
+- Helper policy refusals (raw config directives, the error log check, render
+  errors) now reach the domain's error message with the reason, the domain
+  and the offending directive and line, instead of a generic "privileged
+  managed proxy reconciliation failed".
+
+### Fixed
+
+- **DNS failures stay visible on the domain.** A failed record create or read
+  used to be overwritten by the next route apply, so a domain could look
+  active without a DNS record. The reason is now kept in `dns_error` until DNS
+  converges. A new domain gets its record right away instead of on the next
+  cycle. A record read only shows as an error after three failed passes in a
+  row, so a short provider outage does not flag every domain.
+- **DNS takeover and the reconciler no longer race.** Both take a per-domain
+  DNS lock, so a takeover can no longer end up with an adopted record or a
+  second CNAME.
+- **Parent deletes are guarded by the database (#104).** Agents, servers and
+  zones still in use cannot be deleted by accident (409); `?cascade=true`
+  removes the dependents through the reconciler.
+
+- **Raw nginx configs may carry common tuning directives, and a refusal says
+  why (#149).** The root helper's raw-config policy now admits `gzip*`,
+  `proxy_buffering`, `proxy_request_buffering`, proxy buffer sizes and
+  timeouts, `proxy_hide_header`, `proxy_redirect off`, `proxy_ssl_server_name`,
+  `client_body_buffer_size` and `server_tokens`, and allows the existing header,
+  body-size and `access_log off` directives inside `location /` too. A raw
+  config no longer has to match the dashboard's structured form exactly. When
+  the helper refuses a raw config, the domain's error now names the directive
+  and its line (for example `line 12: nginx directive "include" is not allowed
+  in the server block`) instead of only "privileged managed proxy
+  reconciliation failed". File paths in logs stay limited to `access_log off`
+  and the stock error log. The policy also refuses what `nginx -t` would
+  reject: repeated single-value directives and proxy buffer settings that
+  break nginx's size rules (the three buffer directives go together). Raw
+  `rewrite` stays limited to the two forms the path settings render.
+- **A failed `nginx -t` names the domain that broke it.** The helper applies
+  all domains of an agent together, so one broken vhost fails all of them.
+  When the validator output names a managed vhost file, that domain's error
+  now shows the output, and the other domains say which domain blocked them.
+- **Built-in Caddy loads certificates of domains added later.** Every TLS
+  apply after the first failed against a running Caddy (`409 key already
+  exists` on `automatic_https`), so a central-TLS domain added to a built-in
+  agent that already served one never got its certificate loaded until the
+  agent restarted. The apply now replaces the existing values. Found by the
+  live sandbox.
+- **Built-in Caddy unloads certificates when no central domain is left.**
+  With no provided cert the TLS apply sent `load_files: null`, which Caddy
+  refuses, so the removed domain's certificate stayed loaded and the agent
+  reported an error. It now sends an empty list.
+
+- **Renaming a domain or moving it to another zone cleans up the old name
+  (#151).** The DNS record of the old name is queued and deleted through the
+  provider and zone it was created in, once the record for the new name exists;
+  records NurProxy only adopted are left alone, and failed deletes are retried.
+  A record that a domain still uses, a name a domain still serves, or a record
+  whose name or target changed since is never deleted. So moving a domain to a
+  zone at another DNS provider under the same name (a provider migration)
+  leaves the record at the old provider in place; the audit log shows it as
+  `dns_left_in_use`, and it can be deleted there by hand. The new name gets its
+  record right after the update instead of on the next reconcile cycle.
+  Between Cloudflare zones the new record keeps the old one's proxy (orange
+  cloud) state unless the domain has its own `proxied` setting.
+  The old host's certificate is removed when no other domain uses it (wildcard
+  and imported certificates are kept), and the new central-TLS host is issued
+  right away.
+  A rename on the same nginx/apache agent now removes the old vhost file in the
+  same apply that writes the new one. The MCP `update_domain` tool accepts
+  `subdomain` and `zone_id`. `/api/v1/health` reports queued deletions as
+  `domain_dns_cleanup`. Migration 35 runs on start.
+
 ## [0.5.1] - 2026-10-27
 
 ### Fixed
@@ -376,6 +574,8 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.6.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.6.0
+[0.6.0-rc.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.6.0-rc.1
 [0.5.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.1
 [0.5.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0
 [0.5.0-rc.3]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.3

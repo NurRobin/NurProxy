@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 )
 
 // ErrRecordNotFound signals that a record a caller tried to read or delete does
@@ -38,6 +39,54 @@ type ProviderInfo struct {
 	Description string   `json:"description"`
 	Website     string   `json:"website"`
 	RecordTypes []string `json:"record_types"`
+	// SupportsProxied reports whether Record.Proxied means anything for this
+	// provider (Cloudflare's orange cloud). Providers without it must never be
+	// asked to create a proxied record.
+	SupportsProxied bool `json:"supports_proxied"`
+}
+
+// RecordPatch names the record fields NurProxy owns and wants changed. Nil
+// fields are left alone, and so is everything the provider stores beyond them
+// (Cloudflare comments, tags, per-record settings).
+type RecordPatch struct {
+	Content *string `json:"content,omitempty"`
+	Proxied *bool   `json:"proxied,omitempty"`
+}
+
+// RecordPatcher is implemented by providers that can change selected fields of
+// an existing record without overwriting the rest. Callers fall back to
+// UpdateRecord for providers that don't implement it.
+type RecordPatcher interface {
+	PatchRecord(ctx context.Context, config json.RawMessage, recordID string, patch RecordPatch) error
+}
+
+// PatchOrUpdate applies patch through PatchRecord when p supports it, and
+// otherwise overwrites the record with full via UpdateRecord.
+func PatchOrUpdate(ctx context.Context, p Provider, config json.RawMessage, recordID string, patch RecordPatch, full Record) error {
+	if rp, ok := p.(RecordPatcher); ok {
+		return rp.PatchRecord(ctx, config, recordID, patch)
+	}
+	return p.UpdateRecord(ctx, config, recordID, full)
+}
+
+// SupportsProxied reports whether the registered provider with the given ID
+// can proxy records. Unknown providers report false.
+func SupportsProxied(id string) bool {
+	p, err := Get(id)
+	if err != nil {
+		return false
+	}
+	return p.Info().SupportsProxied
+}
+
+// ProxiableType reports whether a record of this type can carry the proxied
+// bit. Cloudflare only proxies address and alias records.
+func ProxiableType(recordType string) bool {
+	switch strings.ToUpper(recordType) {
+	case "A", "AAAA", "CNAME":
+		return true
+	}
+	return false
 }
 
 // SupportsTXT reports whether the provider can create TXT records, which is the

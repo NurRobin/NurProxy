@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { api, ApiError } from '../lib/api';
-import type { Agent, Server, Domain, DiscoveredNetwork } from '../lib/types';
+import type { Agent, Server, Domain, DiscoveredNetwork, DiscoverySource } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
 import Modal from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -12,6 +12,7 @@ import Callout from '../components/Callout';
 import HelpTip from '../components/HelpTip';
 import { Field, Input, Select } from '../components/Field';
 import { useToast, errMessage } from '../components/toast-context';
+import DiscoverImportModal from '../components/DiscoverImportModal';
 
 // prefillFromNetwork turns a detected subnet into a Server-address prefill (§38).
 // For an IPv4 network on an octet boundary it drops the host octets so the
@@ -79,12 +80,20 @@ export default function Servers() {
   const [deleting, setDeleting] = useState(false);
   const [cascadeDomains, setCascadeDomains] = useState<string[] | null>(null);
 
+  // Server discovery (#25): configured sources and the agent being imported into.
+  const [sources, setSources] = useState<DiscoverySource[]>([]);
+  const [discoverAgent, setDiscoverAgent] = useState<Agent | null>(null);
+
   const eligible = agents.filter((a) => a.status === 'adopted' || a.status === 'offline');
 
   const fetchData = useCallback(async () => {
     try {
-      const [a, d] = await Promise.all([api.listAgents(), api.listDomains()]);
-      setAgents(a); setDomains(d);
+      const [a, d, src] = await Promise.all([
+        api.listAgents(), api.listDomains(),
+        // Discovery is optional; a failure here must not hide the servers.
+        api.listDiscoverySources().catch(() => [] as DiscoverySource[]),
+      ]);
+      setAgents(a); setDomains(d); setSources(src);
       const managed = a.filter((ag) => ag.status === 'adopted' || ag.status === 'offline');
       const entries = await Promise.all(managed.map(async (ag) => {
         try { return [ag.id, await api.listServers(ag.id)] as const; }
@@ -170,6 +179,10 @@ export default function Servers() {
     finally { setDeleting(false); }
   }
 
+  // One configured type names the button after it ("Discover from Proxmox VE").
+  const sourceTypes = [...new Set(sources.map((src) => src.type_name))];
+  const discoverLabel = sourceTypes.length === 1 ? t('discovery.discoverFrom', { name: sourceTypes[0] }) : t('discovery.discoverServers');
+
   const domainsForServer = (sid: string) => domains.filter((d) => d.server_id === sid && d.status !== 'deleting').length;
   const totalServers = Object.values(serversByAgent).reduce((n, s) => n + s.length, 0);
   const totalSuggestions = eligible.reduce((n, a) => n + suggestionsFor(a, serversByAgent[a.id] ?? []).length, 0);
@@ -194,7 +207,7 @@ export default function Servers() {
           description={t('servers.approveFirstBody')}
           action={<Link to="/agents" className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:bg-accent-hover">{t('servers.goToAgents')}</Link>}
         />
-      ) : totalServers === 0 && totalSuggestions === 0 ? (
+      ) : totalServers === 0 && totalSuggestions === 0 && sources.length === 0 ? (
         <EmptyState
           title={t('servers.noneYet')}
           description={t('servers.noneYetBody')}
@@ -213,7 +226,12 @@ export default function Servers() {
                     <StatusBadge status={agent.status} />
                     <span className="text-xs text-fg-faint">{t('counts.servers', { count: servers.length })}</span>
                   </div>
-                  <button onClick={() => openAdd(agent.id)} className="text-sm font-medium text-accent hover:underline">{t('servers.addServer')}</button>
+                  <div className="flex items-center gap-4">
+                    {sources.length > 0 && (
+                      <button onClick={() => setDiscoverAgent(agent)} className="text-sm font-medium text-accent hover:underline">{discoverLabel}</button>
+                    )}
+                    <button onClick={() => openAdd(agent.id)} className="text-sm font-medium text-accent hover:underline">{t('servers.addServer')}</button>
+                  </div>
                 </div>
                 {servers.length === 0 ? (
                   <p className="px-5 py-4 text-sm text-fg-faint">{t('servers.onAgentNone')}</p>
@@ -224,7 +242,22 @@ export default function Servers() {
                       return (
                         <li key={s.id} className="flex items-center justify-between gap-4 px-5 py-3">
                           <div className="min-w-0">
-                            <p className="truncate font-medium text-fg">{s.name}</p>
+                            <p className="flex items-center gap-2 truncate font-medium text-fg">
+                              {s.name}
+                              {s.external_id && (
+                                <span title={s.external_id} className="rounded bg-surface-3 px-1.5 py-0.5 text-[11px] font-normal text-fg-faint">
+                                  {sources.find((src) => src.id === s.discovery_source_id)?.name ?? t('discovery.importedBadge')}
+                                </span>
+                              )}
+                              {s.discovery_missing_since && (
+                                <span
+                                  title={t('discovery.goneTitle', { when: new Date(s.discovery_missing_since).toLocaleString() })}
+                                  className="rounded bg-warning-soft px-1.5 py-0.5 text-[11px] font-medium text-warning-fg"
+                                >
+                                  {t('discovery.goneBadge')}
+                                </span>
+                              )}
+                            </p>
                             <p className="truncate font-mono text-xs text-fg-faint">{s.address}{s.notes && <span className="font-sans"> · {s.notes}</span>}</p>
                           </div>
                           <div className="flex flex-shrink-0 items-center gap-4">
@@ -315,6 +348,17 @@ export default function Servers() {
           </div>
         </div>
       </Modal>
+
+      {discoverAgent && (
+        <DiscoverImportModal
+          open
+          onClose={() => setDiscoverAgent(null)}
+          agent={discoverAgent}
+          agents={agents}
+          sources={sources}
+          onImported={fetchData}
+        />
+      )}
 
       <ConfirmDialog
         open={deleteId !== null && cascadeDomains === null}

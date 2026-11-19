@@ -10,6 +10,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/NurRobin/NurProxy/internal/orchestrator/db"
 	"github.com/NurRobin/NurProxy/internal/shared/auth"
+	"github.com/NurRobin/NurProxy/internal/shared/caddygen"
 	"github.com/NurRobin/NurProxy/internal/shared/dnsname"
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 	"github.com/NurRobin/NurProxy/internal/shared/ratelimit"
@@ -216,14 +218,26 @@ var tools = func() map[string]tool {
 		{
 			name:        "create_domain",
 			description: "Create a proxied domain (subdomain in a zone, pointing at a server+port).",
-			inputSchema: `{"type":"object","properties":{"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]}},"required":["subdomain","zone_id","server_id","port"],"additionalProperties":false}`,
+			inputSchema: `{"type":"object","properties":{"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit or null to keep whatever the existing record has; true/false is enforced. true only for Cloudflare zones."},` + loggingSchemaProps + `,` + routesSchemaProp + `},"required":["subdomain","zone_id","server_id","port"],"additionalProperties":false}`,
 			run:         toolCreateDomain,
 		},
 		{
 			name:        "update_domain",
 			description: "Update fields of an existing domain by id. Re-queues it for reconciliation.",
-			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]}},"required":["id"],"additionalProperties":false}`,
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"subdomain":{"type":"string"},"zone_id":{"type":"string"},"server_id":{"type":"string"},"port":{"type":"integer"},"websocket":{"type":"boolean"},"force_https":{"type":"boolean"},"ssl_mode":{"type":"string","enum":["auto","manual","off"]},"proxied":{"type":["boolean","null"],"description":"Cloudflare proxy (orange cloud). Omit to leave unchanged, null to go back to keeping the existing record state; true/false is enforced. true only for Cloudflare zones."},` + loggingSchemaProps + `,` + routesSchemaProp + `},"required":["id"],"additionalProperties":false}`,
 			run:         toolUpdateDomain,
+		},
+		{
+			name:        "get_domain_failover",
+			description: "Show which servers may serve a domain (primary and failover backups on other agents), their agents' health, and which agent the domain's DNS record currently points at.",
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}`,
+			run:         toolGetDomainFailover,
+		},
+		{
+			name:        "set_domain_backups",
+			description: "Set a domain's failover backup servers, most preferred first; an empty list removes failover. Each backup must be a server on its own agent, other than the primary's, that serves the domain's zone. Backup agents get the route and certificate in advance; the DNS record moves to the first healthy agent when the active one goes offline. At most 3.",
+			inputSchema: `{"type":"object","properties":{"id":{"type":"integer"},"server_ids":{"type":"array","items":{"type":"string"},"maxItems":3}},"required":["id","server_ids"],"additionalProperties":false}`,
+			run:         toolSetDomainBackups,
 		},
 		{
 			name:        "delete_domain",
@@ -344,18 +358,34 @@ func toolListDomains(d *db.DB, args json.RawMessage) (any, error) {
 	if domains == nil {
 		domains = []models.Domain{}
 	}
+	if err := d.FillDomainFailover(domains); err != nil {
+		return nil, err
+	}
 	return domains, nil
 }
 
+// loggingSchemaProps are the per-domain logging properties shared by the
+// create_domain and update_domain input schemas.
+const loggingSchemaProps = `"access_log":{"type":"string","enum":["default","off"],"description":"off writes no access log for this domain; default keeps the proxy's host-wide log"},` +
+	`"error_log_level":{"type":"string","enum":["default","info","notice","warn","error","crit","alert","emerg"],"description":"minimum error log level for this domain; default keeps the host-wide level"}`
+
+// routesSchemaProp is the path routes property of the create_domain and
+// update_domain input schemas.
+const routesSchemaProp = `"routes":{"type":"array","maxItems":32,"description":"Extra path-routed upstreams. Exact beats prefix, the longest prefix wins; everything else goes to server_id/port. A prefix /api matches /api and /api/..., not /apix. Each server must be on the same agent as the domain's server. On update the list replaces the stored one; [] removes all.","items":{"type":"object","properties":{"match":{"type":"string","enum":["prefix","exact"]},"path":{"type":"string","description":"request path starting with /; letters, digits, - . _ / only; a prefix has no trailing slash"},"server_id":{"type":"string"},"port":{"type":"integer"},"upstream_scheme":{"type":"string","enum":["http","https"]},"websocket":{"type":"boolean"},"strip_prefix":{"type":"boolean","description":"remove the path before forwarding (prefix only)"}},"required":["match","path","server_id","port"],"additionalProperties":false}}`
+
 func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	var in struct {
-		Subdomain  string `json:"subdomain"`
-		ZoneID     string `json:"zone_id"`
-		ServerID   string `json:"server_id"`
-		Port       int    `json:"port"`
-		WebSocket  bool   `json:"websocket"`
-		ForceHTTPS bool   `json:"force_https"`
-		SSLMode    string `json:"ssl_mode"`
+		Subdomain     string             `json:"subdomain"`
+		ZoneID        string             `json:"zone_id"`
+		ServerID      string             `json:"server_id"`
+		Port          int                `json:"port"`
+		WebSocket     bool               `json:"websocket"`
+		ForceHTTPS    bool               `json:"force_https"`
+		SSLMode       string             `json:"ssl_mode"`
+		Proxied       *bool              `json:"proxied"`
+		AccessLog     *string            `json:"access_log"`
+		ErrorLogLevel *string            `json:"error_log_level"`
+		Routes        []models.PathRoute `json:"routes"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -375,6 +405,9 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if _, err := d.GetServer(in.ServerID); err != nil {
 		return nil, fmt.Errorf("server not found")
 	}
+	if err := d.ValidateDomainProxied(in.ZoneID, false, in.Proxied); err != nil {
+		return nil, err
+	}
 	existing, _ := d.ListDomains(db.DomainFilter{})
 	for i := range existing {
 		if existing[i].Subdomain == in.Subdomain && existing[i].ZoneID == in.ZoneID {
@@ -393,7 +426,16 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		WebSocket:  in.WebSocket,
 		ForceHTTPS: in.ForceHTTPS,
 		SSLMode:    sslMode,
+		Proxied:    in.Proxied,
 		Status:     models.DomainStatusPending,
+	}
+	applyLoggingArgs(&dom.ProxyConfig, in.AccessLog, in.ErrorLogLevel)
+	if err := d.CheckDomainBackendOptions(dom); err != nil {
+		return nil, err
+	}
+	dom.ProxyConfig.Routes = in.Routes
+	if err := d.CheckDomainRoutes(dom); err != nil {
+		return nil, err
 	}
 	if err := d.CreateDomain(dom); err != nil {
 		return nil, err
@@ -408,12 +450,18 @@ func toolCreateDomain(d *db.DB, args json.RawMessage) (any, error) {
 
 func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	var in struct {
-		ID         int64   `json:"id"`
-		ServerID   *string `json:"server_id"`
-		Port       *int    `json:"port"`
-		WebSocket  *bool   `json:"websocket"`
-		ForceHTTPS *bool   `json:"force_https"`
-		SSLMode    *string `json:"ssl_mode"`
+		ID            int64               `json:"id"`
+		Subdomain     *string             `json:"subdomain"`
+		ZoneID        *string             `json:"zone_id"`
+		ServerID      *string             `json:"server_id"`
+		Port          *int                `json:"port"`
+		WebSocket     *bool               `json:"websocket"`
+		ForceHTTPS    *bool               `json:"force_https"`
+		SSLMode       *string             `json:"ssl_mode"`
+		Proxied       models.OptionalBool `json:"proxied"`
+		AccessLog     *string             `json:"access_log"`
+		ErrorLogLevel *string             `json:"error_log_level"`
+		Routes        *[]models.PathRoute `json:"routes"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, fmt.Errorf("invalid arguments: %w", err)
@@ -426,9 +474,24 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("domain not found")
 	}
 	before := *dom
+	if in.Subdomain != nil {
+		if err := dnsname.ValidateSubdomainOrApex(*in.Subdomain); err != nil {
+			return nil, err
+		}
+		dom.Subdomain = *in.Subdomain
+	}
+	if in.ZoneID != nil {
+		if _, err := d.GetZone(*in.ZoneID); err != nil {
+			return nil, fmt.Errorf("zone not found")
+		}
+		dom.ZoneID = *in.ZoneID
+	}
 	if in.ServerID != nil {
 		if _, err := d.GetServer(*in.ServerID); err != nil {
 			return nil, fmt.Errorf("server not found")
+		}
+		if err := d.CheckPrimaryServer(dom.ID, *in.ServerID); err != nil {
+			return nil, err
 		}
 		dom.ServerID = *in.ServerID
 	}
@@ -447,22 +510,59 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if in.SSLMode != nil {
 		dom.SSLMode = models.SSLMode(*in.SSLMode)
 	}
+	if in.Proxied.Set {
+		dom.Proxied = in.Proxied.Value
+	}
+	if err := d.ValidateDomainProxied(dom.ZoneID, dom.CertOnly, dom.Proxied); err != nil {
+		return nil, err
+	}
+	applyLoggingArgs(&dom.ProxyConfig, in.AccessLog, in.ErrorLogLevel)
+	if err := d.CheckDomainBackendOptions(dom); err != nil {
+		return nil, err
+	}
+	// A rename or ssl_mode change must not leave a zone wildcard opt-in the
+	// shared cert can no longer cover.
+	if err := caddygen.ValidateTLSWildcard(*dom); err != nil {
+		return nil, err
+	}
+	if in.Routes != nil {
+		dom.ProxyConfig.Routes = *in.Routes
+	}
+	// Checked on every update: a server or zone change must keep the route
+	// servers on the domain's agent.
+	if err := d.CheckDomainRoutes(dom); err != nil {
+		return nil, err
+	}
 	dom.Status = models.DomainStatusPending // re-queue for reconciliation
 	// Same move handling as the REST API: tombstone the old host on the old
 	// agent before the row changes, drop the stale artifact afterwards (#148).
 	// The reconciler's next tick pushes both agents.
+	// A rename gets the same treatment (#151): a tombstone for the old vhost on
+	// the same agent, the old DNS record released by UpdateDomain, and the old
+	// certificate dropped afterwards. The renewal scan issues the new host's.
+	now := time.Now().UTC()
 	var move *db.DomainMove
 	if before.ServerID != dom.ServerID {
-		move, err = d.BeginDomainMove(&before, dom.ServerID, time.Now().UTC())
+		move, err = d.BeginDomainMove(&before, dom.ServerID, now)
 		if err != nil {
 			return nil, fmt.Errorf("failed to persist managed deletion identity for the old agent: %w", err)
 		}
 	}
+	rename, err := d.BeginDomainRename(&before, dom, now)
+	if err != nil {
+		d.AbortDomainMove(move)
+		return nil, fmt.Errorf("failed to persist managed deletion identity for the renamed host: %w", err)
+	}
 	if err := d.UpdateDomain(dom); err != nil {
 		d.AbortDomainMove(move)
+		d.AbortDomainRename(rename)
 		return nil, err
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "update", dom.Subdomain)
+	if models.ProxiedLabel(before.Proxied) != models.ProxiedLabel(dom.Proxied) {
+		auditMCP(d, "domain", fmt.Sprintf("%d", dom.ID), "proxied_set",
+			fmt.Sprintf("%s: %s -> %s", dom.Subdomain, models.ProxiedLabel(before.Proxied), models.ProxiedLabel(dom.Proxied)))
+	}
 	// The update is committed from here on, so cleanup failures are reported
 	// as warnings next to the domain rather than as a tool error.
 	var warnings []string
@@ -474,7 +574,23 @@ func toolUpdateDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if err := d.ClaimDomainRoute(dom); err != nil {
 		warnings = append(warnings, "colliding route tombstones could not be dropped: "+err.Error())
 	}
+	if dropped, err := d.FinishDomainRename(rename); err != nil {
+		warnings = append(warnings, "old certificate could not be removed: "+err.Error())
+	} else if dropped {
+		auditMCP(d, "certificate", rename.OldHost, "deleted", "domain renamed to "+rename.NewHost+"; no remaining domain serves this host")
+	}
 	return domainWithWarnings(dom, warnings), nil
+}
+
+// applyLoggingArgs copies the optional logging arguments onto the proxy
+// config; nil leaves a field unchanged.
+func applyLoggingArgs(pc *models.ProxyConfig, accessLog, errorLogLevel *string) {
+	if accessLog != nil {
+		pc.AccessLog = *accessLog
+	}
+	if errorLogLevel != nil {
+		pc.ErrorLogLevel = *errorLogLevel
+	}
 }
 
 // domainResult is a domain plus post-commit cleanup warnings; it marshals as
@@ -501,10 +617,21 @@ func toolDeleteDomain(d *db.DB, args json.RawMessage) (any, error) {
 	if in.ID == 0 {
 		return nil, fmt.Errorf("id is required")
 	}
+	dom, err := d.GetDomain(in.ID)
+	if err != nil {
+		return nil, fmt.Errorf("domain not found")
+	}
+	// Standby routes on failover backup agents (#74) get their tombstones
+	// before any push can stop retaining them; the reconciler teardown
+	// repeats this if it fails here.
+	_, standbyErr := d.TombstoneStandbyRoutes(dom, time.Now().UTC())
 	if err := d.UpdateDomainStatus(in.ID, models.DomainStatusDeleting, ""); err != nil {
 		return nil, fmt.Errorf("domain not found")
 	}
 	auditMCP(d, "domain", fmt.Sprintf("%d", in.ID), "delete", "")
+	if standbyErr != nil {
+		return map[string]any{"id": in.ID, "status": "deleting", "warnings": []string{"standby route deletions could not be stored yet: " + standbyErr.Error()}}, nil
+	}
 	return map[string]any{"id": in.ID, "status": "deleting"}, nil
 }
 
@@ -528,4 +655,46 @@ func nonNilServers(s []models.Server, err error) (any, error) {
 		return []models.Server{}, nil
 	}
 	return s, nil
+}
+
+func toolGetDomainFailover(d *db.DB, args json.RawMessage) (any, error) {
+	var in struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	dom, err := d.GetDomain(in.ID)
+	if err != nil {
+		return nil, fmt.Errorf("domain not found")
+	}
+	return d.DomainFailoverStatus(dom, time.Now().UTC())
+}
+
+// toolSetDomainBackups stores the backup list like the REST API. The agents
+// that gain or lose a standby route, and the DNS target, follow on the next
+// reconcile cycle.
+func toolSetDomainBackups(d *db.DB, args json.RawMessage) (any, error) {
+	var in struct {
+		ID        int64    `json:"id"`
+		ServerIDs []string `json:"server_ids"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if in.ServerIDs == nil {
+		return nil, fmt.Errorf("server_ids is required (an empty list removes all backups)")
+	}
+	if _, err := d.SetDomainBackups(in.ID, in.ServerIDs, time.Now().UTC()); err != nil {
+		if errors.Is(err, db.ErrDomainNotFound) {
+			return nil, fmt.Errorf("domain not found")
+		}
+		return nil, err
+	}
+	auditMCP(d, "domain", fmt.Sprintf("%d", in.ID), "backups_set", "backup servers: ["+strings.Join(in.ServerIDs, ", ")+"]")
+	dom, err := d.GetDomain(in.ID)
+	if err != nil {
+		return nil, fmt.Errorf("domain not found")
+	}
+	return d.DomainFailoverStatus(dom, time.Now().UTC())
 }

@@ -58,6 +58,10 @@ the same calls regardless of dry/real; only the orchestrator behind it differs.
 - [ ] `domain add` (`--subdomain`, `--zone`, `--server`, `--port`, `--websocket`, `--force-https`, `--ssl-mode`, `--proxy-config-file`)
 - [ ] `domain update <id>` (same flags; tri-state bool handling)
 - [ ] `domain delete <id>`
+- [ ] `domain set-cert <id> --cert FILE --key FILE` (import an existing certificate; see 06-tls-acme §16)
+- [ ] `domain cert-candidates <id>` (certificates agents found on disk for the host; see 06-tls-acme §17)
+- [ ] `domain adopt-cert <id> [--fingerprint FP [--from-agent ID]]` (adopt one; the fingerprint may be omitted when the serving agent has exactly one adoptable cert; another agent's cert needs both flags)
+- [ ] `domain issue-cert <id>` (skip the adoption hold and order a new certificate now)
 - [ ] `apikey show`
 - [ ] `apikey create`
 - [ ] `apikey revoke`
@@ -329,7 +333,7 @@ the same calls regardless of dry/real; only the orchestrator behind it differs.
   REST: `GET /api/v1/domains` with query params `agent_id` / `server_id` / `status`
   (only non-empty ones added, `cli_commands.go:341-348`).
 - **Steps:** `./nurproxy domain list` ; `./nurproxy domain list --status active` ; `-json`
-- **Pass:** table `ID  SUBDOMAIN  SERVER  PORT  STATUS` (`cli_commands.go:364`); ID
+- **Pass:** table `ID  SUBDOMAIN  SERVER  PORT  PROXIED  STATUS` (`cli_commands.go:364`); ID
   is the numeric domain ID; STATUS is `pending`/`active`/`deleting`-etc.
   (`models.go:22-23`). `-json` → `[]models.Domain`.
 - **Coverage:** D

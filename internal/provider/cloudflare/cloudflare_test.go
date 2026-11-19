@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -300,6 +301,50 @@ func TestUpdateRecord(t *testing.T) {
 	err := p.UpdateRecord(context.Background(), makeConfig("test-token", "zone-1"), "record-123", record)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
+	}
+}
+
+// TestPatchRecord asserts PatchRecord sends a PATCH carrying only the fields
+// NurProxy owns, so Cloudflare keeps the record's comment, tags and settings.
+func TestPatchRecord(t *testing.T) {
+	target := "edge1.example.com"
+	off, on := false, true
+	tests := []struct {
+		name     string
+		patch    provider.RecordPatch
+		wantBody string
+	}{
+		{"proxy only off", provider.RecordPatch{Proxied: &off}, `{"proxied":false}`},
+		{"proxy only on", provider.RecordPatch{Proxied: &on}, `{"proxied":true}`},
+		{"target and proxy", provider.RecordPatch{Content: &target, Proxied: &on}, `{"content":"edge1.example.com","proxied":true}`},
+		{"target only", provider.RecordPatch{Content: &target}, `{"content":"edge1.example.com"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath, gotBody string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod, gotPath = r.Method, r.URL.Path
+				b, _ := io.ReadAll(r.Body)
+				gotBody = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"success": true, "result": {"id": "record-123"}}`))
+			}))
+			defer server.Close()
+
+			p := newTestProvider(server)
+			if err := p.PatchRecord(context.Background(), makeConfig("test-token", "zone-1"), "record-123", tc.patch); err != nil {
+				t.Fatalf("PatchRecord: %v", err)
+			}
+			if gotMethod != http.MethodPatch {
+				t.Errorf("method = %s, want PATCH", gotMethod)
+			}
+			if gotPath != "/zones/zone-1/dns_records/record-123" {
+				t.Errorf("path = %s", gotPath)
+			}
+			if gotBody != tc.wantBody {
+				t.Errorf("body = %s, want %s", gotBody, tc.wantBody)
+			}
+		})
 	}
 }
 

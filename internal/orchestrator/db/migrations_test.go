@@ -144,6 +144,9 @@ func seedSchema14(t *testing.T, dbPath string) {
 	if _, err := raw.Exec(`INSERT INTO domains (id, subdomain, zone_id, server_id, port) VALUES (1, 'app', 'zone1', 'srv1', 8080)`); err != nil {
 		t.Fatalf("seed domain: %v", err)
 	}
+	if _, err := raw.Exec(`INSERT INTO certificates (id, host, cert_pem, key_pem_enc) VALUES ('app.example.com', 'app.example.com', 'cert', 'key')`); err != nil {
+		t.Fatalf("seed certificate: %v", err)
+	}
 }
 
 // schemaVersion reads the recorded max schema version.
@@ -178,8 +181,8 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 	if got := schemaVersion(t, d); got != len(migrations) {
 		t.Fatalf("schema_version = %d, want %d after upgrade", got, len(migrations))
 	}
-	if len(migrations) != 32 {
-		t.Fatalf("this test pins the schema target at 32 migrations; have %d — update the test", len(migrations))
+	if len(migrations) != 41 {
+		t.Fatalf("this test pins the schema target at 41 migrations; have %d — update the test", len(migrations))
 	}
 
 	// --- new columns exist with the declared defaults on pre-existing rows ---
@@ -194,6 +197,7 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		{"public_ip6", ""},         // migration 18
 		{"dns_record_id6", ""},     // migration 18
 		{"token_enc", ""},          // migration 19
+		{"detected_certs", ""},     // migration 40
 	}
 	for _, tc := range agentStr {
 		t.Run("agent_col_"+tc.col, func(t *testing.T) {
@@ -227,6 +231,28 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 		}
 		if certOnly != 0 {
 			t.Errorf("domains.cert_only = %d, want 0 (default on pre-existing row)", certOnly)
+		}
+	})
+
+	// migration 33: domains.proxied is NULL (not set) on pre-existing rows.
+	t.Run("domain_proxied_default", func(t *testing.T) {
+		var proxied sql.NullInt64
+		if err := d.sql.QueryRow("SELECT proxied FROM domains WHERE id=1").Scan(&proxied); err != nil {
+			t.Fatalf("select proxied: %v", err)
+		}
+		if proxied.Valid {
+			t.Errorf("domains.proxied = %d, want NULL (default on pre-existing row)", proxied.Int64)
+		}
+	})
+
+	// migration 37: domains.dns_error is empty on pre-existing rows.
+	t.Run("domain_dns_error_default", func(t *testing.T) {
+		var dnsErr string
+		if err := d.sql.QueryRow("SELECT dns_error FROM domains WHERE id=1").Scan(&dnsErr); err != nil {
+			t.Fatalf("select dns_error: %v", err)
+		}
+		if dnsErr != "" {
+			t.Errorf("domains.dns_error = %q, want empty (default on pre-existing row)", dnsErr)
 		}
 	})
 
@@ -278,6 +304,37 @@ func TestMigration_UpgradeFrom14(t *testing.T) {
 			if n != 0 {
 				t.Errorf("%s should start empty, has %d rows", table, n)
 			}
+		}
+	})
+
+	// migration 34: a certificate stored before imports existed was issued by
+	// NurProxy, so it defaults to source 'acme'; anything else is refused.
+	t.Run("certificate_source_default", func(t *testing.T) {
+		var source string
+		if err := d.sql.QueryRow("SELECT source FROM certificates WHERE host='app.example.com'").Scan(&source); err != nil {
+			t.Fatalf("select certificates.source: %v", err)
+		}
+		if source != "acme" {
+			t.Errorf("certificates.source = %q, want acme (default on pre-existing row)", source)
+		}
+		if _, err := d.sql.Exec("UPDATE certificates SET source='manual' WHERE host='app.example.com'"); err == nil {
+			t.Error("certificates.source accepted a value outside acme|imported")
+		}
+	})
+
+	// migration 38: a server that existed before discovery is a plain,
+	// unlinked server, and the discovery sources table starts empty.
+	t.Run("server_discovery_defaults", func(t *testing.T) {
+		srv, err := d.GetServer("srv1")
+		if err != nil {
+			t.Fatalf("GetServer: %v", err)
+		}
+		if srv.DiscoverySourceID != "" || srv.ExternalID != "" || srv.DiscoveryMissingSince != nil {
+			t.Errorf("pre-existing server = %+v, want no discovery link", srv)
+		}
+		sources, err := d.ListDiscoverySources()
+		if err != nil || len(sources) != 0 {
+			t.Errorf("discovery sources = %v, %v; want empty", sources, err)
 		}
 	})
 

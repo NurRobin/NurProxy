@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NurRobin/NurProxy/internal/shared/models"
 )
@@ -297,8 +298,143 @@ func cmdAgent(args []string) {
 		}
 		c.emit(raw, "agent deleted: "+id)
 
+	case "upgrade":
+		cmdAgentUpgrade(rest)
+
+	case "upgrades":
+		c, _, id := parseClient("agent upgrades", rest, "agent id", nil)
+		var ups []models.AgentUpgrade
+		if err := c.getInto("/api/v1/agents/"+id+"/upgrades", &ups); err != nil {
+			fatalf("%v", err)
+		}
+		if c.asJSON {
+			c.emit(mustJSON(ups), "")
+			return
+		}
+		rows := make([][]string, len(ups))
+		for i, u := range ups {
+			rows[i] = []string{u.ID, u.CreatedAt.Local().Format("2006-01-02 15:04"), dash(u.FromVersion), u.TargetVersion, string(u.State), u.Trigger, dash(u.Error)}
+		}
+		printTable([]string{"ID", "STARTED", "FROM", "TO", "STATE", "TRIGGER", "ERROR"}, rows)
+
+	case "auto-upgrade":
+		var enabled *bool
+		c, _, id := parseClient("agent auto-upgrade", rest, "agent id", func(fs *flag.FlagSet) {
+			enabled = fs.Bool("enabled", false, "upgrade this agent to the orchestrator's version automatically (off by default)")
+		})
+		raw, err := c.do(http.MethodPut, "/api/v1/agents/"+id+"/auto-upgrade", map[string]bool{"enabled": *enabled})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		c.emit(raw, fmt.Sprintf("agent %s auto-upgrade: %t", id, *enabled))
+
 	default:
-		usage("agent", "list", "status <id>", "adopt <id>", "update <id>", "reject <id>", "delete <id> [--cascade]")
+		usage("agent", "list", "status <id>", "adopt <id>", "update <id>", "reject <id>", "delete <id> [--cascade]",
+			"upgrade <id> [--version X] [--allow-prerelease] [--wait]", "upgrade --all-outdated [--version X] [--allow-prerelease] [--wait]", "upgrades <id>", "auto-upgrade <id> --enabled=true|false")
+	}
+}
+
+// cmdAgentUpgrade handles `agent upgrade <id>` and `agent upgrade
+// --all-outdated`. The target defaults to the orchestrator's own version.
+func cmdAgentUpgrade(args []string) {
+	all := false
+	for _, a := range args {
+		if a == "--all-outdated" || a == "-all-outdated" || a == "--all-outdated=true" {
+			all = true
+		}
+	}
+	var version string
+	var wait, allowPrerelease *bool
+	setup := func(fs *flag.FlagSet) {
+		fs.StringVar(&version, "version", "", "target release (default: the orchestrator's version)")
+		wait = fs.Bool("wait", false, "wait until the upgrade (or rollout) finishes")
+		allowPrerelease = fs.Bool("allow-prerelease", false, "allow a pre-release target (-rc, -beta); refused otherwise")
+		fs.Bool("all-outdated", false, "upgrade every outdated agent, one at a time, stopping at the first failure")
+	}
+	body := map[string]any{}
+	if all {
+		c, _, _ := parseClient("agent upgrade", args, "", setup)
+		if version != "" {
+			body["version"] = version
+		}
+		if *allowPrerelease {
+			body["allow_prerelease"] = true
+		}
+		raw, err := c.do(http.MethodPost, "/api/v1/agents/upgrade-outdated", body)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		if !*wait {
+			c.emit(raw, fmt.Sprintf("rollout %s to %s started", gjson(raw, "id"), gjson(raw, "target_version")))
+			return
+		}
+		for {
+			time.Sleep(3 * time.Second)
+			var resp struct {
+				Rollout *struct {
+					State  string `json:"state"`
+					Error  string `json:"error"`
+					Agents []struct {
+						Name  string `json:"name"`
+						State string `json:"state"`
+						Error string `json:"error"`
+					} `json:"agents"`
+				} `json:"rollout"`
+			}
+			if err := c.getInto("/api/v1/agents/upgrade-rollout", &resp); err != nil {
+				fatalf("%v", err)
+			}
+			if resp.Rollout == nil || resp.Rollout.State == "running" {
+				continue
+			}
+			for _, a := range resp.Rollout.Agents {
+				fmt.Printf("%-30s %-10s %s\n", a.Name, a.State, a.Error)
+			}
+			if resp.Rollout.State != "done" {
+				fatalf("rollout %s: %s", resp.Rollout.State, resp.Rollout.Error)
+			}
+			fmt.Println("rollout done")
+			return
+		}
+	}
+	c, _, id := parseClient("agent upgrade", args, "agent id", setup)
+	if version != "" {
+		body["version"] = version
+	}
+	if *allowPrerelease {
+		body["allow_prerelease"] = true
+	}
+	raw, err := c.do(http.MethodPost, "/api/v1/agents/"+id+"/upgrade", body)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if !*wait {
+		c.emit(raw, fmt.Sprintf("upgrade %s of agent %s to %s requested", gjson(raw, "id"), id, gjson(raw, "target_version")))
+		return
+	}
+	upgradeID := gjson(raw, "id")
+	last := ""
+	for {
+		var ups []models.AgentUpgrade
+		if err := c.getInto("/api/v1/agents/"+id+"/upgrades", &ups); err != nil {
+			fatalf("%v", err)
+		}
+		for _, u := range ups {
+			if u.ID != upgradeID {
+				continue
+			}
+			if string(u.State) != last {
+				last = string(u.State)
+				fmt.Println(last)
+			}
+			if u.State.Terminal() {
+				if u.State != models.UpgradeDone {
+					fatalf("upgrade %s: %s", u.State, u.Error)
+				}
+				return
+			}
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -380,6 +516,17 @@ func cmdServer(args []string) {
 
 // --- domain --------------------------------------------------------------
 
+// addLoggingFlags registers the per-domain logging flags shared by
+// `domain add` and `domain update`. The orchestrator validates the values.
+func addLoggingFlags(fs *flag.FlagSet, accessLog, errorLogLevel *string) {
+	fs.StringVar(accessLog, "access-log", "", `Access log for this domain: "off" or "default" (host-wide log)`)
+	fs.StringVar(errorLogLevel, "error-log-level", "", `Minimum error log level for this domain (info, notice, warn, error, crit, alert, emerg) or "default"`)
+}
+
+// tlsWildcardFlagHelp documents --tls-wildcard on `domain add` / `domain update`.
+const tlsWildcardFlagHelp = "Serve this domain from its zone's shared *.<zone> certificate (central TLS, single label below the zone only). " +
+	"The same private key is then installed on every agent serving a wildcard domain of the zone"
+
 func cmdDomain(args []string) {
 	action, rest := shift(args)
 	switch action {
@@ -410,16 +557,43 @@ func cmdDomain(args []string) {
 		for i, d := range domains {
 			rows[i] = []string{
 				strconv.FormatInt(d.ID, 10), d.Subdomain, d.ServerID,
-				strconv.Itoa(d.Port), string(d.Status),
+				strconv.Itoa(d.Port), proxiedCell(d.Proxied), dnsCell(d), string(d.Status), dash(d.ErrorMsg),
 			}
 		}
-		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "STATUS"}, rows)
+		printTable([]string{"ID", "SUBDOMAIN", "SERVER", "PORT", "PROXIED", "DNS", "STATUS", "REASON"}, rows)
+
+	case "get":
+		c, _, id := parseClient("domain get", rest, "domain id", nil)
+		var d models.Domain
+		if err := c.getInto("/api/v1/domains/"+id, &d); err != nil {
+			fatalf("%v", err)
+		}
+		if c.asJSON {
+			c.emit(mustJSON(d), "")
+			return
+		}
+		printTable([]string{"FIELD", "VALUE"}, [][]string{
+			{"id", strconv.FormatInt(d.ID, 10)},
+			{"subdomain", d.Subdomain},
+			{"zone", d.ZoneID},
+			{"server", d.ServerID},
+			{"port", strconv.Itoa(d.Port)},
+			{"cert_only", strconv.FormatBool(d.CertOnly)},
+			{"proxied", proxiedCell(d.Proxied)},
+			{"dns", dnsCell(d)},
+			{"dns_record_id", dash(d.DNSRecordID)},
+			{"status", string(d.Status)},
+			{"reason", dash(d.ErrorMsg)},
+			{"dns_error", dash(d.DNSError)},
+		})
 
 	case "add":
-		var subdomain, zone, server, sslMode, proxyFile string
+		var subdomain, zone, server, sslMode, proxyFile, proxied, accessLog, errorLogLevel string
 		var port int
-		var ws, forceHTTPS bool
-		c, _, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
+		var ws, forceHTTPS, tlsWildcard bool
+		c, fs, _ := parseClient("domain add", rest, "", func(fs *flag.FlagSet) {
+			addLoggingFlags(fs, &accessLog, &errorLogLevel)
+			fs.BoolVar(&tlsWildcard, "tls-wildcard", false, tlsWildcardFlagHelp)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -428,6 +602,7 @@ func cmdDomain(args []string) {
 			fs.BoolVar(&forceHTTPS, "force-https", false, "Force HTTPS redirect")
 			fs.StringVar(&sslMode, "ssl-mode", "", "SSL mode (auto, ...)")
 			fs.StringVar(&proxyFile, "proxy-config-file", "", "Path to a ProxyConfig JSON file (advanced)")
+			fs.StringVar(&proxied, "proxied", "", proxiedFlagHelp)
 		})
 		if subdomain == "" || zone == "" || server == "" || port == 0 {
 			fatalf("--subdomain, --zone, --server and --port are required")
@@ -437,6 +612,16 @@ func cmdDomain(args []string) {
 			"websocket": ws, "force_https": forceHTTPS,
 		}
 		putStr(body, "ssl_mode", sslMode)
+		if proxied != "" {
+			body["proxied"] = parseProxiedFlag(proxied)
+		}
+		putStr(body, "access_log", accessLog)
+		putStr(body, "error_log_level", errorLogLevel)
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "tls-wildcard" {
+				body["tls_wildcard"] = tlsWildcard
+			}
+		})
 		if proxyFile != "" {
 			body["proxy_config"] = json.RawMessage(readFileArg(proxyFile))
 		}
@@ -447,10 +632,12 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain created: "+gjson(raw, "id"))
 
 	case "update":
-		var subdomain, zone, server, sslMode string
+		var subdomain, zone, server, sslMode, proxied, accessLog, errorLogLevel string
 		var port int
-		var ws, forceHTTPS bool
+		var ws, forceHTTPS, tlsWildcard bool
 		c, fs, id := parseClient("domain update", rest, "domain id", func(fs *flag.FlagSet) {
+			addLoggingFlags(fs, &accessLog, &errorLogLevel)
+			fs.BoolVar(&tlsWildcard, "tls-wildcard", false, tlsWildcardFlagHelp)
 			fs.StringVar(&subdomain, "subdomain", "", "Subdomain label")
 			fs.StringVar(&zone, "zone", "", "Zone ID")
 			fs.StringVar(&server, "server", "", "Server ID")
@@ -458,6 +645,7 @@ func cmdDomain(args []string) {
 			fs.BoolVar(&ws, "websocket", false, "Enable WebSocket support")
 			fs.BoolVar(&forceHTTPS, "force-https", false, "Force HTTPS redirect")
 			fs.StringVar(&sslMode, "ssl-mode", "", "SSL mode")
+			fs.StringVar(&proxied, "proxied", "", proxiedFlagHelp)
 		})
 		body := map[string]interface{}{}
 		putStr(body, "subdomain", subdomain)
@@ -475,6 +663,14 @@ func cmdDomain(args []string) {
 				body["websocket"] = ws
 			case "force-https":
 				body["force_https"] = forceHTTPS
+			case "proxied":
+				body["proxied"] = parseProxiedFlag(proxied)
+			case "access-log":
+				body["access_log"] = accessLog
+			case "error-log-level":
+				body["error_log_level"] = errorLogLevel
+			case "tls-wildcard":
+				body["tls_wildcard"] = tlsWildcard
 			}
 		})
 		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id, body)
@@ -492,16 +688,366 @@ func cmdDomain(args []string) {
 		c.emit(raw, "domain marked for deletion: "+id)
 
 	case "dns-takeover":
-		c, _, id := parseClient("domain dns-takeover", rest, "domain id", nil)
-		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/dns/takeover", nil)
+		var dryRun bool
+		var expect string
+		c, fs, id := parseClient("domain dns-takeover", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.BoolVar(&dryRun, "dry-run", false, "Only list the records the takeover would delete; change nothing")
+			fs.StringVar(&expect, "expect-delete", "", "Comma-separated record ids from --dry-run; refuse if the records at the name changed (\"none\" when it listed none)")
+		})
+		path := "/api/v1/domains/" + id + "/dns/takeover"
+		var body any
+		if dryRun {
+			path += "?dry_run=true"
+		} else if ids, set := expectDeleteIDs(fs, expect); set {
+			body = map[string]any{"expect_delete": ids}
+		}
+		raw, err := c.do(http.MethodPost, path, body)
 		if err != nil {
 			fatalf("%v", err)
 		}
-		c.emit(raw, "DNS takeover applied for domain "+id)
+		c.emit(raw, takeoverText(raw, dryRun, id))
+
+	case "set-cert":
+		var certFile, keyFile string
+		c, _, id := parseClient("domain set-cert", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&certFile, "cert", "", "PEM file with the certificate, leaf first, chain optional (e.g. fullchain.pem)")
+			fs.StringVar(&keyFile, "key", "", "PEM file with the unencrypted private key (e.g. privkey.pem)")
+		})
+		if certFile == "" || keyFile == "" {
+			fatalf("domain set-cert: --cert and --key are required")
+		}
+		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id+"/certificate", map[string]string{
+			"cert_pem": string(readFileArg(certFile)),
+			"key_pem":  string(readFileArg(keyFile)),
+		})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		msg := "certificate imported for domain " + id + ", expires " + gjson(raw, "expires_at")
+		if warning := gjson(raw, "warning"); warning != "" {
+			msg += "\nwarning: " + warning
+		}
+		c.emit(raw, msg)
+
+	case "cert-candidates":
+		c, _, id := parseClient("domain cert-candidates", rest, "domain id", nil)
+		cands := fetchCertCandidates(c, id)
+		if c.asJSON {
+			c.emit(mustJSON(cands), "")
+			return
+		}
+		rows := make([][]string, 0, len(cands.Candidates))
+		for _, cand := range cands.Candidates {
+			state := "yes"
+			if !cand.Adoptable {
+				state = "no: " + cand.Reason
+			}
+			rows = append(rows, []string{cand.AgentName, cand.Fingerprint, strings.Join(cand.Names, ","),
+				cand.NotAfter.Format("2006-01-02"), cand.Source, cand.CertPath, state})
+		}
+		printTable([]string{"AGENT", "FINGERPRINT", "NAMES", "EXPIRES", "SOURCE", "PATH", "ADOPTABLE"}, rows)
+		for _, h := range cands.Hints {
+			fmt.Fprintf(os.Stderr, "note: agent %s cannot scan %s: %s\n", h.AgentName, h.Path, h.Error)
+		}
+
+	case "adopt-cert":
+		var fingerprint, fromAgent string
+		c, _, id := parseClient("domain adopt-cert", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&fingerprint, "fingerprint", "", "SHA-256 fingerprint from 'domain cert-candidates' (optional when the serving agent has exactly one adoptable certificate)")
+			fs.StringVar(&fromAgent, "from-agent", "", "Agent ID to take the certificate from when it is not the serving agent (requires --fingerprint)")
+		})
+		if fromAgent != "" && fingerprint == "" {
+			fatalf("domain adopt-cert: --from-agent requires --fingerprint")
+		}
+		if fingerprint == "" {
+			fp, err := pickServingCandidate(fetchCertCandidates(c, id).Candidates, id)
+			if err != nil {
+				fatalf("domain adopt-cert: %v", err)
+			}
+			fingerprint = fp
+		}
+		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/certificate/adopt", map[string]string{
+			"fingerprint": fingerprint, "agent_id": fromAgent,
+		})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		msg := "certificate adopted for domain " + id + " from " + gjson(raw, "source_path") + ", expires " + gjson(raw, "expires_at")
+		if warning := gjson(raw, "warning"); warning != "" {
+			msg += "\nwarning: " + warning
+		}
+		c.emit(raw, msg)
+
+	case "issue-cert":
+		c, _, id := parseClient("domain issue-cert", rest, "domain id", nil)
+		raw, err := c.do(http.MethodPost, "/api/v1/domains/"+id+"/certificate/issue-now", nil)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		c.emit(raw, gjson(raw, "message"))
+
+	case "backups":
+		var set string
+		var clear bool
+		c, fs, id := parseClient("domain backups", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&set, "set", "", "Comma-separated backup server IDs, most preferred first (each on its own agent that serves the zone)")
+			fs.BoolVar(&clear, "clear", false, "Remove all backup servers (no failover)")
+		})
+		setGiven := false
+		fs.Visit(func(f *flag.Flag) { setGiven = setGiven || f.Name == "set" })
+		if setGiven && clear {
+			fatalf("domain backups: use either --set or --clear")
+		}
+		if !setGiven && !clear {
+			printFailover(c, id)
+			return
+		}
+		ids := splitCSV(set)
+		raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id+"/backups", map[string]any{"server_ids": ids})
+		if err != nil {
+			fatalf("%v", err)
+		}
+		if c.asJSON {
+			c.emit(raw, "")
+			return
+		}
+		if len(ids) == 0 {
+			fmt.Println("backup servers removed for domain " + id)
+		} else {
+			fmt.Println("backup servers set for domain " + id + ": " + strings.Join(ids, ", "))
+		}
+		printFailoverStatus(raw)
+
+	case "failover":
+		c, _, id := parseClient("domain failover", rest, "domain id", nil)
+		printFailover(c, id)
+
+	case "route":
+		cmdDomainRoute(rest)
 
 	default:
-		usage("domain", "list", "add", "update <id>", "delete <id>", "dns-takeover <id>")
+		usage("domain", "list", "get <id>", "add", "update <id>", "delete <id>", "dns-takeover [--dry-run] <id>", "set-cert <id> --cert FILE --key FILE",
+			"route list <id>", "route add <id> --path P --server S --port N [--match prefix|exact]", "route remove <id> --path P [--match prefix|exact]",
+			"backups <id> [--set srv-a,srv-b | --clear]", "failover <id>",
+			"cert-candidates <id>", "adopt-cert <id> [--fingerprint FP [--from-agent ID]]", "issue-cert <id>")
 	}
+}
+
+// certCandidateRow mirrors one entry of GET /api/v1/domains/{id}/certificate/candidates.
+type certCandidateRow struct {
+	models.DiscoveredCert
+	AgentID   string `json:"agent_id"`
+	AgentName string `json:"agent_name"`
+	Serving   bool   `json:"serving"`
+	Adoptable bool   `json:"adoptable"`
+	Reason    string `json:"reason"`
+}
+
+// pickServingCandidate returns the fingerprint of the one adoptable
+// certificate on the domain's serving agent. Certificates on other agents are
+// never picked implicitly: taking a key from another host needs --fingerprint
+// and --from-agent.
+func pickServingCandidate(cands []certCandidateRow, domainID string) (string, error) {
+	var picked []certCandidateRow
+	for _, cand := range cands {
+		if cand.Adoptable && cand.Serving {
+			picked = append(picked, cand)
+		}
+	}
+	if len(picked) != 1 {
+		return "", fmt.Errorf("the serving agent has %d adoptable certificates; pick one with --fingerprint (see 'domain cert-candidates %s')", len(picked), domainID)
+	}
+	return picked[0].Fingerprint, nil
+}
+
+type certCandidates struct {
+	Host       string             `json:"host"`
+	Candidates []certCandidateRow `json:"candidates"`
+	Hints      []struct {
+		AgentName string `json:"agent_name"`
+		Path      string `json:"path"`
+		Error     string `json:"error"`
+	} `json:"hints"`
+}
+
+func fetchCertCandidates(c *client, domainID string) certCandidates {
+	var out certCandidates
+	if err := c.getInto("/api/v1/domains/"+domainID+"/certificate/candidates", &out); err != nil {
+		fatalf("%v", err)
+	}
+	return out
+}
+
+// printFailover shows which servers may serve a domain and where its DNS
+// record points (#74).
+func printFailover(c *client, id string) {
+	raw, err := c.get("/api/v1/domains/" + id + "/failover")
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if c.asJSON {
+		c.emit(raw, "")
+		return
+	}
+	printFailoverStatus(raw)
+}
+
+func printFailoverStatus(raw []byte) {
+	var st models.DomainFailoverStatus
+	if err := json.Unmarshal(raw, &st); err != nil {
+		fatalf("decoding failover status: %v", err)
+	}
+	rows := make([][]string, len(st.Candidates))
+	for i, cand := range st.Candidates {
+		role := "backup " + strconv.Itoa(cand.Priority)
+		if cand.Primary {
+			role = "primary"
+		}
+		active, health := "", "up"
+		if cand.Active {
+			active = "*"
+		}
+		if !cand.Healthy {
+			health = "down"
+			if cand.Reason != "" {
+				health += " (" + cand.Reason + ")"
+			}
+		}
+		rows[i] = []string{active, role, cand.ServerID, cand.AgentName, cand.AgentFQDN, health}
+	}
+	printTable([]string{"ACTIVE", "ROLE", "SERVER", "AGENT", "AGENT FQDN", "HEALTH"}, rows)
+	if len(st.Candidates) < 2 {
+		fmt.Println("no backup servers: the DNS record always points at the primary agent")
+	}
+	if st.AllDown {
+		fmt.Println("every agent is down; the record stays on the active one")
+	}
+	if st.PendingServerID != "" && st.PendingSince != nil {
+		fmt.Printf("failback to %s pending since %s\n", st.PendingServerID, st.PendingSince.Format(time.RFC3339))
+	}
+}
+
+// cmdDomainRoute manages a domain's path routes. Each change reads the
+// stored list, edits it and writes the whole list back as
+// proxy_config.routes; the orchestrator validates the result.
+func cmdDomainRoute(args []string) {
+	action, rest := shift(args)
+	switch action {
+	case "list":
+		c, _, id := parseClient("domain route list", rest, "domain id", nil)
+		dom := getDomainForRoutes(c, id)
+		if c.asJSON {
+			c.emit(mustJSON(dom.ProxyConfig.Routes), "")
+			return
+		}
+		rows := make([][]string, len(dom.ProxyConfig.Routes))
+		for i, p := range dom.ProxyConfig.Routes {
+			scheme := p.UpstreamScheme
+			if scheme == "" {
+				scheme = "http"
+			}
+			rows[i] = []string{p.Match, p.Path, p.ServerID, strconv.Itoa(p.Port), scheme, boolStr(p.WebSocket), boolStr(p.StripPrefix)}
+		}
+		printTable([]string{"MATCH", "PATH", "SERVER", "PORT", "SCHEME", "WEBSOCKET", "STRIP"}, rows)
+
+	case "add":
+		var route models.PathRoute
+		c, _, id := parseClient("domain route add", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&route.Match, "match", "prefix", `"prefix" (the path and everything below it) or "exact"`)
+			fs.StringVar(&route.Path, "path", "", "Request path, e.g. /api")
+			fs.StringVar(&route.ServerID, "server", "", "Server ID (must be on the same agent as the domain's server)")
+			fs.IntVar(&route.Port, "port", 0, "Upstream port")
+			fs.StringVar(&route.UpstreamScheme, "scheme", "", `Upstream scheme: "http" (default) or "https"`)
+			fs.BoolVar(&route.WebSocket, "websocket", false, "Enable WebSocket support on this path")
+			fs.BoolVar(&route.StripPrefix, "strip-prefix", false, "Remove the path before forwarding (prefix only)")
+		})
+		if route.Path == "" || route.ServerID == "" || route.Port == 0 {
+			fatalf("domain route add: --path, --server and --port are required")
+		}
+		dom := getDomainForRoutes(c, id)
+		routes, err := addPathRoute(dom.ProxyConfig.Routes, route)
+		if err != nil {
+			fatalf("domain route add: %v", err)
+		}
+		raw := putDomainRoutes(c, id, routes)
+		c.emit(raw, fmt.Sprintf("path route %s (%s) added to domain %s", route.Path, route.Match, id))
+
+	case "remove":
+		var match, path string
+		c, _, id := parseClient("domain route remove", rest, "domain id", func(fs *flag.FlagSet) {
+			fs.StringVar(&match, "match", "", `Only remove the "prefix" or "exact" route for the path (needed when both exist)`)
+			fs.StringVar(&path, "path", "", "Request path of the route to remove")
+		})
+		if path == "" {
+			fatalf("domain route remove: --path is required")
+		}
+		dom := getDomainForRoutes(c, id)
+		routes, err := removePathRoute(dom.ProxyConfig.Routes, match, path)
+		if err != nil {
+			fatalf("domain route remove: %v", err)
+		}
+		raw := putDomainRoutes(c, id, routes)
+		c.emit(raw, fmt.Sprintf("path route %s removed from domain %s", path, id))
+
+	default:
+		usage("domain route", "list <domain id>",
+			"add <domain id> --path P --server S --port N [--match prefix|exact] [--scheme https] [--websocket] [--strip-prefix]",
+			"remove <domain id> --path P [--match prefix|exact]")
+	}
+}
+
+func getDomainForRoutes(c *client, id string) models.Domain {
+	var dom models.Domain
+	if err := c.getInto("/api/v1/domains/"+id, &dom); err != nil {
+		fatalf("%v", err)
+	}
+	return dom
+}
+
+func putDomainRoutes(c *client, id string, routes []models.PathRoute) []byte {
+	if routes == nil {
+		routes = []models.PathRoute{}
+	}
+	raw, err := c.do(http.MethodPut, "/api/v1/domains/"+id, map[string]interface{}{
+		"proxy_config": map[string]interface{}{"routes": routes},
+	})
+	if err != nil {
+		fatalf("%v", err)
+	}
+	return raw
+}
+
+// addPathRoute appends route, refusing a second route with the same match
+// and path.
+func addPathRoute(routes []models.PathRoute, route models.PathRoute) ([]models.PathRoute, error) {
+	for _, p := range routes {
+		if p.Match == route.Match && p.Path == route.Path {
+			return nil, fmt.Errorf("the domain already has a %s route for %s; remove it first", route.Match, route.Path)
+		}
+	}
+	return append(append([]models.PathRoute(nil), routes...), route), nil
+}
+
+// removePathRoute removes the route for path (and match, when given). It
+// refuses an ambiguous removal when a prefix and an exact route share the
+// path and no match was given.
+func removePathRoute(routes []models.PathRoute, match, path string) ([]models.PathRoute, error) {
+	var kept []models.PathRoute
+	removed := 0
+	for _, p := range routes {
+		if p.Path == path && (match == "" || p.Match == match) {
+			removed++
+			continue
+		}
+		kept = append(kept, p)
+	}
+	switch {
+	case removed == 0:
+		return nil, fmt.Errorf("the domain has no route for %s", path)
+	case removed > 1:
+		return nil, fmt.Errorf("both a prefix and an exact route exist for %s; pass --match", path)
+	}
+	return kept, nil
 }
 
 // --- apikey --------------------------------------------------------------
@@ -648,6 +1194,35 @@ func splitCSV(s string) []string {
 func putStr(m map[string]interface{}, key, val string) {
 	if val != "" {
 		m[key] = val
+	}
+}
+
+const proxiedFlagHelp = "Cloudflare proxy (orange cloud): on, off, or keep (keep whatever the existing record has; the default)"
+
+// parseProxiedFlag maps --proxied to the API's tri-state value. keep becomes
+// JSON null, which the API reads as "not set".
+func parseProxiedFlag(v string) interface{} {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "true", "yes":
+		return true
+	case "off", "false", "no":
+		return false
+	case "keep", "auto", "unset":
+		return nil
+	}
+	fatalf("--proxied must be on, off or keep (got %q)", v)
+	return nil
+}
+
+// proxiedCell renders a domain's proxied setting for table output.
+func proxiedCell(p *bool) string {
+	switch {
+	case p == nil:
+		return "keep"
+	case *p:
+		return "on"
+	default:
+		return "off"
 	}
 }
 

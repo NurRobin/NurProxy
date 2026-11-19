@@ -53,6 +53,27 @@ func TestMarkDomainApplied(t *testing.T) {
 		}
 	})
 
+	t.Run("zone wildcard cert as fallback => active", func(t *testing.T) {
+		d, id := markDomainAppliedFixture(t)
+		if err := d.UpsertCertificate(&models.Certificate{
+			ID: "*.example.com", Host: "*.example.com", IsWildcard: true, CertPEM: "CERT", KeyPEM: "KEY",
+		}); err != nil {
+			t.Fatalf("UpsertCertificate: %v", err)
+		}
+		if err := d.MarkDomainApplied(id, fqdn, true); err != nil {
+			t.Fatalf("MarkDomainApplied: %v", err)
+		}
+		if got := domainStatus(t, d, id); got != models.DomainStatusDegraded {
+			t.Fatalf("without fallback: status %q, want degraded", got)
+		}
+		if err := d.MarkDomainApplied(id, fqdn, true, "*.example.com"); err != nil {
+			t.Fatalf("MarkDomainApplied: %v", err)
+		}
+		if got := domainStatus(t, d, id); got != models.DomainStatusActive {
+			t.Errorf("with fallback: status %q, want active", got)
+		}
+	})
+
 	t.Run("missing cert => degraded plaintext", func(t *testing.T) {
 		d, id := markDomainAppliedFixture(t)
 
@@ -100,4 +121,42 @@ func TestMarkDomainApplied(t *testing.T) {
 			t.Errorf("status: got %q, want %q", got, models.DomainStatusActive)
 		}
 	})
+}
+
+// A domain whose server is gone gets a plain message, not a database error.
+func TestCheckDomainBackendOptionsMissingServer(t *testing.T) {
+	d := testDB(t)
+	dom := &models.Domain{ServerID: "srv-gone", CertOnly: true, ProxyConfig: models.ProxyConfig{AccessLog: "off"}}
+	err := d.CheckDomainBackendOptions(dom)
+	if err == nil || !strings.Contains(err.Error(), `server "srv-gone", which was not found`) || strings.Contains(err.Error(), "querying") {
+		t.Fatalf("CheckDomainBackendOptions() error = %v", err)
+	}
+	if err := d.CheckDomainBackendOptions(&models.Domain{ServerID: "srv-gone"}); err != nil {
+		t.Fatalf("a domain without logging settings needs no server lookup: %v", err)
+	}
+}
+
+// A deleting domain stays deleting: a route ACK or sync result read before the
+// delete must not pull it out of the reconciler teardown.
+func TestDeletingDomainStatusIsFinal(t *testing.T) {
+	d, id := markDomainAppliedFixture(t)
+	if err := d.UpdateDomainStatus(id, models.DomainStatusDeleting, ""); err != nil {
+		t.Fatal(err)
+	}
+	writes := map[string]func() error{
+		"UpdateDomainStatus error": func() error { return d.UpdateDomainStatus(id, models.DomainStatusError, "apply failed") },
+		"MarkDomainSynced":         func() error { return d.MarkDomainSynced(id) },
+		"MarkDomainApplied":        func() error { return d.MarkDomainApplied(id, "app.example.com", true) },
+	}
+	for name, write := range writes {
+		if err := write(); err != nil {
+			t.Fatalf("%s on a deleting domain: %v", name, err)
+		}
+		if got := domainStatus(t, d, id); got != models.DomainStatusDeleting {
+			t.Fatalf("%s changed status to %s", name, got)
+		}
+	}
+	if err := d.UpdateDomainStatus(9999, models.DomainStatusError, ""); err == nil {
+		t.Fatal("status write to a missing domain succeeded")
+	}
 }
