@@ -784,6 +784,14 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
+		// A standby copy cannot carry path routes: their servers sit on the
+		// primary agent (db.ErrRoutesWithBackups). The API refuses the
+		// combination; this covers rows stored before it did.
+		if src.standby && len(dom.ProxyConfig.Routes) > 0 {
+			log.Printf("reconciler: not pushing standby route for domain %d (%s) to agent %s: %v", dom.ID, fqdn, agent.ID, db.ErrRoutesWithBackups)
+			continue
+		}
+
 		artifactID := src.artifactID
 		storedArt, artErr := r.db.GetConfigArtifact(artifactID)
 
