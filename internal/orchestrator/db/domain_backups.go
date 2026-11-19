@@ -228,6 +228,9 @@ func (d *DB) SetDomainBackups(domainID int64, serverIDs []string, at time.Time) 
 		if dom.Status == models.DomainStatusDeleting {
 			return nil, fmt.Errorf("%w: the domain is being deleted", ErrInvalidBackups)
 		}
+		if len(dom.ProxyConfig.Routes) > 0 {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidBackups, ErrRoutesWithBackups)
+		}
 	}
 	if len(serverIDs) > failover.MaxBackups {
 		return nil, fmt.Errorf("%w: at most %d backup servers", ErrInvalidBackups, failover.MaxBackups)

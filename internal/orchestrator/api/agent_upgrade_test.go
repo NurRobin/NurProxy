@@ -36,8 +36,19 @@ func newUpgradeEnv(t *testing.T, orchestratorVersion string) *upgradeEnv {
 		tokens: map[string]string{}, events: map[string]<-chan agenthub.Event{}}
 }
 
-// agent creates an adopted agent on version; connected subscribes it to the hub.
+// agent creates an adopted agent on version that reported self-update
+// support; connected subscribes it to the hub.
 func (e *upgradeEnv) agent(id, version string, connected bool) {
+	e.t.Helper()
+	e.legacyAgent(id, version, connected)
+	if err := e.db.SetAgentSelfUpdateCapability(id, &models.SelfUpdateStatus{Supported: true, InstallKind: "standalone", ServiceManager: "systemd"}); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// legacyAgent creates an adopted agent that never reported self-update
+// support, like an agent from before 0.6.0.
+func (e *upgradeEnv) legacyAgent(id, version string, connected bool) {
 	e.t.Helper()
 	token := "token-" + id
 	if err := e.db.CreateAgent(&models.Agent{
@@ -423,6 +434,26 @@ func TestAutoUpgradeIsOptInAndDoesNotRetry(t *testing.T) {
 	select {
 	case ev := <-e.events["a"]:
 		t.Fatalf("auto-upgrade retried a failed target: %s", ev.Type)
+	default:
+	}
+}
+
+// An agent that never reported self-update support (any agent before 0.6.0
+// ignores the upgrade event) is refused up front and skipped by a rollout,
+// instead of timing out as a failed upgrade that stops the rollout.
+func TestAgentUpgradeRefusesAgentWithoutCapability(t *testing.T) {
+	e := newUpgradeEnv(t, "1.3.0")
+	e.legacyAgent("old", "0.5.1", true)
+	code, body := e.admin("POST", "/api/v1/agents/old/upgrade", nil)
+	if code != http.StatusConflict || !strings.Contains(body, "has not reported self-update support") {
+		t.Fatalf("upgrade of legacy agent: %d %s", code, body)
+	}
+	if code, body := e.admin("POST", "/api/v1/agents/upgrade-outdated", nil); code != http.StatusConflict {
+		t.Fatalf("rollout with only a legacy agent: %d %s", code, body)
+	}
+	select {
+	case ev := <-e.events["old"]:
+		t.Fatalf("legacy agent got an event: %+v", ev)
 	default:
 	}
 }

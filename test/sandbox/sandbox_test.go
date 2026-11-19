@@ -822,7 +822,7 @@ func assertDiscoveryImport(t *testing.T, api *apiClient, agentID string) {
 	}
 	api.post("/api/v1/discovery/sources", map[string]any{
 		"type": "proxmox", "name": "pve-dry",
-		"config": map[string]any{"url": "https://pve.sandbox.test:8006", "token_id": "nurproxy@pve!dry", "token_secret": "dummy-dry-secret"},
+		"config": map[string]any{"url": "https://pve.sandbox.test:8006", "token_id": "nurproxy@pve!dry", "token_secret": "dummy-dry-secret", "verify_tls": true},
 	}, &src)
 	type candidate struct {
 		ExternalID       string `json:"external_id"`

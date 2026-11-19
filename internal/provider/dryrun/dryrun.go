@@ -154,7 +154,7 @@ func (d *dryProvider) UpdateRecord(ctx context.Context, config json.RawMessage, 
 	}
 	shared.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("dryrun: record %q not found", recordID)
+		return fmt.Errorf("%w: dryrun: record %q not found", provider.ErrRecordNotFound, recordID)
 	}
 
 	d.logger.InfoContext(ctx, "dryrun DNS: would update record",
@@ -180,7 +180,7 @@ func (d *dryProvider) PatchRecord(ctx context.Context, config json.RawMessage, r
 	existing, ok := shared.records[recordID]
 	if !ok {
 		shared.mu.Unlock()
-		return fmt.Errorf("dryrun: record %q not found", recordID)
+		return fmt.Errorf("%w: dryrun: record %q not found", provider.ErrRecordNotFound, recordID)
 	}
 	rec := existing.rec
 	if patch.Content != nil {
@@ -233,7 +233,7 @@ func (d *dryProvider) GetRecord(ctx context.Context, _ json.RawMessage, recordID
 	e, ok := shared.records[recordID]
 	shared.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("dryrun: record %q not found", recordID)
+		return nil, fmt.Errorf("%w: dryrun: record %q not found", provider.ErrRecordNotFound, recordID)
 	}
 	d.logger.DebugContext(ctx, "dryrun DNS: get record", slog.String("id", recordID))
 	out := e.rec

@@ -9,6 +9,14 @@ binary if the new one doesn't come up.
 Nothing upgrades on its own. Every upgrade starts with an operator action, unless
 you switch on **Upgrade automatically** for a specific agent (off by default).
 
+## Agents older than 0.6.0
+
+Self-update arrived with 0.6.0, so an agent on 0.5.x or older cannot take a
+remote upgrade: install 0.6.0 on its host by hand once, the same way you
+installed it. From then on the agent reports whether it can self-update, and
+the orchestrator refuses an upgrade (409) for agents that never reported it.
+**Upgrade all outdated** skips them.
+
 ## Before the first upgrade: enable it on the host
 
 Self-update needs one-time consent on each edge server, because the agent runs as

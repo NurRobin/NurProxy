@@ -77,6 +77,10 @@ type Reconciler struct {
 	dnsMu sync.Mutex
 	// domainDNSLocks holds one *sync.Mutex per domain id (domainDNSLock).
 	domainDNSLocks sync.Map
+	// dnsReadFailures counts consecutive transient failures to read a
+	// domain's DNS record (domain id -> int), so one provider hiccup does not
+	// put the domain in error (dnsReadFailureLimit).
+	dnsReadFailures sync.Map
 
 	applyAuthority interface {
 		SignApplyIntent(helperprotocol.ApplyIntent) (helperprotocol.Signed[helperprotocol.ApplyIntent], error)
@@ -784,6 +788,14 @@ func (r *Reconciler) buildDesiredRoutes(agent *models.Agent) (map[string]desired
 			continue
 		}
 
+		// A standby copy cannot carry path routes: their servers sit on the
+		// primary agent (db.ErrRoutesWithBackups). The API refuses the
+		// combination; this covers rows stored before it did.
+		if src.standby && len(dom.ProxyConfig.Routes) > 0 {
+			log.Printf("reconciler: not pushing standby route for domain %d (%s) to agent %s: %v", dom.ID, fqdn, agent.ID, db.ErrRoutesWithBackups)
+			continue
+		}
+
 		artifactID := src.artifactID
 		storedArt, artErr := r.db.GetConfigArtifact(artifactID)
 
@@ -1059,6 +1071,23 @@ func (r *Reconciler) failDomainDNS(dom *models.Domain, msg, audit string) {
 	}
 }
 
+// dnsReadFailureLimit is how many reconcile passes in a row may fail to read
+// a domain's DNS record before the domain shows the error. A single provider
+// API blip or rate limit then stays in the log; a lasting failure is still
+// reported on the domain.
+const dnsReadFailureLimit = 3
+
+// noteDNSReadFailure counts one more consecutive failure to read the domain's
+// record and returns the new count. Callers hold the domain's DNS lock.
+func (r *Reconciler) noteDNSReadFailure(domainID int64) int {
+	n := 1
+	if v, ok := r.dnsReadFailures.Load(domainID); ok {
+		n = v.(int) + 1
+	}
+	r.dnsReadFailures.Store(domainID, n)
+	return n
+}
+
 // dnsConverged clears a DNS error recorded by an earlier pass.
 func (r *Reconciler) dnsConverged(dom *models.Domain) {
 	if dom.DNSError == "" {
@@ -1144,13 +1173,20 @@ func (r *Reconciler) reconcileDomainDNS(ctx context.Context, dom *models.Domain)
 		// defeating teardown cleanup (#66/§79). Preserve the stored dns_managed flag
 		// and the record id, and retry next cycle.
 		if !errors.Is(gErr, provider.ErrRecordNotFound) {
-			r.failDomainDNS(dom, fmt.Sprintf("cannot read DNS record %s for %s, retrying next cycle: %v", dom.DNSRecordID, fqdn, gErr), "")
+			msg := fmt.Sprintf("cannot read DNS record %s for %s, retrying next cycle: %v", dom.DNSRecordID, fqdn, gErr)
+			if n := r.noteDNSReadFailure(dom.ID); n < dnsReadFailureLimit {
+				log.Printf("reconciler: domain %d: %s (attempt %d of %d before it is reported)", dom.ID, msg, n, dnsReadFailureLimit)
+				return
+			}
+			r.failDomainDNS(dom, msg, "")
 			return
 		}
 		log.Printf("reconciler: DNS record %s for domain %d no longer exists, re-resolving by name: %v", dom.DNSRecordID, dom.ID, gErr)
 		r.ensureDomainCNAME(ctx, dom, fqdn, expectedTarget, dnsProvider, provConfig)
 		return
 	}
+
+	r.dnsReadFailures.Delete(dom.ID)
 
 	// Record exists and was retrieved — check content and proxy state. The
 	// proxy bit only counts as drift when the operator set it explicitly;
