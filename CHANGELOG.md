@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-19
+
 ### Upgrade notes
 
 - The orchestrator runs migrations 33–41 on its first start (from 0.5.1).
@@ -572,6 +574,8 @@ health endpoint that actually checks the database.
   rate-limited per IP.** Clients sending larger payloads, or registering many
   agents from a single IP in a short window, may now be rejected.
 
+[0.6.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.6.0
+[0.6.0-rc.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.6.0-rc.1
 [0.5.1]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.1
 [0.5.0]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0
 [0.5.0-rc.3]: https://github.com/NurRobin/NurProxy/releases/tag/v0.5.0-rc.3
