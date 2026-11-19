@@ -290,7 +290,10 @@ func TestValidateConfig(t *testing.T) {
 		cfg     string
 		wantErr bool
 	}{
-		{"valid", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc"}`, false},
+		{"valid", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","verify_tls":true}`, false},
+		{"verification explicitly off", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","verify_tls":false}`, false},
+		{"verify_tls omitted would silently skip certificate checks", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc"}`, true},
+		{"pinned fingerprint without verify_tls", `{"url":"pve.lan","token_id":"root@pam!np","token_secret":"abc","fingerprint":"` + strings.Repeat("AB", 32) + `"}`, false},
 		{"missing url", `{"token_id":"root@pam!np","token_secret":"abc"}`, true},
 		{"token id without realm", `{"url":"pve.lan","token_id":"root!np","token_secret":"abc"}`, true},
 		{"token id without name", `{"url":"pve.lan","token_id":"root@pam","token_secret":"abc"}`, true},

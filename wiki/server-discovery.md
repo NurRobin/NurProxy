@@ -55,7 +55,9 @@ The token ID you enter in NurProxy is the full `nurproxy@pve!discovery`.
   node's **SHA-256 fingerprint** (Node → System → Certificates), which then is
   the only certificate accepted, or paste the cluster CA
   (`/etc/pve/pve-root-ca.pem`) and keep verification on. Turning verification
-  off without a fingerprint lets anyone on the path read the token.
+  off without a fingerprint lets anyone on the path read the token. Through
+  the API or CLI, `verify_tls` must be given explicitly unless a `fingerprint`
+  is pinned; a config without either is refused.
 - **Re-sync**: only on demand, or every 15 minutes to 24 hours.
 
 **Test connection** checks the token, that it can list the nodes, and that it
