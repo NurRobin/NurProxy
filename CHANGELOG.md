@@ -7,7 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- The orchestrator runs migrations 33–41 on its first start (from 0.5.1).
+  Among them, servers and domains are rebuilt with `ON DELETE RESTRICT`
+  foreign keys. Take a backup first (`nurproxy backup`).
+- Agents before 0.6.0 cannot update themselves. Install 0.6.0 on each agent
+  host by hand once; remote upgrades work from then on. The orchestrator
+  refuses a remote upgrade for agents that never reported self-update support.
+- 0.5.1 agents keep working with a 0.6.0 orchestrator, including as failover
+  standby. Path routes and per-domain log settings are held back for them
+  until they run 0.6.0.
+- Deleting an agent, server or zone that is still in use now answers 409
+  instead of 404.
+- Proxmox discovery sources created through the API or CLI need an explicit
+  `verify_tls` unless a `fingerprint` is pinned.
+
 ### Added
+
+- **Failover across agents (#74).** A domain can have up to three backup
+  servers on other agents that serve its zone. Each backup agent keeps the
+  route and certificate warm, and the domain's CNAME points at the first
+  healthy agent, so a failover is only a DNS change. Health is the agent
+  heartbeat (down after `agent_offline_timeout + failover_grace`, 90 + 30 s by
+  default); failback waits `failover_failback_delay` (300 s) and can be turned
+  off. If every agent is down the record stays where it is. Audit entries
+  `failover`/`failback`, metrics `nurproxy_domain_on_backup` and
+  `nurproxy_domain_failover_switches_total`. A domain has either backup
+  servers or path routes, not both, for now. See `wiki/failover.md`.
+- **Agent self-update (#73).** Agents can be upgraded from the dashboard, the
+  CLI (`nurproxy agent upgrade`), in a sequential "all outdated" rollout that
+  stops at the first failure, or automatically for agents that opt in (off by
+  default). The agent verifies the release's cosign keyless signature against
+  the release workflow identity and the archive checksum. A root applier,
+  installed once with `sudo nurproxy-agent self-update-enable`, swaps the
+  binary and restarts the agent; if the new agent does not report healthy
+  within 3 minutes it goes back to the old one. Package-managed (deb, rpm,
+  AUR, Homebrew) and container installs refuse with a reason. See
+  `wiki/agent-upgrades.md`.
+- **Adopt certificates already on an agent's disk (#80).** Agents report
+  certificates they find in certbot's and acme.sh's directories and in the
+  host proxy's `ssl_certificate` / `SSLCertificateFile` directives
+  (metadata only). The operator can adopt one for a domain
+  (`nurproxy domain adopt-cert`, or the Adopt button), and only then the agent
+  uploads it. A new central-TLS domain waits up to an hour before its first
+  ACME order while its agent reports an adoptable certificate, so moving a host
+  to NurProxy does not force a new Let's Encrypt order.
+- **Shared zone wildcard certificates (#69).** A domain can opt into one
+  `*.<zone>` certificate (`tls_wildcard`), issued once per zone and pushed to
+  every agent that serves an opted-in domain. It is removed when no domain of
+  the zone uses it any more.
+- **Proxmox VE server discovery (#25).** A Proxmox source (read-only API
+  token, stored encrypted) lists the cluster's VMs and containers with their
+  addresses (guest agent, cloud-init, LXC interfaces). Selected machines can
+  be imported as normal servers. A re-sync shows new machines and flags
+  imported ones that are gone, but never deletes or overwrites them.
+  Dashboard: Settings → Server discovery, and "Discover from Proxmox VE" per
+  agent. CLI: `nurproxy discovery`. See `wiki/server-discovery.md`.
+- **Cloudflare proxied state is kept (#126).** Record updates no longer flip
+  an orange-cloud record to grey. A domain can also set `proxied` explicitly.
+- **DNS takeover preview (#128).** `?dry_run=true`, `--dry-run` and a
+  dashboard preview show which records a takeover would delete and create. A
+  takeover that stops halfway says which records were already deleted.
 
 - **Path routes: several upstreams per domain (#89).** A domain can send exact
   paths (`= /api/world`) and path prefixes (`/media`, matching `/media` and
@@ -76,6 +137,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   managed proxy reconciliation failed".
 
 ### Fixed
+
+- **DNS failures stay visible on the domain.** A failed record create or read
+  used to be overwritten by the next route apply, so a domain could look
+  active without a DNS record. The reason is now kept in `dns_error` until DNS
+  converges. A new domain gets its record right away instead of on the next
+  cycle. A record read only shows as an error after three failed passes in a
+  row, so a short provider outage does not flag every domain.
+- **DNS takeover and the reconciler no longer race.** Both take a per-domain
+  DNS lock, so a takeover can no longer end up with an adopted record or a
+  second CNAME.
+- **Parent deletes are guarded by the database (#104).** Agents, servers and
+  zones still in use cannot be deleted by accident (409); `?cascade=true`
+  removes the dependents through the reconciler.
 
 - **Raw nginx configs may carry common tuning directives, and a refusal says
   why (#149).** The root helper's raw-config policy now admits `gzip*`,
