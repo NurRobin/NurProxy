@@ -1033,6 +1033,50 @@ func TestReconcileDNS_TransientGetRecordPreservesManaged(t *testing.T) {
 	}
 }
 
+// A transient read failure is only reported on the domain after
+// dnsReadFailureLimit passes in a row, so a single provider blip does not put
+// every domain in error; a successful read resets the count.
+func TestReconcileDNS_TransientGetRecordReportedAfterLimit(t *testing.T) {
+	d := testDB(t)
+	mp := registerMockProvider(t)
+	_, _, _, _, dom := setupScenario(t, d)
+	recordID := mp.seedRecord(provider.Record{Type: "CNAME", Name: "app.example.com", Content: "agent1.example.com"})
+	if err := d.UpdateDomainDNSRecord(dom.ID, recordID, true); err != nil {
+		t.Fatal(err)
+	}
+	r := New(d, newMockAgentClient(), time.Minute)
+	pass := func() *models.Domain {
+		t.Helper()
+		if err := r.reconcileDNS(context.Background()); err != nil {
+			t.Fatalf("reconcileDNS: %v", err)
+		}
+		got, err := d.GetDomain(dom.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	mp.getErr = errors.New("cloudflare API error: 429 rate limited")
+	for i := 1; i < dnsReadFailureLimit; i++ {
+		if got := pass(); got.DNSError != "" || got.Status == models.DomainStatusError {
+			t.Fatalf("pass %d: domain reported a transient read error too early: status=%s dns_error=%q", i, got.Status, got.DNSError)
+		}
+	}
+	// A good read in between starts the count again.
+	mp.getErr = nil
+	pass()
+	mp.getErr = errors.New("cloudflare API error: 429 rate limited")
+	for i := 1; i < dnsReadFailureLimit; i++ {
+		if got := pass(); got.DNSError != "" {
+			t.Fatalf("count was not reset by a good read: dns_error=%q after %d failures", got.DNSError, i)
+		}
+	}
+	if got := pass(); got.DNSError == "" || got.Status != models.DomainStatusError {
+		t.Fatalf("lasting read failure not reported: status=%s dns_error=%q", got.Status, got.DNSError)
+	}
+}
+
 // reconcileAgentDNS must only adopt an existing A/AAAA whose content already
 // matches the agent IP. A same-type record with a DIFFERENT IP is one NurProxy
 // did not create; it must raise an explicit conflict (dns_error + audit) rather

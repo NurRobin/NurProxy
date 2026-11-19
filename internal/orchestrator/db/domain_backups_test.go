@@ -145,3 +145,31 @@ func TestDomainFailoverStateRoundTrip(t *testing.T) {
 		t.Fatalf("state stored for a deleted domain: %+v", states)
 	}
 }
+
+// Path routes and failover backups exclude each other: route servers sit on
+// the primary agent, so a backup agent's standby copy would dial the primary
+// site's addresses.
+func TestDomainBackupsAndPathRoutesExcludeEachOther(t *testing.T) {
+	d := testDB(t)
+	dom := seedBackupTopology(t, d)
+	now := time.Now().UTC()
+
+	if _, err := d.SetDomainBackups(dom.ID, []string{"srv-a"}, now); err != nil {
+		t.Fatal(err)
+	}
+	withRoutes := *dom
+	withRoutes.ProxyConfig.Routes = []models.PathRoute{{Match: "prefix", Path: "/api", ServerID: "srv-p", Port: 7000}}
+	if err := d.CheckDomainRoutes(&withRoutes); !errors.Is(err, ErrRoutesWithBackups) {
+		t.Fatalf("routes on a domain with backups: err = %v, want ErrRoutesWithBackups", err)
+	}
+
+	if _, err := d.SetDomainBackups(dom.ID, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateDomain(&withRoutes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SetDomainBackups(dom.ID, []string{"srv-a"}, now); !errors.Is(err, ErrInvalidBackups) {
+		t.Fatalf("backups on a domain with path routes: err = %v, want ErrInvalidBackups", err)
+	}
+}

@@ -91,3 +91,7 @@ heartbeat.
   server of the domain is healthy (409).
 - A domain cannot be moved onto an agent that is one of its backups; remove
   that backup first.
+- Failover and [path routes](domains#path-routes) don't combine yet. The
+  servers of a path route sit on the domain's own agent, which a backup agent
+  can't reach, so a domain has either backup servers or path routes. The API
+  refuses the other one (400).
