@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Dependency updates for known vulnerabilities: `go-jose/v4` 4.1.9,
+  `golang.org/x/crypto` 0.59.0, `golang.org/x/net` 0.62.0, `golang.org/x/text`
+  0.44.0, `golang.org/x/mod` 0.42.0; dashboard lockfile refreshed (vite,
+  brace-expansion, minimatch, zod, i18next and others).
+- Building from source now needs Go 1.26 (required by `golang.org/x/crypto`
+  0.56+; Go 1.25 is out of support).
+
 ## [0.6.0] - 2026-11-19
 
 ### Upgrade notes
