@@ -31,7 +31,7 @@ func TestLoadOrGenerateAccountKeyFileFreshAndExisting(t *testing.T) {
 	}
 	a := first.(*ecdsa.PrivateKey)
 	b := second.(*ecdsa.PrivateKey)
-	if a.D.Cmp(b.D) != 0 {
+	if !a.Equal(b) {
 		t.Fatal("existing account key changed")
 	}
 }
